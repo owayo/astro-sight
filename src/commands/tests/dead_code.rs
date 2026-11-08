@@ -1114,6 +1114,7 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
         kind: "function".to_string(),
         file: "src/notes.ts".to_string(),
         refs_internal: 0,
+        cfg_availability: None,
     }];
     let filtered = filter_dead_by_wip_added(dead, &added);
     let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
@@ -1122,6 +1123,32 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
         vec!["legacyUnused"],
         "WIP added は dead から除外、既存 dead は残す"
     );
+}
+
+/// 有る設定が増えただけの既存の項目 (`cfg_availability` を添えた追加。Issue #291) は WIP にせず、
+/// dead のまま残す。
+#[test]
+fn filter_dead_by_wip_added_keeps_widened_existing_items() {
+    use crate::models::review::{ApiSymbol, CfgAvailability, DeadSymbol};
+    let dead = vec![DeadSymbol {
+        name: "widened".to_string(),
+        kind: "function".to_string(),
+        file: "src/lib.rs".to_string(),
+        line: None,
+    }];
+    let added = vec![ApiSymbol {
+        inline_module: None,
+        name: "widened".to_string(),
+        kind: "function".to_string(),
+        file: "src/lib.rs".to_string(),
+        refs_internal: 0,
+        cfg_availability: Some(CfgAvailability {
+            old: vec![vec!["cfg(feature = \"x\")".to_string()]],
+            new: vec![vec![]],
+        }),
+    }];
+    let filtered = filter_dead_by_wip_added(dead, &added);
+    assert_eq!(filtered.len(), 1, "既存の項目の dead は残す");
 }
 
 /// `filter_dead_by_wip_added` は (file, name) ペアで突合せ、同名でもファイルが
@@ -1142,6 +1169,7 @@ fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
         kind: "function".to_string(),
         file: "src/b.ts".to_string(),
         refs_internal: 0,
+        cfg_availability: None,
     }];
     let filtered = filter_dead_by_wip_added(dead, &added);
     assert_eq!(filtered.len(), 1);

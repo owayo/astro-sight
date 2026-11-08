@@ -67,6 +67,13 @@ pub(crate) struct RustUnionShape {
 }
 
 impl RustUnionShape {
+    /// 囲む項目 (inline module・ファイルの先頭など) の有る条件を足す。比べる設定を、union の有る
+    /// 設定に絞る (Issue #291)。
+    pub(super) fn with_enclosing(mut self, enclosing: Vec<Attr>) -> Self {
+        self.conditions.extend(enclosing);
+        self
+    }
+
     /// `union_item` の形。読めない構文があれば None。
     pub(crate) fn from_node(item: Node<'_>, source: &[u8]) -> Option<Self> {
         if item.kind() != "union_item" || item.has_error() {
@@ -336,7 +343,11 @@ fn compare_effective(
 }
 
 /// 旧新の公開の形を比べる。
-pub(crate) fn classify(old: &RustUnionShape, new: &RustUnionShape) -> ShapeChange {
+pub(crate) fn classify(
+    old: &RustUnionShape,
+    new: &RustUnionShape,
+    availability_compared: bool,
+) -> ShapeChange {
     use ShapeChange::Breaking;
     if old.visibility.as_ref().map(Tokens::key) != new.visibility.as_ref().map(Tokens::key) {
         return Breaking;
@@ -377,10 +388,12 @@ pub(crate) fn classify(old: &RustUnionShape, new: &RustUnionShape) -> ShapeChang
         else {
             continue;
         };
-        // 旧くビルドできた設定で、新しい union が無いかビルドできないのは壊す。
-        let Some(new_union) = effective(new, &new_conditions, config).filter(|shape| shape.present)
-        else {
-            return Breaking;
+        let new_union = match effective(new, &new_conditions, config) {
+            Some(shape) if shape.present => shape,
+            // 有る設定の変化を別に比べる (Issue #291) なら、新しい union が無い設定は比べない。
+            Some(_) if availability_compared => continue,
+            // 旧くビルドできた設定で、新しい union が無いかビルドできないのは壊す。
+            _ => return Breaking,
         };
         compared = true;
         // 型の引数と寿命の境界 (推論されるものは、この設定で有るフィールドから)。
@@ -409,7 +422,7 @@ pub(crate) fn classify(old: &RustUnionShape, new: &RustUnionShape) -> ShapeChang
             return Breaking;
         }
     }
-    if !compared {
+    if !compared && !availability_compared {
         return Breaking;
     }
     change
@@ -465,7 +478,8 @@ pub(crate) fn unique_union_shape(source: &[u8], name: &str) -> Option<RustUnionS
     let [item] = items.as_slice() else {
         return None;
     };
-    RustUnionShape::from_node(*item, source)
+    let enclosing = super::rust_declarations::enclosing_conditions(*item, source)?;
+    Some(RustUnionShape::from_node(*item, source)?.with_enclosing(enclosing))
 }
 
 #[cfg(test)]
@@ -477,7 +491,7 @@ mod tests {
     }
 
     fn change(old: &str, new: &str) -> ShapeChange {
-        classify(&shape(old), &shape(new))
+        classify(&shape(old), &shape(new), false)
     }
 
     #[test]

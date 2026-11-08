@@ -26,6 +26,23 @@ pub(crate) struct RustDeclarationContext {
     pub(crate) conditions: Vec<String>,
     /// 宣言の始まりの位置 (行, 列。0 始まり)。
     pub(crate) start: (usize, usize),
+    /// 宣言を囲む最も内側の impl・trait の見出し (`impl<T: Copy> S<T> where ..` の、中身の前までの
+    /// トークン)。同じキーの分岐を比べるとき、残った分岐の契約に含める (Issue #291)。
+    pub(crate) container_header: Vec<String>,
+    /// 宣言の有る条件 (Issue #291)。宣言自身の外側の属性と本体の内側の属性 (関数・trait)、囲む
+    /// 項目 (impl・trait・inline module・extern ブロック) の外側の属性と中身の内側の属性、ファイルの
+    /// 先頭の内側の属性のうち、`cfg` と、`cfg` だけに絞った `cfg_attr` (外側から)。読めない属性が
+    /// あれば None。別のファイルの親 module (`#[cfg(x)] mod m;`) の条件は含まない。
+    pub(crate) availability: Option<Vec<AvailabilityAttr>>,
+}
+
+/// 宣言の有る条件の属性 1 つ (`cfg(..)` か、`cfg` だけに絞った `cfg_attr(..)`)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AvailabilityAttr {
+    /// 比べる鍵 (`rust_cfg_predicate::Atoms::presence` に渡す)。
+    pub(crate) key: Vec<String>,
+    /// 表示 (`#[` と `]` を除く)。
+    pub(crate) shown: String,
 }
 
 /// 変更ファイルの旧新の公開シンボルの宣言の文脈 (それぞれ `old_syms`・`new_syms` と同じ順)。
@@ -95,6 +112,102 @@ pub(crate) fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -
     tokens
 }
 
+/// `item` の直前に並ぶ外側の属性 (`attribute_item`) のノード (内側から。コメントは飛ばす)。
+fn preceding_attribute_items(item: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut attributes = Vec::new();
+    let mut previous = item.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => attributes.push(sibling),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    attributes
+}
+
+/// 中身 (`declaration_list`・`block`・`source_file`) の内側の属性 (`inner_attribute_item`) のノード。
+fn inner_attribute_items(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|child| child.kind() == "inner_attribute_item")
+        .collect()
+}
+
+/// 属性のノードのうち、有る条件に効くもの (`cfg` と、`cfg` だけに絞った `cfg_attr`) を `out` に足す。
+/// 読めない属性があれば `out` を None にする。
+fn push_availability(
+    attributes: &[tree_sitter::Node<'_>],
+    source: &[u8],
+    out: &mut Option<Vec<AvailabilityAttr>>,
+) {
+    for attribute in attributes {
+        let Some(found) = out.as_mut() else {
+            return;
+        };
+        match super::rust_type_api::project_attribute(*attribute, source, &["cfg"]) {
+            Some(Some(attr)) => found.push(AvailabilityAttr {
+                key: attr.key,
+                shown: attr.shown,
+            }),
+            Some(None) => {}
+            None => *out = None,
+        }
+    }
+}
+
+/// 宣言の項目 `item` を囲む項目 (中身が `declaration_list` の impl・trait・inline module・extern
+/// ブロック) の中身の内側の属性と外側の属性、ファイルの先頭の内側の属性のノード (内側から)。
+fn enclosing_attribute_items(item: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut attributes = Vec::new();
+    let mut node = item;
+    while let Some(body) = node.parent() {
+        if body.kind() != "declaration_list" {
+            break;
+        }
+        let Some(container) = body.parent() else {
+            break;
+        };
+        attributes.extend(inner_attribute_items(body).into_iter().rev());
+        attributes.extend(preceding_attribute_items(container));
+        node = container;
+    }
+    if let Some(file) = node.parent()
+        && file.kind() == "source_file"
+    {
+        attributes.extend(inner_attribute_items(file).into_iter().rev());
+    }
+    attributes
+}
+
+/// 宣言の項目 `item` を囲む項目とファイルの先頭の、有る条件の属性 (`cfg` と、`cfg` だけに絞った
+/// `cfg_attr`)。enum・union の形を、項目の有る設定で比べるのに使う (Issue #291)。読めない属性が
+/// あれば None。
+pub(super) fn enclosing_conditions(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Vec<super::rust_type_api::Attr>> {
+    let mut conditions = Vec::new();
+    for attribute in enclosing_attribute_items(item) {
+        if let Some(attr) = super::rust_type_api::project_attribute(attribute, source, &["cfg"])? {
+            conditions.push(attr);
+        }
+    }
+    Some(conditions)
+}
+
+/// 宣言の項目 `item` 自身の本体の内側の属性 (関数の `{ #![cfg(..)] }`・trait の中身の先頭)。
+fn own_inner_attribute_items(item: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    match item.kind() {
+        "function_item" | "trait_item" => item
+            .child_by_field_name("body")
+            .map(inner_attribute_items)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// 中身 (`declaration_list`) の内側の属性のうち、`cfg`・`cfg_attr` のトークンの並び。
 pub(crate) fn inner_conditions(body: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -138,7 +251,22 @@ pub(crate) fn rust_declaration_context(
     }
     // 外側から並べるため、内側から集めて最後に逆にする。
     let mut modules: Vec<String> = Vec::new();
-    let mut conditions: Vec<Vec<String>> = vec![preceding_conditions(item, source)];
+    // 関数・trait 自身の本体の先頭の `#![cfg]` も、宣言の条件 (分岐の判定に使う)。
+    let own_inner = match item.kind() {
+        "function_item" | "trait_item" => item
+            .child_by_field_name("body")
+            .map(|body| inner_conditions(body, source))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut conditions: Vec<Vec<String>> = vec![own_inner, preceding_conditions(item, source)];
+    // 有る条件の属性のノードも、内側から集める (宣言自身の本体の内側、宣言の外側、囲む項目の
+    // 中身の内側と外側、ファイルの先頭の内側の順)。
+    let mut attributes: Vec<tree_sitter::Node<'_>> =
+        own_inner_attribute_items(item).into_iter().rev().collect();
+    attributes.extend(preceding_attribute_items(item));
+    attributes.extend(enclosing_attribute_items(item));
+    let mut header_found = false;
     let mut node = item;
     while let Some(body) = node.parent() {
         if body.kind() != "declaration_list" {
@@ -149,6 +277,10 @@ pub(crate) fn rust_declaration_context(
         };
         conditions.push(inner_conditions(body, source));
         conditions.push(preceding_conditions(container, source));
+        if matches!(container.kind(), "impl_item" | "trait_item") && !header_found {
+            header_found = true;
+            context.container_header = header_tokens(container, source);
+        }
         if container.kind() == "impl_item"
             && context.owner.is_empty()
             && let Some(owner) = container.child_by_field_name("type")
@@ -165,6 +297,10 @@ pub(crate) fn rust_declaration_context(
         }
         node = container;
     }
+    attributes.reverse();
+    let mut availability = Some(Vec::new());
+    push_availability(&attributes, source, &mut availability);
+    context.availability = availability;
     modules.reverse();
     conditions.reverse();
     context.inline_module = modules.join("::");
@@ -187,6 +323,12 @@ pub(crate) struct RustPairing {
     /// 同じキーの宣言が複数あり、変わっていないとみなしたキーの、旧と新の添字の並び。契約が名指す
     /// 名前の束縛は別に比べる (Issue #283)。
     pub(crate) unchanged_groups: Vec<(Vec<usize>, Vec<usize>)>,
+    /// `pairs` のうち、条件付きの分岐 (`#[cfg]` の分岐) の代表として選んだ組。ほかの分岐の形は
+    /// 比べていない (Issue #291)。
+    pub(crate) branch_representatives: HashSet<(usize, usize)>,
+    /// 旧新の両方に宣言のあるキーの、旧と新の全ての添字の並び (`#[cfg]` の分岐を代表 1 つに縮めない)。
+    /// 項目の有る設定を比べるのに使う (Issue #291)。
+    pub(crate) groups: Vec<(Vec<usize>, Vec<usize>)>,
     /// 旧か新に、同じ qualname の宣言が 2 つ以上ある名前。名前で引く判定は別の宣言に当たり得る。
     shared_names: HashSet<String>,
 }
@@ -233,6 +375,8 @@ impl RustPairing {
             pairs: Vec::new(),
             ambiguous: Vec::new(),
             unchanged_groups: Vec::new(),
+            branch_representatives: HashSet::new(),
+            groups: Vec::new(),
             shared_names: counts
                 .into_iter()
                 .filter(|(_, (old, new))| *old > 1 || *new > 1)
@@ -240,43 +384,76 @@ impl RustPairing {
                 .collect(),
         };
         for (olds, news) in groups.into_values() {
+            if !olds.is_empty() && !news.is_empty() {
+                pairing.groups.push((olds.clone(), news.clone()));
+            }
             match (olds.as_slice(), news.as_slice()) {
                 ([], _) => news.iter().for_each(|&j| pairing.added[j] = true),
                 (_, []) => olds.iter().for_each(|&i| pairing.removed[i] = true),
                 ([i], [j]) => pairing.pairs.push((*i, *j)),
                 _ => {
+                    // 新しい版で同じ名前の宣言が同じ設定に並ぶ (旧い版では並ばなかった) なら、その
+                    // 設定ではビルドできない (Issue #291)。
+                    if !exclusive_branches(&news, new_declarations)
+                        && exclusive_branches(&olds, old_declarations)
+                    {
+                        pairing.ambiguous.push((olds, news));
+                        continue;
+                    }
                     let old_signatures: HashSet<&str> =
                         olds.iter().map(|&i| old[i].2.as_str()).collect();
                     let new_signatures: HashSet<&str> =
                         news.iter().map(|&j| new[j].2.as_str()).collect();
+                    // 囲む impl・trait の見出しも分岐の契約 (Issue #291)。
+                    let headers = |indices: &[usize], declarations: &[RustDeclarationContext]| {
+                        indices
+                            .iter()
+                            .map(|&k| declarations[k].container_header.clone())
+                            .collect::<HashSet<Vec<String>>>()
+                    };
                     // どちらの側も条件付きの分岐だけ (1 つなら条件は問わない) なら、分岐をまとめた・
-                    // 分けた変更として扱える。signature がすべて同じなら利用者から見た契約は
-                    // 変わらない (どの設定で使えるかの変化は比べない)。各側の signature がそれぞれ
-                    // 1 種類なら、どの設定でも契約はその 1 つなので、その 2 つを比べる。
+                    // 分けた変更として扱える。signature と囲む impl・trait の見出しがすべて同じなら
+                    // 利用者から見た契約は変わらない (どの設定で使えるかの変化は別に比べる)。各側の
+                    // signature がそれぞれ 1 種類なら、どの設定でも契約はその 1 つなので、その 2 つを
+                    // 比べる。
                     if only_conditional_variants(&olds, old_declarations)
                         && only_conditional_variants(&news, new_declarations)
                         && old_signatures.len() == 1
                         && new_signatures.len() == 1
+                        && single_header(
+                            &headers(&olds, old_declarations),
+                            &headers(&news, new_declarations),
+                        )
                     {
                         if old_signatures != new_signatures {
                             pairing.pairs.push((olds[0], news[0]));
+                            if olds.len() > 1 || news.len() > 1 {
+                                pairing.branch_representatives.insert((olds[0], news[0]));
+                            }
                         } else {
                             pairing.unchanged_groups.push((olds, news));
                         }
                         continue;
                     }
-                    if condition_signatures(&olds, old, old_declarations)
-                        != condition_signatures(&news, new, new_declarations)
+                    // 分岐を消しただけか足しただけ (片方の版の (条件, signature, 囲む impl・trait の
+                    // 見出し) の組が他方に全て含まれる。足した分岐が並ばないことは上で確かめた) なら、
+                    // 残った分岐の契約は同じ。有る設定の変化は別に比べる (Issue #291)。
+                    let old_entries = condition_signatures(&olds, old, old_declarations);
+                    let new_entries = condition_signatures(&news, new, new_declarations);
+                    if includes(&old_entries, &new_entries) || includes(&new_entries, &old_entries)
                     {
-                        pairing.ambiguous.push((olds, news));
-                    } else {
                         pairing.unchanged_groups.push((olds, news));
+                    } else {
+                        pairing.ambiguous.push((olds, news));
                     }
                 }
             }
         }
         // 出力の順を新しい版の宣言の順にそろえる。
         pairing.pairs.sort_by_key(|&(_, j)| j);
+        pairing
+            .groups
+            .sort_by_key(|(_, news)| news.first().copied());
         Some(pairing)
     }
 
@@ -294,15 +471,87 @@ fn only_conditional_variants(indices: &[usize], declarations: &[RustDeclarationC
             .all(|&k| !declarations[k].conditions.is_empty())
 }
 
-/// 同じキーの宣言 `indices` の、cfg の条件と signature の組 (並べ替え済み)。
+/// impl・trait の見出しのトークン (中身 (`body`) の前まで。コメントを除く)。
+fn header_tokens(container: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let body = container.child_by_field_name("body");
+    let mut tokens = Vec::new();
+    let mut cursor = container.walk();
+    for child in container.children(&mut cursor) {
+        if Some(child) == body {
+            break;
+        }
+        push_tokens(child, source, &mut tokens);
+    }
+    tokens
+}
+
+/// 宣言 `indices` の有る条件が、どの設定でも 2 つ同時に成り立たないか (同じ名前の宣言が同じ
+/// 設定に並ばない)。読めない条件があるか、原子が多すぎれば false。
+fn exclusive_branches(indices: &[usize], declarations: &[RustDeclarationContext]) -> bool {
+    exclusive_declarations(indices.iter().map(|&index| &declarations[index]))
+}
+
+/// 宣言の有る条件が、どの設定でも 2 つ同時に成り立たないか (同じ名前の宣言が同じ設定に並ばない)。
+/// 読めない条件があるか、原子が多すぎれば false。
+pub(crate) fn exclusive_declarations<'a>(
+    declarations: impl IntoIterator<Item = &'a RustDeclarationContext>,
+) -> bool {
+    use super::rust_cfg_predicate::{Atoms, Predicate};
+    let mut atoms = Atoms::default();
+    let mut predicates = Vec::new();
+    for declaration in declarations {
+        let Some(attributes) = &declaration.availability else {
+            return false;
+        };
+        predicates.push(Predicate::All(
+            attributes
+                .iter()
+                .map(|attribute| atoms.presence(&attribute.key))
+                .collect(),
+        ));
+    }
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    configs.all(|config| {
+        predicates
+            .iter()
+            .filter(|predicate| predicate.holds(config))
+            .count()
+            <= 1
+    })
+}
+
+/// 旧新を通じて、囲む impl・trait の見出しが 1 種類だけか (分岐ごとに見出しが違えば、条件と見出しの
+/// 対応を保って比べる必要がある)。
+fn single_header(old: &HashSet<Vec<String>>, new: &HashSet<Vec<String>>) -> bool {
+    old.len() == 1 && old == new
+}
+
+/// 並べ替えた多重集合 `larger` が `smaller` を全て含むか。
+fn includes<T: Ord>(larger: &[T], smaller: &[T]) -> bool {
+    let mut rest = larger.iter().peekable();
+    smaller.iter().all(|wanted| {
+        while rest.next_if(|candidate| *candidate < wanted).is_some() {}
+        rest.next_if(|candidate| *candidate == wanted).is_some()
+    })
+}
+
+/// 同じキーの宣言 `indices` の、cfg の条件と signature と囲む impl・trait の見出しの組 (並べ替え済み)。
 fn condition_signatures<'a>(
     indices: &[usize],
     symbols: &'a [(String, String, String)],
     declarations: &'a [RustDeclarationContext],
-) -> Vec<(&'a [String], &'a str)> {
-    let mut entries: Vec<(&[String], &str)> = indices
+) -> Vec<(&'a [String], &'a str, &'a [String])> {
+    let mut entries: Vec<(&[String], &str, &[String])> = indices
         .iter()
-        .map(|&k| (declarations[k].conditions.as_slice(), symbols[k].2.as_str()))
+        .map(|&k| {
+            (
+                declarations[k].conditions.as_slice(),
+                symbols[k].2.as_str(),
+                declarations[k].container_header.as_slice(),
+            )
+        })
         .collect();
     entries.sort();
     entries
@@ -324,6 +573,11 @@ pub(crate) struct RustDeclarationSite {
     /// 契約が名指す名前の指す先が変わったか、同じと確かめられなかったときの理由 (Issue #283)。
     /// あれば、互換・変更なし・追随済みとせず blocking にする。
     pub(crate) dependency: Option<crate::models::review::ApiModificationUnverifiedReason>,
+    /// 旧新の宣言がそれぞれ 1 つ (`#[cfg]` の分岐の代表でない) の同じファイルの組で、項目の有る
+    /// 設定の変化を別に比べる (Issue #291)。このとき enum・union の形は、新しい版に無い設定では
+    /// 比べない (消える設定は削除と同じ区分で出す)。分岐の代表の組では、ほかの分岐の形を比べ
+    /// られないので false。
+    pub(crate) availability_compared: bool,
 }
 
 /// Rust のソース `source` の、名前が `name` の関数・メソッドの宣言 (非公開・入れ子を含む) の数。
@@ -387,10 +641,10 @@ pub(crate) fn enum_shape_at(
     start: (usize, usize),
 ) -> Option<super::rust_enum_api::RustEnumShape> {
     let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    super::rust_enum_api::RustEnumShape::from_node(
-        item_at(tree.root_node(), start, "enum_item")?,
-        source,
-    )
+    let item = item_at(tree.root_node(), start, "enum_item")?;
+    super::rust_enum_api::RustEnumShape::from_node(item, source)?
+        .with_enclosing(enclosing_conditions(item, source)?)
+        .into()
 }
 
 /// `source` の `start` に始まる union の形。
@@ -399,10 +653,10 @@ pub(crate) fn union_shape_at(
     start: (usize, usize),
 ) -> Option<super::rust_union_api::RustUnionShape> {
     let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    super::rust_union_api::RustUnionShape::from_node(
-        item_at(tree.root_node(), start, "union_item")?,
-        source,
-    )
+    let item = item_at(tree.root_node(), start, "union_item")?;
+    super::rust_union_api::RustUnionShape::from_node(item, source)?
+        .with_enclosing(enclosing_conditions(item, source)?)
+        .into()
 }
 
 #[cfg(test)]

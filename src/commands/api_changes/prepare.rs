@@ -91,6 +91,12 @@ pub(crate) struct ApiChangeBuckets {
     /// 新しいファイルの `pub use` で同じ名前を再公開したので削除にしなかった Rust の旧い宣言と、
     /// 再公開したファイル (新しいパス)。再公開の先の宣言と組にして比べる (Issue #281)。
     pub(crate) reexported_removals: Vec<(ApiSymbolCandidate, String)>,
+    /// 有る設定の一部から消えた Rust の項目 (`#[cfg]` を足した・狭めた。Issue #291) と旧新の条件。
+    /// 項目は残るので移動の相殺にかけず、参照の有無で `removed` と `removed_dead` に分ける。
+    pub(crate) cfg_removed: Vec<(ApiSymbolCandidate, crate::models::review::CfgAvailability)>,
+    /// 無かった設定に増えた Rust の項目 (`#[cfg]` を外した・広げた。Issue #291) と旧新の条件。
+    /// 追加と同じ絞り込みを通したもの。
+    pub(crate) cfg_added: Vec<(ApiSymbolCandidate, crate::models::review::CfgAvailability)>,
 }
 
 /// diff 全体で不変な入力。ファイル単位の分類関数が共通で参照する。

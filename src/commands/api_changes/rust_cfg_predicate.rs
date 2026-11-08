@@ -1,10 +1,13 @@
-//! Rust の `#[cfg]`・`#[cfg_attr]` の述語 (Issue #276・#277)。
+//! Rust の `#[cfg]`・`#[cfg_attr]` の述語 (Issue #276・#277・#291)。
 //!
-//! 公開 enum と union の形を、cfg の原子 (`unix`・`feature = "x"` など) の真偽の組み合わせ (設定) ごとに
-//! 比べるための部品。`#[cfg(P)]` は P、`#[cfg_attr(P, cfg(Q))]` は `not(P) or Q` として読み、入れ子の
+//! 公開 enum と union の形や項目の有る設定を、cfg の原子 (`unix`・`feature = "x"` など) の真偽の
+//! 組み合わせ (設定) ごとに比べるための部品。`#[cfg(P)]` は P、`#[cfg_attr(P, cfg(Q))]` は `not(P) or Q` として読み、入れ子の
 //! `#[cfg_attr]` の中の属性は、述語が全て成り立つときに効くものとする。1 つの値しか取らない鍵
 //! (`target_os` など) の原子は同時に真にせず、`cfg(true)`・`cfg(false)` は定数、文字列の値は中身で
 //! 比べる (エスケープを解く。解けない値の原子は、ほかの値と同時に真になり得るものとする)。
+//! `target_family = "unix"`・`"windows"` は `unix`・`windows` と同じ原子にし、rustc の組み込みの
+//! target で確かめた含意 (Unix 系の `target_os` は `unix`、`target_os = "windows"` は `windows` を
+//! 含み、`unix` と `windows` は同時に真にならない) の無い組み合わせは比べない。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,6 +96,32 @@ const SINGLE_VALUED: [&str; 8] = [
     "target_pointer_width",
     "target_vendor",
     "panic",
+];
+
+/// `target_os` の値のうち、rustc の組み込みの target の `target_family` に `"unix"` を含むもの
+/// (`target_os = "linux"` なら `unix` も真)。確かめたものだけを載せ、載せない値には含意を置かない
+/// (wasm の `wasi` などは Unix とも Unix でないとも言えない)。
+const UNIX_OSES: [&str; 20] = [
+    "aix",
+    "android",
+    "cygwin",
+    "dragonfly",
+    "emscripten",
+    "freebsd",
+    "fuchsia",
+    "haiku",
+    "hurd",
+    "illumos",
+    "ios",
+    "linux",
+    "macos",
+    "netbsd",
+    "openbsd",
+    "redox",
+    "solaris",
+    "tvos",
+    "visionos",
+    "watchos",
 ];
 
 /// 文字列のリテラル (`"x"`・`r"x"`・`r#"x"#`) の中身。エスケープ (`\n`・`\x6c`・`\u{6c}`・行の
@@ -198,6 +227,12 @@ impl Atoms {
         let unrawn: Vec<String> = tokens.iter().map(|token| unraw(token).to_owned()).collect();
         let normalized: Vec<String> = match unrawn.as_slice() {
             [key, equals, value] if equals == "=" => match string_value(value) {
+                // `target_family = "unix"` は `unix` (`windows` も同じ)。
+                Some(value)
+                    if key == "target_family" && matches!(value.as_str(), "unix" | "windows") =>
+                {
+                    vec![value]
+                }
                 Some(value) => vec![key.clone(), equals.clone(), format!("{value:?}")],
                 None => unrawn.clone(),
             },
@@ -321,6 +356,39 @@ impl Atoms {
         reprs
     }
 
+    /// target の含意。(条件の原子のビット, 条件が真なら真であるべきビット, 偽であるべきビット) の並び。
+    /// Unix 系の `target_os` は `unix` を含み `windows` を除き、`target_os = "windows"` は `windows` を
+    /// 含み `unix` を除き、`unix` は `windows` を除く (無い原子のビットは 0)。
+    fn implications(&self) -> Vec<(u64, u64, u64)> {
+        let bit = |name: &str| {
+            self.0
+                .iter()
+                .position(|atom| matches!(atom.as_slice(), [only] if only == name))
+                .map_or(0, |index| 1u64 << index)
+        };
+        let (unix, windows) = (bit("unix"), bit("windows"));
+        let mut implications = Vec::new();
+        if unix != 0 {
+            implications.push((unix, 0, windows));
+        }
+        for (index, atom) in self.0.iter().enumerate() {
+            let [key, equals, value] = atom.as_slice() else {
+                continue;
+            };
+            if key != "target_os" || equals != "=" {
+                continue;
+            }
+            match string_value(value).as_deref() {
+                Some(os) if UNIX_OSES.contains(&os) => {
+                    implications.push((1 << index, unix, windows));
+                }
+                Some("windows") => implications.push((1 << index, windows, unix)),
+                _ => {}
+            }
+        }
+        implications
+    }
+
     /// 比べる設定 (原子の真偽の組み合わせのうち起こり得るもの)。原子が [`MAX_ATOMS`] を超えれば
     /// None (呼び出し側は壊す扱いにする)。
     pub(super) fn configs(&self) -> Option<impl Iterator<Item = u64> + use<>> {
@@ -328,7 +396,13 @@ impl Atoms {
             return None;
         }
         let exclusive = self.exclusive();
-        Some((0..1u64 << self.0.len()).filter(move |config| possible(*config, &exclusive)))
+        let implications = self.implications();
+        Some((0..1u64 << self.0.len()).filter(move |config| {
+            possible(*config, &exclusive)
+                && implications.iter().all(|&(atom, required, forbidden)| {
+                    config & atom == 0 || (config & required == required && config & forbidden == 0)
+                })
+        }))
     }
 }
 
@@ -459,6 +533,35 @@ mod tests {
         atoms.predicate(&tokens("target_os = \"linux\""));
         atoms.predicate(&tokens("target_os = \"\\qinux\""));
         assert_eq!(atoms.exclusive(), vec![0b01]);
+    }
+
+    #[test]
+    fn target_relations_follow_rustc_targets() {
+        let tokens = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
+        let configs = |atoms: &Atoms| -> Vec<u64> { atoms.configs().expect("configs").collect() };
+        // `target_family = "unix"` は `unix`
+        let mut atoms = Atoms::default();
+        let family = atoms.predicate(&tokens("target_family = \"unix\""));
+        let bare = atoms.predicate(&tokens("unix"));
+        assert_eq!(atoms.len(), 1);
+        assert!(family.holds(0b1) && bare.holds(0b1) && !family.holds(0b0));
+        // Unix 系の `target_os` は `unix` を含み、`windows` を除く
+        let mut atoms = Atoms::default();
+        atoms.predicate(&tokens("target_os = \"linux\""));
+        atoms.predicate(&tokens("unix"));
+        atoms.predicate(&tokens("windows"));
+        assert_eq!(configs(&atoms), vec![0b000, 0b010, 0b011, 0b100]);
+        // `target_os = "windows"` は `windows` を含み、`unix` を除く
+        let mut atoms = Atoms::default();
+        atoms.predicate(&tokens("target_os = \"windows\""));
+        atoms.predicate(&tokens("unix"));
+        atoms.predicate(&tokens("target_family = \"windows\""));
+        assert_eq!(configs(&atoms), vec![0b000, 0b010, 0b100, 0b101]);
+        // 載せない値 (`wasi`) には含意を置かない
+        let mut atoms = Atoms::default();
+        atoms.predicate(&tokens("target_os = \"wasi\""));
+        atoms.predicate(&tokens("unix"));
+        assert_eq!(configs(&atoms), vec![0b00, 0b01, 0b10, 0b11]);
     }
 
     #[test]

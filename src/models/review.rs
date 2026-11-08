@@ -243,6 +243,20 @@ pub struct ApiSymbol {
     /// 0 は JSON 出力から省略される (compact 規約)。
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub refs_internal: usize,
+    /// Rust の項目の有る設定の旧新の条件 (Issue #291)。`removed`・`removed_dead` では、旧版で有った
+    /// 設定の一部から消えた (`#[cfg]` を足した・狭めた) 項目、`added` では、無かった設定に増えた
+    /// (`#[cfg]` を外した・広げた) 項目に添える。宣言ごとと同じでない項目の削除・追加には付かない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_availability: Option<CfgAvailability>,
+}
+
+/// Rust の項目の有る条件の旧新 (Issue #291)。宣言 (同じ場所の `#[cfg]` の分岐) ごとに、有る条件の
+/// 属性 (`cfg(..)` と、`cfg` だけに絞った `cfg_attr(..)`。同じファイルの囲む項目とファイルの先頭の
+/// ものも含む) の表示を並べる。無条件の宣言は空の並び。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CfgAvailability {
+    pub old: Vec<Vec<String>>,
+    pub new: Vec<Vec<String>>,
 }
 
 /// `serde(skip_serializing_if)` 用: 参照数 0 は出力から省略する (compact 規約)。
@@ -329,6 +343,9 @@ pub enum ApiModificationUnverifiedReason {
     RustSignatureDependencyChanged,
     /// Rust の公開シンボルの契約が名指す名前の指す先を解けず、同じと確かめられなかった (Issue #283)。
     RustSignatureDependencyUnresolved,
+    /// Rust の項目の有る条件 (`#[cfg]`) を読めないか、原子が多すぎて、旧新で有る設定が同じと
+    /// 確かめられなかった (Issue #291)。
+    RustCfgAvailabilityUnverified,
 }
 
 /// 変更後ソースの位置。line は refs と同じ 0 始まり。

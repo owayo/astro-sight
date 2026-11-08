@@ -299,6 +299,11 @@ pub(crate) fn detect_api_changes_with_renames(
         &member_files,
     );
 
+    // 別のファイルへ移した Rust の項目も、移動元と移動先の宣言 (同じ場所の `#[cfg]` の分岐を
+    // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
+    // ことの証明にはしない。
+    compare_moved_availability(&inputs, &mut state, &moved);
+
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
     // caller も削除」も同 diff 内で repo 内到達性 0 になるため同一カテゴリに含む。
@@ -328,6 +333,11 @@ pub(crate) fn detect_api_changes_with_renames(
         &ambiguous_relation_keys,
     );
     removed_kept.extend(unverified_removed);
+    // 有る設定の一部から消えた Rust の項目 (Issue #291) は、項目そのものは残るので移動の相殺に
+    // かけず、名前の参照が repo に残れば removed、無ければ removed_dead にする。
+    let (cfg_removed_kept, cfg_removed_dead) =
+        partition_cfg_removals(dir, std::mem::take(&mut state.buckets.cfg_removed));
+    let cfg_added = std::mem::take(&mut state.buckets.cfg_added);
 
     // cfg の相補的な 2 分岐は公開名として 1 件。同一ファイルの新規候補だけを
     // move 照合が終わった後に畳み、シグネチャ別の対応付け材料は保持する。
@@ -339,10 +349,19 @@ pub(crate) fn detect_api_changes_with_renames(
     // 引くため追加のディレクトリ走査は発生しない。
     let added: Vec<ApiSymbol> = added
         .into_iter()
-        .map(|c| {
+        .map(|c| (c, None))
+        .chain(
+            cfg_added
+                .into_iter()
+                .map(|(c, availability)| (c, Some(availability))),
+        )
+        .map(|(c, cfg_availability)| {
             let refs_internal =
                 count_internal_refs(&ref_index, dir, &c.file, &c.name, &mut closure_caches);
-            c.into_added_api_symbol(refs_internal)
+            ApiSymbol {
+                cfg_availability,
+                ..c.into_added_api_symbol(refs_internal)
+            }
         })
         .collect();
 
@@ -358,6 +377,7 @@ pub(crate) fn detect_api_changes_with_renames(
         removed: removed_kept
             .into_iter()
             .map(|c| c.into_api_symbol())
+            .chain(cfg_removed_kept)
             .collect(),
         modified: buckets.modified,
         moved,
@@ -365,6 +385,7 @@ pub(crate) fn detect_api_changes_with_renames(
         removed_dead: removed_dead
             .into_iter()
             .map(|c| c.into_api_symbol())
+            .chain(cfg_removed_dead)
             .collect(),
         modified_closed_in_diff: buckets.modified_closed_in_diff,
         const_value_changes: buckets.const_value_changes,
@@ -374,6 +395,57 @@ pub(crate) fn detect_api_changes_with_renames(
         callback_body_changes: buckets.callback_body_changes,
         compatible_modified: buckets.compatible_modified,
     }
+}
+
+/// 有る設定の一部から消えた Rust の項目 (Issue #291) を、名前の参照 (定義を除く) が repo に残るもの
+/// (removed) と残らないもの (removed_dead) に分ける。項目は残るので、削除の区分の残った定義への
+/// 帰属 (`partition_removed_dead_candidates`) は使わない (残った定義は消えた設定の項目そのもの)。
+/// 同じ名前の別のものの参照も数える (保守側)。参照を探せなければ removed に残す。
+fn partition_cfg_removals(
+    dir: &str,
+    candidates: Vec<(ApiSymbolCandidate, crate::models::review::CfgAvailability)>,
+) -> (Vec<ApiSymbol>, Vec<ApiSymbol>) {
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (candidate, _) in &candidates {
+        let name = bare_name(&candidate.name).to_owned();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let referenced: Option<HashSet<String>> = AppService::new()
+        .find_symbol_references_batch(&names, dir, None)
+        .ok()
+        .map(|results| {
+            results
+                .into_iter()
+                .filter(|result| {
+                    result.references.iter().any(|reference| {
+                        reference.kind != Some(crate::models::reference::RefKind::Definition)
+                    })
+                })
+                .map(|result| result.symbol)
+                .collect()
+        });
+    let mut kept = Vec::new();
+    let mut dead = Vec::new();
+    for (candidate, availability) in candidates {
+        let live = referenced
+            .as_ref()
+            .is_none_or(|names| names.contains(bare_name(&candidate.name)));
+        let symbol = ApiSymbol {
+            cfg_availability: Some(availability),
+            ..candidate.into_api_symbol()
+        };
+        if live {
+            kept.push(symbol);
+        } else {
+            dead.push(symbol);
+        }
+    }
+    (kept, dead)
 }
 
 fn collapse_exclusive_rust_const_additions(
@@ -655,6 +727,7 @@ mod removed_ffi;
 mod removed_rust_paths;
 mod removed_scope;
 
+mod rust_availability;
 mod rust_cfg_predicate;
 mod rust_declarations;
 mod rust_dependencies;

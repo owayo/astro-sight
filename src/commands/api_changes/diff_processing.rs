@@ -22,6 +22,7 @@ impl ApiSymbolCandidate {
             kind: self.kind,
             file: self.file,
             refs_internal: 0,
+            cfg_availability: None,
         }
     }
 
@@ -63,6 +64,9 @@ pub(crate) fn process_modified_file(
         &new_symbols_in_current_file,
     );
     collect_modified_symbols(inputs, state, df, facts, &maps);
+    if let (Some(pairing), Some(declarations)) = (&maps.rust, facts.rust_declarations) {
+        collect_rust_availability_changes(inputs, state, df, facts, pairing, declarations);
+    }
     // シグネチャ差分に乗らない契約変更。上の 3 つと違い「old/new でシグネチャが同じ」
     // シンボルを見るため、最後に独立した経路として走らせる。
     collect_python_contract_changes(inputs, state, df, facts, &maps);
@@ -820,6 +824,9 @@ fn collect_rust_modified_symbols(
             name_shared: pairing.name_is_shared(name),
             callee_shared: declarations.new_shared_callables.contains(bare_name(name)),
             dependency,
+            availability_compared: !pairing
+                .branch_representatives
+                .contains(&(old_index, new_index)),
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -849,6 +856,7 @@ fn collect_rust_modified_symbols(
             name_shared: true,
             callee_shared: true,
             dependency: Some(dependency),
+            availability_compared: false,
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -890,6 +898,363 @@ fn collect_rust_modified_symbols(
                 first_unproven: None,
             }),
         );
+    }
+}
+
+/// Rust の変更ファイルで、旧新の両方に宣言のある項目の有る設定を比べる (Issue #291)。項目の API の
+/// signature は項目自身の `#[cfg]` を含まないので、signature の比較とは別に、同じキーの宣言
+/// (`#[cfg]` の分岐をまとめて) の有る条件を比べる。旧版で有った設定の一部から消えた項目は削除と
+/// 同じ区分の候補にし、無かった設定に増えた項目は追加と同じ絞り込みを通して追加の候補にする
+/// (別の条件への付け替えは両方)。比べられなければ blocking の変更にする。
+fn collect_rust_availability_changes(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    df: &crate::models::impact::DiffFile,
+    facts: &ModifiedFileFacts<'_>,
+    pairing: &RustPairing,
+    declarations: &RustDeclarationPair,
+) {
+    use super::rust_availability::{AvailabilityChange, compare, describe};
+    let &DetectionInputs {
+        dir,
+        base_blobs,
+        diff_new_paths,
+        ref_index,
+        ..
+    } = inputs;
+    if is_binary_only_rust_crate(dir, &df.new_path) {
+        return;
+    }
+    for (olds, news) in &pairing.groups {
+        let old: Vec<&RustDeclarationContext> =
+            olds.iter().map(|&i| &declarations.old[i]).collect();
+        let new: Vec<&RustDeclarationContext> =
+            news.iter().map(|&j| &declarations.new[j]).collect();
+        let change = compare(&old, &new);
+        if change == AvailabilityChange::Same {
+            continue;
+        }
+        let (Some(&first_old), Some(&first_new)) = (olds.first(), news.first()) else {
+            continue;
+        };
+        let (name, kind, old_sig) = &facts.old_syms[first_old];
+        let new_sig = &facts.new_syms[first_new].2;
+        let candidate = ApiSymbolCandidate {
+            inline_module: declarations.new_inline_module(first_new),
+            name: name.clone(),
+            kind: kind.clone(),
+            file: df.new_path.clone(),
+            signature: new_sig.clone(),
+        };
+        let removable = !is_rust_old_symbol_outside_public_api_surface(
+            dir,
+            base_blobs,
+            &df.old_path,
+            name,
+            state.rust_public,
+        );
+        let item = AvailabilityItem {
+            candidate,
+            old_signature: old_sig.clone(),
+            availability: describe(&old, &new),
+            removable,
+        };
+        record_availability_change(inputs, state, change, item, |state| {
+            !is_rust_new_symbol_outside_public_api_surface(
+                dir,
+                &df.new_path,
+                name,
+                state.rust_public,
+            ) && !is_internally_connected(facts.in_file_callees, name)
+                && !is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths)
+        });
+    }
+}
+
+/// 有る設定の比較 (Issue #291) で振り分ける項目。
+struct AvailabilityItem {
+    /// 新しい版の項目 (削除・追加の候補にする)。
+    candidate: ApiSymbolCandidate,
+    /// 旧い版の signature (比べられなかったときの変更に添える)。
+    old_signature: String,
+    /// 旧新の有る条件の表示。
+    availability: crate::models::review::CfgAvailability,
+    /// 旧い版で公開 API 面にあり、消える設定を削除と同じ区分の候補にしてよいか。
+    removable: bool,
+}
+
+/// 有る設定の比較の結果 (Issue #291) を、変更ファイルと移動で共通の規則で振り分ける。消える設定が
+/// あれば削除と同じ区分の候補、増える設定があれば (`addable` なら) 追加の候補、比べられなければ
+/// blocking の変更にする。
+fn record_availability_change(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    change: super::rust_availability::AvailabilityChange,
+    item: AvailabilityItem,
+    addable: impl FnOnce(&mut DetectionState<'_>) -> bool,
+) {
+    use super::rust_availability::AvailabilityChange;
+    let AvailabilityItem {
+        candidate,
+        old_signature,
+        availability,
+        removable,
+    } = item;
+    match change {
+        AvailabilityChange::Same => {}
+        AvailabilityChange::Unverified => {
+            if !removable {
+                return;
+            }
+            let change = ApiSymbolChange {
+                inline_module: candidate.inline_module,
+                unverified: None,
+                name: candidate.name,
+                kind: candidate.kind,
+                file: candidate.file,
+                old_signature: Some(old_signature),
+                new_signature: Some(candidate.signature),
+                no_resolved_internal_callers: false,
+                contract_change: None,
+            };
+            record_signature_decision(
+                inputs,
+                state,
+                change,
+                SignatureDecision::Unverified(ApiModificationUnverified {
+                    reason: ApiModificationUnverifiedReason::RustCfgAvailabilityUnverified,
+                    first_unproven: None,
+                }),
+            );
+        }
+        AvailabilityChange::Changed { lost, gained } => {
+            if lost && removable {
+                state
+                    .buckets
+                    .cfg_removed
+                    .push((candidate.clone(), availability.clone()));
+            }
+            if gained && addable(state) {
+                state.buckets.cfg_added.push((candidate, availability));
+            }
+        }
+    }
+}
+
+/// 別のファイルへ移した Rust の項目 (`moved`) の、移動元 (base) と移動先 (作業ツリー) の宣言 (同じ
+/// 場所の `#[cfg]` の分岐をまとめて) の有る設定を比べる (Issue #291)。
+pub(crate) fn compare_moved_availability(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    moved: &[crate::models::review::MovedSymbol],
+) {
+    type Facts = Option<(ExportedSymbols, Vec<RustDeclarationContext>)>;
+    /// 宣言と、その (名前, 種類, signature)。
+    type Declarations<'a> = Vec<(&'a (String, String, String), &'a RustDeclarationContext)>;
+    let rust = |path: &str| {
+        crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok()
+            == Some(crate::language::LangId::Rust)
+    };
+    let facts = |path: &str, source: Option<Vec<u8>>| -> Facts {
+        let (symbols, declarations) =
+            extract_deleted_exported_facts(path, &source?, inputs.strip_internal)?;
+        Some((symbols, declarations?))
+    };
+    let mut old_files: std::collections::HashMap<String, Facts> = std::collections::HashMap::new();
+    let mut new_files: std::collections::HashMap<String, Facts> = std::collections::HashMap::new();
+    // `#[cfg]` の分岐ごとに移動が並ぶ (signature ごとに 1 つ) ので、同じ項目は 1 度だけ比べる。
+    let mut compared = std::collections::HashSet::new();
+    for symbol in moved {
+        if !rust(&symbol.from) || !rust(&symbol.to) {
+            continue;
+        }
+        if !compared.insert((
+            &symbol.from,
+            &symbol.to,
+            &symbol.name,
+            &symbol.kind,
+            &symbol.from_inline_module,
+            &symbol.to_inline_module,
+        )) {
+            continue;
+        }
+        let old = old_files
+            .entry(symbol.from.clone())
+            .or_insert_with(|| facts(&symbol.from, inputs.base_blobs.read(&symbol.from)));
+        let new = new_files.entry(symbol.to.clone()).or_insert_with(|| {
+            facts(
+                &symbol.to,
+                load_new_source(inputs.dir, &symbol.to).map(|source| source.to_vec()),
+            )
+        });
+        /// 同じ名前・種類・inline module の宣言 (`#[cfg]` の分岐を含む) と、その signature。
+        fn select<'a>(
+            facts: &'a Facts,
+            symbol: &crate::models::review::MovedSymbol,
+            inline_module: &Option<String>,
+        ) -> Option<Declarations<'a>> {
+            let (symbols, declarations) = facts.as_ref()?;
+            let selected: Declarations<'a> = symbols
+                .iter()
+                .zip(declarations)
+                .filter(|((name, kind, _), declaration)| {
+                    *name == symbol.name
+                        && *kind == symbol.kind
+                        && inline_module_of(declaration) == *inline_module
+                })
+                .collect();
+            (!selected.is_empty()).then_some(selected)
+        }
+        let (Some(old_side), Some(new_side)) = (
+            select(old, symbol, &symbol.from_inline_module),
+            select(new, symbol, &symbol.to_inline_module),
+        ) else {
+            continue;
+        };
+        // 宣言を (impl の対象の型, signature) ごとに組にする。同じ名前の別の型のメソッド (`S<u8>` と
+        // `S<u16>`) や、`#[cfg]` の分岐の間で signature を入れ替えた移動を混ぜない。同じ組が両方に無い
+        // 宣言は、型の書き方を変えた移動 (`crate::S<u8>` と `super::S<u8>`) として signature だけで組に
+        // する。それでも一意に決まらず、条件の付いた (か読めない) 宣言があれば、比べられなかったものと
+        // する。片方にしかない signature の宣言 (移動先に元からある別のメソッドなど) は比べない。
+        type Key = (Vec<String>, String);
+        let keyed = |side: &Declarations<'_>| {
+            let mut keyed: std::collections::BTreeMap<Key, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (index, (symbol, declaration)) in side.iter().enumerate() {
+                keyed
+                    .entry((declaration.owner.clone(), symbol.2.clone()))
+                    .or_default()
+                    .push(index);
+            }
+            keyed
+        };
+        let (old_keyed, new_keyed) = (keyed(&old_side), keyed(&new_side));
+        // 移動先で同じ型の宣言が同じ設定に並び (移動元では並ばなかった)、その設定でビルドできない
+        // なら、組を決められない変更として blocking にする。
+        let duplicated = new_keyed.keys().map(|(owner, _)| owner).any(|owner| {
+            let of_owner = |side: &Declarations<'_>| {
+                side.iter()
+                    .filter(|(_, declaration)| declaration.owner == *owner)
+                    .count()
+            };
+            let new_owner = new_side
+                .iter()
+                .filter(|(_, declaration)| declaration.owner == *owner)
+                .map(|(_, declaration)| *declaration);
+            let old_owner = old_side
+                .iter()
+                .filter(|(_, declaration)| declaration.owner == *owner)
+                .map(|(_, declaration)| *declaration);
+            of_owner(&new_side) > 1
+                && !exclusive_declarations(new_owner)
+                && exclusive_declarations(old_owner)
+        });
+        if duplicated {
+            let change = ApiSymbolChange {
+                inline_module: symbol.to_inline_module.clone(),
+                unverified: None,
+                name: symbol.name.clone(),
+                kind: symbol.kind.clone(),
+                file: symbol.to.clone(),
+                old_signature: Some(old_side[0].0.2.clone()),
+                new_signature: Some(new_side[0].0.2.clone()),
+                no_resolved_internal_callers: false,
+                contract_change: None,
+            };
+            record_signature_decision(
+                inputs,
+                state,
+                change,
+                SignatureDecision::Unverified(ApiModificationUnverified {
+                    reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
+                    first_unproven: None,
+                }),
+            );
+            continue;
+        }
+        let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        // signature ごとの、同じ組の無かった旧新の鍵。
+        let mut unmatched: std::collections::BTreeMap<String, (Vec<&Key>, Vec<&Key>)> =
+            std::collections::BTreeMap::new();
+        for (key, olds) in &old_keyed {
+            match new_keyed.get(key) {
+                Some(news) => groups.push((olds.clone(), news.clone())),
+                None => unmatched.entry(key.1.clone()).or_default().0.push(key),
+            }
+        }
+        for key in new_keyed.keys().filter(|key| !old_keyed.contains_key(*key)) {
+            if let Some((_, news)) = unmatched.get_mut(&key.1) {
+                news.push(key);
+            }
+        }
+        let conditional = |declaration: &RustDeclarationContext| {
+            declaration
+                .availability
+                .as_ref()
+                .is_none_or(|attributes| !attributes.is_empty())
+        };
+        for (old_keys, new_keys) in unmatched.into_values() {
+            if new_keys.is_empty() {
+                continue;
+            }
+            let olds: Vec<usize> = old_keys
+                .iter()
+                .flat_map(|key| old_keyed[*key].iter().copied())
+                .collect();
+            let news: Vec<usize> = new_keys
+                .iter()
+                .flat_map(|key| new_keyed[*key].iter().copied())
+                .collect();
+            if old_keys.len() == 1 && new_keys.len() == 1 {
+                groups.push((olds, news));
+            } else if olds.iter().any(|&index| conditional(old_side[index].1))
+                || news.iter().any(|&index| conditional(new_side[index].1))
+            {
+                groups.push((olds, Vec::new()));
+            }
+        }
+        for (olds, news) in groups {
+            let old_declarations: Vec<&RustDeclarationContext> =
+                olds.iter().map(|&index| old_side[index].1).collect();
+            let new_declarations: Vec<&RustDeclarationContext> =
+                news.iter().map(|&index| new_side[index].1).collect();
+            // 組を決められなかったとき (`news` が空) は、比べられなかったものとする。
+            let change = if new_declarations.is_empty() {
+                super::rust_availability::AvailabilityChange::Unverified
+            } else {
+                super::rust_availability::compare(&old_declarations, &new_declarations)
+            };
+            if change == super::rust_availability::AvailabilityChange::Same {
+                continue;
+            }
+            let item = AvailabilityItem {
+                candidate: ApiSymbolCandidate {
+                    inline_module: symbol.to_inline_module.clone(),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.clone(),
+                    file: symbol.to.clone(),
+                    signature: news.first().map_or_else(
+                        || old_side[olds[0]].0.2.clone(),
+                        |&index| new_side[index].0.2.clone(),
+                    ),
+                },
+                old_signature: old_side[olds[0]].0.2.clone(),
+                availability: super::rust_availability::describe(
+                    &old_declarations,
+                    &new_declarations,
+                ),
+                removable: true,
+            };
+            record_availability_change(inputs, state, change, item, |_| {
+                !is_used_in_diff_paths(
+                    inputs.ref_index,
+                    inputs.dir,
+                    &symbol.name,
+                    &symbol.to,
+                    inputs.diff_new_paths,
+                )
+            });
+        }
     }
 }
 
@@ -1086,6 +1451,7 @@ fn reexport_site(
         name_shared,
         callee_shared,
         dependency: None,
+        availability_compared: false,
     }
 }
 
@@ -1555,7 +1921,11 @@ impl<'a> ChangedSignatureFiles<'a> {
                                     super::rust_enum_api::unique_enum_shape(&sources.new, name)?,
                                 ),
                             };
-                            Some(super::rust_enum_api::classify(&old, &new))
+                            Some(super::rust_enum_api::classify(
+                                &old,
+                                &new,
+                                site.is_some_and(|site| site.availability_compared),
+                            ))
                         }
                         _ => {
                             let (old, new) = match site {
@@ -1568,7 +1938,11 @@ impl<'a> ChangedSignatureFiles<'a> {
                                     super::rust_union_api::unique_union_shape(&sources.new, name)?,
                                 ),
                             };
-                            Some(super::rust_union_api::classify(&old, &new))
+                            Some(super::rust_union_api::classify(
+                                &old,
+                                &new,
+                                site.is_some_and(|site| site.availability_compared),
+                            ))
                         }
                     }
                 });
@@ -2371,6 +2745,7 @@ fn record_signature_decision(
                 kind: change.kind,
                 file: change.file,
                 refs_internal: 0,
+                cfg_availability: None,
             });
         }
         SignatureDecision::TypeAnnotationOnly => {
@@ -2390,6 +2765,7 @@ fn record_signature_decision(
                 kind: change.kind,
                 file: change.file,
                 refs_internal: 0,
+                cfg_availability: None,
             });
         }
         SignatureDecision::Compatible(mut compat)

@@ -256,6 +256,13 @@ fn variants(body: Node<'_>, source: &[u8]) -> Option<Vec<Variant>> {
 }
 
 impl RustEnumShape {
+    /// 囲む項目 (inline module・ファイルの先頭など) の有る条件を足す。比べる設定を、enum の有る
+    /// 設定に絞る (Issue #291)。
+    pub(super) fn with_enclosing(mut self, enclosing: Vec<Attr>) -> Self {
+        self.conditions.extend(enclosing);
+        self
+    }
+
     /// `enum_item` の形。読めない構文があれば None。
     pub(crate) fn from_node(item: Node<'_>, source: &[u8]) -> Option<Self> {
         if item.kind() != "enum_item" || item.has_error() {
@@ -846,8 +853,14 @@ fn compare_effective(
     change
 }
 
-/// 旧新の公開の形を比べる。
-pub(crate) fn classify(old: &RustEnumShape, new: &RustEnumShape) -> ShapeChange {
+/// 旧新の公開の形を比べる。`availability_compared` は、旧新の有る設定の変化を別に比べる
+/// (同じファイルの宣言の組。Issue #291) か。比べるなら、新しい enum が無い設定はここでは比べない
+/// (消える設定は削除と同じ区分で出す)。
+pub(crate) fn classify(
+    old: &RustEnumShape,
+    new: &RustEnumShape,
+    availability_compared: bool,
+) -> ShapeChange {
     use ShapeChange::Breaking;
     if old.visibility.as_ref().map(Tokens::key) != new.visibility.as_ref().map(Tokens::key) {
         return Breaking;
@@ -887,10 +900,11 @@ pub(crate) fn classify(old: &RustEnumShape, new: &RustEnumShape) -> ShapeChange 
         else {
             continue;
         };
-        // 旧くビルドできた設定で、新しい enum が無いかビルドできないのは壊す。
-        let Some(new_enum) = effective(new, &new_conditions, config).filter(|shape| shape.present)
-        else {
-            return Breaking;
+        let new_enum = match effective(new, &new_conditions, config) {
+            Some(shape) if shape.present => shape,
+            Some(_) if availability_compared => continue,
+            // 旧くビルドできた設定で、新しい enum が無いかビルドできないのは壊す。
+            _ => return Breaking,
         };
         compared = true;
         // 型の引数と寿命の境界 (推論されるものは、この設定で有るフィールドから)。
@@ -914,7 +928,7 @@ pub(crate) fn classify(old: &RustEnumShape, new: &RustEnumShape) -> ShapeChange 
             return Breaking;
         }
     }
-    if !compared {
+    if !compared && !availability_compared {
         return Breaking;
     }
     change
@@ -970,7 +984,8 @@ pub(crate) fn unique_enum_shape(source: &[u8], name: &str) -> Option<RustEnumSha
     let [item] = items.as_slice() else {
         return None;
     };
-    RustEnumShape::from_node(*item, source)
+    let enclosing = super::rust_declarations::enclosing_conditions(*item, source)?;
+    Some(RustEnumShape::from_node(*item, source)?.with_enclosing(enclosing))
 }
 
 #[cfg(test)]

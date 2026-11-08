@@ -213,6 +213,8 @@ React の `memo()` で包んだ関数部品 (`export const Tag = memo(function T
 
 Rust の `union` は種類 `union` のシンボルで、公開 API の union も公開の形で比べます。`pub` のフィールドの削除・改名・型の変更・制限、`#[repr]` の変更、全てのフィールドが `pub` の `#[repr]` の union へのフィールドの追加、クレートの外から作れる union への型の引数の追加 (値は 1 つのフィールドで作るので、新しい引数を推論できないことがある) は blocking な `api.mod` にします。union の値は 1 つのフィールドで作るので、`pub` のフィールドの追加は `mod_compat` の理由 `rust_union_shape_compatible` とし、フィールドの並べ替えや `pub` でないフィールドの変更は報告しません。
 
+Rust の公開の項目に `#[cfg]` を足したり条件を狭めたりすると、signature は変わらないまま、一部の設定から項目が消えます。`api_changes` は、項目がどの設定に有るか (項目自身の `#[cfg]`・`#[cfg_attr]` の `cfg` の部分・同じファイルの囲む項目の条件を、`#[cfg]` の分岐ごとにまとめたもの) を、条件の原子の真偽の全ての組み合わせで比べます (Unix 系の `target_os` は `unix` を含むものとします)。一部の設定から消えた項目は削除と同じく (参照が残れば `removed`、残らなければ `removed_dead`)、新しい設定に増えた項目は追加と同じく報告し、`cfg_availability` (hook の出力では `cfg`) に旧新の条件を添えます。同値な書き換えと、条件を変えない移動は報告せず、条件を狭める移動は削除としても報告します。
+
 Rust の 1 つのファイルの別々の inline module にある同じ名前の項目 (`pub mod a { pub fn run() }` と `pub mod b { pub fn run() }`) は、宣言ごとに比べます。`api_changes` は宣言を囲む inline module の経路で組にし、出力ではその経路を `inline_module` (hook の出力では `m`) に添えます。`name` は裸の名前のままです。組にできない同じ場所の宣言 (`#[cfg]` の分岐など) の変更は blocking な `api.mod` に残します。
 
 Rust のシグネチャが別名 (`use … as Text;` や非公開の `type Text = …;`) を通して型を名指すときは、`api_changes` は別名の指す先も比べます。シグネチャの字面が同じまま指す先が変われば、`unverified.reason` が `rust_signature_dependency_changed` の blocking な `api.mod` にします。束縛は同じファイルの中で追います。
