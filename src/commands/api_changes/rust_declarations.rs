@@ -34,6 +34,11 @@ pub(crate) struct RustDeclarationContext {
     /// 先頭の内側の属性のうち、`cfg` と、`cfg` だけに絞った `cfg_attr` (外側から)。読めない属性が
     /// あれば None。別のファイルの親 module (`#[cfg(x)] mod m;`) の条件は含まない。
     pub(crate) availability: Option<Vec<AvailabilityAttr>>,
+    /// `availability` に入れる属性 (読めないものも) の `cfg`・`cfg_attr` の生のトークン (外側から)。
+    /// 読めない属性があるときの字面の比較に使う。
+    pub(crate) availability_raw: Vec<String>,
+    /// 宣言を囲む inline module が全て `pub` (制限なし) か (Issue #305)。ファイルの module の直下なら真。
+    pub(crate) inline_public: bool,
 }
 
 /// 宣言の有る条件の属性 1 つ (`cfg(..)` か、`cfg` だけに絞った `cfg_attr(..)`)。
@@ -86,7 +91,8 @@ fn is_condition_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bo
         .named_children(&mut inner_cursor)
         .next()
         .and_then(|path| path.utf8_text(source).ok())
-        .is_some_and(|path| matches!(path, "cfg" | "cfg_attr"))
+        // `r#cfg` も `cfg` (raw identifier の `r#` は名前に含まれない)。
+        .is_some_and(|path| matches!(path.strip_prefix("r#").unwrap_or(path), "cfg" | "cfg_attr"))
 }
 
 /// `item` の直前に並ぶ外側の属性のうち、`cfg`・`cfg_attr` のトークンの並び (書いた順)。
@@ -181,6 +187,65 @@ fn enclosing_attribute_items(item: tree_sitter::Node<'_>) -> Vec<tree_sitter::No
     attributes
 }
 
+/// 属性のノードのうち、有る条件に効く部分のトークン (並びの順): `cfg` と、`cfg_attr` の `cfg` に
+/// 絞った鍵。読めない `cfg_attr` は属性全体。`cfg` を含まない `cfg_attr(x, doc = "..")` や、
+/// `cfg_attr` の中のほかの属性は入れない。
+fn condition_tokens(attributes: &[tree_sitter::Node<'_>], source: &[u8]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for attribute in attributes {
+        if !is_condition_attribute(*attribute, source) {
+            continue;
+        }
+        match super::rust_type_api::project_attribute(*attribute, source, &["cfg"]) {
+            Some(Some(projected)) => {
+                tokens.push("#[".to_owned());
+                tokens.extend(projected.key);
+                tokens.push("]".to_owned());
+            }
+            Some(None) => {}
+            None => push_tokens(*attribute, source, &mut tokens),
+        }
+    }
+    tokens
+}
+
+/// 項目 `item` (`mod` の宣言など) の有る条件 (Issue #305): 項目自身の外側の属性、囲む項目の中身の
+/// 内側と外側の属性、ファイルの先頭の内側の属性のうち、`cfg` と `cfg` だけに絞った `cfg_attr` (外側から。
+/// 読めない属性があれば None) と、その `cfg`・`cfg_attr` の生のトークン。
+pub(crate) fn item_availability(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> (Option<Vec<AvailabilityAttr>>, Vec<String>) {
+    // inline module の中身の先頭の内側の属性 (`mod m { #![cfg(x)] }`) は、その module 自身に効く。
+    let mut attributes: Vec<tree_sitter::Node<'_>> = match item.kind() {
+        "mod_item" => item
+            .child_by_field_name("body")
+            .map(inner_attribute_items)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .collect(),
+        _ => Vec::new(),
+    };
+    attributes.extend(preceding_attribute_items(item));
+    attributes.extend(enclosing_attribute_items(item));
+    attributes.reverse();
+    let mut availability = Some(Vec::new());
+    push_availability(&attributes, source, &mut availability);
+    (availability, condition_tokens(&attributes, source))
+}
+
+/// ファイル (`source_file` の `root`) の先頭の内側の属性のうち、`cfg` と `cfg` に絞った `cfg_attr` (外側
+/// から。読めない属性があれば None。Issue #305)。
+pub(crate) fn file_availability(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Vec<AvailabilityAttr>> {
+    let mut availability = Some(Vec::new());
+    push_availability(&inner_attribute_items(root), source, &mut availability);
+    availability
+}
+
 /// 宣言の項目 `item` を囲む項目とファイルの先頭の、有る条件の属性 (`cfg` と、`cfg` だけに絞った
 /// `cfg_attr`)。enum・union の形を、項目の有る設定で比べるのに使う (Issue #291)。読めない属性が
 /// あれば None。
@@ -237,6 +302,7 @@ pub(crate) fn rust_declaration_context(
     };
     let mut context = RustDeclarationContext {
         start: (start.row, start.column),
+        inline_public: true,
         ..RustDeclarationContext::default()
     };
     let Some(mut item) = root.descendant_for_point_range(start, end) else {
@@ -287,13 +353,18 @@ pub(crate) fn rust_declaration_context(
         {
             push_tokens(owner, source, &mut context.owner);
         }
-        if container.kind() == "mod_item"
-            && let Some(name) = container
+        if container.kind() == "mod_item" {
+            context.inline_public &=
+                crate::engine::symbols::rust_node_has_unrestricted_pub_visibility(
+                    container, source,
+                );
+            if let Some(name) = container
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source).ok())
-        {
-            // `r#api` と `api` は同じ module。
-            modules.push(name.strip_prefix("r#").unwrap_or(name).to_owned());
+            {
+                // `r#api` と `api` は同じ module。
+                modules.push(name.strip_prefix("r#").unwrap_or(name).to_owned());
+            }
         }
         node = container;
     }
@@ -301,6 +372,7 @@ pub(crate) fn rust_declaration_context(
     let mut availability = Some(Vec::new());
     push_availability(&attributes, source, &mut availability);
     context.availability = availability;
+    context.availability_raw = condition_tokens(&attributes, source);
     modules.reverse();
     conditions.reverse();
     context.inline_module = modules.join("::");

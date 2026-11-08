@@ -56,6 +56,15 @@ pub(crate) struct CrateVersion<'a> {
     exists: RefCell<HashMap<String, bool>>,
     /// crate root から全ての `mod` 宣言をたどった木。必要になったときに作る。たどれなければ None。
     tree: OnceCell<Option<ModuleTree>>,
+    /// ファイルの module の置き場と条件 (Issue #305)。必要になったときに作る。
+    placements: OnceCell<super::placements::Placements>,
+    /// 開いたファイルの読んだ量 (索引を作ったときだけ数える)。
+    bytes: std::cell::Cell<usize>,
+    /// 新しく開くファイルの大きさの上限 (1 つ, 合計)。超えるファイルは解析せず、開けないことにする
+    /// (覚えない)。
+    limit: std::cell::Cell<Option<(usize, usize)>>,
+    /// 上限で開かなかったファイルがある。
+    limited: std::cell::Cell<bool>,
 }
 
 impl<'a> CrateVersion<'a> {
@@ -73,7 +82,32 @@ impl<'a> CrateVersion<'a> {
             own: RefCell::new(HashMap::new()),
             exists: RefCell::new(HashMap::new()),
             tree: OnceCell::new(),
+            placements: OnceCell::new(),
+            bytes: std::cell::Cell::new(0),
+            limit: std::cell::Cell::new(None),
+            limited: std::cell::Cell::new(false),
         }
+    }
+
+    /// crate root のパス (`dir` 相対)。
+    pub(crate) fn root_path(&self) -> &str {
+        &self.root
+    }
+
+    /// 新しく開くファイルの大きさの上限 (1 つ, 合計) を置く・外す。
+    pub(crate) fn set_limit(&self, limit: Option<(usize, usize)>) {
+        self.limit.set(limit);
+    }
+
+    /// 上限で開かなかったファイルがあるか。
+    pub(crate) fn limited(&self) -> bool {
+        self.limited.get()
+    }
+
+    /// ファイルの module の置き場と条件 (Issue #305)。
+    pub(crate) fn placements(&self) -> &super::placements::Placements {
+        self.placements
+            .get_or_init(|| super::placements::walk(self))
     }
 
     /// パス `path` の中身 (この版)。
@@ -100,10 +134,21 @@ impl<'a> CrateVersion<'a> {
         } else {
             self.own.borrow().get(&key).cloned()
         };
-        let cached = cached.unwrap_or_else(|| {
-            let opened = match (self.read)(path) {
+        let cached = if let Some(cached) = cached {
+            cached
+        } else {
+            let source = (self.read)(path);
+            // 上限を超えるファイルは解析せず、覚えない (上限を外した後の比較で開けるように)。
+            if let (Some(source), Some((per_file, total))) = (&source, self.limit.get())
+                && (source.len() > per_file || self.bytes.get() + source.len() > total)
+            {
+                self.limited.set(true);
+                return Opened::Unknown;
+            }
+            let opened = match source {
                 None => Cached::Missing,
                 Some(source) => {
+                    self.bytes.set(self.bytes.get() + source.len());
                     match DependencyIndex::new_in_module(&source, path, Some(key.1.clone()), mod_rs)
                     {
                         Some(index) => Cached::File(Rc::new(index)),
@@ -117,7 +162,7 @@ impl<'a> CrateVersion<'a> {
                 self.own.borrow_mut().insert(key, opened.clone());
             }
             opened
-        });
+        };
         match cached {
             Cached::File(file) => Opened::File(file),
             // 差分に無いファイルの構文エラーは旧新で同じ。
@@ -373,6 +418,13 @@ pub(crate) struct CratePair<'a> {
     pub(crate) incomplete: Option<String>,
     /// 2 つ以上の module に使うファイル (どの module として比べるか決められない)。
     multi_placed: HashSet<String>,
+    /// 束縛が旧新で変わり、上の束縛の変化と比べ直すファイルを求めた (Issue #300)。
+    dependencies: bool,
+    /// module の置き場の条件に効く入力 ([`DependencyIndex::module_condition_fingerprint`]) が旧新で
+    /// 変わった (Issue #305)。
+    pub(crate) module_conditions: bool,
+    /// package (いちばん近い `Cargo.toml` のあるディレクトリ)。
+    pub(crate) package: String,
 }
 
 impl CratePair<'_> {
@@ -407,9 +459,13 @@ impl CratePair<'_> {
     }
 }
 
-/// 差分の中の package の lib crate のうち、束縛が旧新で変わったもの (検出 1 回の間に作る)。
+/// 差分の中の package の lib crate のうち、束縛か module の置き場の条件に効く入力が旧新で変わったもの
+/// (検出 1 回の間に作る)。
 pub(crate) struct RustCrates<'a> {
     pairs: HashMap<String, CratePair<'a>>,
+    /// module の置き場の条件に効く入力が変わったが、lib crate を開けなかった package の crate root と
+    /// 理由 (Issue #305)。
+    module_gaps: Vec<(String, String)>,
 }
 
 /// パスが package の lib crate のソースになり得るなら、その package (いちばん近い `Cargo.toml` の
@@ -448,6 +504,38 @@ pub(crate) fn crate_package(dir: &str, path: &str) -> Option<String> {
     (!other_target).then(|| package.to_owned())
 }
 
+/// パスの package (いちばん近い `Cargo.toml` のあるディレクトリ)。別の target のソースも含める
+/// (`#[path]` で lib が読み得る。lib の module かは置き場の索引で決める。Issue #305)。
+pub(crate) fn package_of(dir: &str, path: &str) -> Option<String> {
+    if path == "/dev/null" || !path.ends_with(".rs") {
+        return None;
+    }
+    let mut ancestor = parent_dir(path);
+    loop {
+        let manifest = if ancestor.is_empty() {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("{ancestor}/Cargo.toml")
+        };
+        if std::path::Path::new(dir).join(&manifest).is_file() {
+            return Some(ancestor.to_owned());
+        }
+        if ancestor.is_empty() {
+            return None;
+        }
+        ancestor = parent_dir(ancestor);
+    }
+}
+
+/// package の crate root のパス (`dir` 相対)。
+fn library_root(package: &str) -> String {
+    if package.is_empty() {
+        "src/lib.rs".to_owned()
+    } else {
+        format!("{package}/src/lib.rs")
+    }
+}
+
 impl<'a> RustCrates<'a> {
     /// 差分 `diff_files` の Rust のソースのある package ごとに、resolver が読む束縛が旧新で変わって
     /// いれば、旧新の lib crate を作り、束縛の変化と比べ直すファイルを求める。`renames` は hunk の無い
@@ -473,64 +561,120 @@ impl<'a> RustCrates<'a> {
         let mut packages: Vec<String> = all
             .iter()
             .flat_map(|df| [df.old_path.as_str(), df.new_path.as_str()])
-            .filter_map(|path| crate_package(dir, path))
+            .filter_map(|path| package_of(dir, path))
             .collect();
         packages.sort();
         packages.dedup();
-        let pairs = packages
-            .into_iter()
-            .filter_map(|package| {
-                let pair = build_pair(dir, &all, &rename_pairs, base_blobs, &package)?;
-                Some((package, pair))
-            })
-            .collect();
-        Self { pairs }
+        let mut pairs = HashMap::new();
+        let mut module_gaps = Vec::new();
+        for package in packages {
+            match build_pair(dir, &all, &rename_pairs, base_blobs, &package) {
+                Built::Pair(pair) => {
+                    pairs.insert(package, *pair);
+                }
+                Built::ModuleGap(reason) => module_gaps.push((library_root(&package), reason)),
+                Built::Nothing => {}
+            }
+        }
+        Self { pairs, module_gaps }
     }
 
     /// パス `path` の package の旧新の lib crate。束縛の入力が旧新で変わらない (ファイルの外へ出る
     /// パスの束縛は旧新で同じ)・lib が無いなら None。
     pub(crate) fn pair(&self, dir: &str, path: &str) -> Option<&CratePair<'a>> {
-        self.pairs.get(&crate_package(dir, path)?)
+        self.pairs
+            .get(&crate_package(dir, path)?)
+            .filter(|pair| pair.dependencies)
     }
 
     /// 束縛が変わった package の、crate root のパスと旧新の lib crate。
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (String, &CratePair<'a>)> {
-        self.pairs.iter().map(|(package, pair)| {
-            let root = if package.is_empty() {
-                "src/lib.rs".to_owned()
-            } else {
-                format!("{package}/src/lib.rs")
-            };
-            (root, pair)
-        })
+        self.pairs
+            .iter()
+            .filter(|(_, pair)| pair.dependencies)
+            .map(|(package, pair)| (library_root(package), pair))
+    }
+
+    /// module の置き場の条件に効く入力が変わった package の、crate root のパスと旧新の lib crate
+    /// (Issue #305)。
+    pub(crate) fn module_pairs(&self) -> impl Iterator<Item = (String, &CratePair<'a>)> {
+        let mut pairs: Vec<(String, &CratePair<'a>)> = self
+            .pairs
+            .values()
+            .filter(|pair| pair.module_conditions)
+            .map(|pair| (pair.old.root_path().to_owned(), pair))
+            .collect();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs.into_iter()
+    }
+
+    /// module の置き場の条件に効く入力が変わったが、lib crate を開けなかった package の crate root と
+    /// 理由 (Issue #305)。
+    pub(crate) fn module_gaps(&self) -> &[(String, String)] {
+        &self.module_gaps
     }
 }
 
-/// package `package` の旧新の lib crate を作り、束縛の変化を求める。束縛が変わらない・lib が無い・
-/// `[lib] path` で crate root を変えた package は None。
+/// package の旧新の lib crate を作った結果。
+enum Built<'a> {
+    Pair(Box<CratePair<'a>>),
+    /// module の置き場の条件に効く入力が変わったが、lib crate を開けない (理由)。
+    ModuleGap(String),
+    Nothing,
+}
+
+/// package `package` の旧新の lib crate を作る。束縛が変われば束縛の変化と比べ直すファイルを求め
+/// (Issue #300)、module の置き場の条件に効く入力が変われば印を付ける (Issue #305)。どちらも変わらない・
+/// lib が旧新のどちらかに無い package は作らない。`[lib] path` で crate root を変えた package は扱わず、
+/// module の置き場の条件に効く入力が変わっていれば開けなかったことを返す。
 fn build_pair<'a>(
     dir: &'a str,
     diff_files: &[crate::models::impact::DiffFile],
     rename_pairs: &[(String, String)],
     base_blobs: &'a crate::commands::git_input::GitBlobBatch,
     package: &str,
-) -> Option<CratePair<'a>> {
+) -> Built<'a> {
     let in_package = |path: &str| crate_package(dir, path).as_deref() == Some(package);
     let files: Vec<&crate::models::impact::DiffFile> = diff_files
         .iter()
         .filter(|df| in_package(&df.old_path) || in_package(&df.new_path))
         .collect();
-    if files.is_empty() || !bindings_changed(dir, base_blobs, &files) {
-        return None;
+    let module_files: Vec<&crate::models::impact::DiffFile> = diff_files
+        .iter()
+        .filter(|df| {
+            package_of(dir, &df.old_path).as_deref() == Some(package)
+                || package_of(dir, &df.new_path).as_deref() == Some(package)
+        })
+        .collect();
+    let (dependencies, module_conditions) = inputs_changed(dir, base_blobs, &module_files, |df| {
+        in_package(&df.old_path) || in_package(&df.new_path)
+    });
+    // crate root は旧新の manifest の `[lib] path` (無ければ `src/lib.rs`)。束縛の比べ直し (#300) は
+    // `src` 相対の規約の経路を使うので、規約の root だけを扱う。module の置き場 (#305) は root から
+    // たどるので、旧新で同じ root なら扱う。
+    let manifest = manifest_path(package);
+    let old_root = library_root_in(package, base_blobs.read(&manifest).as_deref());
+    let new_root = library_root_in(
+        package,
+        super::super::source_pair::load_new_source(dir, &manifest)
+            .map(|text| text.to_vec())
+            .as_deref(),
+    );
+    let conventional = library_root(package);
+    let dependencies = dependencies
+        && old_root.as_deref() == Some(conventional.as_str())
+        && new_root.as_deref() == Some(conventional.as_str());
+    if !dependencies && !module_conditions {
+        return Built::Nothing;
     }
-    // `[lib] path` で crate root を変えた package は扱わない (`src` 相対の規約の経路が使えない)。
-    if lib_path_customized(dir, package) {
-        return None;
-    }
-    let root = if package.is_empty() {
-        "src/lib.rs".to_owned()
-    } else {
-        format!("{package}/src/lib.rs")
+    let root = match (old_root, new_root) {
+        (Some(old_root), Some(new_root)) if old_root == new_root => old_root,
+        _ if module_conditions => {
+            return Built::ModuleGap(
+                "the library root could not be read or differs between the versions".to_owned(),
+            );
+        }
+        _ => return Built::Nothing,
     };
     let old_paths: HashSet<String> = diff_files
         .iter()
@@ -571,17 +715,34 @@ fn build_pair<'a>(
     let shared = Rc::new(RefCell::new(HashMap::new()));
     let old = CrateVersion::new(root.clone(), read_old, changed.clone(), shared.clone());
     let new = CrateVersion::new(root, read_new, changed, shared);
-    // lib が旧新の両方に無ければ扱わない (公開面ごと現れる・消える)。
-    if !matches!(old.root(), Opened::File(_)) || !matches!(new.root(), Opened::File(_)) {
-        return None;
+    // lib が旧新の両方に無ければ扱わない (公開面ごと現れる・消える)。読めない・構文エラーなら、
+    // module の置き場の条件を比べられない。
+    let (old_root, new_root) = (old.root(), new.root());
+    let lib_exists = |version: &CrateVersion<'_>| version.read(&version.root).is_some();
+    if !matches!(old_root, Opened::File(_)) || !matches!(new_root, Opened::File(_)) {
+        return if module_conditions && lib_exists(&old) && lib_exists(&new) {
+            Built::ModuleGap("the crate root does not parse".to_owned())
+        } else {
+            Built::Nothing
+        };
     }
-    let renames: Vec<(String, String)> = rename_pairs
-        .iter()
-        .filter(|(old_path, new_path)| in_package(old_path) || in_package(new_path))
-        .cloned()
-        .collect();
-    let analysis = super::dependents::analyze(dir, package, &files, &renames, &old, &new);
-    Some(CratePair {
+    let analysis = if dependencies {
+        let renames: Vec<(String, String)> = rename_pairs
+            .iter()
+            .filter(|(old_path, new_path)| in_package(old_path) || in_package(new_path))
+            .cloned()
+            .collect();
+        super::dependents::analyze(dir, package, &files, &renames, &old, &new)
+    } else {
+        super::dependents::Analysis {
+            changes: ChangeSet::default(),
+            moves: MoveMap::new(),
+            dependents: Vec::new(),
+            incomplete: None,
+            multi_placed: HashSet::new(),
+        }
+    };
+    Built::Pair(Box::new(CratePair {
         old,
         new,
         changes: analysis.changes,
@@ -589,58 +750,93 @@ fn build_pair<'a>(
         dependents: analysis.dependents,
         incomplete: analysis.incomplete,
         multi_placed: analysis.multi_placed,
-    })
+        dependencies,
+        module_conditions,
+        package: package.to_owned(),
+    }))
 }
 
-/// 差分のファイル `files` で、resolver が読む束縛が旧新で変わったか。ファイルの追加・削除・rename と、
-/// 旧新のどちらかの構文エラーは変わったとする。
-fn bindings_changed(
+/// 差分のファイル `files` で、resolver が読む束縛 ([`DependencyIndex::fingerprint`]。`dependency` が真の
+/// ファイルだけ、Issue #300) と、module の置き場の条件に効く入力
+/// ([`DependencyIndex::module_condition_fingerprint`]、Issue #305) が旧新で変わったか。ファイルの追加・
+/// 削除・rename と、旧新のどちらかが読めない・構文エラーなら変わったとする。旧新は 1 度ずつ解析する。
+fn inputs_changed(
     dir: &str,
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     files: &[&crate::models::impact::DiffFile],
-) -> bool {
-    files.iter().any(|df| {
-        if df.old_path != df.new_path {
-            return true;
+    dependency: impl Fn(&crate::models::impact::DiffFile) -> bool,
+) -> (bool, bool) {
+    let (mut bindings, mut modules) = (false, false);
+    for df in files {
+        let follows = dependency(df);
+        if bindings && modules || (!follows && modules) {
+            continue;
         }
-        let (Some(old), Some(new)) = (
-            base_blobs.read(&df.old_path),
-            super::super::source_pair::load_new_source(dir, &df.new_path),
-        ) else {
-            return true;
+        // 版のファイルの索引 (無ければ Some(None)、読めない・構文エラーなら None)。
+        let index = |source: Option<Vec<u8>>, path: &str| match source {
+            None => Some(None),
+            Some(source) => DependencyIndex::new(&source, path).map(Some),
         };
-        match (
-            DependencyIndex::new(&old, &df.old_path),
-            DependencyIndex::new(&new, &df.new_path),
-        ) {
-            (Some(old), Some(new)) => old.fingerprint() != new.fingerprint(),
-            _ => true,
-        }
-    })
+        let old = if df.old_path == "/dev/null" {
+            Some(None)
+        } else {
+            index(base_blobs.read(&df.old_path), &df.old_path)
+        };
+        let new = if df.new_path == "/dev/null" {
+            Some(None)
+        } else {
+            index(
+                super::super::source_pair::load_new_source(dir, &df.new_path)
+                    .map(|source| source.to_vec()),
+                &df.new_path,
+            )
+        };
+        // 束縛は、同じパスの旧新の索引があるときだけ比べる (rename・追加・削除は変わったとする)。
+        bindings |= follows
+            && match (&old, &new) {
+                (Some(Some(old)), Some(Some(new))) if df.old_path == df.new_path => {
+                    old.fingerprint() != new.fingerprint()
+                }
+                _ => true,
+            };
+        // module の置き場の条件に効く入力は、無いファイルを `mod` の宣言の無いファイルとして比べる
+        // (宣言の無いファイルの追加・削除・rename では変わらない)。読めないファイルは変わったとする。
+        let module_fingerprint = |index: &Option<Option<DependencyIndex>>| {
+            index.as_ref().map(|index| {
+                index
+                    .as_ref()
+                    .map(DependencyIndex::module_condition_fingerprint)
+                    .unwrap_or_default()
+            })
+        };
+        modules |=
+            old.is_none() || new.is_none() || module_fingerprint(&old) != module_fingerprint(&new);
+    }
+    (bindings, modules)
 }
 
-/// package の `Cargo.toml` (作業ツリー) が `[lib] path` で `src/lib.rs` 以外を crate root にするか。
-/// 読めなければ変えたとする。
-fn lib_path_customized(dir: &str, package: &str) -> bool {
-    let manifest = if package.is_empty() {
+/// package の `Cargo.toml` のパス。
+fn manifest_path(package: &str) -> String {
+    if package.is_empty() {
         "Cargo.toml".to_owned()
     } else {
         format!("{package}/Cargo.toml")
+    }
+}
+
+/// package の lib crate の root のパス (`dir` 相対): `Cargo.toml` の中身 `manifest` の `[lib] path` (無い・
+/// 指定が無ければ `src/lib.rs`)。読めない・解けない・package の外へ出るパスなら None。
+fn library_root_in(package: &str, manifest: Option<&[u8]>) -> Option<String> {
+    let relative = match manifest {
+        None => "src/lib.rs".to_owned(),
+        Some(text) => {
+            let text = std::str::from_utf8(text).ok()?;
+            let value = toml::from_str::<toml::Value>(text).ok()?;
+            match value.get("lib").and_then(|lib| lib.get("path")) {
+                None => "src/lib.rs".to_owned(),
+                Some(path) => path.as_str()?.to_owned(),
+            }
+        }
     };
-    let Some(text) = super::super::source_pair::load_new_source(dir, &manifest) else {
-        return false;
-    };
-    let Ok(text) = std::str::from_utf8(&text) else {
-        return true;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(text) else {
-        return true;
-    };
-    value
-        .get("lib")
-        .and_then(|lib| lib.get("path"))
-        .is_some_and(|path| {
-            path.as_str()
-                .is_none_or(|path| path.trim_start_matches("./") != "src/lib.rs")
-        })
+    join_path(package, &relative)
 }

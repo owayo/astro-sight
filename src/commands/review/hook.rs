@@ -23,6 +23,9 @@ enum HookBlockingCategory {
     /// Rust の束縛の変化を名指し得るファイルを探し切れなかった (Issue #300)。
     #[serde(rename = "api.rust_dependents_incomplete")]
     ApiRustDependentsIncomplete,
+    /// module の宣言の条件が変わった Rust の module の公開の項目を探し切れなかった (Issue #305)。
+    #[serde(rename = "api.rust_module_availability_incomplete")]
+    ApiRustModuleAvailabilityIncomplete,
     #[serde(rename = "impacts")]
     Impacts,
     #[serde(rename = "api.rm")]
@@ -872,6 +875,12 @@ pub(crate) fn build_review_hook_json_for_diff(
         }) {
             blocking_categories.push(HookBlockingCategory::ApiRustDependentsIncomplete);
         }
+        if result.truncations.iter().any(|t| {
+            t.reason
+                == crate::models::truncation::TruncationReason::RustModuleAvailabilityIncomplete
+        }) {
+            blocking_categories.push(HookBlockingCategory::ApiRustModuleAvailabilityIncomplete);
+        }
         has_any_output = true;
         let truncs: Vec<HookTruncation<'_>> = result
             .truncations
@@ -908,6 +917,9 @@ pub(crate) fn build_review_hook_json_for_diff(
                     }
                     crate::models::truncation::TruncationReason::RustDependentsIncomplete => {
                         "rust_dependents_incomplete"
+                    }
+                    crate::models::truncation::TruncationReason::RustModuleAvailabilityIncomplete => {
+                        "rust_module_availability_incomplete"
                     }
                 },
                 d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
