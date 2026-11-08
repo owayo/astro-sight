@@ -23,6 +23,7 @@ mod rust_reexport;
 mod rust_reexport_moves;
 mod rust_reference_sites;
 mod rust_same_name_items;
+mod rust_signature_dependencies;
 mod rust_struct_fields;
 mod rust_type_alias;
 mod rust_union_fields;

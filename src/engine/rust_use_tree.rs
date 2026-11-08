@@ -99,6 +99,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                             list_node = Some(child);
                             break;
                         }
+                        "line_comment" | "block_comment" => {}
                         _ => path_node = Some(child),
                     }
                 }
@@ -137,6 +138,10 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                 let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
+                    // コメントは path でも alias でもない (`a as /* c */ b`)。
+                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
                     named.push(child);
                 }
                 if named.len() != 2 {
@@ -159,7 +164,9 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
             "use_wildcard" => {
                 // named child = [path]
                 let mut cursor = node.walk();
-                let path_node = node.named_children(&mut cursor).next();
+                let path_node = node
+                    .named_children(&mut cursor)
+                    .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"));
                 let (target_module, origin) = if let Some(path_node) = path_node {
                     let (resolved_prefix, leaf_name, own_origin) =
                         resolve_use_path_node(path_node, source, &path_prefix, current_module)?;
@@ -339,6 +346,10 @@ fn flatten_use_path(
                 let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
+                    // コメントは path でも alias でもない (`a as /* c */ b`)。
+                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
                     named.push(child);
                 }
                 match named.as_slice() {
@@ -544,6 +555,7 @@ mod tests {
                             list_node = Some(child);
                             break;
                         }
+                        "line_comment" | "block_comment" => {}
                         _ => path_node = Some(child),
                     }
                 }
