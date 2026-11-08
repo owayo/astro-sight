@@ -781,14 +781,49 @@ fn collect_rust_modified_symbols(
     files: &mut ChangedSignatureFiles<'_>,
 ) {
     // 契約が名指す名前の束縛を旧新で比べる (Issue #283)。旧新のソースを読めて構文エラーが無い
-    // ときだけ比べる。
-    let indexes = inputs.base_blobs.read(&df.old_path).and_then(|old_source| {
-        let new_source = load_new_source(inputs.dir, &df.new_path)?;
-        Some((
-            DependencyIndex::new(&old_source, &df.old_path)?,
-            DependencyIndex::new(&new_source, &df.new_path)?,
-        ))
+    // ときだけ比べる。同じ package の lib crate で束縛が変わったときは、ファイルの外へ出るパスも
+    // 版ごとにほかのファイルの束縛で解く (Issue #300)。
+    let pair = inputs
+        .rust_crates
+        .pair(inputs.dir, &df.new_path)
+        .or_else(|| inputs.rust_crates.pair(inputs.dir, &df.old_path));
+    let versioned = pair.and_then(|pair| {
+        let files = pair.current_files(&df.old_path, &df.new_path)?;
+        Some((pair, files))
     });
+    let resolvers = match &versioned {
+        Some((pair, (old, new))) => Some((
+            Resolver::new(
+                Some(&pair.old as &dyn CrateFiles),
+                old.clone(),
+                None,
+                Some(&pair.changes),
+            ),
+            Resolver::new(
+                Some(&pair.new as &dyn CrateFiles),
+                new.clone(),
+                Some(&pair.moves),
+                Some(&pair.changes),
+            ),
+        )),
+        None => {
+            // 束縛が変わった crate で、比べるファイルの module を版ごとに決められなければ、変わった
+            // 束縛に触れるパスは同じと言えない (lib の crate の外と分かれば、今までどおり字面で比べる)。
+            let unplaced = pair
+                .filter(|pair| pair.may_contain(&df.old_path, &df.new_path))
+                .map(|pair| &pair.changes);
+            let textual = |index: DependencyIndex| {
+                Resolver::new(None, std::rc::Rc::new(index), None, unplaced)
+            };
+            inputs.base_blobs.read(&df.old_path).and_then(|old_source| {
+                let new_source = load_new_source(inputs.dir, &df.new_path)?;
+                Some((
+                    textual(DependencyIndex::new(&old_source, &df.old_path)?),
+                    textual(DependencyIndex::new(&new_source, &df.new_path)?),
+                ))
+            })
+        }
+    };
     // 定義を差分の中のほかのファイルへ移したかは、そのファイルの旧新を引いて確かめる (索引は
     // 引くときに作る)。
     let modules = DiffModules::new(
@@ -798,14 +833,12 @@ fn collect_rust_modified_symbols(
         Box::new(|path: &str| load_new_source(inputs.dir, path).map(|source| source.to_vec())),
     );
     let dependency = |olds: &[usize], news: &[usize]| {
-        let (old_index, new_index) = indexes.as_ref()?;
+        let (old_resolver, new_resolver) = resolvers.as_ref()?;
         let old: Vec<RustDeclarationContext> =
             olds.iter().map(|&i| declarations.old[i].clone()).collect();
         let new: Vec<RustDeclarationContext> =
             news.iter().map(|&j| declarations.new[j].clone()).collect();
-        old_index
-            .compare(&old, new_index, &new, &modules)
-            .unverified_reason()
+        compare_dependencies(old_resolver, &old, new_resolver, &new, &modules).unverified_reason()
     };
     for &(old_index, new_index) in &pairing.pairs {
         let (name, _, old_sig) = &facts.old_syms[old_index];

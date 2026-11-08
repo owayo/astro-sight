@@ -1,4 +1,4 @@
-//! Rust の公開シンボルの契約が名指す名前の束縛を旧新で比べる (Issue #283)。
+//! Rust の公開シンボルの契約が名指す名前の束縛を旧新で比べる (Issue #283・#300)。
 //!
 //! 公開関数のシグネチャや公開構造体のフィールドの型が `use … as Text` の別名や非公開の
 //! `type Text = …;` を名指すと、別名の指す先を変えてもシグネチャの字面は変わらない。宣言ごとに、
@@ -6,28 +6,41 @@
 //! 型別名の右辺、trait の境界と関連型) が名指す名前 (ジェネリクスの引数と `Self` を除く) を、宣言を
 //! 囲む module のスコープで解き、旧新で比べる。
 //!
-//! - 束縛は同じファイルの中で追う: 囲む inline module、`self::`・`super::`・`crate::`、明示の
-//!   `use` (`as` の別名と module の別名を含む)、型別名と定数 (右辺の名前を宣言したスコープで解いて
-//!   置き換えた並びで識別し、連鎖をたどる。右辺の型の名前は値の式の中でも型として解く)、同じ
-//!   ファイルの中の module への glob、item 位置のマクロの呼び出し (呼び出しとファイルのマクロ定義の
-//!   字面を識別に入れる)。cfg の付いた束縛 (`use`・module の別名・glob) は条件ごとの枝に分けて解き、
-//!   枝の識別に条件を添える
+//! - 束縛は、囲む inline module、`self::`・`super::`・`crate::`、明示の `use` (`as` の別名と module
+//!   の別名を含む)、型別名と定数 (右辺の名前を宣言したスコープで解いて置き換えた並びで識別し、連鎖を
+//!   たどる。右辺の型の名前は値の式の中でも型として解く)、module への glob、item 位置のマクロの
+//!   呼び出し (呼び出しとファイルのマクロ定義の字面を識別に入れる) で追う。cfg の付いた束縛 (`use`・
+//!   module の別名・glob・module の宣言) は条件ごとの枝に分けて解き、枝の識別に条件を添える
 //! - 同じスコープの構造体・enum などの宣言は「そこで宣言した」ことを識別にし、中身は入れない
 //!   (型自身の変更は型の api.mod として出る)
-//! - ファイルの外へ出るパス (ほかのファイルの module・外部 crate・prelude) は字面で比べる。ほかの
-//!   ファイルの module は crate root からの経路にする
+//! - ほかのファイルの module (Issue #300): 差分の中の同じ package の Rust のファイルで、resolver が
+//!   読む束縛 ([`DependencyIndex::fingerprint`]) が旧新で変わったときだけ、版ごとに lib の crate
+//!   root から `mod` 宣言をたどってほかのファイルを開き、その束縛で解き続ける ([`crates`])。変わって
+//!   いなければ、ファイルの外へ出るパスの束縛は旧新で同じなので、今までどおり字面 (crate root からの
+//!   経路) で比べる。外部 crate・prelude は字面で比べる
 //! - 識別は束縛の先だけで作り、書き方 (明示の use か glob か、`self::` の有無、`r#`、見える範囲の
-//!   指定、コメント、並び順) では変えない
+//!   指定、コメント、並び順) では変えない。比べるファイルの中の定義はファイル相対の場所、ほかの
+//!   ファイルの定義は crate root からの場所 (`crate::a::b`) で識別する
 //! - 旧新の両方に現れる名前の字面ごとに、解いた束縛を比べる。片方にしか無い名前は、契約の字面の
 //!   変更そのものが説明する (透過的な別名の導入など) ので比べない
 //! - 束縛が変わっても、同じ定義を移しただけ (名前・種類・中身が同じで、差分の中で元の場所から消して
 //!   移した先に足した。移した先はこのファイルか、差分の中の同じ crate のファイル) なら変化にしない。
 //!   外の型の取り込みへの差し替えや、元からあった別の定義への付け替えは変化
+//! - 名指す側のファイルが差分に無くても、変わった束縛を名指し得るファイルを探して比べ直す
+//!   ([`dependents`])
 
 use super::*;
 use std::collections::HashMap;
 
 use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_use_tree_edges_ast};
+
+pub(crate) mod crates;
+pub(crate) mod dependents;
+mod resolver;
+
+pub(crate) use crates::RustCrates;
+pub(crate) use dependents::{ChangeSet, MoveMap};
+pub(crate) use resolver::{CrateFiles, File, Opened, Resolver};
 
 /// 束縛を解く深さの上限 (別名の連鎖・module の経路・glob をたどる回数)。超えれば解けない。
 const MAX_DEPTH: usize = 32;
@@ -68,6 +81,91 @@ struct UseTarget {
     item: Option<String>,
     origin: UsePathOrigin,
     conditions: Vec<String>,
+    /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
+    visibility: Visibility,
+}
+
+impl UseTarget {
+    /// 束縛の指紋の字面。
+    fn fingerprint(&self) -> String {
+        format!(
+            "use {:?} {} {:?} {} {:?}",
+            self.origin,
+            self.module.join("::"),
+            self.item,
+            self.conditions.join(" "),
+            self.visibility
+        )
+    }
+}
+
+/// 宣言の見える範囲 (Issue #300)。glob が取り込むかを、取り込む側の module で決める。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    /// `pub` (どこからも見える)。
+    Public,
+    /// この module (crate root からの経路) とその子孫からだけ見える (`pub(crate)`・`pub(super)`・
+    /// `pub(in …)`・`pub(self)`・指定なし)。
+    Within(Vec<String>),
+}
+
+impl Visibility {
+    /// module `importer` (crate root からの経路) から見えるか。
+    fn visible_from(&self, importer: &[String]) -> bool {
+        match self {
+            Visibility::Public => true,
+            Visibility::Within(module) => importer.starts_with(module),
+        }
+    }
+}
+
+/// module `current` (crate root からの経路) の中の項目 `item` の見える範囲。読めない `pub(in …)` は
+/// どこからも見えるとする (glob が余分に取り込むだけで、見逃しにはならない)。
+fn visibility(item: tree_sitter::Node<'_>, source: &[u8], current: &[String]) -> Visibility {
+    let mut cursor = item.walk();
+    let Some(modifier) = item
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "visibility_modifier")
+    else {
+        return Visibility::Within(current.to_vec());
+    };
+    let text: String = modifier
+        .utf8_text(source)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    let parent = || current[..current.len().saturating_sub(1)].to_vec();
+    match text.as_str() {
+        "pub" => Visibility::Public,
+        "pub(crate)" => Visibility::Within(Vec::new()),
+        "pub(self)" => Visibility::Within(current.to_vec()),
+        "pub(super)" => Visibility::Within(parent()),
+        _ => {
+            let Some(path) = text
+                .strip_prefix("pub(in")
+                .and_then(|rest| rest.strip_suffix(')'))
+            else {
+                return Visibility::Public;
+            };
+            let segments: Vec<&str> = path.split("::").collect();
+            let mut module = match segments.first() {
+                Some(&"crate") => Vec::new(),
+                Some(&"self") => current.to_vec(),
+                Some(&"super") => parent(),
+                _ => return Visibility::Public,
+            };
+            for segment in &segments[1..] {
+                match *segment {
+                    "super" => {
+                        module.pop();
+                    }
+                    "self" => {}
+                    segment => module.push(unraw(segment).to_owned()),
+                }
+            }
+            Visibility::Within(module)
+        }
+    }
 }
 
 /// 識別に右辺を使う宣言 (型別名・定数・static)。右辺はソースの範囲で持ち、解くときに読む。
@@ -76,6 +174,8 @@ struct Definition {
     conditions: Vec<String>,
     /// 宣言のノードのバイトの範囲。
     range: (usize, usize),
+    /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
+    visibility: Visibility,
 }
 
 /// 宣言した項目 (種類と条件)。中身は識別に入れない。
@@ -83,6 +183,43 @@ struct Definition {
 struct ItemDeclaration {
     kind: &'static str,
     conditions: Vec<String>,
+    /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
+    visibility: Visibility,
+}
+
+/// `mod` の宣言 (Issue #300)。
+#[derive(Debug)]
+pub(crate) struct ModuleDeclaration {
+    /// 中身がこのファイルにある (inline)。
+    inline: bool,
+    /// 中身のファイルの指定 (`#[path]`)。
+    path: ModuleSource,
+    /// 宣言の条件 (囲む module の条件と、宣言自身の条件)。
+    conditions: Vec<String>,
+    /// 宣言の属性のトークン (指紋に入れる)。
+    attributes: Vec<String>,
+    /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
+    visibility: Visibility,
+}
+
+impl ModuleDeclaration {
+    /// 宣言に `#[cfg(test)]` が付いているか (テストの build にだけある module)。
+    pub(crate) fn only_in_tests(&self) -> bool {
+        self.conditions
+            .windows(4)
+            .any(|window| window == ["identifier:cfg", "(", "identifier:test", ")"])
+    }
+}
+
+/// `mod name;` の中身のファイルの指定。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModuleSource {
+    /// 既定の場所 (`name.rs`・`name/mod.rs`)。
+    Default,
+    /// `#[path = "…"]` の値。
+    Path(String),
+    /// 読めない指定 (`cfg_attr` の中の `path`、重なる `path`、文字列でない値)。
+    Unknown,
 }
 
 /// module のスコープの束縛。
@@ -94,12 +231,14 @@ struct ScopeBindings {
     aliases: HashMap<String, Vec<Definition>>,
     /// 定数・static。
     constants: HashMap<String, Vec<Definition>>,
-    /// 子の module (中身がこのファイルにあれば true)。
-    modules: HashMap<String, bool>,
+    /// 子の module の宣言。
+    modules: HashMap<String, Vec<ModuleDeclaration>>,
     uses: HashMap<String, Vec<UseTarget>>,
     globs: Vec<UseTarget>,
     /// item 位置のマクロの呼び出しと、展開できない `use` のトークン (どの名前も生成し得る)。
     macros: Vec<String>,
+    /// inline module に `#[path]` が付いている (中の `mod x;` の場所を決められない)。
+    path_attribute: bool,
 }
 
 impl ScopeBindings {
@@ -114,82 +253,28 @@ impl ScopeBindings {
         for (name, constants) in other.constants {
             self.constants.entry(name).or_default().extend(constants);
         }
-        for (name, inline) in other.modules {
-            *self.modules.entry(name).or_default() |= inline;
+        for (name, modules) in other.modules {
+            self.modules.entry(name).or_default().extend(modules);
         }
         for (name, uses) in other.uses {
             self.uses.entry(name).or_default().extend(uses);
         }
         self.globs.extend(other.globs);
         self.macros.extend(other.macros);
-    }
-}
-
-/// 束縛の先。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Target {
-    /// このファイルの module (中身がこのファイルにある)。
-    Module(Vec<String>),
-    /// 識別の字面。
-    Identity(String),
-}
-
-/// 束縛の候補。条件 (cfg) の付いた束縛は、条件ごとの候補に分かれる。
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Candidate {
-    /// 候補の条件 (cfg のトークン)。外側の条件から順に並ぶ。
-    conditions: Vec<String>,
-    target: Target,
-}
-
-impl Candidate {
-    fn new(conditions: &[String], target: Target) -> Self {
-        Self {
-            conditions: conditions.to_vec(),
-            target,
-        }
+        self.path_attribute |= other.path_attribute;
     }
 
-    /// 条件を前置きした識別の字面。
-    fn identity(&self) -> String {
-        let identity = match &self.target {
-            Target::Module(path) => format!("mod:{}", path.join("::")),
-            Target::Identity(identity) => identity.clone(),
-        };
-        conditioned(&self.conditions, identity)
-    }
-}
-
-/// 束縛を解いた結果 (候補の並び)。
-#[derive(Debug)]
-struct Resolved(Vec<Candidate>);
-
-impl Resolved {
-    /// 条件の無い 1 つの先。
-    fn single(target: Target) -> Self {
-        Self(vec![Candidate::new(&[], target)])
-    }
-
-    /// 各候補の条件の前に、外側の条件 `conditions` を足した候補。
-    fn under(self, conditions: &[String]) -> Vec<Candidate> {
-        self.0
-            .into_iter()
-            .map(|mut candidate| {
-                let mut all = conditions.to_vec();
-                all.append(&mut candidate.conditions);
-                candidate.conditions = all;
-                candidate
-            })
+    /// スコープが束縛する名前 (宣言・型別名・定数・module・`use`)。
+    fn names(&self) -> std::collections::BTreeSet<&str> {
+        self.items
+            .keys()
+            .chain(self.aliases.keys())
+            .chain(self.constants.keys())
+            .chain(self.modules.keys())
+            .chain(self.uses.keys())
+            .map(String::as_str)
             .collect()
     }
-}
-
-/// 候補の識別を並べ替えて `|` でつないだ字面。
-fn joined_identity(candidates: &[Candidate]) -> String {
-    let mut identities: Vec<String> = candidates.iter().map(Candidate::identity).collect();
-    identities.sort();
-    identities.dedup();
-    identities.join("|")
 }
 
 /// 外のパスの識別 `prefix` (`crate:a`・経路の無い `crate:`) に、続く名前の並び `rest` を足す。
@@ -207,8 +292,14 @@ fn outside_path(prefix: &str, rest: &[String]) -> String {
 /// Rust のファイルの、module のスコープごとの束縛の索引。
 pub(crate) struct DependencyIndex {
     scopes: HashMap<Vec<String>, ScopeBindings>,
-    /// ファイルの module の crate の中の経路 (`src` 相対の位置から)。分からなければ None。
+    /// ファイルの module の crate の中の経路 (`src` 相対の位置か、crate root から `mod` 宣言を
+    /// たどった経路)。分からなければ None。
     file_module: Option<Vec<String>>,
+    /// ファイルのパス (`dir` 相対)。
+    path: String,
+    /// 中の `mod x;` のファイルを、このファイルのディレクトリから探す (crate root・`mod.rs`・
+    /// `#[path]` で開いたファイル)。ほかは、ファイルの名前のディレクトリから探す。
+    mod_rs: bool,
     /// ファイルのマクロ定義 (`macro_rules!`) のトークン。マクロの呼び出しの識別に添える。
     macro_definitions: Vec<String>,
     tree: tree_sitter::Tree,
@@ -296,16 +387,47 @@ fn conditioned(conditions: &[String], identity: String) -> String {
     format!("cfg({}){identity}", attributes.join(" "))
 }
 
+/// module のスコープの束縛の指紋 (Issue #300)。resolver が読む中身だけを持つ。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScopeFingerprint {
+    /// 名前ごとの束縛 (宣言の種類と条件、型別名・定数の宣言の全トークン、`mod` の宣言、`use` の先)。
+    pub(crate) names: std::collections::BTreeMap<String, Vec<String>>,
+    /// glob の先。
+    pub(crate) globs: Vec<String>,
+    /// item 位置のマクロの呼び出し (と、呼び出しがあればファイルのマクロ定義)。
+    pub(crate) macros: Vec<String>,
+    /// `mod` の宣言のある名前。
+    pub(crate) modules: std::collections::BTreeSet<String>,
+}
+
 impl DependencyIndex {
-    /// Rust のソース `source` (ファイル `file`、`dir` 相対) の索引。構文エラーなら None。
+    /// Rust のソース `source` (ファイル `file`、`dir` 相対) の索引。module の経路はパスの規約
+    /// (`src` 相対の位置) から決める。構文エラーなら None。
     pub(crate) fn new(source: &[u8], file: &str) -> Option<Self> {
+        let module = source_module_path(file).map(|(_, module)| module);
+        let mod_rs = std::path::Path::new(file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "lib.rs" | "main.rs" | "mod.rs"));
+        Self::new_in_module(source, file, module, mod_rs)
+    }
+
+    /// module の経路 `file_module` を指定した索引 (`#[path]` で開いたファイルなど)。構文エラーなら None。
+    pub(crate) fn new_in_module(
+        source: &[u8],
+        file: &str,
+        file_module: Option<Vec<String>>,
+        mod_rs: bool,
+    ) -> Option<Self> {
         let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
         if tree.root_node().has_error() {
             return None;
         }
         let mut index = Self {
             scopes: HashMap::new(),
-            file_module: source_module_path(file).map(|(_, module)| module),
+            file_module,
+            path: file.to_owned(),
+            mod_rs,
             macro_definitions: Vec::new(),
             tree,
             source: source.to_vec(),
@@ -314,13 +436,14 @@ impl DependencyIndex {
         let mut scopes = Vec::new();
         let mut definitions = Vec::new();
         // 深い入れ子の inline module でもスタックを溢れさせないよう、明示のスタックで下りる。
-        let mut pending = vec![(root, Vec::new(), Vec::new())];
-        while let Some((scope, path, inherited)) = pending.pop() {
+        let mut pending = vec![(root, Vec::new(), Vec::new(), false)];
+        while let Some((scope, path, inherited, path_attribute)) = pending.pop() {
             pending.extend(collect_scope(
                 scope,
                 &index.source,
                 path,
                 &inherited,
+                path_attribute,
                 index.file_module.as_deref(),
                 &mut scopes,
                 &mut definitions,
@@ -335,533 +458,16 @@ impl DependencyIndex {
         Some(index)
     }
 
-    /// `start` (行, 列) に始まる宣言の契約が名指す名前の、字面ごとの束縛 (解けなければ None の
-    /// 要素)。宣言を引けなければ None。
-    fn declaration_dependencies(
-        &self,
-        start: (usize, usize),
-        inline_module: &str,
-    ) -> Option<HashMap<String, Vec<Option<String>>>> {
-        let declaration = declaration_at(self.tree.root_node(), start)?;
-        let scope: Vec<String> = if inline_module.is_empty() {
-            Vec::new()
-        } else {
-            inline_module.split("::").map(str::to_owned).collect()
-        };
-        let mut found: HashMap<String, Vec<Option<String>>> = HashMap::new();
-        for reference in contract_references(declaration, &self.source) {
-            let identity = self.resolve_path(&scope, &reference, 0);
-            let entry = found.entry(reference.text()).or_default();
-            if !entry.contains(&identity) {
-                entry.push(identity);
-            }
-        }
-        for identities in found.values_mut() {
-            identities.sort();
-        }
-        Some(found)
+    /// ファイルのパス (`dir` 相対)。
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
-    /// スコープ `scope` で、パス `reference` を解いた識別。解けなければ None。
-    fn resolve_path(
-        &self,
-        scope: &[String],
-        reference: &Reference,
-        depth: usize,
-    ) -> Option<String> {
-        let (name, prefix) = reference.segments.split_last()?;
-        if name.starts_with("<macro ") {
-            return Some(format!(
-                "{name}{SEPARATOR}{}",
-                self.macro_definitions.join(" ")
-            ));
-        }
-        let mut candidates = Vec::new();
-        for branch in self.resolve_module_prefix(scope, prefix, depth)? {
-            match branch.target {
-                Target::Module(module) => candidates.extend(
-                    self.resolve_name(&module, name, reference.namespace, depth)?
-                        .under(&branch.conditions),
-                ),
-                Target::Identity(outside) => candidates.push(Candidate::new(
-                    &branch.conditions,
-                    Target::Identity(outside_path(&outside, std::slice::from_ref(name))),
-                )),
-            }
-        }
-        (candidates.len() <= MAX_CANDIDATES).then(|| joined_identity(&candidates))
+    /// ファイルの module の crate の中の経路。
+    pub(crate) fn file_module(&self) -> Option<&[String]> {
+        self.file_module.as_deref()
     }
 
-    /// スコープ `scope` からパスの module の部分 `segments` (`crate`・`self`・`super`・`::` で
-    /// 始まり得る) を解いた枝 (このファイルの module か、外のパスの識別)。空ならそのスコープ。
-    fn resolve_module_prefix(
-        &self,
-        scope: &[String],
-        segments: &[String],
-        depth: usize,
-    ) -> Option<Vec<Candidate>> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let outside =
-            |identity: String| Some(vec![Candidate::new(&[], Target::Identity(identity))]);
-        let Some((first, rest)) = segments.split_first() else {
-            return Some(vec![Candidate::new(&[], Target::Module(scope.to_vec()))]);
-        };
-        match first.as_str() {
-            "::" => outside(outside_path("global:", rest)),
-            "crate" => self.walk_absolute(rest.to_vec(), depth),
-            "self" => self.walk_modules(scope.to_vec(), rest, depth),
-            "super" => {
-                let supers = segments
-                    .iter()
-                    .take_while(|segment| segment.as_str() == "super")
-                    .count();
-                let rest = &segments[supers..];
-                if supers <= scope.len() {
-                    return self.walk_modules(scope[..scope.len() - supers].to_vec(), rest, depth);
-                }
-                // ファイルの外の祖先の module は、crate root からの経路にする。
-                let up = supers - scope.len();
-                match &self.file_module {
-                    Some(file_module) if up <= file_module.len() => {
-                        let mut absolute = file_module[..file_module.len() - up].to_vec();
-                        absolute.extend(rest.iter().cloned());
-                        self.walk_absolute(absolute, depth)
-                    }
-                    _ => outside(format!("outside:{}", segments.join("::"))),
-                }
-            }
-            _ => self.walk_modules(scope.to_vec(), segments, depth),
-        }
-    }
-
-    /// crate root からの module の経路 `absolute` をたどる。このファイルの中なら束縛でたどり、
-    /// 外なら `crate:` の識別にする。
-    fn walk_absolute(&self, absolute: Vec<String>, depth: usize) -> Option<Vec<Candidate>> {
-        match &self.file_module {
-            Some(file_module) if absolute.starts_with(file_module) => {
-                self.walk_modules(Vec::new(), &absolute[file_module.len()..], depth)
-            }
-            _ => Some(vec![Candidate::new(
-                &[],
-                Target::Identity(outside_path("crate:", &absolute)),
-            )]),
-        }
-    }
-
-    /// module `module` から、module の名前の並び `segments` をたどった枝。別名 (`use a as m`) も
-    /// 解き、条件付きの別名は条件ごとの枝に分ける。外へ出た枝は、残りの名前を足した識別にする。
-    fn walk_modules(
-        &self,
-        module: Vec<String>,
-        segments: &[String],
-        depth: usize,
-    ) -> Option<Vec<Candidate>> {
-        let mut walking = vec![Candidate::new(&[], Target::Module(module))];
-        let mut done = Vec::new();
-        for (index, segment) in segments.iter().enumerate() {
-            let mut next = Vec::new();
-            for branch in walking {
-                let Target::Module(module) = &branch.target else {
-                    continue;
-                };
-                for candidate in self
-                    .resolve_name_in(module, segment, Namespace::Type, depth + 1, true)?
-                    .under(&branch.conditions)
-                {
-                    match candidate.target {
-                        Target::Module(_) => next.push(candidate),
-                        Target::Identity(identity) => done.push(Candidate {
-                            conditions: candidate.conditions,
-                            target: Target::Identity(outside_path(
-                                &identity,
-                                &segments[index + 1..],
-                            )),
-                        }),
-                    }
-                }
-            }
-            walking = next;
-            if walking.len() + done.len() > MAX_CANDIDATES {
-                return None;
-            }
-        }
-        done.extend(walking);
-        Some(done)
-    }
-
-    /// スコープ `scope` で名前 `name` を解く。明示の束縛が無ければ、同じファイルの中の glob、
-    /// マクロ、外の glob、prelude の候補をまとめる。型の名前空間で見つからなければ、値の名前空間も
-    /// 引く (const ジェネリクスの引数)。
-    fn resolve_name(
-        &self,
-        scope: &[String],
-        name: &str,
-        namespace: Namespace,
-        depth: usize,
-    ) -> Option<Resolved> {
-        self.resolve_name_in(scope, name, namespace, depth, false)
-    }
-
-    /// [`Self::resolve_name`] の本体。`module_segment` はパスの module の区切り (`std::path::X` の
-    /// `std`) で、明示の束縛に無ければ外の crate の名前として識別する。module の区切りは glob から
-    /// 引かない (glob の経路そのものを解くときに同じ glob を引き直して循環せず、外の glob やマクロの
-    /// 変化を外のパスへ広げない。glob が module の名前を持ち込むことはまれ)。
-    fn resolve_name_in(
-        &self,
-        scope: &[String],
-        name: &str,
-        namespace: Namespace,
-        depth: usize,
-        module_segment: bool,
-    ) -> Option<Resolved> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let namespaces: &[Namespace] = match namespace {
-            Namespace::Type => &[Namespace::Type, Namespace::Value],
-            Namespace::Value => &[Namespace::Value],
-        };
-        for &namespace in namespaces {
-            if let Some(found) = self.lookup(scope, name, namespace, depth)? {
-                return Some(found);
-            }
-        }
-        if module_segment {
-            return Some(Resolved::single(Target::Identity(format!("extern:{name}"))));
-        }
-        let Some(bindings) = self.scopes.get(scope) else {
-            return Some(Resolved::single(Target::Identity(format!(
-                "outside:{}::{name}",
-                scope.join("::")
-            ))));
-        };
-        let mut certain = Vec::new();
-        let mut uncertain = Vec::new();
-        for glob in &bindings.globs {
-            for branch in self.resolve_use_module(scope, glob, depth)? {
-                let mut conditions = glob.conditions.clone();
-                conditions.extend(branch.conditions);
-                match branch.target {
-                    Target::Module(module) => {
-                        for &namespace in namespaces {
-                            if let Some(found) = self.lookup(&module, name, namespace, depth + 1)? {
-                                certain.extend(found.under(&conditions));
-                                break;
-                            }
-                        }
-                    }
-                    Target::Identity(target) => uncertain.push(Candidate::new(
-                        &conditions,
-                        Target::Identity(format!("glob:{target}")),
-                    )),
-                }
-            }
-        }
-        if !bindings.macros.is_empty() {
-            uncertain.push(Candidate::new(
-                &[],
-                Target::Identity(format!(
-                    "macros:{}{SEPARATOR}{}",
-                    bindings.macros.join(" "),
-                    self.macro_definitions.join(" ")
-                )),
-            ));
-        }
-        // 同じファイルの中の glob で見つかり、外の glob とマクロが無ければ、その先だけにする。
-        if certain.is_empty() || !uncertain.is_empty() {
-            certain.extend(uncertain);
-            certain.push(Candidate::new(
-                &[],
-                Target::Identity(format!("prelude:{name}")),
-            ));
-        }
-        (certain.len() <= MAX_CANDIDATES).then_some(Resolved(certain))
-    }
-
-    /// `use` の先の module の部分を解いた枝。
-    fn resolve_use_module(
-        &self,
-        scope: &[String],
-        target: &UseTarget,
-        depth: usize,
-    ) -> Option<Vec<Candidate>> {
-        match target.origin {
-            // crate root からの経路 (`crate`・`self`・`super` を解いた後)。
-            UsePathOrigin::Anchored => self.walk_absolute(target.module.clone(), depth),
-            // 2018 以降の識別子で始まる経路は、同じスコープの束縛 (子の module・別名) から読む。
-            UsePathOrigin::Bare => self.walk_modules(scope.to_vec(), &target.module, depth),
-            UsePathOrigin::Global => Some(vec![Candidate::new(
-                &[],
-                Target::Identity(outside_path("global:", &target.module)),
-            )]),
-        }
-    }
-
-    /// スコープ `scope` の明示の束縛 (宣言・型別名・定数・module・`use`) で名前 `name` を引く。
-    /// 無ければ Some(None)、解けなければ None。
-    fn lookup(
-        &self,
-        scope: &[String],
-        name: &str,
-        namespace: Namespace,
-        depth: usize,
-    ) -> Option<Option<Resolved>> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let Some(bindings) = self.scopes.get(scope) else {
-            return Some(None);
-        };
-        let place = scope.join("::");
-        let mut found: Vec<Candidate> = Vec::new();
-        if namespace == Namespace::Type {
-            if let Some(&inline) = bindings.modules.get(name) {
-                let mut path = scope.to_vec();
-                path.push(name.to_owned());
-                if inline && self.scopes.contains_key(&path) {
-                    return Some(Some(Resolved::single(Target::Module(path))));
-                }
-                found.push(Candidate::new(
-                    &[],
-                    Target::Identity(format!("mod-file:{}", path.join("::"))),
-                ));
-            }
-            for alias in bindings.aliases.get(name).into_iter().flatten() {
-                let rendered = self.render_definition(scope, alias, depth + 1)?;
-                found.push(Candidate::new(
-                    &alias.conditions,
-                    Target::Identity(format!("alias:{place}#{name}:{rendered}")),
-                ));
-            }
-        } else {
-            for constant in bindings.constants.get(name).into_iter().flatten() {
-                let rendered = self.render_definition(scope, constant, depth + 1)?;
-                found.push(Candidate::new(
-                    &constant.conditions,
-                    Target::Identity(format!("const:{place}#{name}:{rendered}")),
-                ));
-            }
-        }
-        for item in bindings.items.get(name).into_iter().flatten() {
-            if item_namespaces(item.kind).contains(&namespace) {
-                found.push(Candidate::new(
-                    &item.conditions,
-                    Target::Identity(format!("item:{place}#{name}:{}", item.kind)),
-                ));
-            }
-        }
-        for target in bindings.uses.get(name).into_iter().flatten() {
-            let item = target.item.as_deref()?;
-            // `use name;` は同じスコープの子の module か外部 crate (自分の束縛を引き直さない)。
-            if target.origin == UsePathOrigin::Bare && target.module.is_empty() {
-                let mut path = scope.to_vec();
-                path.push(item.to_owned());
-                let resolved = if self.scopes.contains_key(&path) {
-                    Target::Module(path)
-                } else {
-                    Target::Identity(format!("extern:{item}"))
-                };
-                found.push(Candidate::new(&target.conditions, resolved));
-                continue;
-            }
-            for branch in self.resolve_use_module(scope, target, depth + 1)? {
-                let mut conditions = target.conditions.clone();
-                conditions.extend(branch.conditions);
-                match branch.target {
-                    Target::Module(module) => {
-                        // 同じスコープの同じ名前を指す use (宣言の再公開) は、宣言で表す。
-                        if module == scope && item == name {
-                            continue;
-                        }
-                        found.extend(
-                            self.resolve_name(&module, item, namespace, depth + 1)?
-                                .under(&conditions),
-                        );
-                    }
-                    Target::Identity(prefix) => found.push(Candidate {
-                        conditions,
-                        target: Target::Identity(outside_path(&prefix, &[item.to_owned()])),
-                    }),
-                }
-            }
-        }
-        if found.is_empty() {
-            return Some(None);
-        }
-        (found.len() <= MAX_CANDIDATES).then_some(Some(Resolved(found)))
-    }
-
-    /// 型別名・定数の宣言 (スコープ `scope`) を、右辺の名前を解いた識別に置き換えた並びにする。
-    /// 宣言の名前・見える範囲の指定・コメントは入れない。
-    fn render_definition(
-        &self,
-        scope: &[String],
-        definition: &Definition,
-        depth: usize,
-    ) -> Option<String> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let node = self
-            .tree
-            .root_node()
-            .descendant_for_byte_range(definition.range.0, definition.range.1)?;
-        let generics = generic_parameter_names(node, &self.source);
-        let mut tokens = Vec::new();
-        for (field, namespace) in [
-            ("type_parameters", Namespace::Type),
-            ("type", Namespace::Type),
-            ("value", Namespace::Value),
-        ] {
-            if let Some(child) = node.child_by_field_name(field) {
-                tokens.push(format!("<{field}>"));
-                self.render(child, scope, namespace, &generics, depth, &mut tokens)?;
-            }
-        }
-        Some(tokens.join(SEPARATOR))
-    }
-
-    /// `node` の字面を、名前を解いた識別に置き換えて `tokens` に足す。深い入れ子でもスタックを
-    /// 溢れさせないよう、明示のスタックで前順にたどる。
-    fn render(
-        &self,
-        node: tree_sitter::Node<'_>,
-        scope: &[String],
-        namespace: Namespace,
-        generics: &[String],
-        depth: usize,
-        tokens: &mut Vec<String>,
-    ) -> Option<()> {
-        enum Work<'tree> {
-            Node(tree_sitter::Node<'tree>, Namespace),
-            Marker(&'static str),
-        }
-        let mut stack = vec![Work::Node(node, namespace)];
-        while let Some(work) = stack.pop() {
-            let (node, namespace) = match work {
-                Work::Node(node, namespace) => (node, namespace),
-                Work::Marker(marker) => {
-                    tokens.push(marker.to_owned());
-                    continue;
-                }
-            };
-            // 型の名前は値の式の中 (`size_of::<T>()`) でも型の名前空間で解き、値の名前は値の
-            // 位置でだけ解く。
-            let reference_namespace = match node.kind() {
-                "type_identifier" | "scoped_type_identifier" => Some(Namespace::Type),
-                "identifier" | "scoped_identifier" if namespace == Namespace::Value => {
-                    Some(Namespace::Value)
-                }
-                _ => None,
-            };
-            if let Some(reference_namespace) = reference_namespace
-                && let Some(segments) = path_segments(node, &self.source)
-            {
-                if let Some(index) = generics.iter().position(|g| Some(g) == segments.first()) {
-                    tokens.push(format!("<generic {index}>"));
-                    if segments.len() > 1 {
-                        tokens.push(segments[1..].join("::"));
-                    }
-                } else {
-                    tokens.push(self.resolve_path(
-                        scope,
-                        &Reference {
-                            segments,
-                            namespace: reference_namespace,
-                        },
-                        depth + 1,
-                    )?);
-                }
-                continue;
-            }
-            let children_namespace = match node.kind() {
-                "line_comment" | "block_comment" => continue,
-                "array_type" => {
-                    if let Some(length) = node.child_by_field_name("length") {
-                        stack.push(Work::Node(length, Namespace::Value));
-                        stack.push(Work::Marker("<length>"));
-                    }
-                    if let Some(element) = node.child_by_field_name("element") {
-                        stack.push(Work::Node(element, Namespace::Type));
-                    }
-                    continue;
-                }
-                "block" if namespace == Namespace::Type => Namespace::Value,
-                _ => namespace,
-            };
-            if node.child_count() == 0 {
-                push_tokens(node, &self.source, tokens);
-                continue;
-            }
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            stack.extend(
-                children
-                    .into_iter()
-                    .rev()
-                    .map(|child| Work::Node(child, children_namespace)),
-            );
-        }
-        Some(())
-    }
-
-    /// 旧い版 `self` の宣言 (`old`) と新しい版 `new_index` の宣言 (`new`) の契約が名指す名前の束縛を
-    /// 比べる。旧新の両方に現れる名前だけを比べる。定義の移動は、差分の中のファイル `files` で
-    /// 確かめる。
-    pub(crate) fn compare(
-        &self,
-        old: &[RustDeclarationContext],
-        new_index: &DependencyIndex,
-        new: &[RustDeclarationContext],
-        files: &DiffModules<'_>,
-    ) -> DependencyComparison {
-        let collect = |index: &DependencyIndex, declarations: &[RustDeclarationContext]| {
-            let mut merged: HashMap<String, Vec<Option<String>>> = HashMap::new();
-            for declaration in declarations {
-                let found = index
-                    .declaration_dependencies(declaration.start, &declaration.inline_module)?;
-                for (text, identities) in found {
-                    let entry = merged.entry(text).or_default();
-                    for identity in identities {
-                        if !entry.contains(&identity) {
-                            entry.push(identity);
-                        }
-                    }
-                }
-            }
-            for identities in merged.values_mut() {
-                identities.sort();
-            }
-            Some(merged)
-        };
-        let (Some(old_dependencies), Some(new_dependencies)) =
-            (collect(self, old), collect(new_index, new))
-        else {
-            return DependencyComparison::Unknown;
-        };
-        let mut result = DependencyComparison::Same;
-        for (text, old_identities) in &old_dependencies {
-            let Some(new_identities) = new_dependencies.get(text) else {
-                continue;
-            };
-            if old_identities.contains(&None) || new_identities.contains(&None) {
-                result = DependencyComparison::Unknown;
-            } else if old_identities != new_identities
-                && !self.moved_definition(old_identities, new_index, new_identities, files)
-            {
-                return DependencyComparison::Changed;
-            }
-        }
-        result
-    }
-}
-
-/// 子の inline module の中身と、その経路と条件。
-type ChildScope<'tree> = (tree_sitter::Node<'tree>, Vec<String>, Vec<String>);
-
-impl DependencyIndex {
     /// スコープ `scope` に名前 `name` の定義 (宣言・型別名・定数) があるか。
     fn defines(&self, scope: &[String], name: &str) -> bool {
         self.scopes.get(scope).is_some_and(|bindings| {
@@ -871,115 +477,281 @@ impl DependencyIndex {
         })
     }
 
-    /// スコープ `scope` の名前 `name` の、条件の無いただ 1 つの定義 (宣言・型別名・定数) の識別
-    /// ([`Self::lookup`] と同じ字面)。無いか、条件付きか、複数あれば None。
-    fn sole_definition(&self, scope: &[String], name: &str) -> Option<String> {
-        let bindings = self.scopes.get(scope)?;
-        let place = scope.join("::");
-        let mut found = Vec::new();
-        for alias in bindings.aliases.get(name).into_iter().flatten() {
-            let rendered = self.render_definition(scope, alias, 1)?;
-            found.push((
-                &alias.conditions,
-                format!("alias:{place}#{name}:{rendered}"),
-            ));
-        }
-        for constant in bindings.constants.get(name).into_iter().flatten() {
-            let rendered = self.render_definition(scope, constant, 1)?;
-            found.push((
-                &constant.conditions,
-                format!("const:{place}#{name}:{rendered}"),
-            ));
-        }
-        for item in bindings.items.get(name).into_iter().flatten() {
-            found.push((
-                &item.conditions,
-                format!("item:{place}#{name}:{}", item.kind),
-            ));
-        }
-        match found.as_slice() {
-            [(conditions, identity)] if conditions.is_empty() => Some(identity.clone()),
-            _ => None,
-        }
+    /// スコープ `scope` の名前 `name` の、inline でない `mod` の宣言。
+    pub(crate) fn module_declarations(
+        &self,
+        scope: &[String],
+        name: &str,
+    ) -> Vec<&ModuleDeclaration> {
+        self.scopes
+            .get(scope)
+            .and_then(|bindings| bindings.modules.get(name))
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
-    /// 識別 `identity` (この版で解いたもの) がただ 1 つの定義を指すなら、その場所と中身。差分の中の
-    /// ほかのファイルの定義は、`files` の同じ版 (`old`) の索引で引く。
-    fn located_definition(
-        &self,
-        identity: &str,
-        files: &DiffModules<'_>,
-        old: bool,
-    ) -> Option<LocatedDefinition> {
-        if let Some((place, name)) = local_definition(identity) {
-            let scope = split_place(place);
-            // 右辺が `|` を含み得るので、字面を分けずに引き直して 1 つの定義を指すことを確かめる。
-            if self.sole_definition(&scope, name)? != identity {
-                return None;
-            }
-            return Some(LocatedDefinition {
-                place: DefinitionPlace::Local(scope),
-                name: name.to_owned(),
-                content: definition_content(identity)?,
-            });
-        }
-        let (module, name) = self.crate_location(identity)?;
-        let (index, scope) = files.module_index(&module, old)?;
-        let definition = index.sole_definition(&scope, &name)?;
-        Some(LocatedDefinition {
-            place: DefinitionPlace::Crate(module),
-            content: definition_content(&definition)?,
-            name,
+    /// スコープ `scope` に inline の module `name` があるか。
+    pub(crate) fn has_inline_module(&self, scope: &[String], name: &str) -> bool {
+        let mut path = scope.to_vec();
+        path.push(name.to_owned());
+        self.scopes.contains_key(&path)
+            && self
+                .scopes
+                .get(scope)
+                .and_then(|bindings| bindings.modules.get(name))
+                .is_some_and(|declarations| declarations.iter().any(|d| d.inline))
+    }
+
+    /// スコープ `scope` (inline module の経路) に `#[path]` が付いているか。
+    pub(crate) fn scope_has_path_attribute(&self, scope: &[String]) -> bool {
+        (1..=scope.len()).any(|depth| {
+            self.scopes
+                .get(&scope[..depth])
+                .is_some_and(|bindings| bindings.path_attribute)
         })
     }
 
-    /// 識別 `identity` が crate の中のほかのファイルの名前 (`crate:`・`mod-file:`) なら、その
-    /// module の crate root からの経路と名前。
-    fn crate_location(&self, identity: &str) -> Option<(Vec<String>, String)> {
-        let mut path = if let Some(path) = identity.strip_prefix("crate:") {
-            path_names(path)?
-        } else {
-            let mut path = self.file_module.clone()?;
-            path.extend(path_names(identity.strip_prefix("mod-file:")?)?);
-            path
-        };
-        let name = path.pop()?;
-        Some((path, name))
+    /// スコープの経路 (inline module の経路) の並び。
+    pub(crate) fn scope_paths(&self) -> impl Iterator<Item = &Vec<String>> {
+        self.scopes.keys()
     }
 
-    /// 旧い束縛 `old` から新しい束縛 `new` への変化が、同じ定義を移しただけか。旧新がそれぞれ
-    /// ただ 1 つの定義 (このファイルか、差分の中の同じ crate のファイル `files` のもの) を指し、
-    /// 名前・種類・中身 (型別名と定数は右辺を解いた並び) が同じで、差分の中で旧い定義の場所から
-    /// 消して新しい定義の場所に足したこと。外の型の取り込みへの差し替えや、元からあった別の定義への
-    /// 付け替えは移動でない。移した定義そのものの変更は、その定義の変更として出る。
-    fn moved_definition(
-        &self,
-        old: &[Option<String>],
-        new_index: &DependencyIndex,
-        new: &[Option<String>],
-        files: &DiffModules<'_>,
-    ) -> bool {
-        let ([Some(old)], [Some(new)]) = (old, new) else {
-            return false;
+    /// スコープ `scope` の名前 `name` の束縛が名指すパス (`use` の先、型別名・定数の右辺の名前、
+    /// `mod` の名前)。
+    pub(crate) fn binding_paths(&self, scope: &[String], name: &str) -> Vec<Vec<String>> {
+        let Some(bindings) = self.scopes.get(scope) else {
+            return Vec::new();
         };
-        let (Some(from), Some(to)) = (
-            self.located_definition(old, files, true),
-            new_index.located_definition(new, files, false),
-        ) else {
-            return false;
-        };
-        from.name == to.name
-            && from.content == to.content
-            && from.place != to.place
-            && !defined_at(&from, new_index, files, false)
-            && !defined_at(&to, self, files, true)
+        let mut paths = Vec::new();
+        for target in bindings.uses.get(name).into_iter().flatten() {
+            let mut path = target.module.clone();
+            path.extend(target.item.iter().cloned());
+            paths.push(path);
+        }
+        let definitions = bindings
+            .aliases
+            .get(name)
+            .into_iter()
+            .flatten()
+            .chain(bindings.constants.get(name).into_iter().flatten());
+        for definition in definitions {
+            if let Some(node) = self
+                .tree
+                .root_node()
+                .descendant_for_byte_range(definition.range.0, definition.range.1)
+            {
+                // 型と型引数は型、定数の右辺は値として名前を集める ([`Resolver`] の右辺の解き方と同じ)。
+                let mut references = Vec::new();
+                for (field, namespace) in [
+                    ("type_parameters", Namespace::Type),
+                    ("type", Namespace::Type),
+                    ("value", Namespace::Value),
+                ] {
+                    if let Some(child) = node.child_by_field_name(field) {
+                        collect_references(child, &self.source, namespace, &mut references);
+                    }
+                }
+                paths.extend(references.into_iter().map(|reference| reference.segments));
+            }
+        }
+        if bindings.modules.contains_key(name) {
+            paths.push(vec![name.to_owned()]);
+        }
+        paths
     }
+
+    /// スコープ `scope` の glob の経路。
+    pub(crate) fn glob_paths(&self, scope: &[String]) -> Vec<Vec<String>> {
+        self.scopes
+            .get(scope)
+            .map(|bindings| {
+                bindings
+                    .globs
+                    .iter()
+                    .map(|glob| glob.module.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 中身のファイルを `#[path]` で指定した (か、指定を読めない) `mod` の宣言があるか。
+    pub(crate) fn declares_path_modules(&self) -> bool {
+        self.scopes.values().any(|bindings| {
+            bindings.path_attribute
+                || bindings
+                    .modules
+                    .values()
+                    .flatten()
+                    .any(|declaration| declaration.path != ModuleSource::Default)
+        })
+    }
+
+    /// スコープ `scope` が束縛する名前。
+    pub(crate) fn scope_names(&self, scope: &[String]) -> Vec<String> {
+        self.scopes
+            .get(scope)
+            .map(|bindings| bindings.names().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// resolver が読む束縛の指紋 (Issue #300)。スコープ (inline module の経路) ごと。関数の本体・
+    /// impl・構造体の中身・コメントは入れない。
+    pub(crate) fn fingerprint(&self) -> std::collections::BTreeMap<Vec<String>, ScopeFingerprint> {
+        let node_tokens = |definition: &Definition| {
+            self.tree
+                .root_node()
+                .descendant_for_byte_range(definition.range.0, definition.range.1)
+                .map(|node| tokens_of(node, &self.source).join(" "))
+                .unwrap_or_default()
+        };
+        let mut result = std::collections::BTreeMap::new();
+        for (path, bindings) in &self.scopes {
+            let mut fingerprint = ScopeFingerprint::default();
+            let mut push = |name: &str, entry: String| {
+                fingerprint
+                    .names
+                    .entry(name.to_owned())
+                    .or_insert_with(Vec::new)
+                    .push(entry);
+            };
+            for (name, items) in &bindings.items {
+                for item in items {
+                    push(
+                        name,
+                        format!(
+                            "item {} {:?} {}",
+                            item.kind,
+                            item.visibility,
+                            item.conditions.join(" ")
+                        ),
+                    );
+                }
+            }
+            for (name, aliases) in &bindings.aliases {
+                for alias in aliases {
+                    push(
+                        name,
+                        format!(
+                            "alias {} {}",
+                            alias.conditions.join(" "),
+                            node_tokens(alias)
+                        ),
+                    );
+                }
+            }
+            for (name, constants) in &bindings.constants {
+                for constant in constants {
+                    push(
+                        name,
+                        format!(
+                            "const {} {}",
+                            constant.conditions.join(" "),
+                            node_tokens(constant)
+                        ),
+                    );
+                }
+            }
+            for (name, modules) in &bindings.modules {
+                for module in modules {
+                    push(
+                        name,
+                        format!(
+                            "mod {} {:?} {:?} {} {}",
+                            module.inline,
+                            module.path,
+                            module.visibility,
+                            module.conditions.join(" "),
+                            module.attributes.join(" ")
+                        ),
+                    );
+                }
+                fingerprint.modules.insert(name.clone());
+            }
+            for (name, uses) in &bindings.uses {
+                for target in uses {
+                    push(name, target.fingerprint());
+                }
+            }
+            for entries in fingerprint.names.values_mut() {
+                entries.sort();
+            }
+            fingerprint.globs = bindings.globs.iter().map(UseTarget::fingerprint).collect();
+            fingerprint.globs.sort();
+            fingerprint.macros = bindings.macros.clone();
+            if !bindings.macros.is_empty() {
+                fingerprint.macros.push(SEPARATOR.to_owned());
+                fingerprint
+                    .macros
+                    .extend(self.macro_definitions.iter().cloned());
+            }
+            fingerprint
+                .globs
+                .push(format!("path_attribute {}", bindings.path_attribute));
+            result.insert(path.clone(), fingerprint);
+        }
+        result
+    }
+}
+
+/// 子の inline module の中身と、その経路と条件と、`#[path]` が付いているか。
+type ChildScope<'tree> = (tree_sitter::Node<'tree>, Vec<String>, Vec<String>, bool);
+
+/// 旧い版の宣言 (`old_declarations`、旧い版の文脈 `old`) と新しい版の宣言 (`new_declarations`、
+/// 新しい版の文脈 `new`) の契約が名指す名前の束縛を比べる。旧新の両方に現れる名前だけを比べる。
+/// 定義の移動は、差分の中のファイル `files` で確かめる。
+pub(crate) fn compare_dependencies(
+    old: &Resolver<'_>,
+    old_declarations: &[RustDeclarationContext],
+    new: &Resolver<'_>,
+    new_declarations: &[RustDeclarationContext],
+    files: &DiffModules<'_>,
+) -> DependencyComparison {
+    let collect = |resolver: &Resolver<'_>, declarations: &[RustDeclarationContext]| {
+        let mut merged: HashMap<String, Vec<Option<String>>> = HashMap::new();
+        for declaration in declarations {
+            let found =
+                resolver.declaration_dependencies(declaration.start, &declaration.inline_module)?;
+            for (text, identities) in found {
+                let entry = merged.entry(text).or_default();
+                for identity in identities {
+                    if !entry.contains(&identity) {
+                        entry.push(identity);
+                    }
+                }
+            }
+        }
+        for identities in merged.values_mut() {
+            identities.sort();
+        }
+        Some(merged)
+    };
+    let (Some(old_dependencies), Some(new_dependencies)) = (
+        collect(old, old_declarations),
+        collect(new, new_declarations),
+    ) else {
+        return DependencyComparison::Unknown;
+    };
+    let mut result = DependencyComparison::Same;
+    for (text, old_identities) in &old_dependencies {
+        let Some(new_identities) = new_dependencies.get(text) else {
+            continue;
+        };
+        if old_identities.contains(&None) || new_identities.contains(&None) {
+            result = DependencyComparison::Unknown;
+        } else if old_identities != new_identities
+            && !moved_definition(old, old_identities, new, new_identities, files)
+        {
+            return DependencyComparison::Changed;
+        }
+    }
+    result
 }
 
 /// 定義の場所。
 #[derive(Debug, PartialEq, Eq)]
 enum DefinitionPlace {
-    /// このファイルの module のスコープ。
+    /// 比べるファイルの module のスコープ。
     Local(Vec<String>),
     /// 差分の中のほかのファイルの module (crate root からの経路)。
     Crate(Vec<String>),
@@ -994,24 +766,110 @@ struct LocatedDefinition {
     content: String,
 }
 
-/// 定義 `definition` の場所に、版 (`old`) で同じ名前の定義があるか。このファイルの場所は `index`
-/// (その版のこのファイルの索引) で、ほかのファイルの場所は `files` で引く。その版の差分にその場所の
+/// 識別 `identity` (版の文脈 `resolver` で解いたもの) がただ 1 つの定義を指すなら、その場所と中身。
+/// 差分の中のほかのファイルの定義は、`files` の同じ版 (`old`) の索引で引く。
+fn located_definition(
+    resolver: &Resolver<'_>,
+    identity: &str,
+    files: &DiffModules<'_>,
+    old: bool,
+) -> Option<LocatedDefinition> {
+    if let Some((place, name)) = local_definition(identity) {
+        let (file, scope, location) = match place_module(place) {
+            // ほかのファイルの定義 (crate root からの場所)。
+            Some(module) => {
+                let (file, scope) = files.module_index(&module, old)?;
+                (file, scope, DefinitionPlace::Crate(module))
+            }
+            None => {
+                let scope = split_place(place);
+                (
+                    resolver.current.clone(),
+                    scope.clone(),
+                    DefinitionPlace::Local(scope),
+                )
+            }
+        };
+        // 右辺が `|` を含み得るので、字面を分けずに引き直して 1 つの定義を指すことを確かめる。
+        if resolver.sole_definition(&file, &scope, name)? != identity {
+            return None;
+        }
+        return Some(LocatedDefinition {
+            place: location,
+            name: name.to_owned(),
+            content: definition_content(identity)?,
+        });
+    }
+    let (module, name) = crate_location(resolver, identity)?;
+    let (file, scope) = files.module_index(&module, old)?;
+    let definition = resolver.sole_definition(&file, &scope, &name)?;
+    Some(LocatedDefinition {
+        place: DefinitionPlace::Crate(module),
+        content: definition_content(&definition)?,
+        name,
+    })
+}
+
+/// 字面の識別 `identity` が crate の中のほかのファイルの名前 (`crate:`・`mod-file:`) なら、その
+/// module の crate root からの経路と名前。
+fn crate_location(resolver: &Resolver<'_>, identity: &str) -> Option<(Vec<String>, String)> {
+    let mut path = if let Some(path) = identity.strip_prefix("crate:") {
+        path_names(path)?
+    } else {
+        let mut path = resolver.current.file_module.clone()?;
+        path.extend(path_names(identity.strip_prefix("mod-file:")?)?);
+        path
+    };
+    let name = path.pop()?;
+    Some((path, name))
+}
+
+/// 旧い束縛 `old_identities` から新しい束縛 `new_identities` への変化が、同じ定義を移しただけか。
+/// 旧新がそれぞれただ 1 つの定義 (比べるファイルか、差分の中の同じ crate のファイル `files` のもの) を
+/// 指し、名前・種類・中身 (型別名と定数は右辺を解いた並び) が同じで、差分の中で旧い定義の場所から
+/// 消して新しい定義の場所に足したこと。外の型の取り込みへの差し替えや、元からあった別の定義への
+/// 付け替えは移動でない。移した定義そのものの変更は、その定義の変更として出る。
+fn moved_definition(
+    old: &Resolver<'_>,
+    old_identities: &[Option<String>],
+    new: &Resolver<'_>,
+    new_identities: &[Option<String>],
+    files: &DiffModules<'_>,
+) -> bool {
+    let ([Some(old_identity)], [Some(new_identity)]) = (old_identities, new_identities) else {
+        return false;
+    };
+    let (Some(from), Some(to)) = (
+        located_definition(old, old_identity, files, true),
+        located_definition(new, new_identity, files, false),
+    ) else {
+        return false;
+    };
+    from.name == to.name
+        && from.content == to.content
+        && from.place != to.place
+        && !defined_at(&from, &new.current, files, false)
+        && !defined_at(&to, &old.current, files, true)
+}
+
+/// 定義 `definition` の場所に、版 (`old`) で同じ名前の定義があるか。比べるファイルの場所は `current`
+/// (その版の比べるファイルの索引) で、ほかのファイルの場所は `files` で引く。その版の差分にその場所の
 /// ファイルが無ければ (消した・移した) 無いとする。
 fn defined_at(
     definition: &LocatedDefinition,
-    index: &DependencyIndex,
+    current: &DependencyIndex,
     files: &DiffModules<'_>,
     old: bool,
 ) -> bool {
     match &definition.place {
-        DefinitionPlace::Local(scope) => index.defines(scope, &definition.name),
+        DefinitionPlace::Local(scope) => current.defines(scope, &definition.name),
         DefinitionPlace::Crate(module) => files
             .module_index(module, old)
             .is_some_and(|(other, scope)| other.defines(&scope, &definition.name)),
     }
 }
 
-/// このファイルの定義の識別 (`item:` / `alias:` / `const:`) の、場所と名前。
+/// 定義の識別 (`item:` / `alias:` / `const:`) の、場所と名前。
 fn local_definition(identity: &str) -> Option<(&str, &str)> {
     let rest = ["item:", "alias:", "const:"]
         .iter()
@@ -1029,6 +887,15 @@ fn definition_content(identity: &str) -> Option<String> {
     let (_, rest) = rest.split_once('#')?;
     let (_, content) = rest.split_once(':')?;
     Some(format!("{prefix}{content}"))
+}
+
+/// crate root からの場所 (`crate`・`crate::a::b`) なら、その module の経路。
+fn place_module(place: &str) -> Option<Vec<String>> {
+    let rest = place.strip_prefix("crate")?;
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(split_place(rest.strip_prefix("::")?))
 }
 
 /// `a::b` の形の場所のスコープ。
@@ -1069,7 +936,7 @@ pub(crate) struct DiffModules<'a> {
 struct ModuleFile {
     module: Vec<String>,
     path: String,
-    index: std::cell::OnceCell<Option<DependencyIndex>>,
+    index: std::cell::OnceCell<Option<File>>,
 }
 
 impl<'a> DiffModules<'a> {
@@ -1110,11 +977,7 @@ impl<'a> DiffModules<'a> {
     /// crate の module `module` (crate root からの経路) の中身を持つ、版 (`old`) の差分の中の
     /// ファイルの索引と、ファイルの中の inline module の経路。祖先の module のファイルの inline
     /// module も見る。差分に無ければ None。
-    fn module_index(
-        &self,
-        module: &[String],
-        old: bool,
-    ) -> Option<(&DependencyIndex, Vec<String>)> {
+    fn module_index(&self, module: &[String], old: bool) -> Option<(File, Vec<String>)> {
         let (files, read) = if old {
             (&self.old, &self.read_old)
         } else {
@@ -1126,25 +989,32 @@ impl<'a> DiffModules<'a> {
             .max_by_key(|file| file.module.len())?;
         let index = file
             .index
-            .get_or_init(|| DependencyIndex::new(&read(&file.path)?, &file.path))
-            .as_ref()?;
+            .get_or_init(|| {
+                DependencyIndex::new(&read(&file.path)?, &file.path).map(std::rc::Rc::new)
+            })
+            .clone()?;
         Some((index, module[file.module.len()..].to_vec()))
     }
 }
 
 /// module のスコープ `scope` (ファイルの `source_file` か inline module の `declaration_list`) の
-/// 束縛を集め、子の inline module を返す。`inherited` は囲む module の条件。
+/// 束縛を集め、子の inline module を返す。`inherited` は囲む module の条件、`path_attribute` は
+/// スコープの inline module に `#[path]` が付いているか。
 #[allow(clippy::too_many_arguments)]
 fn collect_scope<'tree>(
     scope: tree_sitter::Node<'tree>,
     source: &[u8],
     path: Vec<String>,
     inherited: &[String],
+    path_attribute: bool,
     file_module: Option<&[String]>,
     scopes: &mut Vec<(Vec<String>, ScopeBindings)>,
     definitions: &mut Vec<String>,
 ) -> Vec<ChildScope<'tree>> {
-    let mut bindings = ScopeBindings::default();
+    let mut bindings = ScopeBindings {
+        path_attribute,
+        ..ScopeBindings::default()
+    };
     let mut current_module: Vec<String> = file_module.map(<[String]>::to_vec).unwrap_or_default();
     current_module.extend(path.iter().cloned());
     let mut children = Vec::new();
@@ -1183,6 +1053,7 @@ fn collect_scope<'tree>(
                     continue;
                 }
                 let conditions = conditions();
+                let visibility = visibility(item, source, &current_module);
                 let unraw_all =
                     |module: Vec<String>| module.iter().map(|s| unraw(s).to_owned()).collect();
                 for edge in edges {
@@ -1202,6 +1073,7 @@ fn collect_scope<'tree>(
                                 item: Some(unraw(&target_item).to_owned()),
                                 origin,
                                 conditions: conditions.clone(),
+                                visibility: visibility.clone(),
                             }),
                         RustPubUseEdge::Wildcard {
                             target_module,
@@ -1212,6 +1084,7 @@ fn collect_scope<'tree>(
                             item: None,
                             origin,
                             conditions: conditions.clone(),
+                            visibility: visibility.clone(),
                         }),
                     }
                 }
@@ -1232,6 +1105,7 @@ fn collect_scope<'tree>(
                         item: Some(crate_name),
                         origin: UsePathOrigin::Global,
                         conditions: conditions(),
+                        visibility: visibility(item, source, &current_module),
                     });
                 }
             }
@@ -1240,6 +1114,7 @@ fn collect_scope<'tree>(
                     bindings.aliases.entry(name).or_default().push(Definition {
                         conditions: conditions(),
                         range: (item.start_byte(), item.end_byte()),
+                        visibility: visibility(item, source, &current_module),
                     });
                 }
             }
@@ -1252,6 +1127,7 @@ fn collect_scope<'tree>(
                         .push(Definition {
                             conditions: conditions(),
                             range: (item.start_byte(), item.end_byte()),
+                            visibility: visibility(item, source, &current_module),
                         });
                 }
             }
@@ -1276,6 +1152,7 @@ fn collect_scope<'tree>(
                         .push(ItemDeclaration {
                             kind,
                             conditions: conditions(),
+                            visibility: visibility(item, source, &current_module),
                         });
                 }
             }
@@ -1284,13 +1161,26 @@ fn collect_scope<'tree>(
                     continue;
                 };
                 let body = item.child_by_field_name("body");
-                *bindings.modules.entry(name.clone()).or_default() |= body.is_some();
+                let attributes = preceding_attribute_tokens(item, source);
+                let module_source = module_source(item, source);
+                let path_attribute = module_source != ModuleSource::Default;
+                bindings
+                    .modules
+                    .entry(name.clone())
+                    .or_default()
+                    .push(ModuleDeclaration {
+                        inline: body.is_some(),
+                        path: module_source,
+                        conditions: conditions(),
+                        attributes,
+                        visibility: visibility(item, source, &current_module),
+                    });
                 if let Some(body) = body {
                     let mut child = path.clone();
                     child.push(name);
                     let mut child_conditions = conditions();
                     child_conditions.extend(inner_conditions(body, source));
-                    children.push((body, child, child_conditions));
+                    children.push((body, child, child_conditions, path_attribute));
                 }
             }
             "macro_invocation" | "expression_statement" => {
@@ -1302,6 +1192,76 @@ fn collect_scope<'tree>(
     }
     scopes.push((path, bindings));
     children
+}
+
+/// 項目 `item` の直前に並ぶ外側の属性のトークン (コメントは飛ばす)。
+fn preceding_attribute_tokens(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut previous = item.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => attributes.push(sibling),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    let mut tokens = Vec::new();
+    for attribute in attributes.into_iter().rev() {
+        push_tokens(attribute, source, &mut tokens);
+    }
+    tokens
+}
+
+/// `mod` の宣言 `item` の中身のファイルの指定 (`#[path = "…"]`)。`cfg_attr` の中の `path`、2 つ以上の
+/// `path`、文字列で読めない値は読めない指定にする。
+fn module_source(item: tree_sitter::Node<'_>, source: &[u8]) -> ModuleSource {
+    let mut found = ModuleSource::Default;
+    let mut previous = item.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                let mut cursor = sibling.walk();
+                for attribute in sibling.named_children(&mut cursor) {
+                    if attribute.kind() != "attribute" {
+                        continue;
+                    }
+                    let name = attribute
+                        .named_child(0)
+                        .and_then(|name| name.utf8_text(source).ok())
+                        .map(str::trim);
+                    match name {
+                        Some("path") => {
+                            let value = attribute
+                                .child_by_field_name("value")
+                                .filter(|value| {
+                                    matches!(value.kind(), "string_literal" | "raw_string_literal")
+                                })
+                                .and_then(|value| value.utf8_text(source).ok())
+                                .and_then(super::rust_cfg_predicate::string_value);
+                            found = match (found, value) {
+                                (ModuleSource::Default, Some(value)) => ModuleSource::Path(value),
+                                _ => ModuleSource::Unknown,
+                            };
+                        }
+                        // `cfg_attr(…, path = "…")` は条件で場所が変わる。
+                        Some("cfg_attr")
+                            if tokens_of(attribute, source)
+                                .iter()
+                                .any(|token| token == "identifier:path") =>
+                        {
+                            found = ModuleSource::Unknown;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    found
 }
 
 /// `start` (行, 列) に始まる宣言の項目のノード。
@@ -1708,9 +1668,11 @@ mod tests {
             panic!("declaration {name}");
         };
         let files = DiffModules::new("src/lib.rs", &[], Box::new(|_| None), Box::new(|_| None));
-        index(old).compare(
+        let resolver = |source: &str| Resolver::textual(std::rc::Rc::new(index(source)));
+        super::compare_dependencies(
+            &resolver(old),
             &[declaration(old)],
-            &index(new),
+            &resolver(new),
             &[declaration(new)],
             &files,
         )

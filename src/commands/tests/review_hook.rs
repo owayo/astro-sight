@@ -2318,3 +2318,31 @@ fn build_review_hook_json_reports_cfg_availability() {
     assert_eq!(value["api"]["rm_dead"][0]["cfg"], expected, "{value}");
     assert!(build.is_blocking, "参照の残る rm は blocking");
 }
+
+/// Rust の束縛の変化を名指し得るファイルを探し切れなかった申告は、公開シグネチャの変化を見逃し得る
+/// ので blocking (Issue #300)。
+#[test]
+fn build_review_hook_json_blocks_incomplete_rust_dependents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        truncations: vec![crate::models::truncation::TruncationInfo::new(
+            Some("src/lib.rs".to_string()),
+            crate::models::truncation::TruncationReason::RustDependentsIncomplete,
+            "Rust sources that may name the changed bindings of this crate were not all compared"
+                .to_string(),
+        )],
+        ..Default::default()
+    };
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let value = build.value.expect("申告を hook に出すべき");
+    assert_eq!(
+        value["trunc"][0]["r"], "rust_dependents_incomplete",
+        "{value}"
+    );
+    assert_eq!(
+        value["blocking_categories"],
+        serde_json::json!(["api.rust_dependents_incomplete"]),
+        "{value}"
+    );
+    assert!(build.is_blocking, "探し切れなければ hook を止める: {value}");
+}

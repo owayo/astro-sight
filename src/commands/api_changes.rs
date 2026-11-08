@@ -93,6 +93,9 @@ pub(crate) fn detect_api_changes_with_renames(
 
     // 変更 / 削除ファイルの旧版はここで 1 プロセスの `git cat-file --batch` から読む。
     let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
+    // 差分の中の package の Rust の lib crate (Issue #300)。束縛が変わった package だけ、旧新の
+    // module のファイルを必要になったときに開く。
+    let rust_crates = RustCrates::new(dir, diff_files, renames, &base_blobs);
     // Phase 0: diff ファイルごとの事実と、ApiRefIndex で検索する名前を先に集める。
     let PreparedDiff {
         files: prepared,
@@ -107,6 +110,7 @@ pub(crate) fn detect_api_changes_with_renames(
         renames,
         canonical_dir.as_deref(),
         &base_blobs,
+        &rust_crates,
     );
     buckets.parse_truncations.extend(parse_truncations);
 
@@ -145,6 +149,7 @@ pub(crate) fn detect_api_changes_with_renames(
         prepared: &prepared,
         base_blobs: &base_blobs,
         strip_internal: &strip_internal,
+        rust_crates: &rust_crates,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,

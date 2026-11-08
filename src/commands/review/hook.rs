@@ -20,6 +20,9 @@ pub(crate) struct HookJsonBuild {
 enum HookBlockingCategory {
     #[serde(rename = "api.diff_base_mismatch")]
     ApiDiffBaseMismatch,
+    /// Rust の束縛の変化を名指し得るファイルを探し切れなかった (Issue #300)。
+    #[serde(rename = "api.rust_dependents_incomplete")]
+    ApiRustDependentsIncomplete,
     #[serde(rename = "impacts")]
     Impacts,
     #[serde(rename = "api.rm")]
@@ -864,6 +867,11 @@ pub(crate) fn build_review_hook_json_for_diff(
         {
             blocking_categories.push(HookBlockingCategory::ApiDiffBaseMismatch);
         }
+        if result.truncations.iter().any(|t| {
+            t.reason == crate::models::truncation::TruncationReason::RustDependentsIncomplete
+        }) {
+            blocking_categories.push(HookBlockingCategory::ApiRustDependentsIncomplete);
+        }
         has_any_output = true;
         let truncs: Vec<HookTruncation<'_>> = result
             .truncations
@@ -897,6 +905,9 @@ pub(crate) fn build_review_hook_json_for_diff(
                     }
                     crate::models::truncation::TruncationReason::TsStripInternalUnavailable => {
                         "ts_strip_internal_unavailable"
+                    }
+                    crate::models::truncation::TruncationReason::RustDependentsIncomplete => {
+                        "rust_dependents_incomplete"
                     }
                 },
                 d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {

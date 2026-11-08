@@ -127,7 +127,7 @@ const UNIX_OSES: [&str; 20] = [
 /// 文字列のリテラル (`"x"`・`r"x"`・`r#"x"#`) の中身。エスケープ (`\n`・`\x6c`・`\u{6c}`・行の
 /// 継続) は Rust の字句の規則で解き、CRLF は LF にする (Rust はソースの CRLF を LF として読む)。
 /// 読めなければ None。
-fn string_value(literal: &str) -> Option<String> {
+pub(super) fn string_value(literal: &str) -> Option<String> {
     if let Some(rest) = literal.strip_prefix('r') {
         let hashes = rest.len() - rest.trim_start_matches('#').len();
         let inner = rest.get(hashes..rest.len().checked_sub(hashes)?)?;
