@@ -71,6 +71,9 @@ struct HookNameFile<'a> {
     #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
     inline_module: Option<&'a str>,
     f: &'a str,
+    /// Rust の項目の有る設定の一部から消えたときの旧新の条件 (rm・rm_dead。Issue #291)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a crate::models::review::CfgAvailability>,
 }
 
 /// api.add 用 DTO。`HookNameFile` と分けるのは、同一ファイル内参照数を持つのが added だけで、
@@ -92,6 +95,9 @@ struct HookAddedSymbol<'a> {
         skip_serializing_if = "crate::models::review::is_zero_usize"
     )]
     refs_internal: usize,
+    /// Rust の項目が無かった設定に増えたときの旧新の条件 (Issue #291)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfg: Option<&'a crate::models::review::CfgAvailability>,
 }
 
 /// api.mod 用 DTO。`HookNameFile` と分けるのは、「解決できた呼び出し参照ゼロ」フラグを
@@ -301,6 +307,7 @@ impl<'a> HookApi<'a> {
                 n: name.as_str(),
                 inline_module,
                 f: file.as_str(),
+                cfg: None,
             };
         let added: Vec<HookAddedSymbol<'a>> = api
             .added
@@ -310,6 +317,7 @@ impl<'a> HookApi<'a> {
                 inline_module: change.inline_module.as_deref(),
                 f: change.file.as_str(),
                 refs_internal: change.refs_internal,
+                cfg: change.cfg_availability.as_ref(),
             })
             .collect();
         let added_scope = (!added.is_empty()).then_some("no_cross_file_refs_in_diff");
@@ -359,8 +367,9 @@ impl<'a> HookApi<'a> {
             removed: api
                 .removed
                 .iter()
-                .map(|change| {
-                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                .map(|change| HookNameFile {
+                    cfg: change.cfg_availability.as_ref(),
+                    ..name_file(&change.name, change.inline_module.as_deref(), &change.file)
                 })
                 .collect(),
             modified: api
@@ -432,8 +441,9 @@ impl<'a> HookApi<'a> {
             removed_dead: api
                 .removed_dead
                 .iter()
-                .map(|change| {
-                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                .map(|change| HookNameFile {
+                    cfg: change.cfg_availability.as_ref(),
+                    ..name_file(&change.name, change.inline_module.as_deref(), &change.file)
                 })
                 .collect(),
             property_to_field: api

@@ -17,6 +17,7 @@ mod rust_cargo_removal;
 mod rust_const_fn;
 mod rust_crate_kind;
 mod rust_enum_variants;
+mod rust_item_cfg;
 mod rust_module_visibility;
 mod rust_parameter_binding;
 mod rust_reexport;

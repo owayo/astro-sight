@@ -1391,8 +1391,11 @@ pub(crate) fn filter_dead_by_wip_added(
     if added.is_empty() {
         return dead;
     }
+    // 有る設定が増えただけの既存の項目 (`cfg_availability` を添えた追加。Issue #291) は、新しく
+    // 書いた宣言ではないので WIP にしない。
     let added_set: std::collections::HashSet<(&str, &str)> = added
         .iter()
+        .filter(|a| a.cfg_availability.is_none())
         .map(|a| (a.file.as_str(), a.name.as_str()))
         .collect();
     dead.into_iter()

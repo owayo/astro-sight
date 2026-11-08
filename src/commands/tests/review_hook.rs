@@ -779,6 +779,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
                 refs_internal: 0,
+                cfg_availability: None,
             }],
             removed: Vec::new(),
             modified: Vec::new(),
@@ -858,6 +859,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
             kind: "function".to_string(),
             file: "a.rs".to_string(),
             refs_internal: 0,
+            cfg_availability: None,
         }],
         ..empty_api()
     });
@@ -882,6 +884,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
             kind: "function".to_string(),
             file: "a.rs".to_string(),
             refs_internal: 0,
+            cfg_availability: None,
         }],
         ..empty_api()
     });
@@ -937,6 +940,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         kind: "interface".to_string(),
         file: "module.ts".to_string(),
         refs_internal: 2,
+        cfg_availability: None,
     }]);
     let build = build_review_hook_json(
         &with_internal_refs,
@@ -956,6 +960,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         kind: "interface".to_string(),
         file: "module.ts".to_string(),
         refs_internal: 0,
+        cfg_availability: None,
     }]);
     let build = build_review_hook_json(
         &without_internal_refs,
@@ -1040,6 +1045,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
                 refs_internal: 0,
+                cfg_availability: None,
             }],
             modified: Vec::new(),
             moved: Vec::new(),
@@ -1290,6 +1296,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
                     kind: "object".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
                     refs_internal: 0,
+                    cfg_availability: None,
                 },
                 ApiSymbol {
                     inline_module: None,
@@ -1297,6 +1304,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
                     kind: "function".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
                     refs_internal: 0,
+                    cfg_availability: None,
                 },
             ],
             modified_closed_in_diff: Vec::new(),
@@ -2002,6 +2010,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         kind: "function".into(),
         file: "changed.ts".into(),
         refs_internal: 0,
+        cfg_availability: None,
     };
     let change = || ApiSymbolChange {
         inline_module: None,
@@ -2158,6 +2167,7 @@ fn build_review_hook_json_preserves_unanalyzable_source_detail() {
                 kind: "class".into(),
                 file: "api.ts".into(),
                 refs_internal: 0,
+                cfg_availability: None,
             });
         }
         let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
@@ -2279,4 +2289,32 @@ fn build_review_hook_json_diff_base_mismatch_blocks_without_symbols() {
     let value = build.value.expect("hook JSON");
     assert_eq!(value["trunc"][0]["r"], "diff_base_mismatch");
     assert_eq!(value["blocking_categories"][0], "api.diff_base_mismatch");
+}
+
+/// 有る設定の一部から消えた Rust の項目 (Issue #291) は、hook の rm / rm_dead に旧新の条件を添える。
+#[test]
+fn build_review_hook_json_reports_cfg_availability() {
+    use crate::models::review::CfgAvailability;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let availability = CfgAvailability {
+        old: vec![vec![]],
+        new: vec![vec!["cfg(feature = \"x\")".to_owned()]],
+    };
+    let symbol = |name: &str| ApiSymbol {
+        inline_module: None,
+        name: name.to_owned(),
+        kind: "function".to_owned(),
+        file: "src/lib.rs".to_owned(),
+        refs_internal: 0,
+        cfg_availability: Some(availability.clone()),
+    };
+    let mut result = ReviewResult::default();
+    result.api_changes.removed.push(symbol("live"));
+    result.api_changes.removed_dead.push(symbol("dead"));
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let value = build.value.expect("hook output");
+    let expected = serde_json::json!({"old": [[]], "new": [["cfg(feature = \"x\")"]]});
+    assert_eq!(value["api"]["rm"][0]["cfg"], expected, "{value}");
+    assert_eq!(value["api"]["rm_dead"][0]["cfg"], expected, "{value}");
+    assert!(build.is_blocking, "参照の残る rm は blocking");
 }

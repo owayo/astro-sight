@@ -1697,6 +1697,8 @@ mod tests {
                         owner: Vec::new(),
                         conditions: Vec::new(),
                         start: (start.row, start.column),
+                        container_header: Vec::new(),
+                        availability: Some(Vec::new()),
                     };
                 }
                 let mut cursor = node.walk();

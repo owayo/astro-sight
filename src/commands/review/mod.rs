@@ -875,6 +875,7 @@ mod snapshot_tests {
             kind: "function".into(),
             file: "a.ts".into(),
             refs_internal: 0,
+            cfg_availability: None,
         };
         let change = |name: &str| ApiSymbolChange {
             inline_module: None,
