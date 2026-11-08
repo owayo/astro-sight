@@ -67,6 +67,10 @@ pub enum TruncationReason {
     /// `.gitattributes` の `linguist-generated` を解決できず (属性ファイルや index を読めない、
     /// リポジトリを開けない)、生成物として外さずに通常のソースとして解析した。
     GeneratedDetectionUnavailable,
+    /// TS の `stripInternal` の設定を旧新で読み切れず (設定を読めない・解けない、比べ直す
+    /// ソースの上限を超えた)、設定の変更で宣言ファイルから消える・現れる宣言を比べなかった
+    /// (Issue #287)。
+    TsStripInternalUnavailable,
 }
 
 impl TruncationInfo {

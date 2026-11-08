@@ -228,6 +228,38 @@ pub(crate) struct PreparedDiff {
     pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     /// TS の `stripInternal` の設定。公開面の抽出で読んだ設定を、分類でも使う。
     pub(crate) strip_internal: super::ts_strip_internal::StripInternal,
+    /// 設定だけの変更で `stripInternal` の当たり方が変わった、差分に無い TS のソース
+    /// (Issue #287)。旧版 (base の版の設定) と新版 (今の設定) を変更ファイルと同じく比べる。
+    /// `diff_files` には入れない (変えたファイルとして扱わない)。
+    pub(crate) rechecks: Vec<(crate::models::impact::DiffFile, PreparedDiffFile)>,
+}
+
+/// 設定だけの変更で比べ直す TS のソースの数・1 つの大きさ・合計の上限 (Issue #287)。超えれば
+/// 比べ直さず申告する。
+const MAX_RECHECK_FILES: usize = 10_000;
+const MAX_RECHECK_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RECHECK_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// 出力する TS のソースのパスか (宣言ファイルを除く)。
+fn is_emitted_ts_path(path: &str) -> bool {
+    [".ts", ".tsx", ".mts", ".cts"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+        && !super::ts_module_paths::is_declaration_path(path)
+}
+
+/// `stripInternal` の判定を決められなかったときの申告。
+fn strip_internal_unavailable(
+    path: Option<&str>,
+    message: &str,
+) -> crate::models::truncation::TruncationInfo {
+    crate::models::truncation::TruncationInfo::new(
+        path.map(str::to_owned),
+        crate::models::truncation::TruncationReason::TsStripInternalUnavailable,
+        format!(
+            "TS stripInternal could not be compared between the base and current configs: {message}"
+        ),
+    )
 }
 
 impl PreparedDiff {
@@ -237,9 +269,12 @@ impl PreparedDiff {
     ///
     /// 生成物の判定の属性は `canonical_dir` で解決する。解決できずに対象に残したファイルは
     /// `parse_truncations` で申告する。
+    /// `renames` は内容が同じ rename (`diff_files` には入れない)。旧新のパスに当たる
+    /// `stripInternal` の設定が違うものだけを比べ直す (Issue #287)。
     pub(crate) fn new(
         dir: &str,
         diff_files: &[crate::models::impact::DiffFile],
+        renames: &[crate::models::impact::DiffFile],
         canonical_dir: Option<&std::path::Path>,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
     ) -> Self {
@@ -249,11 +284,14 @@ impl PreparedDiff {
             unverified_deleted_paths: HashSet::new(),
             parse_truncations: Vec::new(),
             strip_internal: super::ts_strip_internal::StripInternal::disabled(),
+            rechecks: Vec::new(),
         };
         let resolver = canonical_dir.map(crate::engine::gitattributes::AttributeResolver::open);
         let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
         let mut undetermined = Vec::new();
-        let strip_internal = super::ts_strip_internal::StripInternal::new(dir);
+        // 旧版のソースは base の版の設定で、新版は今の設定で判定する (Issue #287)。
+        let strip_internal =
+            super::ts_strip_internal::StripInternal::with_base(dir, base_blobs.rev());
         for df in diff_files {
             let file = prepared.prepare_file(
                 dir,
@@ -266,6 +304,46 @@ impl PreparedDiff {
             );
             prepared.files.push(file);
         }
+        // 内容が同じ rename でも、旧新のパスに当たる `stripInternal` の設定が違えば、宣言
+        // ファイルの面が変わる (Issue #287)。生成物は通常の差分と同じく外す。
+        for df in renames {
+            if df.old_path != df.new_path
+                && is_emitted_ts_path(&df.new_path)
+                && let Some(source) = super::source_pair::load_new_source(dir, &df.new_path)
+                && prepared.strip_changed(&df.old_path, &df.new_path, &source, &strip_internal)
+                && !should_skip_diff_file(df, lookup.as_mut(), canonical_dir, &mut undetermined)
+            {
+                let file = prepared.prepare_modified_file(dir, df, base_blobs, &strip_internal);
+                prepared.rechecks.push((df.clone(), file));
+            }
+        }
+        // 設定 (JSON。内容が同じ rename も) を変えた差分では、差分に無い TS のソースも、
+        // `stripInternal` の当たり方が変われば比べ直す (Issue #287)。base の版の設定を読めな
+        // ければ、比べ直せないことを申告する。
+        let configs_changed = diff_files.iter().chain(renames).any(|df| {
+            [&df.old_path, &df.new_path]
+                .iter()
+                .any(|path| path.ends_with(".json"))
+        });
+        if configs_changed {
+            if strip_internal.has_base() {
+                prepared.recheck_strip_internal(
+                    dir,
+                    diff_files,
+                    renames,
+                    base_blobs,
+                    &strip_internal,
+                    lookup.as_mut(),
+                    canonical_dir,
+                    &mut undetermined,
+                );
+            } else {
+                prepared.parse_truncations.push(strip_internal_unavailable(
+                    None,
+                    "the base revision's configs could not be read",
+                ));
+            }
+        }
         if let Some(root) = canonical_dir {
             prepared.parse_truncations.extend(
                 crate::engine::refs::generated_undetermined_truncations(root, &undetermined),
@@ -273,6 +351,122 @@ impl PreparedDiff {
         }
         prepared.strip_internal = strip_internal;
         prepared
+    }
+
+    /// 設定だけの変更で `stripInternal` の当たり方が変わる、差分に無い TS のソースを比べ直す
+    /// (Issue #287)。追跡している出力する TS のソースのうち `@internal` を含むものについて、旧版
+    /// (base の版の設定) と新版 (今の設定) の判定が違えば、変更ファイルと同じく比べる。
+    #[allow(clippy::too_many_arguments)]
+    fn recheck_strip_internal(
+        &mut self,
+        dir: &str,
+        diff_files: &[crate::models::impact::DiffFile],
+        renames: &[crate::models::impact::DiffFile],
+        base_blobs: &crate::commands::git_input::GitBlobBatch,
+        strip_internal: &super::ts_strip_internal::StripInternal,
+        mut generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
+        canonical_dir: Option<&std::path::Path>,
+        undetermined: &mut Vec<GeneratedUndetermined>,
+    ) {
+        let touched: HashSet<&str> = diff_files
+            .iter()
+            .chain(renames)
+            .flat_map(|df| [df.old_path.as_str(), df.new_path.as_str()])
+            .collect();
+        let Some(tracked) = tracked_files(dir) else {
+            self.parse_truncations.push(strip_internal_unavailable(
+                None,
+                "the tracked files could not be listed",
+            ));
+            return;
+        };
+        let mut files = 0usize;
+        let mut bytes = 0usize;
+        let mut unread = 0usize;
+        for path in tracked {
+            if touched.contains(path.as_str())
+                || !is_emitted_ts_path(&path)
+                || is_test_path(std::path::Path::new(&path))
+                || !crate::engine::impact::is_safe_diff_path(&path)
+            {
+                continue;
+            }
+            files += 1;
+            if files > MAX_RECHECK_FILES {
+                self.parse_truncations.push(strip_internal_unavailable(
+                    None,
+                    &format!("more than {MAX_RECHECK_FILES} TS sources to recheck"),
+                ));
+                return;
+            }
+            let full = std::path::Path::new(dir).join(&path);
+            let Some(source) =
+                crate::engine::bounded_read::read_file_limited(&full, MAX_RECHECK_FILE_BYTES)
+            else {
+                unread += 1;
+                continue;
+            };
+            bytes += source.len();
+            if bytes > MAX_RECHECK_TOTAL_BYTES {
+                self.parse_truncations.push(strip_internal_unavailable(
+                    None,
+                    &format!("more than {MAX_RECHECK_TOTAL_BYTES} bytes of TS sources to recheck"),
+                ));
+                return;
+            }
+            if !self.strip_changed(&path, &path, &source, strip_internal) {
+                continue;
+            }
+            let df = crate::models::impact::DiffFile {
+                old_path: path.clone(),
+                new_path: path,
+                hunks: Vec::new(),
+                deleted_old_source: None,
+            };
+            // 生成物は通常の差分と同じく外す。
+            if should_skip_diff_file(&df, generated.as_deref_mut(), canonical_dir, undetermined) {
+                continue;
+            }
+            let file = self.prepare_modified_file(dir, &df, base_blobs, strip_internal);
+            self.rechecks.push((df, file));
+        }
+        if unread > 0 {
+            self.parse_truncations.push(strip_internal_unavailable(
+                None,
+                &format!(
+                    "{unread} TS sources could not be read (or exceed {MAX_RECHECK_FILE_BYTES} bytes)"
+                ),
+            ));
+        }
+    }
+
+    /// ソース `source` (新版 `new_path`、旧版 `old_path`) に当たる `stripInternal` の判定が旧新で
+    /// 変わったか。決められなければ申告して false (確定した差分にしない)。
+    fn strip_changed(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+        source: &[u8],
+        strip_internal: &super::ts_strip_internal::StripInternal,
+    ) -> bool {
+        let Ok(lang) = parser::detect_lang(camino::Utf8Path::new(new_path), source) else {
+            return false;
+        };
+        if !super::ts_strip_internal::may_strip(new_path, lang, source) {
+            return false;
+        }
+        let Some((old, new)) = strip_internal.states(old_path, new_path) else {
+            return false;
+        };
+        use super::ts_alias_resolution::StripState;
+        if old == StripState::Unknown || new == StripState::Unknown {
+            self.parse_truncations.push(strip_internal_unavailable(
+                Some(new_path),
+                "a config could not be read or resolved",
+            ));
+            return false;
+        }
+        old != new
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,11 +496,19 @@ impl PreparedDiff {
         if df.hunks.is_empty() {
             let leaves_source = renames_out_of_known_extension(df)
                 && extract_new_file_facts(dir, &df.new_path, strip_internal).language_unknown;
-            return if leaves_source {
-                self.prepare_deleted_file(df, base_blobs, "renamed file", strip_internal)
-            } else {
-                PreparedDiffFile::Skip
-            };
+            if leaves_source {
+                return self.prepare_deleted_file(df, base_blobs, "renamed file", strip_internal);
+            }
+            // 内容が同じ rename でも、旧新のパスに当たる `stripInternal` の設定が違えば、宣言
+            // ファイルの面が変わる (Issue #287)。
+            if df.old_path != df.new_path
+                && is_emitted_ts_path(&df.new_path)
+                && let Some(source) = super::source_pair::load_new_source(dir, &df.new_path)
+                && self.strip_changed(&df.old_path, &df.new_path, &source, strip_internal)
+            {
+                return self.prepare_modified_file(dir, df, base_blobs, strip_internal);
+            }
+            return PreparedDiffFile::Skip;
         }
         self.prepare_modified_file(dir, df, base_blobs, strip_internal)
     }
@@ -378,6 +580,26 @@ impl PreparedDiff {
         base_blobs: &crate::commands::git_input::GitBlobBatch,
         strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
+        // 旧新の片方の `stripInternal` の設定を決められなければ、決められた側の判定を両方に当て
+        // (設定が変わったかを確かめられないので、変わらなかったとみなす)、申告する (Issue #287)。
+        // 旧版にだけ `@internal` がある (最後のタグを消した) 変更も見る。
+        let may_strip = |path: &str, source: &[u8]| {
+            parser::detect_lang(camino::Utf8Path::new(path), source)
+                .is_ok_and(|lang| super::ts_strip_internal::may_strip(path, lang, source))
+        };
+        if (is_emitted_ts_path(&df.old_path) || is_emitted_ts_path(&df.new_path))
+            && (super::source_pair::load_new_source(dir, &df.new_path)
+                .is_some_and(|source| may_strip(&df.new_path, &source))
+                || base_blobs
+                    .read(&df.old_path)
+                    .is_some_and(|source| may_strip(&df.old_path, &source)))
+            && strip_internal.align(&df.old_path, &df.new_path)
+        {
+            self.parse_truncations.push(strip_internal_unavailable(
+                Some(&df.new_path),
+                "a config could not be read or resolved; both sides use the known setting",
+            ));
+        }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
         let mut old_facts =
             extract_exported_file_facts_from_git(base_blobs, &df.old_path, strip_internal);
@@ -851,4 +1073,24 @@ pub(crate) fn extract_new_file_facts(
     }
 
     facts
+}
+
+/// `dir` で追跡しているファイル (`dir` 相対)。列挙できなければ None。
+fn tracked_files(dir: &str) -> Option<Vec<String>> {
+    let output = crate::git_support::git_command_for_dir(dir)
+        .args(["ls-files", "-z"])
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).ok())
+        .collect()
 }

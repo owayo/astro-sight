@@ -1023,8 +1023,15 @@ fn append_untracked_added_diffs(
     for (pair, synth) in &planned {
         if let Some(pos) = diff.find(&pair.block_text) {
             diff.replace_range(pos..pos + pair.block_text.len(), "");
-            if let Some(s) = synth {
-                diff.push_str(s);
+            match synth {
+                Some(s) => diff.push_str(s),
+                // 内容が同じ rename は、commit 済みの rename (`git diff -M`) と同じく hunk の無い
+                // rename の見出しにする (`parse_hunkless_renames` が拾う。Issue #287)。中身を
+                // 読まなかった上限超過のファイルは、同じ内容と言えないので見出しも出さない。
+                None if !oversized_untracked.contains(pair.new_path.as_str()) => {
+                    diff.push_str(&hunkless_rename_header(&pair.old_path, &pair.new_path));
+                }
+                None => {}
             }
         }
     }
@@ -1363,6 +1370,13 @@ fn exported_symbols_match(
 /// 検出を抑える)。内容同一 (100% rename) は commit 済みの hunkless rename (git -M) と同様、
 /// 解析対象 hunk を作らず `None` を返す。削除 block は呼び出し側で除去済みなので、Modified を
 /// 合成しないことで api_changes だけでなく dead-code / cochange も commit 済みと一致する。
+/// 内容が同じ rename の、hunk の無い見出し (`git diff -M` の 100% の rename と同じ形)。
+fn hunkless_rename_header(old_path: &str, new_path: &str) -> String {
+    format!(
+        "diff --git a/{old_path} b/{new_path}\nsimilarity index 100%\nrename from {old_path}\nrename to {new_path}\n"
+    )
+}
+
 fn synthesize_modified_file_diff(
     old_path: &str,
     new_path: &str,
