@@ -45,7 +45,7 @@ use crate::git_support::normalize_workspace_separators;
 mod config_fs;
 mod strip_internal;
 pub(crate) use config_fs::{BaseTree, ConfigFs};
-pub(crate) use strip_internal::{StripInternalConfigs, StripState};
+pub(crate) use strip_internal::{StripInternalConfigs, StripState, imports_differ};
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: usize = 8 * 1024 * 1024;
@@ -217,21 +217,21 @@ impl TsAliasResolver {
         })
     }
 
-    /// 設定 1 つで `spec` を解く。TypeScript の版で解釈が分かれる置換 (空の捕獲) は解釈ごとに解き、
-    /// どれかが native の解決へ進み得るなら、それも残す。決められなければ None。
+    /// 設定 1 つで `spec` を解く。native の解決へ進み得るなら、それも残す。決められなければ None。
     fn project_reach(&self, effective: &Effective, spec: &str) -> Option<Reach> {
         let interpretations = match effective
             .paths
             .as_ref()
-            .map(|paths| paths.interpretations(spec))
+            .map(|paths| paths.substitutions(spec))
         {
-            Some(Some(Some(interpretations))) => interpretations,
+            Some(Some(Some(substitutions))) => vec![substitutions],
             Some(None) => return None,
             // paths に当たらなければ baseUrl の下を探す (paths に当たったら baseUrl は見ない)。
             Some(Some(None)) | None => match &effective.base_url {
                 Some(base) => vec![vec![Substitution {
                     path: base.join(spec),
                     directory_only: spec.ends_with('/'),
+                    extension: None,
                 }]],
                 None => {
                     return Some(Reach {
@@ -619,6 +619,52 @@ struct Substitution {
     path: PathBuf,
     /// `/` で終わる (TypeScript はファイルを探さずディレクトリだけを探す)。
     directory_only: bool,
+    /// 置換先 (`*` を置き換える前) に書いた拡張子。TypeScript はそのファイルを先に見る
+    /// (`tryGetExtensionFromPath(subst)`)。
+    extension: Option<&'static str>,
+}
+
+/// TypeScript が取り除く拡張子 (`removeFileExtension` の順)。
+const EXTENSIONS_TO_REMOVE: [&str; 12] = [
+    ".d.ts", ".d.mts", ".d.cts", ".mjs", ".mts", ".cjs", ".cts", ".ts", ".js", ".tsx", ".jsx",
+    ".json",
+];
+
+/// パスの既知の拡張子 (TypeScript の `tryGetExtensionFromPath`。大文字小文字を区別する)。
+fn known_extension(path: &str) -> Option<&'static str> {
+    EXTENSIONS_TO_REMOVE
+        .into_iter()
+        .find(|extension| path.len() > extension.len() && path.ends_with(extension))
+}
+
+/// `value` の最初の `*` を `captured` で置き換える。TypeScript は JavaScript の
+/// `String.prototype.replace` で置き換えるので、`captured` の `$$` は `$`、`$&` は `*`、`` $` `` は
+/// `*` の前、`$'` は `*` の後になる。
+fn replace_first_star(value: &str, captured: &str) -> String {
+    let Some(star) = value.find('*') else {
+        return value.to_owned();
+    };
+    let (before, after) = (&value[..star], &value[star + 1..]);
+    let mut replacement = String::new();
+    let mut chars = captured.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '$' {
+            replacement.push(character);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => replacement.push('$'),
+            Some('&') => replacement.push('*'),
+            Some('`') => replacement.push_str(before),
+            Some('\'') => replacement.push_str(after),
+            _ => {
+                replacement.push('$');
+                continue;
+            }
+        }
+        chars.next();
+    }
+    format!("{before}{replacement}{after}")
 }
 
 /// 実効の `paths`。
@@ -632,10 +678,11 @@ struct Paths {
 }
 
 impl Paths {
-    /// `spec` に当たるパターンの置換先を、TypeScript の版で分かれる解釈ごとに返す。当たらなければ
-    /// `Some(None)`、置換先を作れなければ None。完全一致のキーを先に、無ければ接頭辞の最も長い
-    /// パターン (同じ長さなら先に書いたもの) を使う。
-    fn interpretations(&self, spec: &str) -> Option<Option<Vec<Vec<Substitution>>>> {
+    /// `spec` に当たるパターンの置換先 (書いた順)。当たらなければ `Some(None)`、置換先を作れなければ
+    /// None。完全一致のキーを先に、無ければ接頭辞の最も長いパターン (同じ長さなら先に書いたもの) を
+    /// 使う。TypeScript (5・6 とも) と同じく、置換先の最初の `*` を捕獲した文字列で置き換え
+    /// ([`replace_first_star`])、完全一致のキーと空の捕獲では置き換えない。
+    fn substitutions(&self, spec: &str) -> Option<Option<Vec<Substitution>>> {
         // (捕獲した文字列。完全一致のキーは None, 置換先)
         let mut best: Option<(Option<&str>, &[String])> = None;
         let mut best_prefix = 0;
@@ -664,34 +711,31 @@ impl Paths {
         let Some((captured, values)) = best else {
             return Some(None);
         };
-        // 完全一致のキーの置換先の `*` は置き換えない。空の捕獲は TS 6 では置き換えないので、
-        // 置き換えた解釈と置き換えない解釈の両方を解く。
-        let captures = match captured {
-            Some("") if values.iter().any(|value| value.contains('*')) => vec![Some(""), None],
-            captured => vec![captured],
-        };
-        let mut interpretations = Vec::new();
-        for captured in captures {
-            let mut substitutions = Vec::new();
-            for value in values {
-                // `${configDir}` は設定の値として先に展開する (指定子から捕獲した文字列は展開しない)。
-                let (base, rest) = match value.strip_prefix(CONFIG_DIR) {
-                    Some(rest) => (&self.leaf, rest.trim_start_matches('/')),
-                    None if value.contains(CONFIG_DIR) => return None,
-                    None => (&self.base, value.as_str()),
-                };
-                let rest = match captured {
-                    Some(captured) => rest.replacen('*', captured, 1),
-                    None => rest.to_owned(),
-                };
-                substitutions.push(Substitution {
-                    path: base.join(&rest),
-                    directory_only: rest.ends_with('/'),
-                });
-            }
-            interpretations.push(substitutions);
+        let mut substitutions = Vec::new();
+        for value in values {
+            // `${configDir}` は設定の値として先に展開する (指定子から捕獲した文字列は展開しない)。
+            let (base, rest, expanded) = match value.strip_prefix(CONFIG_DIR) {
+                Some(rest) => (&self.leaf, rest.trim_start_matches('/'), true),
+                None if value.contains(CONFIG_DIR) => return None,
+                None => (&self.base, value.as_str(), false),
+            };
+            let rest = match captured.filter(|captured| !captured.is_empty()) {
+                // 展開した値の `*` の前後を指す `` $` ``・`$'` は、展開した後の文字列を指す。
+                Some(captured)
+                    if expanded && (captured.contains("$`") || captured.contains("$'")) =>
+                {
+                    return None;
+                }
+                Some(captured) => replace_first_star(rest, captured),
+                None => rest.to_owned(),
+            };
+            substitutions.push(Substitution {
+                path: base.join(&rest),
+                directory_only: rest.ends_with('/'),
+                extension: known_extension(value),
+            });
         }
-        Some(Some(interpretations))
+        Some(Some(substitutions))
     }
 }
 
@@ -1482,7 +1526,19 @@ mod tests {
     /// 完全一致のキーの置換先の `*` は置き換えない。空の捕獲は置き換えた形と置き換えない形の
     /// 両方を候補にする。
     #[test]
-    fn star_substitution_follows_both_typescript_versions() {
+    fn star_replacement_follows_javascript_replace() {
+        assert_eq!(replace_first_star("./src/*", "a"), "./src/a");
+        // JavaScript の `String.prototype.replace` の置換の規則
+        assert_eq!(replace_first_star("./src/*", "a$$b"), "./src/a$b");
+        assert_eq!(replace_first_star("./src/*.ts", "$&"), "./src/*.ts");
+        assert_eq!(replace_first_star("./src/*.ts", "$`"), "./src/./src/.ts");
+        assert_eq!(replace_first_star("./src/*.ts", "$'"), "./src/.ts.ts");
+        assert_eq!(replace_first_star("./src/*", "$1$x$"), "./src/$1$x$");
+    }
+
+    #[test]
+    fn star_substitution_follows_typescript() {
+        // 空の捕獲では `*` を置き換えない (TypeScript 5・6 とも)
         let config = r#"{ "compilerOptions": { "paths": { "a*": ["./x*", "./old"] } } }"#;
         assert_eq!(
             resolve(
@@ -1493,7 +1549,7 @@ mod tests {
                 ],
                 "a"
             ),
-            "local:old.ts,x.ts"
+            "local:old.ts"
         );
         let config = r#"{ "compilerOptions": { "paths": { "exact": ["./lib/*"] } } }"#;
         assert_eq!(

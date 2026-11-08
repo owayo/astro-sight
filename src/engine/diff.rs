@@ -577,17 +577,44 @@ fn flush_file(
 /// 必要な呼び出し側だけが個別に取り込めるよう別関数にしている。
 /// C 形式でクォートされたパス (`rename from "a\tb"`) は安全に復元できないので返さない。
 pub fn parse_hunkless_renames(input: &str) -> Vec<DiffFile> {
+    parse_hunkless(input, false)
+}
+
+/// hunk の無い変更: 内容が同じ rename ([`parse_hunkless_renames`]) と、空のファイルの追加・削除
+/// (`new file mode` / `deleted file mode` だけのブロック。`parse_unified_diff` には現れない)。追加は
+/// 旧パスを、削除は新パスを `/dev/null` にする。空のファイルの出入りでも、TypeScript の指定子の
+/// 解決先は変わる (Issue #288)。Git が C 形式でクォートしたパス (`core.quotePath`) も戻す。
+pub fn parse_hunkless_changes(input: &str) -> Vec<DiffFile> {
+    parse_hunkless(input, true)
+}
+
+fn parse_hunkless(input: &str, empty_files: bool) -> Vec<DiffFile> {
     #[derive(Default)]
     struct Block {
         from: Option<String>,
         to: Option<String>,
+        /// `diff --git a/<p> b/<p>` の見出しの、旧新で同じパス。
+        path: Option<String>,
+        added: bool,
+        deleted: bool,
         has_content: bool,
     }
     impl Block {
-        fn finish(self, out: &mut Vec<DiffFile>) {
-            if let (Some(old_path), Some(new_path)) = (self.from, self.to)
-                && !self.has_content
-            {
+        fn finish(self, out: &mut Vec<DiffFile>, empty_files: bool) {
+            if self.has_content {
+                return;
+            }
+            let paths = match (self.from, self.to, self.path) {
+                (Some(old_path), Some(new_path), _) => Some((old_path, new_path)),
+                (None, None, Some(path)) if empty_files && self.added => {
+                    Some(("/dev/null".to_string(), path))
+                }
+                (None, None, Some(path)) if empty_files && self.deleted => {
+                    Some((path, "/dev/null".to_string()))
+                }
+                _ => None,
+            };
+            if let Some((old_path, new_path)) = paths {
                 out.push(DiffFile {
                     old_path,
                     new_path,
@@ -597,13 +624,48 @@ pub fn parse_hunkless_renames(input: &str) -> Vec<DiffFile> {
             }
         }
     }
-    let unquoted = |path: &str| (!path.starts_with('"')).then(|| path.to_string());
+    // 内容同一の rename だけを返すときは、クォートしたパスを戻さない (従来どおり)。
+    let unquoted = |path: &str| {
+        if path.starts_with('"') {
+            empty_files.then(|| unquote_c_path(path)).flatten()
+        } else {
+            Some(path.to_string())
+        }
+    };
+    // `diff --git a/<p> b/<p>` (旧新で同じパス) の `<p>`。
+    let same_path = |line: &str| -> Option<String> {
+        let rest = line.strip_prefix("diff --git ")?;
+        if rest.starts_with('"') {
+            if !empty_files {
+                return None;
+            }
+            // `"a/<p>" "b/<p>"`
+            let (old, new) = split_c_quoted(rest)?;
+            let old = unquote_c_path(old)?;
+            let new = unquote_c_path(new.strip_prefix(' ')?)?;
+            let (old, new) = (old.strip_prefix("a/")?, new.strip_prefix("b/")?);
+            return (old == new).then(|| old.to_string());
+        }
+        let rest = rest.strip_prefix("a/")?;
+        let length = rest.len().checked_sub(" b/".len())?;
+        if length % 2 != 0 {
+            return None;
+        }
+        let (old, new) = rest.split_at_checked(length / 2)?;
+        let new = new.strip_prefix(" b/")?;
+        (old == new).then(|| old.to_string())
+    };
 
     let mut out = Vec::new();
     let mut block = Block::default();
     for line in input.lines() {
         if line.starts_with("diff --git ") {
-            std::mem::take(&mut block).finish(&mut out);
+            std::mem::take(&mut block).finish(&mut out, empty_files);
+            block.path = same_path(line);
+        } else if line.starts_with("new file mode ") {
+            block.added = true;
+        } else if line.starts_with("deleted file mode ") {
+            block.deleted = true;
         } else if let Some(path) = line.strip_prefix("rename from ") {
             block.from = unquoted(path);
         } else if let Some(path) = line.strip_prefix("rename to ") {
@@ -618,8 +680,63 @@ pub fn parse_hunkless_renames(input: &str) -> Vec<DiffFile> {
             block.has_content = true;
         }
     }
-    block.finish(&mut out);
+    block.finish(&mut out, empty_files);
     out
+}
+
+/// `text` の先頭の C 形式でクォートした文字列 (`"…"`) と、その後ろ。閉じていなければ None。
+fn split_c_quoted(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some((&text[..=index], &text[index + 1..])),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Git が C 形式でクォートしたパス (`"src/\346\251\213.ts"`) を戻す。形が違えば None。
+fn unquote_c_path(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut iter = inner.bytes();
+    while let Some(byte) = iter.next() {
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let escaped = match iter.next()? {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            first @ b'0'..=b'3' => {
+                let mut value = u32::from(first - b'0');
+                for _ in 0..2 {
+                    let digit = iter.next()?;
+                    if !(b'0'..=b'7').contains(&digit) {
+                        return None;
+                    }
+                    value = value * 8 + u32::from(digit - b'0');
+                }
+                u8::try_from(value).ok()?
+            }
+            _ => return None,
+        };
+        bytes.push(escaped);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// `"@@ -10,5 +10,8 @@"` や `"@@ -10,5 +10,8 @@ fn foo()"` の hunk ヘッダを解析する。
@@ -1297,5 +1414,55 @@ rename to lib/b.rs
         let files = parse_unified_diff(diff);
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(files[0].new_path, "src/edited.txt");
+    }
+
+    /// 空のファイルの追加・削除 (hunk も `---`/`+++` も無いブロック) は、hunk の無い変更として
+    /// 返す (Issue #288)。中身のある追加・mode だけの変更は返さない。C 形式でクォートしたパスは
+    /// 戻す。
+    #[test]
+    fn parse_hunkless_changes_returns_empty_file_additions_and_deletions() {
+        let diff = r#"diff --git a/src/empty.ts b/src/empty.ts
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/gone b/c.ts b/src/gone b/c.ts
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/full.ts b/src/full.ts
+new file mode 100644
+index 0000000..3b18e51
+--- /dev/null
++++ b/src/full.ts
+@@ -0,0 +1 @@
++export {};
+diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+diff --git "a/src/q\tx.ts" "b/src/q\tx.ts"
+new file mode 100644
+index 0000000..e69de29
+diff --git a/lib/a.rs b/lib/b.rs
+similarity index 100%
+rename from lib/a.rs
+rename to lib/b.rs
+diff --git "a/src/\346\251\213.ts" "b/src/\346\251\213.ts"
+deleted file mode 100644
+index e69de29..0000000
+"#;
+        let changes: Vec<(String, String)> = parse_hunkless_changes(diff)
+            .into_iter()
+            .map(|f| (f.old_path, f.new_path))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("/dev/null".to_string(), "src/empty.ts".to_string()),
+                ("src/gone b/c.ts".to_string(), "/dev/null".to_string()),
+                ("/dev/null".to_string(), "src/q\tx.ts".to_string()),
+                ("lib/a.rs".to_string(), "lib/b.rs".to_string()),
+                ("src/\u{6a4b}.ts".to_string(), "/dev/null".to_string()),
+            ]
+        );
+        // 内容同一の rename だけを返す既存の関数は変えない。
+        assert_eq!(parse_hunkless_renames(diff).len(), 1);
     }
 }

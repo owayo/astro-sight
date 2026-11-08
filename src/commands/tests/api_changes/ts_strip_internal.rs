@@ -21,7 +21,11 @@ fn bucket_after(
     removed: &[&str],
     name: &str,
 ) -> &'static str {
-    let api = changed_api(files, changes, removed);
+    classify(&changed_api(files, changes, removed), name)
+}
+
+/// API の差分の `name` の区分。
+fn classify(api: &crate::models::review::ApiChanges, name: &str) -> &'static str {
     if api.modified.iter().any(|change| change.name == name) {
         "mod"
     } else if api.removed.iter().any(|symbol| symbol.name == name) {
@@ -444,8 +448,8 @@ fn ts_strip_internal_uses_configs_that_compile_the_file() {
         ),
         "mod"
     );
-    // 入口だけを `files` に書いた出力の設定が import で取り込むファイルには、その設定の
-    // `stripInternal` をまだ当てない (取り込むと確かめられないので、宣言ファイルに残るとみなす)
+    // 入口だけを `files` に書いた出力の設定が import で取り込むファイルにも、その設定の
+    // `stripInternal` を当てる (Issue #288)
     assert_eq!(
         bucket(
             &[
@@ -460,7 +464,7 @@ fn ts_strip_internal_uses_configs_that_compile_the_file() {
             &[("src/lib.ts", OPTIONS_INTERNAL_MEMBER)],
             "Options"
         ),
-        "none"
+        "mod"
     );
     // `exclude` で外したファイルは、近い設定でも判定を止めない (祖先の出力の設定で決める)
     assert_eq!(
@@ -932,4 +936,605 @@ fn ts_strip_internal_alignment_covers_both_unknown_and_removed_tags() {
         &[],
     );
     assert!(api.added.iter().any(|symbol| symbol.name == "f"), "{api:?}");
+}
+
+/// 入口だけを `files` に書いた出力の設定。
+const BUILD: &str = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true }, \"files\": [\"src/index.ts\"] }\n";
+
+/// `src/lib.ts` の `retries` に `@internal` を足したときの `Options` の区分 (`index` が入口)。取り込み
+/// を確かめられる構成なので、決められない申告が無いことも確かめる。
+fn bucket_with_entry(files: &[(&str, &str)], index: &str) -> &'static str {
+    let mut all = vec![("src/index.ts", index), ("src/lib.ts", OPTIONS)];
+    all.extend_from_slice(files);
+    let api = changed_api(&all, &[("src/lib.ts", OPTIONS_INTERNAL_MEMBER)], &[]);
+    assert!(
+        api.parse_truncations
+            .iter()
+            .all(|truncation| truncation.reason
+                != crate::models::truncation::TruncationReason::TsStripInternalUnavailable),
+        "{api:?}"
+    );
+    classify(&api, "Options")
+}
+
+/// Issue #288 の再現: 入力から import で取り込むファイルも、その設定が宣言を出すファイルとして
+/// `stripInternal` を当てる。TypeScript と同じ解決で、実際に選ぶファイルを辿る。
+#[test]
+fn ts_strip_internal_follows_imports_from_entry_files() {
+    let base = [("tsconfig.json", NO_STRIP), ("tsconfig.build.json", BUILD)];
+    // 取り込みの先の先 (ディレクトリの index と `import` の再公開)
+    assert_eq!(
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", BUILD),
+                ("src/api/index.ts", "export * from \"../lib\";\n")
+            ],
+            "import { connect } from \"./api\";\nexport { connect };\n"
+        ),
+        "mod"
+    );
+    // `/// <reference path>` の先
+    assert_eq!(
+        bucket_with_entry(&base, "/// <reference path=\"./lib.ts\" />\nexport {};\n"),
+        "mod"
+    );
+    // 型の位置の `import()` の先
+    assert_eq!(
+        bucket_with_entry(
+            &base,
+            "export type Connect = typeof import(\"./lib\").connect;\n"
+        ),
+        "mod"
+    );
+    // node16 系の ESM では `.js` の指定子を `.ts` に置き換えて解く
+    let esm = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true, \"module\": \"nodenext\" }, \"files\": [\"src/index.ts\"] }\n";
+    let esm_files = [
+        ("package.json", "{ \"type\": \"module\" }\n"),
+        ("tsconfig.json", NO_STRIP),
+        ("tsconfig.build.json", esm),
+    ];
+    assert_eq!(
+        bucket_with_entry(&esm_files, "export * from \"./lib.js\";\n"),
+        "mod"
+    );
+    // 対照: ESM では拡張子を補わないので、拡張子の無い指定子は解けず取り込まない
+    assert_eq!(
+        bucket_with_entry(&esm_files, "export * from \"./lib\";\n"),
+        "none"
+    );
+}
+
+/// 取り込みを変えるだけの差分でも、差分に無いソースの判定が変われば比べ直す。旧版は旧版の
+/// 取り込みで判定する。
+#[test]
+fn ts_strip_internal_import_changes_recheck_unchanged_sources() {
+    let files = [
+        ("tsconfig.json", NO_STRIP),
+        ("tsconfig.build.json", BUILD),
+        ("src/index.ts", "export const version = 1;\n"),
+        ("src/api.ts", API),
+    ];
+    let reexport = "export const version = 1;\nexport * from \"./api\";\n";
+    assert!(
+        matches!(
+            bucket(&files, &[("src/index.ts", reexport)], "f"),
+            "rm" | "rm_dead"
+        ),
+        "{:?}",
+        changed_api(&files, &[("src/index.ts", reexport)], &[])
+    );
+    assert_eq!(
+        bucket(&files, &[("src/index.ts", reexport)], "Options"),
+        "mod"
+    );
+    // 取り込みを変えなければ比べ直さない
+    assert_eq!(
+        bucket(
+            &files,
+            &[("src/index.ts", "export const version = 2;\n")],
+            "f"
+        ),
+        "none"
+    );
+}
+
+/// `allowJs` の無い設定は JS を取り込まず、その先を辿らない。`allowJs` なら JS の `require()` も
+/// 辿る。
+#[test]
+fn ts_strip_internal_follows_javascript_only_with_allow_js() {
+    let build = |allow_js: bool| {
+        format!(
+            "{{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": {{ \"stripInternal\": true, \"allowJs\": {allow_js} }}, \"files\": [\"src/index.ts\"] }}\n"
+        )
+    };
+    let files = |build: &str| {
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", build),
+                ("src/bridge.js", "module.exports = require(\"./lib\");\n"),
+            ],
+            "export * from \"./bridge.js\";\n",
+        )
+    };
+    assert_eq!(files(&build(false)), "none");
+    assert_eq!(files(&build(true)), "mod");
+}
+
+/// 取り込みで届く近い設定は、祖先の出力の設定より先に判定を決める。
+#[test]
+fn ts_strip_internal_nearest_config_that_imports_the_file_decides() {
+    let src = "{ \"compilerOptions\": { \"declaration\": true }, \"files\": [\"index.ts\"] }\n";
+    let files = [("tsconfig.json", STRIP), ("src/tsconfig.json", src)];
+    assert_eq!(
+        bucket_with_entry(&files, "export * from \"./lib\";\n"),
+        "none"
+    );
+    // 対照: 取り込まなければ、祖先の出力の設定で決める
+    assert_eq!(bucket_with_entry(&files, "export const x = 1;\n"), "mod");
+}
+
+/// `exclude` を書かなければ、`outDir` の下は入力に含まない (TypeScript の既定の除外)。
+#[test]
+fn ts_strip_internal_excludes_out_dir_by_default() {
+    let files = |config: &str| {
+        bucket(
+            &[("tsconfig.json", config), ("out/lib.ts", OPTIONS)],
+            &[("out/lib.ts", OPTIONS_INTERNAL_MEMBER)],
+            "Options",
+        )
+    };
+    assert_eq!(
+        files(
+            "{ \"compilerOptions\": { \"declaration\": true, \"stripInternal\": true, \"outDir\": \"out\" } }\n"
+        ),
+        "none"
+    );
+    // 対照: `exclude` を書けば、`outDir` の下も入力になる
+    assert_eq!(
+        files(
+            "{ \"compilerOptions\": { \"declaration\": true, \"stripInternal\": true, \"outDir\": \"out\" }, \"exclude\": [] }\n"
+        ),
+        "mod"
+    );
+}
+
+/// 判定を決められなかったときの申告。
+fn strip_unavailable(
+    api: &crate::models::review::ApiChanges,
+) -> Vec<crate::models::truncation::TruncationInfo> {
+    api.parse_truncations
+        .iter()
+        .filter(|truncation| {
+            truncation.reason
+                == crate::models::truncation::TruncationReason::TsStripInternalUnavailable
+        })
+        .cloned()
+        .collect()
+}
+
+/// 自身の名前 (`exports` のある package.json の `name`) で取り込むと、どのファイルに解かれるかを
+/// 確かめないので、判定を決められないと申告する。この差分で付けた `@internal` は、消える場合に
+/// 備えて削除として出す。設定の変更で比べ直せないソースは、まとめて申告する。
+#[test]
+fn ts_strip_internal_unresolved_imports_are_reported() {
+    let package = "{ \"name\": \"pkg\", \"exports\": { \"./*\": \"./src/*.ts\" } }\n";
+    let api = changed_api(
+        &[
+            ("package.json", package),
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export * from \"pkg/lib\";\n"),
+            ("src/lib.ts", OPTIONS),
+        ],
+        &[("src/lib.ts", OPTIONS_INTERNAL_MEMBER)],
+        &[],
+    );
+    assert!(
+        api.modified.iter().any(|change| change.name == "Options"),
+        "{api:?}"
+    );
+    assert!(!strip_unavailable(&api).is_empty(), "{api:?}");
+    // 設定だけの変更: 差分に無い `src/api.ts` は比べ直せないので、まとめて申告する
+    let api = changed_api(
+        &[
+            ("package.json", package),
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export * from \"pkg/api\";\n"),
+            ("src/api.ts", API),
+        ],
+        &[(
+            "tsconfig.json",
+            "{ \"compilerOptions\": { \"declaration\": true, \"strict\": true } }\n",
+        )],
+        &[],
+    );
+    assert!(
+        api.removed_dead.iter().all(|symbol| symbol.name != "f"),
+        "{api:?}"
+    );
+    assert!(
+        strip_unavailable(&api).iter().any(
+            |truncation| truncation.path.is_none() && truncation.message.contains("src/api.ts")
+        ),
+        "{api:?}"
+    );
+}
+
+/// `paths` と `baseUrl` は TypeScript と同じ順に解く (当たったパターンの置換先、無ければ
+/// `baseUrl` の下)。
+#[test]
+fn ts_strip_internal_follows_paths_and_base_url() {
+    let config = |options: &str| {
+        format!(
+            "{{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": {{ \"stripInternal\": true, {options} }}, \"files\": [\"src/index.ts\"] }}\n"
+        )
+    };
+    let paths = config("\"paths\": { \"@/*\": [\"./src/*\"] }");
+    assert_eq!(
+        bucket_with_entry(
+            &[("tsconfig.json", NO_STRIP), ("tsconfig.build.json", &paths)],
+            "export * from \"@/lib\";\n"
+        ),
+        "mod"
+    );
+    let base_url = config("\"baseUrl\": \"./src\"");
+    assert_eq!(
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", &base_url)
+            ],
+            "export * from \"lib\";\n"
+        ),
+        "mod"
+    );
+    // 対照: どれにも当たらない指定子は外のライブラリ (宣言を出すファイルを足さない)
+    assert_eq!(
+        bucket_with_entry(
+            &[("tsconfig.json", NO_STRIP), ("tsconfig.build.json", &paths)],
+            "export * from \"react\";\n"
+        ),
+        "none"
+    );
+}
+
+/// モジュールの拡張 (`declare module "./lib"`) は名前を解くだけで、ファイルを取り込まない。
+#[test]
+fn ts_strip_internal_augmentations_do_not_reach_files() {
+    assert_eq!(
+        bucket_with_entry(
+            &[("tsconfig.json", NO_STRIP), ("tsconfig.build.json", BUILD)],
+            "export {};\ndeclare module \"./lib\" {\n  interface Extra {}\n}\n"
+        ),
+        "none"
+    );
+}
+
+/// 空のファイルを消すと指定子の解決先が変わる (`./bridge` が `bridge.ts` から `bridge.js` に)。
+/// hunk の無い削除でも比べ直す。
+#[test]
+fn ts_strip_internal_empty_file_changes_recheck_unchanged_sources() {
+    let build = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true, \"allowJs\": true }, \"files\": [\"src/index.ts\"] }\n";
+    let files = [
+        ("tsconfig.json", NO_STRIP),
+        ("tsconfig.build.json", build),
+        ("src/index.ts", "import \"./bridge\";\n"),
+        ("src/bridge.ts", ""),
+        ("src/bridge.js", "module.exports = require(\"./api\");\n"),
+        ("src/api.ts", API),
+    ];
+    assert!(
+        matches!(
+            bucket_after(&files, &[], &["src/bridge.ts"], "f"),
+            "rm" | "rm_dead"
+        ),
+        "{:?}",
+        changed_api(&files, &[], &["src/bridge.ts"])
+    );
+}
+
+/// `include` のワイルドカードの `*` は `.min.js` に当たらない (書けば当たる)。`jsconfig.json` は
+/// `allowJs` を既定で有効にする。
+#[test]
+fn ts_strip_internal_lists_javascript_inputs_like_typescript() {
+    let build = |include: &str| {
+        format!(
+            "{{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": {{ \"stripInternal\": true, \"allowJs\": true }}, \"include\": [\"{include}\"] }}\n"
+        )
+    };
+    let files = |build: &str| {
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", build),
+                ("entry/loader.min.js", "require(\"../src/lib\");\n"),
+            ],
+            "export {};\n",
+        )
+    };
+    assert_eq!(files(&build("entry/*")), "none");
+    assert_eq!(files(&build("entry/*.min.js")), "mod");
+    assert_eq!(
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                (
+                    "jsconfig.json",
+                    "{ \"compilerOptions\": { \"stripInternal\": true }, \"files\": [\"src/main.js\"] }\n"
+                ),
+                ("src/main.js", "require(\"./lib\");\n"),
+            ],
+            "export {};\n"
+        ),
+        "mod"
+    );
+}
+
+/// 旧版の判定を決められず新版は消すとき、ソースから消した `@internal` の宣言の削除は隠さない。
+/// 旧新とも決められなければ、この差分で付けた `@internal` を削除として出す (元からの
+/// `@internal` の項目は比べる)。
+#[test]
+fn ts_strip_internal_undetermined_sides_keep_source_changes() {
+    // 旧版の入口は解析できない (取り込みを決められない)。新版の入口は `./api` を取り込む
+    let files = [
+        ("tsconfig.json", NO_STRIP),
+        ("tsconfig.build.json", BUILD),
+        ("src/index.ts", "export const broken = ;\n"),
+        ("src/api.ts", API),
+    ];
+    let without_f =
+        "export interface Options {\n  name: string;\n  /** @internal */\n  retries: number;\n}\n";
+    let api = changed_api(
+        &files,
+        &[
+            ("src/index.ts", "export * from \"./api\";\n"),
+            ("src/api.ts", without_f),
+        ],
+        &[],
+    );
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "f")
+            || api.removed_dead.iter().any(|symbol| symbol.name == "f"),
+        "{api:?}"
+    );
+    // 元から `@internal` で変えていないメンバーは、判定の違いだけで変化にしない
+    assert!(
+        api.modified.iter().all(|change| change.name != "Options"),
+        "{api:?}"
+    );
+    assert!(!strip_unavailable(&api).is_empty(), "{api:?}");
+    // 旧新とも決められない: `@internal` を付けた export は削除として出す
+    let files = [
+        ("tsconfig.json", NO_STRIP),
+        ("tsconfig.build.json", BUILD),
+        ("src/index.ts", "export const broken = ;\n"),
+        ("src/lib.ts", OPTIONS),
+    ];
+    let api = changed_api(
+        &files,
+        &[
+            ("src/index.ts", "export const broken = ;\nexport {};\n"),
+            ("src/lib.ts", OPTIONS_INTERNAL_EXPORT),
+        ],
+        &[],
+    );
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "connect")
+            || api
+                .removed_dead
+                .iter()
+                .any(|symbol| symbol.name == "connect"),
+        "{api:?}"
+    );
+}
+
+/// 判定を決められない側の項目は宣言ごとに対応させる: 変数の文の宣言を減らしても、元から
+/// `@internal` の宣言を付け足しとはみなさない。文字列の中の空白の変化はソースの変化として扱う。
+#[test]
+fn ts_strip_internal_undetermined_items_follow_bindings_and_literals() {
+    // 旧版は入口が届かないと確かめられ (消さない)、新版は入口を解析できない (決められない)
+    let api = changed_api(
+        &[
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export const ok = 1;\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport const a = 1, b = 2;\nexport const c = 3;\n",
+            ),
+        ],
+        &[
+            ("src/index.ts", "export const broken = ;\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport const a = 1;\nexport const c = 3;\n",
+            ),
+        ],
+        &[],
+    );
+    let removed = |name: &str| {
+        api.removed.iter().any(|symbol| symbol.name == name)
+            || api.removed_dead.iter().any(|symbol| symbol.name == name)
+    };
+    assert!(removed("b"), "{api:?}");
+    assert!(!removed("a"), "{api:?}");
+    // 宣言を足しても、元から `@internal` の宣言を付け足しとはみなさない
+    let api = changed_api(
+        &[
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export const ok = 1;\n"),
+            ("src/lib.ts", "/** @internal */\nexport const a = 1;\n"),
+        ],
+        &[
+            ("src/index.ts", "export const broken = ;\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport const a = 1, b = 2;\n",
+            ),
+        ],
+        &[],
+    );
+    assert!(
+        api.removed.iter().all(|symbol| symbol.name != "a")
+            && api.removed_dead.iter().all(|symbol| symbol.name != "a"),
+        "{api:?}"
+    );
+    // 旧版を決められず新版は消す: `return` の後の改行で式が切れる変化 (構造の変化) も比べる
+    let api = changed_api(
+        &[
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export const broken = ;\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport function f() {\n  return \"ok\";\n}\nexport const c = 3;\n",
+            ),
+        ],
+        &[
+            ("src/index.ts", "export * from \"./lib\";\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport function f() {\n  return\n  \"ok\";\n}\nexport const c = 3;\n",
+            ),
+        ],
+        &[],
+    );
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "f")
+            || api.removed_dead.iter().any(|symbol| symbol.name == "f")
+            || api.modified.iter().any(|change| change.name == "f"),
+        "{api:?}"
+    );
+    // 旧版を決められず新版は消す: `@internal` の型の文字列の中身を変えたら、残したまま比べる
+    let api = changed_api(
+        &[
+            ("tsconfig.json", NO_STRIP),
+            ("tsconfig.build.json", BUILD),
+            ("src/index.ts", "export const broken = ;\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport type T = \"a b\";\nexport const c = 3;\n",
+            ),
+        ],
+        &[
+            ("src/index.ts", "export * from \"./lib\";\n"),
+            (
+                "src/lib.ts",
+                "/** @internal */\nexport type T = \"ab\";\nexport const c = 3;\n",
+            ),
+        ],
+        &[],
+    );
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "T")
+            || api.removed_dead.iter().any(|symbol| symbol.name == "T")
+            || api.modified.iter().any(|change| change.name == "T"),
+        "{api:?}"
+    );
+}
+
+/// `paths` の置換先の拡張子は、`*` を置き換える前の値で見る (`@/lib.js` は `lib.ts` を先に探す)。
+#[test]
+fn ts_strip_internal_paths_check_extensions_before_substitution() {
+    let paths = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true, \"paths\": { \"@/*\": [\"./src/*\"] } }, \"files\": [\"src/index.ts\"] }\n";
+    assert_eq!(
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", paths),
+                ("src/lib.js", "module.exports = {};\n"),
+            ],
+            "export * from \"@/lib.js\";\n"
+        ),
+        "mod"
+    );
+}
+
+/// 合成の取り込み (`importHelpers` の tslib) は、TypeScript がモジュールに足すときだけ辿る。
+/// モジュールかを決められないスクリプトでは、足し得る先があれば決めない。
+#[test]
+fn ts_strip_internal_synthetic_imports_follow_module_detection() {
+    let build = |detection: &str| {
+        format!(
+            "{{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": {{ \"stripInternal\": true, \"importHelpers\": true, \"paths\": {{ \"tslib\": [\"./src/lib.ts\"] }}{detection} }}, \"files\": [\"src/index.ts\"] }}\n"
+        )
+    };
+    let api = |build: &str, index: &str| {
+        changed_api(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", build),
+                ("src/index.ts", index),
+                ("src/lib.ts", OPTIONS),
+            ],
+            &[("src/lib.ts", OPTIONS_INTERNAL_MEMBER)],
+            &[],
+        )
+    };
+    // モジュールには足す (届く)
+    let module = api(&build(""), "export const x = 1;\n");
+    assert_eq!(classify(&module, "Options"), "mod", "{module:?}");
+    assert!(strip_unavailable(&module).is_empty(), "{module:?}");
+    // `moduleDetection: legacy` のスクリプトには足さない (届かない)
+    let legacy = api(
+        &build(", \"moduleDetection\": \"legacy\""),
+        "const x = 1;\n",
+    );
+    assert_eq!(classify(&legacy, "Options"), "none", "{legacy:?}");
+    assert!(strip_unavailable(&legacy).is_empty(), "{legacy:?}");
+    // 既定の `moduleDetection` のスクリプトは決めない
+    let auto = api(&build(""), "const x = 1;\n");
+    assert!(!strip_unavailable(&auto).is_empty(), "{auto:?}");
+    // `import.meta` を使うソースは `legacy` でもモジュール (足す)
+    let meta = api(
+        &build(", \"moduleDetection\": \"legacy\""),
+        "void import.meta;\n",
+    );
+    assert_eq!(classify(&meta, "Options"), "mod", "{meta:?}");
+    assert!(strip_unavailable(&meta).is_empty(), "{meta:?}");
+}
+
+/// JSX の runtime の取り込みは、ソースの pragma (`@jsxRuntime classic` など) で変わるので、pragma の
+/// あるソースからは届くと決めない。同じ宣言ファイルで宣言した ambient module の名前の取り込みは、
+/// ファイルを探さない。
+#[test]
+fn ts_strip_internal_jsx_pragmas_and_own_ambient_modules() {
+    let build = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true, \"jsx\": \"react-jsx\", \"paths\": { \"react/jsx-runtime\": [\"./src/lib.ts\"] } }, \"files\": [\"src/index.ts\"] }\n";
+    let api = |index: &str| {
+        changed_api(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", build),
+                ("src/index.ts", index),
+                ("src/lib.ts", OPTIONS),
+            ],
+            &[("src/lib.ts", OPTIONS_INTERNAL_MEMBER)],
+            &[],
+        )
+    };
+    let module = api("export {};\n");
+    assert_eq!(classify(&module, "Options"), "mod", "{module:?}");
+    assert!(strip_unavailable(&module).is_empty(), "{module:?}");
+    let pragma = api("/** @jsxRuntime classic */\nexport {};\n");
+    assert!(!strip_unavailable(&pragma).is_empty(), "{pragma:?}");
+    // 同じ宣言ファイルの ambient module の名前は `paths` で解かない
+    let entry = "{ \"extends\": \"./tsconfig.json\", \"compilerOptions\": { \"stripInternal\": true, \"paths\": { \"pkg\": [\"./src/lib.ts\"] } }, \"files\": [\"src/entry.d.ts\"] }\n";
+    assert_eq!(
+        bucket_with_entry(
+            &[
+                ("tsconfig.json", NO_STRIP),
+                ("tsconfig.build.json", entry),
+                (
+                    "src/entry.d.ts",
+                    "declare module \"use\" {\n  export { X } from \"pkg\";\n}\ndeclare module \"pkg\" {\n  export interface X {}\n}\n"
+                ),
+            ],
+            "export {};\n"
+        ),
+        "none"
+    );
 }

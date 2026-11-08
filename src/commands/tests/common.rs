@@ -83,7 +83,7 @@ pub(crate) fn detect_api_changes_from_worktree(repo: &std::path::Path) -> ApiCha
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         &api_diff_files(&diff_files, &diff),
-        &crate::engine::diff::parse_hunkless_renames(&diff),
+        &crate::engine::diff::parse_hunkless_changes(&diff),
     )
 }
 

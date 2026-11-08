@@ -248,6 +248,45 @@ fn is_emitted_ts_path(path: &str) -> bool {
         && !super::ts_module_paths::is_declaration_path(path)
 }
 
+/// TS・JS のソースのパスか (宣言ファイルを含む)。
+fn is_module_source_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// 差分が、設定が入力から取り込むファイルを変え得るか (Issue #288): TS・JS のソースの追加・削除・
+/// rename (指定子の解決の候補が変わる) と、取り込み (import・export … from・`require()`・
+/// `/// <reference>` など) の変更。読めなければ変え得るとする。
+fn changes_module_graph(
+    dir: &str,
+    df: &crate::models::impact::DiffFile,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+) -> bool {
+    if !(is_module_source_path(&df.old_path) || is_module_source_path(&df.new_path)) {
+        return false;
+    }
+    if df.old_path != df.new_path {
+        return true;
+    }
+    if df.hunks.is_empty() {
+        return false;
+    }
+    match (
+        base_blobs.read(&df.old_path),
+        super::source_pair::load_new_source(dir, &df.new_path),
+    ) {
+        (Some(old), Some(new)) => {
+            super::ts_alias_resolution::imports_differ(&df.new_path, &old, &new)
+        }
+        _ => true,
+    }
+}
+
+/// `stripInternal` の判定を決められなかったときの説明。
+const STRIP_UNDETERMINED: &str = "a config could not be read or resolved, or whether a config compiles the file through imports could not be determined";
+
 /// `stripInternal` の判定を決められなかったときの申告。
 fn strip_internal_unavailable(
     path: Option<&str>,
@@ -317,32 +356,30 @@ impl PreparedDiff {
                 prepared.rechecks.push((df.clone(), file));
             }
         }
-        // 設定 (JSON。内容が同じ rename も) を変えた差分では、差分に無い TS のソースも、
-        // `stripInternal` の当たり方が変われば比べ直す (Issue #287)。base の版の設定を読めな
-        // ければ、比べ直せないことを申告する。
+        // 設定 (JSON。内容が同じ rename も) を変えた差分 (Issue #287) と、TS・JS のソースの取り込み
+        // やファイルの構成を変えた差分 (Issue #288。設定が入力から取り込むファイルが変わる) では、
+        // 差分に無い TS のソースも、`stripInternal` の当たり方が変われば比べ直す。
         let configs_changed = diff_files.iter().chain(renames).any(|df| {
             [&df.old_path, &df.new_path]
                 .iter()
                 .any(|path| path.ends_with(".json"))
         });
-        if configs_changed {
-            if strip_internal.has_base() {
-                prepared.recheck_strip_internal(
-                    dir,
-                    diff_files,
-                    renames,
-                    base_blobs,
-                    &strip_internal,
-                    lookup.as_mut(),
-                    canonical_dir,
-                    &mut undetermined,
-                );
-            } else {
-                prepared.parse_truncations.push(strip_internal_unavailable(
-                    None,
-                    "the base revision's configs could not be read",
-                ));
-            }
+        if configs_changed
+            || diff_files
+                .iter()
+                .chain(renames)
+                .any(|df| changes_module_graph(dir, df, base_blobs))
+        {
+            prepared.recheck_strip_internal(
+                dir,
+                diff_files,
+                renames,
+                base_blobs,
+                &strip_internal,
+                lookup.as_mut(),
+                canonical_dir,
+                &mut undetermined,
+            );
         }
         if let Some(root) = canonical_dir {
             prepared.parse_truncations.extend(
@@ -353,9 +390,11 @@ impl PreparedDiff {
         prepared
     }
 
-    /// 設定だけの変更で `stripInternal` の当たり方が変わる、差分に無い TS のソースを比べ直す
-    /// (Issue #287)。追跡している出力する TS のソースのうち `@internal` を含むものについて、旧版
-    /// (base の版の設定) と新版 (今の設定) の判定が違えば、変更ファイルと同じく比べる。
+    /// 設定や取り込みの変更で `stripInternal` の当たり方が変わる、差分に無い TS のソースを比べ直す
+    /// (Issue #287・#288)。追跡している出力する TS のソースのうち `@internal` を含むものについて、
+    /// 旧版 (base の版の設定と取り込み) と新版 (今の設定と取り込み) の判定が違えば、変更ファイルと
+    /// 同じく比べる。base の版の設定は、`@internal` を含むソースが見つかってから読む (それまで git を
+    /// 動かさない)。判定を決められないソースは、まとめて申告する。
     #[allow(clippy::too_many_arguments)]
     fn recheck_strip_internal(
         &mut self,
@@ -383,6 +422,8 @@ impl PreparedDiff {
         let mut files = 0usize;
         let mut bytes = 0usize;
         let mut unread = 0usize;
+        let mut base_checked = false;
+        let mut undetermined_sources = Vec::new();
         for path in tracked {
             if touched.contains(path.as_str())
                 || !is_emitted_ts_path(&path)
@@ -414,8 +455,28 @@ impl PreparedDiff {
                 ));
                 return;
             }
-            if !self.strip_changed(&path, &path, &source, strip_internal) {
+            let may_strip = parser::detect_lang(camino::Utf8Path::new(&path), &source)
+                .is_ok_and(|lang| super::ts_strip_internal::may_strip(&path, lang, &source));
+            if !may_strip {
                 continue;
+            }
+            if !base_checked {
+                base_checked = true;
+                if !strip_internal.has_base() {
+                    self.parse_truncations.push(strip_internal_unavailable(
+                        None,
+                        "the base revision's configs could not be read",
+                    ));
+                    return;
+                }
+            }
+            match Self::strip_comparison(&path, &path, &source, strip_internal) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    undetermined_sources.push(path);
+                    continue;
+                }
             }
             let df = crate::models::impact::DiffFile {
                 old_path: path.clone(),
@@ -438,6 +499,21 @@ impl PreparedDiff {
                 ),
             ));
         }
+        if !undetermined_sources.is_empty() {
+            const EXAMPLES: usize = 5;
+            let mut examples =
+                undetermined_sources[..undetermined_sources.len().min(EXAMPLES)].join(", ");
+            if undetermined_sources.len() > EXAMPLES {
+                examples.push_str(", ...");
+            }
+            self.parse_truncations.push(strip_internal_unavailable(
+                None,
+                &format!(
+                    "{} TS sources were not rechecked ({STRIP_UNDETERMINED}): {examples}",
+                    undetermined_sources.len()
+                ),
+            ));
+        }
     }
 
     /// ソース `source` (新版 `new_path`、旧版 `old_path`) に当たる `stripInternal` の判定が旧新で
@@ -449,24 +525,40 @@ impl PreparedDiff {
         source: &[u8],
         strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> bool {
+        match Self::strip_comparison(old_path, new_path, source, strip_internal) {
+            Some(changed) => changed,
+            None => {
+                self.parse_truncations.push(strip_internal_unavailable(
+                    Some(new_path),
+                    STRIP_UNDETERMINED,
+                ));
+                false
+            }
+        }
+    }
+
+    /// [`Self::strip_changed`] の判定。決められなければ None。`@internal` を含まない・出力しない
+    /// ソースと、base の版の設定を読めないときは変わらないとする。
+    fn strip_comparison(
+        old_path: &str,
+        new_path: &str,
+        source: &[u8],
+        strip_internal: &super::ts_strip_internal::StripInternal,
+    ) -> Option<bool> {
         let Ok(lang) = parser::detect_lang(camino::Utf8Path::new(new_path), source) else {
-            return false;
+            return Some(false);
         };
         if !super::ts_strip_internal::may_strip(new_path, lang, source) {
-            return false;
+            return Some(false);
         }
         let Some((old, new)) = strip_internal.states(old_path, new_path) else {
-            return false;
+            return Some(false);
         };
         use super::ts_alias_resolution::StripState;
         if old == StripState::Unknown || new == StripState::Unknown {
-            self.parse_truncations.push(strip_internal_unavailable(
-                Some(new_path),
-                "a config could not be read or resolved",
-            ));
-            return false;
+            return None;
         }
-        old != new
+        Some(old != new)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -580,25 +672,36 @@ impl PreparedDiff {
         base_blobs: &crate::commands::git_input::GitBlobBatch,
         strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
-        // 旧新の片方の `stripInternal` の設定を決められなければ、決められた側の判定を両方に当て
-        // (設定が変わったかを確かめられないので、変わらなかったとみなす)、申告する (Issue #287)。
-        // 旧版にだけ `@internal` がある (最後のタグを消した) 変更も見る。
+        // 旧新の片方の `stripInternal` の判定を決められなければ、項目ごとに当て方を決め
+        // ([`super::ts_strip_internal::StripInternal::align`])、申告する (Issue #287・#288)。旧版に
+        // だけ `@internal` がある (最後のタグを消した) 変更も見る。
         let may_strip = |path: &str, source: &[u8]| {
             parser::detect_lang(camino::Utf8Path::new(path), source)
                 .is_ok_and(|lang| super::ts_strip_internal::may_strip(path, lang, source))
         };
-        if (is_emitted_ts_path(&df.old_path) || is_emitted_ts_path(&df.new_path))
-            && (super::source_pair::load_new_source(dir, &df.new_path)
-                .is_some_and(|source| may_strip(&df.new_path, &source))
-                || base_blobs
-                    .read(&df.old_path)
-                    .is_some_and(|source| may_strip(&df.old_path, &source)))
-            && strip_internal.align(&df.old_path, &df.new_path)
-        {
-            self.parse_truncations.push(strip_internal_unavailable(
-                Some(&df.new_path),
-                "a config could not be read or resolved; both sides use the known setting",
-            ));
+        if is_emitted_ts_path(&df.old_path) || is_emitted_ts_path(&df.new_path) {
+            let new_source = super::source_pair::load_new_source(dir, &df.new_path);
+            let old_source = base_blobs.read(&df.old_path);
+            if (new_source
+                .as_ref()
+                .is_some_and(|source| may_strip(&df.new_path, source))
+                || old_source
+                    .as_ref()
+                    .is_some_and(|source| may_strip(&df.old_path, source)))
+                && strip_internal.align(
+                    &df.old_path,
+                    &df.new_path,
+                    old_source.as_deref(),
+                    new_source.as_deref(),
+                )
+            {
+                self.parse_truncations.push(strip_internal_unavailable(
+                    Some(&df.new_path),
+                    &format!(
+                        "{STRIP_UNDETERMINED}; only changes in the source that break either way are compared"
+                    ),
+                ));
+            }
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
         let mut old_facts =
@@ -997,54 +1100,58 @@ pub(crate) fn extract_new_file_facts(
         facts.language_unknown = true;
         return facts;
     };
+    // 片側の `stripInternal` の判定を決められなかったファイルは、残すと決めた項目の `@internal` を
+    // 読まない (Issue #288。位置は変わらない)。
+    let view = strip_internal.view(false, file_path, lang_id, &source);
+    let source: &[u8] = &view;
 
     // lexer-only (Xojo): tree-sitter parse は呼ばない (parse_source は Err を返すため callees/
     // reexports は元実装でも空)。exported のみ lexer 経由 (非 test かつ safe のとき)。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
         if !is_test && safe {
             facts.exported = Some(ExportedFileFacts::from_symbols(
-                crate::engine::lexer::extract_exported_symbols(&source, lexer_lang, false),
+                crate::engine::lexer::extract_exported_symbols(source, lexer_lang, false),
             ));
         }
         return facts;
     }
 
-    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+    let Ok(tree) = parser::parse_source(source, lang_id) else {
         return facts;
     };
     let root = tree.root_node();
 
     if lang_id == crate::language::LangId::Bash && root.has_error() {
         use crate::engine::bash_parse_recovery::{parse_error_message, unparsed_declarations};
-        facts.unparsed_declarations = unparsed_declarations(root, &source);
+        facts.unparsed_declarations = unparsed_declarations(root, source);
         facts
             .parse_truncations
             .push(crate::models::truncation::TruncationInfo::new(
                 Some(file_path.to_owned()),
                 crate::models::truncation::TruncationReason::ParseErrorRegion,
-                parse_error_message(file_path, &source).to_owned(),
+                parse_error_message(file_path, source).to_owned(),
             ));
     }
 
     // callees: test/safe ガードなし (extract_in_file_callees と一致)。
     facts.callees =
-        crate::engine::calls::extract_all_callees(root, &source, lang_id).unwrap_or_default();
+        crate::engine::calls::extract_all_callees(root, source, lang_id).unwrap_or_default();
 
     // exported (非 test かつ safe): extract_symbols → filter_exported_symbols。
     // extract_symbols 失敗は None のまま (元 _inner の `?` と一致)。
     if !is_test
         && safe
-        && let Ok(syms) = crate::engine::symbols::extract_symbols(root, &source, lang_id)
+        && let Ok(syms) = crate::engine::symbols::extract_symbols(root, source, lang_id)
     {
         facts.exported = Some(filter_exported_file_facts(
             &syms,
             root,
-            &source,
+            source,
             lang_id,
             true,
             false,
             Some(file_path),
-            strip_internal.applies(file_path, lang_id, &source),
+            strip_internal.applies(file_path, lang_id, source),
         ));
     }
 
@@ -1060,13 +1167,13 @@ pub(crate) fn extract_new_file_facts(
     {
         facts.export_surface_names = match lang_id {
             crate::language::LangId::Rust => {
-                crate::engine::symbols::collect_rust_reexported_names(root, &source)
+                crate::engine::symbols::collect_rust_reexported_names(root, source)
             }
-            _ => crate::engine::symbols::collect_js_ts_named_export_surface_names(root, &source),
+            _ => crate::engine::symbols::collect_js_ts_named_export_surface_names(root, source),
         };
         // `stripInternal` で宣言ファイルから消える export 文だけが公開する名前は、公開の面に無い。
-        if strip_internal.applies(file_path, lang_id, &source) {
-            for name in super::ts_strip_internal::internal_only_export_names(root, &source) {
+        if strip_internal.applies(file_path, lang_id, source) {
+            for name in super::ts_strip_internal::internal_only_export_names(root, source) {
                 facts.export_surface_names.remove(&name);
             }
         }

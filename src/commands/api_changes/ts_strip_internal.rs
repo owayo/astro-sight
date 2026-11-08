@@ -6,8 +6,11 @@
 //! として、そうした宣言を公開の一覧から除き、型のメンバーはシグネチャと互換の判定から除く
 //! ([`published_source`])。`@internal` の付け足しは、その宣言の削除と同じ区分になる。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use tree_sitter::Node;
 
@@ -26,9 +29,18 @@ pub(crate) struct StripInternal {
     /// で、旧版も今の設定で判定する。
     base_configs:
         std::cell::OnceCell<Option<RefCell<super::ts_alias_resolution::StripInternalConfigs>>>,
-    /// 片方の設定を決められなかったファイルの、もう片方の判定 ((旧版か, パス) → 当たるか)。
+    /// 旧新の片方の判定を決められなかったファイルの当て方 ((旧版か, パス) → 当て方)。
     /// [`Self::align`]。
-    overrides: RefCell<std::collections::HashMap<(bool, String), bool>>,
+    overrides: RefCell<HashMap<(bool, String), Override>>,
+}
+
+/// 判定を決められなかったファイルの、片側の当て方 ([`StripInternal::align`])。
+#[derive(Clone, Debug, Default)]
+struct Override {
+    /// `stripInternal` を当てるか。
+    strips: bool,
+    /// 当てるときにも残す (消さない) `@internal` の項目の鍵 ([`items`])。
+    keep: Rc<HashSet<String>>,
 }
 
 impl StripInternal {
@@ -94,7 +106,7 @@ impl StripInternal {
         self.configs.as_ref().is_some_and(|configs| {
             may_strip(path, lang, source)
                 && match self.overrides.borrow().get(&(false, path.to_owned())) {
-                    Some(&value) => value,
+                    Some(value) => value.strips,
                     None => configs.borrow_mut().strips(path),
                 }
         })
@@ -106,42 +118,127 @@ impl StripInternal {
         may_strip(path, lang, source)
             && self.old_configs().is_some_and(|configs| {
                 match self.overrides.borrow().get(&(true, path.to_owned())) {
-                    Some(&value) => value,
+                    Some(value) => value.strips,
                     None => configs.borrow_mut().strips(path),
                 }
             })
     }
 
-    /// 旧版 `old_path` と新版 `new_path` の片方の設定を決められなければ、決められた側の判定を
-    /// 両方に当てる (設定が変わったかを確かめられないので、変わらなかったとみなす)。旧新とも決め
-    /// られなければ、両方とも有効にしないとみなす (読めない設定の扱いと同じ。片方だけが有効と
-    /// 読めても、変化を結論しない)。決められない側があれば true (申告する)。
-    pub(crate) fn align(&self, old_path: &str, new_path: &str) -> bool {
+    /// `stripInternal` で消すかを決めるときに読む `source` (旧版なら `old`)。[`Self::align`] で残すと
+    /// 決めた項目の `@internal` を、同じ長さの別の字 (`@INTERNAL`) にしたもの (位置は変えない)。
+    pub(crate) fn view<'s>(
+        &self,
+        old: bool,
+        path: &str,
+        lang: LangId,
+        source: &'s [u8],
+    ) -> Cow<'s, [u8]> {
+        let keep = match self.overrides.borrow().get(&(old, path.to_owned())) {
+            Some(value) if value.strips && !value.keep.is_empty() => Rc::clone(&value.keep),
+            _ => return Cow::Borrowed(source),
+        };
+        match crate::engine::parser::parse_source(source, lang) {
+            Ok(tree) => Cow::Owned(neutralize(tree.root_node(), source, &keep)),
+            Err(_) => Cow::Borrowed(source),
+        }
+    }
+
+    /// 旧版 `old_path` (ソース `old_source`) と新版 `new_path` (`new_source`) の片方の判定を決め
+    /// られなければ、項目ごとに当て方を決める (Issue #287・#288)。判定の違い (環境) だけによる
+    /// 変化は結論せず、ソースの変化は、決められない側がどちらの判定でも壊れ得るなら出す。
+    ///
+    /// - 旧版を決められず新版は消す: 旧版でも消すが、新版で消えたか中身の変わった `@internal` の
+    ///   項目は残す (ソースから消した宣言の削除を隠さない)。
+    /// - 旧版を決められず新版は消さない: 旧版も消さない。
+    /// - 新版を決められず旧版は消す: 新版も消す。
+    /// - 新版を決められず旧版は消さない (旧新とも決められないときを含む): 旧版は消さず、新版は
+    ///   この差分で `@internal` を付けた項目だけを消す (付け足しを削除として出し、元からの
+    ///   `@internal` の項目は比べる)。
+    ///
+    /// 決められない側があれば true (申告する)。
+    pub(crate) fn align(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> bool {
         use super::ts_alias_resolution::StripState;
         let Some((old, new)) = self.states(old_path, new_path) else {
             return false;
         };
-        match (old, new) {
-            (StripState::Unknown, StripState::Unknown) => {
-                let mut overrides = self.overrides.borrow_mut();
-                overrides.insert((true, old_path.to_owned()), false);
-                overrides.insert((false, new_path.to_owned()), false);
-                true
-            }
-            (StripState::Unknown, known) => {
-                self.overrides
-                    .borrow_mut()
-                    .insert((true, old_path.to_owned()), known == StripState::Strips);
-                true
-            }
-            (known, StripState::Unknown) => {
-                self.overrides
-                    .borrow_mut()
-                    .insert((false, new_path.to_owned()), known == StripState::Strips);
-                true
-            }
-            _ => false,
+        if old != StripState::Unknown && new != StripState::Unknown {
+            return false;
         }
+        let parsed = |path: &str, source: Option<&[u8]>| {
+            let source = source?;
+            let lang =
+                crate::engine::parser::detect_lang(camino::Utf8Path::new(path), source).ok()?;
+            let tree = crate::engine::parser::parse_source(source, lang).ok()?;
+            Some(items(tree.root_node(), source))
+        };
+        let old_items = parsed(old_path, old_source).unwrap_or_default();
+        let new_items = parsed(new_path, new_source).unwrap_or_default();
+        // `@internal` の項目のうち、`keep` の文 (項目の `owner`) 以外を消す当て方 (消すものが無ければ
+        // 当てない)。
+        let partial = |items: &HashMap<String, Item>, keep: HashSet<String>| Override {
+            strips: items
+                .values()
+                .any(|item| item.internal && !keep.contains(&item.owner)),
+            keep: Rc::new(keep),
+        };
+        let (old_override, new_override) = match (old, new) {
+            (StripState::Unknown, StripState::Strips) => {
+                // 新版で消えたか中身の変わった項目の文は残す。
+                let keep = old_items
+                    .iter()
+                    .filter(|(key, item)| {
+                        item.internal
+                            && new_items
+                                .get(*key)
+                                .is_none_or(|other| other.text != item.text)
+                    })
+                    .map(|(_, item)| item.owner.clone())
+                    .collect();
+                (Some(partial(&old_items, keep)), None)
+            }
+            (StripState::Unknown, StripState::Keeps) => (Some(Override::default()), None),
+            (StripState::Strips, StripState::Unknown) => (
+                None,
+                Some(Override {
+                    strips: true,
+                    keep: Rc::default(),
+                }),
+            ),
+            _ => {
+                // この差分で旧版からある項目に `@internal` を付けた文だけを消し、ほかの `@internal` の
+                // 文は残す (新しく足した項目は付け足しではない)。
+                let tagged: HashSet<&String> = new_items
+                    .iter()
+                    .filter(|(key, item)| {
+                        item.internal && old_items.get(*key).is_some_and(|other| !other.internal)
+                    })
+                    .map(|(_, item)| &item.owner)
+                    .collect();
+                let keep = new_items
+                    .values()
+                    .filter(|item| item.internal && !tagged.contains(&item.owner))
+                    .map(|item| item.owner.clone())
+                    .collect();
+                (
+                    (old == StripState::Unknown).then(Override::default),
+                    Some(partial(&new_items, keep)),
+                )
+            }
+        };
+        let mut overrides = self.overrides.borrow_mut();
+        if let Some(old_override) = old_override {
+            overrides.insert((true, old_path.to_owned()), old_override);
+        }
+        if let Some(new_override) = new_override {
+            overrides.insert((false, new_path.to_owned()), new_override);
+        }
+        true
     }
 
     /// `path` に `stripInternal` が当たるとき、宣言ファイルの型のメンバーにした `source`
@@ -150,8 +247,9 @@ impl StripInternal {
         if !self.applies(path, lang, source) {
             return None;
         }
-        let tree = crate::engine::parser::parse_source(source, lang).ok()?;
-        published_source(tree.root_node(), source)
+        let view = self.view(false, path, lang, source);
+        let tree = crate::engine::parser::parse_source(&view, lang).ok()?;
+        published_source(tree.root_node(), &view)
     }
 
     /// [`Self::published`] の旧版。
@@ -159,8 +257,9 @@ impl StripInternal {
         if !self.applies_old(path, lang, source) {
             return None;
         }
-        let tree = crate::engine::parser::parse_source(source, lang).ok()?;
-        published_source(tree.root_node(), source)
+        let view = self.view(true, path, lang, source);
+        let tree = crate::engine::parser::parse_source(&view, lang).ok()?;
+        published_source(tree.root_node(), &view)
     }
 
     /// 旧版 `old_path` と新版 `new_path` に当たる設定の判定 (`@internal` の有無を問わない)。
@@ -189,6 +288,234 @@ pub(crate) fn may_strip(path: &str, lang: LangId, source: &[u8]) -> bool {
         && source
             .windows(b"@internal".len())
             .any(|window| window == b"@internal")
+}
+
+/// `stripInternal` で消し得る項目 1 つ ([`items`])。
+#[derive(Debug)]
+struct Item {
+    /// 前のコメントに `@internal` があり、宣言ファイルに写す位置にある。
+    internal: bool,
+    /// 本文のトークン ([`fingerprint`])。
+    text: String,
+    /// `@internal` を読む文の鍵 ([`neutralize`] で残す単位)。変数の文は、宣言ごとの項目が文を
+    /// 共有する。
+    owner: String,
+}
+
+/// 項目を辿るときのノード。
+#[derive(Clone, Copy)]
+enum ItemNode<'tree> {
+    /// `@internal` を読む文やメンバー。
+    Anchor(Node<'tree>),
+    /// 変数の文 `statement` の宣言 1 つ。
+    Binding {
+        statement: Node<'tree>,
+        declarator: Node<'tree>,
+    },
+}
+
+/// 宣言を並べる本体の直下の文 (export 文を含む) か、型・クラス・enum のメンバーかタプルの要素か。
+fn is_item(node: Node<'_>) -> bool {
+    node.is_named()
+        && node.kind() != "comment"
+        && (node
+            .parent()
+            .is_some_and(|parent| is_declaration_body(parent.kind()))
+            || is_strippable_type_element(node))
+}
+
+/// 本文の構造とトークン (コメントを除く。名前のあるノードの種類と境界を含め、`return` の後の
+/// 改行で式が切れるような構造の違いも区別する。文字列・テンプレート・正規表現は中身の空白も保つ)。
+fn fingerprint(node: Node<'_>, source: &[u8]) -> String {
+    enum Step<'tree> {
+        Enter(Node<'tree>),
+        Exit,
+    }
+    let mut out = String::new();
+    let mut stack = vec![Step::Enter(node)];
+    while let Some(step) = stack.pop() {
+        let Step::Enter(node) = step else {
+            out.push('\u{3}');
+            continue;
+        };
+        match node.kind() {
+            "comment" => continue,
+            "string" | "template_string" | "regex" => {}
+            _ if node.child_count() > 0 => {
+                if node.is_named() {
+                    out.push_str(node.kind());
+                    out.push('\u{2}');
+                    stack.push(Step::Exit);
+                }
+                let mut cursor = node.walk();
+                let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev().map(Step::Enter));
+                continue;
+            }
+            _ => {}
+        }
+        out.push_str(node.utf8_text(source).unwrap_or_default());
+        out.push('\u{1}');
+    }
+    out
+}
+
+/// 変数の文 (export 文を含む) なら、その宣言のノード。
+fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    let declaration = declaration_of(node);
+    matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    )
+    .then_some(declaration)
+}
+
+/// 項目の名前 (宣言の名前。名前の無いものは種類と本文)。
+fn item_name(node: Node<'_>, source: &[u8]) -> String {
+    let declaration = declaration_of(node);
+    if let Some(name) = declaration.child_by_field_name("name") {
+        return fingerprint(name, source);
+    }
+    match declaration.kind() {
+        "property_identifier" | "string" => fingerprint(declaration, source),
+        kind => format!("{kind}:{}", fingerprint(declaration, source)),
+    }
+}
+
+/// 前のコメントに `@internal` があり、宣言ファイルに写す位置にあるか。
+fn is_internal_item(node: Node<'_>, source: &[u8]) -> bool {
+    has_internal_comment(node, source) && is_emitted_position(node)
+}
+
+/// ソースの項目 (鍵 → 項目)。鍵は、囲む項目の名前と自身の名前をつないだもの (同じ鍵は現れた順の
+/// 番号を付ける。オーバーロードなど)。変数の文は宣言ごとに項目にする (`const a = 1, b = 2` の
+/// 宣言を足し引きしても、ほかの宣言は同じ鍵で対応する)。
+fn items(root: Node<'_>, source: &[u8]) -> HashMap<String, Item> {
+    let mut items = HashMap::new();
+    visit_items(root, source, &mut |node, key, owner| {
+        let item = match node {
+            ItemNode::Anchor(anchor) if variable_declaration(anchor).is_some() => return,
+            ItemNode::Anchor(anchor) => Item {
+                internal: is_internal_item(anchor, source),
+                text: fingerprint(anchor, source),
+                owner: owner.to_owned(),
+            },
+            ItemNode::Binding {
+                statement,
+                declarator,
+            } => {
+                // `const`・`let`・`var` の違いも宣言ファイルに出る。
+                let keyword = variable_declaration(statement)
+                    .and_then(|declaration| declaration.child(0))
+                    .and_then(|keyword| keyword.utf8_text(source).ok())
+                    .unwrap_or_default();
+                Item {
+                    internal: is_internal_item(statement, source),
+                    text: format!("{keyword}\u{1}{}", fingerprint(declarator, source)),
+                    owner: owner.to_owned(),
+                }
+            }
+        };
+        items.insert(key.to_owned(), item);
+    });
+    items
+}
+
+/// 項目を文書の順に辿る (ノード, [`items`] の鍵, `@internal` を読む文の鍵)。
+fn visit_items(root: Node<'_>, source: &[u8], visit: &mut impl FnMut(ItemNode<'_>, &str, &str)) {
+    fn key(prefix: &str, name: &str, seen: &mut HashMap<String, usize>) -> String {
+        let base = format!("{prefix}\u{1f}{name}");
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            base
+        } else {
+            format!("{base}#{count}")
+        }
+    }
+    fn walk(
+        node: Node<'_>,
+        prefix: &str,
+        source: &[u8],
+        seen: &mut HashMap<String, usize>,
+        visit: &mut impl FnMut(ItemNode<'_>, &str, &str),
+    ) {
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        for child in children {
+            if !is_item(child) {
+                walk(child, prefix, source, seen, visit);
+                continue;
+            }
+            let Some(declaration) = variable_declaration(child) else {
+                let item = key(prefix, &item_name(child, source), seen);
+                visit(ItemNode::Anchor(child), &item, &item);
+                walk(child, &item, source, seen, visit);
+                continue;
+            };
+            let mut cursor = declaration.walk();
+            let declarators: Vec<Node<'_>> = declaration
+                .named_children(&mut cursor)
+                .filter(|declarator| declarator.kind() == "variable_declarator")
+                .collect();
+            let names: Vec<String> = declarators
+                .iter()
+                .filter_map(|declarator| declarator.child_by_field_name("name"))
+                .map(|name| fingerprint(name, source))
+                .collect();
+            let owner = key(prefix, &format!("var:{}", names.join(",")), seen);
+            visit(ItemNode::Anchor(child), &owner, &owner);
+            for declarator in declarators {
+                let name = declarator
+                    .child_by_field_name("name")
+                    .map(|name| fingerprint(name, source))
+                    .unwrap_or_default();
+                let binding = key(prefix, &name, seen);
+                visit(
+                    ItemNode::Binding {
+                        statement: child,
+                        declarator,
+                    },
+                    &binding,
+                    &owner,
+                );
+                walk(declarator, &binding, source, seen, visit);
+            }
+        }
+    }
+    walk(root, "", source, &mut HashMap::new(), visit);
+}
+
+/// 鍵が `keep` の文の前のコメントの `@internal` を `@INTERNAL` にした `source` (位置は変えない)。
+fn neutralize(root: Node<'_>, source: &[u8], keep: &HashSet<String>) -> Vec<u8> {
+    let mut ranges = Vec::new();
+    visit_items(root, source, &mut |node, key, _| {
+        if let ItemNode::Anchor(anchor) = node
+            && keep.contains(key)
+        {
+            ranges.extend(
+                leading_comments(anchor, source)
+                    .iter()
+                    .map(|comment| comment.byte_range()),
+            );
+        }
+    });
+    let mut view = source.to_vec();
+    for range in ranges {
+        let Some(comment) = view.get_mut(range) else {
+            continue;
+        };
+        let mut index = 0;
+        while index + b"@internal".len() <= comment.len() {
+            if &comment[index..index + b"@internal".len()] == b"@internal" {
+                comment[index..index + b"@internal".len()].copy_from_slice(b"@INTERNAL");
+                index += b"@internal".len();
+            } else {
+                index += 1;
+            }
+        }
+    }
+    view
 }
 
 /// TypeScript の改行 (`\n`・`\r`・U+2028・U+2029) があるか。

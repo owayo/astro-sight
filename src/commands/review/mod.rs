@@ -325,7 +325,7 @@ fn review_attempt_with_swift_protocols(
             analysis_dir,
             analysis_base,
             &api_diff_files(&diff_files, &diff_input),
-            &crate::engine::diff::parse_hunkless_renames(&diff_input),
+            &crate::engine::diff::parse_hunkless_changes(&diff_input),
         )
     });
     if keep_reference_downgrades_blocking {

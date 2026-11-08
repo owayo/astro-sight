@@ -68,8 +68,9 @@ pub(crate) fn detect_api_changes(
     detect_api_changes_with_renames(dir, base, diff_files, &[])
 }
 
-/// `renames` は diff の内容同一の rename (`parse_hunkless_renames`)。API の分類には使わず、
-/// 削除した Rust の宣言と同名の参照があるファイルの、変更前の位置を引くためだけに使う。
+/// `renames` は diff の hunk の無い変更 (`parse_hunkless_changes`: 内容同一の rename と空のファイルの
+/// 追加・削除)。API の分類には使わず、削除した Rust の宣言と同名の参照があるファイルの変更前の位置を
+/// 引くのと、TS の `stripInternal` の比べ直しの引き金 (Issue #287・#288) にだけ使う。
 pub(crate) fn detect_api_changes_with_renames(
     dir: &str,
     base: &str,
