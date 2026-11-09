@@ -2374,3 +2374,31 @@ fn build_review_hook_json_blocks_incomplete_rust_module_availability() {
     );
     assert!(build.is_blocking, "探し切れなければ hook を止める: {value}");
 }
+
+/// 変わった `use` が再公開する名前を探し切れなかった申告は、再公開した名前の削除を見逃し得るので
+/// blocking (Issue #306・#318)。
+#[test]
+fn build_review_hook_json_blocks_incomplete_rust_reexports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        truncations: vec![crate::models::truncation::TruncationInfo::new(
+            Some("src/lib.rs".to_string()),
+            crate::models::truncation::TruncationReason::RustReexportsIncomplete,
+            "names re-exported by changed Rust `use` declarations were not all compared"
+                .to_string(),
+        )],
+        ..Default::default()
+    };
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let value = build.value.expect("申告を hook に出すべき");
+    assert_eq!(
+        value["trunc"][0]["r"], "rust_reexports_incomplete",
+        "{value}"
+    );
+    assert_eq!(
+        value["blocking_categories"],
+        serde_json::json!(["api.rust_reexports_incomplete"]),
+        "{value}"
+    );
+    assert!(build.is_blocking, "探し切れなければ hook を止める: {value}");
+}

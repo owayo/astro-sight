@@ -133,11 +133,14 @@ fn preceding_attribute_items(item: tree_sitter::Node<'_>) -> Vec<tree_sitter::No
     attributes
 }
 
-/// 中身 (`declaration_list`・`block`・`source_file`) の内側の属性 (`inner_attribute_item`) のノード。
+/// 中身 (`declaration_list`・`block`・`source_file`) の内側の属性 (`inner_attribute_item`) のノード。内側の
+/// 属性は中身の先頭 (ファイルなら shebang の後) にしか書けない (項目の後ろは rustc が拒む) ので、項目が来たら
+/// 止める (項目ごとにファイルの全ての項目を読まない)。
 fn inner_attribute_items(body: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     let mut cursor = body.walk();
     body.named_children(&mut cursor)
-        .filter(|child| child.kind() == "inner_attribute_item")
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment" | "shebang"))
+        .take_while(|child| child.kind() == "inner_attribute_item")
         .collect()
 }
 

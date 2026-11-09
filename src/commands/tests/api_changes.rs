@@ -23,6 +23,7 @@ mod rust_module_visibility;
 mod rust_parameter_binding;
 mod rust_reexport;
 mod rust_reexport_moves;
+mod rust_reexport_names;
 mod rust_reference_sites;
 mod rust_same_name_items;
 mod rust_signature_dependencies;

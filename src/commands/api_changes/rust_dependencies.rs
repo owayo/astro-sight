@@ -36,8 +36,10 @@ use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_us
 
 pub(crate) mod crates;
 pub(crate) mod dependents;
+pub(crate) mod exports;
 pub(crate) mod placements;
 mod resolver;
+pub(crate) mod use_scan;
 
 pub(crate) use crates::RustCrates;
 pub(crate) use dependents::{ChangeSet, MoveMap};
@@ -130,6 +132,16 @@ fn visibility(item: tree_sitter::Node<'_>, source: &[u8], current: &[String]) ->
     else {
         return Visibility::Within(current.to_vec());
     };
+    modifier_visibility(modifier, source, current)
+}
+
+/// module `current` の中の見える範囲の指定 `modifier` (`visibility_modifier`) が表す範囲 (タプル構造体の
+/// フィールドにも使う)。
+fn modifier_visibility(
+    modifier: tree_sitter::Node<'_>,
+    source: &[u8],
+    current: &[String],
+) -> Visibility {
     let text: String = modifier
         .utf8_text(source)
         .unwrap_or_default()
