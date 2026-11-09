@@ -79,6 +79,10 @@ pub enum TruncationReason {
     /// module の公開の項目を探し切れなかった (場所を決められない・読めない・構文エラー・項目の位置の
     /// マクロ・上限、Issue #305)。公開の項目が消える設定を見逃し得るので、hook は止める。
     RustModuleAvailabilityIncomplete,
+    /// Rust の lib crate で再公開に効く `use` が変わり、それが作る名前を探し切れなかった (列挙できない
+    /// glob・上限・lib crate を開けない、Issue #306・#318)。再公開した名前の削除を見逃し得るので、hook は
+    /// 止める。
+    RustReexportsIncomplete,
 }
 
 impl TruncationInfo {

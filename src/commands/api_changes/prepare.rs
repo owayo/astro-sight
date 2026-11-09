@@ -97,6 +97,18 @@ pub(crate) struct ApiChangeBuckets {
     /// 無かった設定に増えた Rust の項目 (`#[cfg]` を外した・広げた。Issue #291) と旧新の条件。
     /// 追加と同じ絞り込みを通したもの。
     pub(crate) cfg_added: Vec<(ApiSymbolCandidate, crate::models::review::CfgAvailability)>,
+    /// 再公開した名前の削除 (`pub use` を消した・公開範囲を狭めた。Issue #318) と、旧版で名前の指して
+    /// いた宣言。移動の相殺にかけない。
+    pub(crate) reexport_removed: Vec<(
+        ApiSymbolCandidate,
+        Vec<super::rust_reexport_names::DeclarationId>,
+    )>,
+    /// 新しく再公開した名前 (Issue #306) と、新版で名前の指す宣言。追加と同じ絞り込みを通したもの。
+    /// 移動の相殺にかけない。
+    pub(crate) reexport_added: Vec<(
+        ApiSymbolCandidate,
+        Vec<super::rust_reexport_names::DeclarationId>,
+    )>,
 }
 
 /// diff 全体で不変な入力。ファイル単位の分類関数が共通で参照する。
@@ -124,6 +136,8 @@ pub(crate) struct DetectionInputs<'a> {
     /// module の宣言の条件が変わった module の項目の比べ直し (Issue #305)。比べ直した項目は、
     /// ファイルごとの有る設定の比較と削除・追加の候補から外す。
     pub(crate) module_availability: &'a super::rust_module_availability::ModuleAvailability,
+    /// 変わった `use` が再公開する名前の比べ直し (Issue #306・#318)。
+    pub(crate) reexport_names: &'a super::rust_reexport_names::ReexportNames,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。

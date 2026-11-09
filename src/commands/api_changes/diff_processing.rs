@@ -1251,6 +1251,96 @@ pub(crate) fn record_module_availability(
     }
 }
 
+/// 再公開した名前の比べ直しの結果 (Issue #306・#318) を振り分ける: 有る設定の変化は #291 と同じ区分、
+/// 名前の削除・追加はふつうの削除・追加 (移動の相殺にかけない)、比べられなければ blocking の変更。
+pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut DetectionState<'_>) {
+    use super::rust_availability::AvailabilityChange;
+    use super::rust_reexport_names::NameOutcome;
+    // 追加は #291 と同じ絞り込み: 名前を作るファイルの中から呼ぶ名前と、差分のほかのファイルで使う名前は
+    // 除く。
+    let mut callees: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut addable = |candidate: &ApiSymbolCandidate| {
+        let in_file = callees.entry(candidate.file.clone()).or_insert_with(|| {
+            super::prepare::extract_new_file_facts(
+                inputs.dir,
+                &candidate.file,
+                inputs.strip_internal,
+            )
+            .callees
+        });
+        !is_internally_connected(in_file, &candidate.name)
+            && !is_used_in_diff_paths(
+                inputs.ref_index,
+                inputs.dir,
+                &candidate.name,
+                &candidate.file,
+                inputs.diff_new_paths,
+            )
+    };
+    for outcome in inputs.reexport_names.outcomes() {
+        match outcome {
+            NameOutcome::Availability {
+                candidate,
+                lost,
+                gained,
+                availability,
+            } => {
+                let item = AvailabilityItem {
+                    candidate: candidate.clone(),
+                    old_signature: candidate.signature.clone(),
+                    availability: availability.clone(),
+                    removable: true,
+                };
+                let change = AvailabilityChange::Changed {
+                    lost: *lost,
+                    gained: *gained,
+                };
+                record_availability_change(inputs, state, change, item, |_| addable(candidate));
+            }
+            NameOutcome::Removed(candidate, targets) => {
+                state
+                    .buckets
+                    .reexport_removed
+                    .push((candidate.clone(), targets.clone()));
+            }
+            NameOutcome::Added(candidate, targets) => {
+                if addable(candidate) {
+                    state
+                        .buckets
+                        .reexport_added
+                        .push((candidate.clone(), targets.clone()));
+                }
+            }
+            NameOutcome::Unverified {
+                candidate,
+                old_signature,
+            } => {
+                let change = ApiSymbolChange {
+                    inline_module: candidate.inline_module.clone(),
+                    unverified: None,
+                    name: candidate.name.clone(),
+                    kind: candidate.kind.clone(),
+                    file: candidate.file.clone(),
+                    old_signature: Some(old_signature.clone()),
+                    new_signature: Some(candidate.signature.clone()),
+                    no_resolved_internal_callers: false,
+                    contract_change: None,
+                };
+                record_signature_decision(
+                    inputs,
+                    state,
+                    change,
+                    SignatureDecision::Unverified(ApiModificationUnverified {
+                        reason: ApiModificationUnverifiedReason::RustCfgAvailabilityUnverified,
+                        first_unproven: None,
+                    }),
+                );
+            }
+        }
+    }
+}
+
 /// 別のファイルへ移した Rust の項目 (`moved`) の、移動元 (base) と移動先 (作業ツリー) の宣言 (同じ
 /// 場所の `#[cfg]` の分岐をまとめて) の有る設定を比べる (Issue #291)。
 pub(crate) fn compare_moved_availability(

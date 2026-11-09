@@ -73,6 +73,55 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
     alias_override: Option<&str>,
     out: &mut Vec<RustPubUseEdge>,
 ) -> Option<()> {
+    expand_edges(
+        node,
+        source,
+        path_prefix,
+        current_module,
+        source_module,
+        alias_override,
+        out,
+        None,
+    )
+}
+
+/// [`expand_rust_use_tree_edges_ast`] と同じく展開し、group の中の `self` の取り込み (`a::b::{self}`・
+/// `a::b::{self as c}`) が作った Named の edge の `out` の添字を `self_edges` に足す (この取り込みは
+/// 型の名前空間の名前だけを作る。Issue #306・#318)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_rust_use_tree_edges_marking_self(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    current_module: &[String],
+    source_module: &[String],
+    alias_override: Option<&str>,
+    out: &mut Vec<RustPubUseEdge>,
+    self_edges: &mut Vec<usize>,
+) -> Option<()> {
+    expand_edges(
+        node,
+        source,
+        path_prefix,
+        current_module,
+        source_module,
+        alias_override,
+        out,
+        Some(self_edges),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_edges(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    current_module: &[String],
+    source_module: &[String],
+    alias_override: Option<&str>,
+    out: &mut Vec<RustPubUseEdge>,
+    mut self_edges: Option<&mut Vec<usize>>,
+) -> Option<()> {
     let mut pending = vec![UseTreeFrame {
         node,
         path_prefix: Rc::from(path_prefix),
@@ -204,6 +253,19 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                     let exported_name = alias_override
                         .map(str::to_string)
                         .unwrap_or_else(|| item.clone());
+                    // group の中の `self` (`a::b::{self}`) と末尾の `::self` (`a::b::self`) は、経路の
+                    // module 自身を取り込む。
+                    let trailing_self = node.kind() == "scoped_identifier"
+                        && node
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(source).ok())
+                            .map(str::trim)
+                            == Some("self");
+                    if ((node.kind() == "self" && !path_prefix.is_empty()) || trailing_self)
+                        && let Some(marks) = self_edges.as_deref_mut()
+                    {
+                        marks.push(out.len());
+                    }
                     out.push(RustPubUseEdge::Named {
                         source_module: source_module.to_vec(),
                         exported_name,

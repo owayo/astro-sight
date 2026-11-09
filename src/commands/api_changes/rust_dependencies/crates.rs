@@ -8,7 +8,7 @@
 
 use super::*;
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 /// 開いたファイルの鍵 (パス・module の経路・`mod.rs` と同じ扱いか)。
@@ -113,6 +113,18 @@ impl<'a> CrateVersion<'a> {
     /// パス `path` の中身 (この版)。
     pub(crate) fn read(&self, path: &str) -> Option<Vec<u8>> {
         (self.read)(path)
+    }
+
+    /// この版の package `package` の lib target の edition (決められなければ None)。
+    pub(crate) fn edition(
+        &self,
+        package: &str,
+    ) -> Option<crate::engine::rust_edition::RustEdition> {
+        use crate::engine::rust_edition::{ManifestUnreadable, library_edition};
+        library_edition(std::path::Path::new(package), |manifest| {
+            let path = manifest.to_str().ok_or(ManifestUnreadable)?;
+            Ok(self.read(&crate::git_support::normalize_workspace_separators(path)))
+        })
     }
 
     /// パス `path` がこの版にあるか。
@@ -423,6 +435,8 @@ pub(crate) struct CratePair<'a> {
     /// module の置き場の条件に効く入力 ([`DependencyIndex::module_condition_fingerprint`]) が旧新で
     /// 変わった (Issue #305)。
     pub(crate) module_conditions: bool,
+    /// 再公開に効く `use` ([`super::exports::reexport_fingerprint`]) が旧新で変わった (Issue #306・#318)。
+    pub(crate) reexports: bool,
     /// package (いちばん近い `Cargo.toml` のあるディレクトリ)。
     pub(crate) package: String,
 }
@@ -466,6 +480,8 @@ pub(crate) struct RustCrates<'a> {
     /// module の置き場の条件に効く入力が変わったが、lib crate を開けなかった package の crate root と
     /// 理由 (Issue #305)。
     module_gaps: Vec<(String, String)>,
+    /// 再公開に効く `use` が変わったが、lib crate を開けなかった package の crate root と理由 (Issue #306)。
+    reexport_gaps: Vec<(String, String)>,
 }
 
 /// パスが package の lib crate のソースになり得るなら、その package (いちばん近い `Cargo.toml` の
@@ -558,25 +574,58 @@ impl<'a> RustCrates<'a> {
             })
             .map(|df| (df.old_path.clone(), df.new_path.clone()))
             .collect();
+        // manifest だけを変えた package も (edition は経路の読み方を変える。Issue #306・#318)。workspace の
+        // manifest なら、edition を継承し得る member の package も。
         let mut packages: Vec<String> = all
             .iter()
             .flat_map(|df| [df.old_path.as_str(), df.new_path.as_str()])
-            .filter_map(|path| package_of(dir, path))
+            .filter_map(|path| package_of(dir, path).or_else(|| manifest_package(dir, path)))
             .collect();
+        let mut member_gaps: Vec<(String, String)> = Vec::new();
+        for df in &all {
+            for path in [df.old_path.as_str(), df.new_path.as_str()] {
+                if path == "Cargo.toml" || path.ends_with("/Cargo.toml") {
+                    let (members, truncated) = workspace_members(dir, path);
+                    packages.extend(members);
+                    if truncated {
+                        member_gaps.push((
+                            path.to_owned(),
+                            "the members of the workspace could not all be listed".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         packages.sort();
         packages.dedup();
         let mut pairs = HashMap::new();
         let mut module_gaps = Vec::new();
+        let mut reexport_gaps = member_gaps;
         for package in packages {
             match build_pair(dir, &all, &rename_pairs, base_blobs, &package) {
                 Built::Pair(pair) => {
                     pairs.insert(package, *pair);
                 }
-                Built::ModuleGap(reason) => module_gaps.push((library_root(&package), reason)),
+                Built::Gap {
+                    modules,
+                    reexports,
+                    reason,
+                } => {
+                    if modules {
+                        module_gaps.push((library_root(&package), reason.clone()));
+                    }
+                    if reexports {
+                        reexport_gaps.push((library_root(&package), reason));
+                    }
+                }
                 Built::Nothing => {}
             }
         }
-        Self { pairs, module_gaps }
+        Self {
+            pairs,
+            module_gaps,
+            reexport_gaps,
+        }
     }
 
     /// パス `path` の package の旧新の lib crate。束縛の入力が旧新で変わらない (ファイルの外へ出る
@@ -613,13 +662,35 @@ impl<'a> RustCrates<'a> {
     pub(crate) fn module_gaps(&self) -> &[(String, String)] {
         &self.module_gaps
     }
+
+    /// 再公開に効く `use` が変わった package の、crate root のパスと旧新の lib crate (Issue #306・#318)。
+    pub(crate) fn reexport_pairs(&self) -> impl Iterator<Item = (String, &CratePair<'a>)> {
+        let mut pairs: Vec<(String, &CratePair<'a>)> = self
+            .pairs
+            .values()
+            .filter(|pair| pair.reexports)
+            .map(|pair| (pair.old.root_path().to_owned(), pair))
+            .collect();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs.into_iter()
+    }
+
+    /// 再公開に効く `use` が変わったが、lib crate を開けなかった package の crate root と理由。
+    pub(crate) fn reexport_gaps(&self) -> &[(String, String)] {
+        &self.reexport_gaps
+    }
 }
 
 /// package の旧新の lib crate を作った結果。
 enum Built<'a> {
     Pair(Box<CratePair<'a>>),
-    /// module の置き場の条件に効く入力が変わったが、lib crate を開けない (理由)。
-    ModuleGap(String),
+    /// module の置き場の条件に効く入力 (`modules`) か再公開に効く `use` (`reexports`) が変わったが、lib
+    /// crate を開けない (理由)。
+    Gap {
+        modules: bool,
+        reexports: bool,
+        reason: String,
+    },
     Nothing,
 }
 
@@ -646,7 +717,13 @@ fn build_pair<'a>(
                 || package_of(dir, &df.new_path).as_deref() == Some(package)
         })
         .collect();
-    let (dependencies, module_conditions) = inputs_changed(dir, base_blobs, &module_files, |df| {
+    let InputChanges {
+        bindings: dependencies,
+        modules: module_conditions,
+        reexports,
+        imports,
+        declarations,
+    } = inputs_changed(dir, base_blobs, &module_files, |df| {
         in_package(&df.old_path) || in_package(&df.new_path)
     });
     // crate root は旧新の manifest の `[lib] path` (無ければ `src/lib.rs`)。束縛の比べ直し (#300) は
@@ -664,15 +741,59 @@ fn build_pair<'a>(
     let dependencies = dependencies
         && old_root.as_deref() == Some(conventional.as_str())
         && new_root.as_deref() == Some(conventional.as_str());
-    if !dependencies && !module_conditions {
+    // module の置き場が変われば、その module の名前を取り込む名前も変わり得る。edition が変われば、名前で
+    // 始まる経路の読み方が変わる (Issue #306・#318)。
+    let edition = |read: &dyn Fn(&str) -> Option<Vec<u8>>| {
+        crate::engine::rust_edition::library_edition(std::path::Path::new(package), |manifest| {
+            let path = manifest
+                .to_str()
+                .ok_or(crate::engine::rust_edition::ManifestUnreadable)?;
+            Ok(read(&crate::git_support::normalize_workspace_separators(
+                path,
+            )))
+        })
+    };
+    // edition は workspace の manifest から継承され得るので、どの manifest の変更でも比べる。
+    let manifest_changed = diff_files.iter().any(|df| {
+        [df.old_path.as_str(), df.new_path.as_str()]
+            .iter()
+            .any(|path| *path == "Cargo.toml" || path.ends_with("/Cargo.toml"))
+    });
+    let edition_changed = manifest_changed
+        && edition(&|path: &str| base_blobs.read(path))
+            != edition(&|path: &str| {
+                super::super::source_pair::load_new_source(dir, path).map(|text| text.to_vec())
+            });
+    // 宣言と非公開の取り込みだけが変わったなら、宣言が extern prelude の crate の名前を隠し得るか、非公開の
+    // 取り込みの名前を経路に使う `use` か字面に持つ module の位置のマクロが package にあるときだけ開く (crate
+    // 全体を旧新で読むのは重い)。glob のあるスコープの宣言は、門の前の確認で開いている。
+    let shadows = !declarations.is_empty()
+        && extern_prelude_names(dir, package, base_blobs)
+            .is_none_or(|names| declarations.iter().any(|name| names.contains(name)));
+    let reexports = reexports
+        || module_conditions
+        || edition_changed
+        || shadows
+        || (!imports.is_empty() && {
+            // 旧版にだけある `use` も数える (1 つずつ読み、合計の上限を超えたら残りを読まない)。
+            let old_sources = module_files
+                .iter()
+                .filter(|df| df.old_path != "/dev/null" && df.old_path.ends_with(".rs"))
+                .filter_map(|df| base_blobs.read(&df.old_path));
+            super::use_scan::mentions(dir, package, &imports, old_sources)
+        });
+    if !dependencies && !module_conditions && !reexports {
         return Built::Nothing;
     }
     let root = match (old_root, new_root) {
         (Some(old_root), Some(new_root)) if old_root == new_root => old_root,
-        _ if module_conditions => {
-            return Built::ModuleGap(
-                "the library root could not be read or differs between the versions".to_owned(),
-            );
+        _ if module_conditions || reexports => {
+            return Built::Gap {
+                modules: module_conditions,
+                reexports,
+                reason: "the library root could not be read or differs between the versions"
+                    .to_owned(),
+            };
         }
         _ => return Built::Nothing,
     };
@@ -720,8 +841,12 @@ fn build_pair<'a>(
     let (old_root, new_root) = (old.root(), new.root());
     let lib_exists = |version: &CrateVersion<'_>| version.read(&version.root).is_some();
     if !matches!(old_root, Opened::File(_)) || !matches!(new_root, Opened::File(_)) {
-        return if module_conditions && lib_exists(&old) && lib_exists(&new) {
-            Built::ModuleGap("the crate root does not parse".to_owned())
+        return if (module_conditions || reexports) && lib_exists(&old) && lib_exists(&new) {
+            Built::Gap {
+                modules: module_conditions,
+                reexports,
+                reason: "the crate root does not parse".to_owned(),
+            }
         } else {
             Built::Nothing
         };
@@ -752,24 +877,28 @@ fn build_pair<'a>(
         multi_placed: analysis.multi_placed,
         dependencies,
         module_conditions,
+        reexports,
         package: package.to_owned(),
     }))
 }
 
 /// 差分のファイル `files` で、resolver が読む束縛 ([`DependencyIndex::fingerprint`]。`dependency` が真の
-/// ファイルだけ、Issue #300) と、module の置き場の条件に効く入力
-/// ([`DependencyIndex::module_condition_fingerprint`]、Issue #305) が旧新で変わったか。ファイルの追加・
+/// ファイルだけ、Issue #300)、module の置き場の条件に効く入力
+/// ([`DependencyIndex::module_condition_fingerprint`]、Issue #305)、再公開した名前に効く変化
+/// ([`super::exports::reexport_change`]、Issue #306・#318) が旧新で変わったか。ファイルの追加・
 /// 削除・rename と、旧新のどちらかが読めない・構文エラーなら変わったとする。旧新は 1 度ずつ解析する。
 fn inputs_changed(
     dir: &str,
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     files: &[&crate::models::impact::DiffFile],
     dependency: impl Fn(&crate::models::impact::DiffFile) -> bool,
-) -> (bool, bool) {
-    let (mut bindings, mut modules) = (false, false);
+) -> InputChanges {
+    let (mut bindings, mut modules, mut reexports) = (false, false, false);
+    let mut imports: Vec<(Vec<String>, String)> = Vec::new();
+    let mut declarations: Vec<String> = Vec::new();
     for df in files {
         let follows = dependency(df);
-        if bindings && modules || (!follows && modules) {
+        if (bindings || !follows) && modules && reexports {
             continue;
         }
         // 版のファイルの索引 (無ければ Some(None)、読めない・構文エラーなら None)。
@@ -811,8 +940,370 @@ fn inputs_changed(
         };
         modules |=
             old.is_none() || new.is_none() || module_fingerprint(&old) != module_fingerprint(&new);
+        // 再公開した名前に効く変化は、無いファイルを名前を作るものの無いファイルとして比べる。読めない
+        // ファイルは変わったとする。宣言と非公開の取り込みだけの変化は、それを経路に使う取り込みがあるかを
+        // 後で確かめる。
+        match (&old, &new) {
+            (Some(old), Some(new)) => {
+                match super::exports::reexport_change(old.as_ref(), new.as_ref()) {
+                    super::exports::ReexportChange::None => {}
+                    super::exports::ReexportChange::Relevant => reexports = true,
+                    super::exports::ReexportChange::Mentioned {
+                        imports: changed_imports,
+                        declarations: changed_declarations,
+                    } => {
+                        imports.extend(changed_imports);
+                        declarations.extend(changed_declarations);
+                    }
+                }
+            }
+            _ => reexports = true,
+        }
     }
-    (bindings, modules)
+    InputChanges {
+        bindings,
+        modules,
+        reexports,
+        imports,
+        declarations,
+    }
+}
+
+/// 差分のファイルの入力の変化 ([`inputs_changed`])。
+struct InputChanges {
+    /// resolver が読む束縛 (#300)。
+    bindings: bool,
+    /// module の置き場の条件に効く入力 (#305)。
+    modules: bool,
+    /// 再公開した名前に効く変化 (#306・#318)。
+    reexports: bool,
+    /// 非公開の取り込みだけが変わった (module, 名前)。
+    imports: Vec<(Vec<String>, String)>,
+    /// 見える範囲のほかが変わった宣言の名前 (glob のないスコープ)。
+    declarations: Vec<String>,
+}
+
+/// package の extern prelude に入り得る crate の名前 (sysroot の crate と、旧新の manifest の依存 (dev・build・
+/// target ごとのものも) の名前。`-` は `_`)。manifest を読めなければ None。
+fn extern_prelude_names(
+    dir: &str,
+    package: &str,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+) -> Option<HashSet<String>> {
+    let mut names: HashSet<String> = ["std", "core", "alloc", "proc_macro", "test"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let manifest = manifest_path(package);
+    let versions = [
+        base_blobs.read(&manifest),
+        super::super::source_pair::load_new_source(dir, &manifest).map(|text| text.to_vec()),
+    ];
+    for text in versions.into_iter().flatten() {
+        let value = String::from_utf8(text).ok()?.parse::<toml::Table>().ok()?;
+        for table in dependency_tables(&value) {
+            names.extend(table.keys().map(|key| key.replace('-', "_")));
+        }
+    }
+    Some(names)
+}
+
+/// manifest の依存の表 (dev・build も。`target.<条件>` の下にも同じ表がある)。
+const DEPENDENCY_TABLES: [&str; 5] = [
+    "dependencies",
+    "dev-dependencies",
+    "dev_dependencies",
+    "build-dependencies",
+    "build_dependencies",
+];
+
+/// manifest `manifest` の依存の表 (target ごとのものも)。
+fn dependency_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
+    let mut tables: Vec<&toml::Value> = DEPENDENCY_TABLES
+        .iter()
+        .filter_map(|key| manifest.get(*key))
+        .collect();
+    for target in manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values())
+    {
+        tables.extend(DEPENDENCY_TABLES.iter().filter_map(|key| target.get(*key)));
+    }
+    tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .collect()
+}
+
+/// workspace の manifest `path` の member の package と、列挙し切れなかったか。`members` の glob (`*`・`?`・
+/// `[...]`・`**`) を展開し、member の path 依存のうち workspace のディレクトリの中の package (Cargo は暗黙の
+/// member にする) も足し、`exclude` のパスとその下を除く。読めなければ空。
+fn workspace_members(dir: &str, path: &str) -> (Vec<String>, bool) {
+    let base = path.strip_suffix("Cargo.toml").unwrap_or_default();
+    let read = |manifest: &str| -> Option<toml::Table> {
+        std::fs::read_to_string(std::path::Path::new(dir).join(manifest))
+            .ok()?
+            .parse::<toml::Table>()
+            .ok()
+    };
+    let Some(manifest) = read(path) else {
+        return (Vec::new(), false);
+    };
+    let Some(workspace) = manifest.get("workspace") else {
+        return (Vec::new(), false);
+    };
+    let list = |key: &str| -> Vec<String> {
+        workspace
+            .get(key)
+            .and_then(|values| values.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| format!("{base}{value}").trim_end_matches('/').to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let excluded = list("exclude");
+    let root = base.trim_end_matches('/');
+    // `dep.workspace = true` の依存は、workspace の `[workspace.dependencies]` の `path` (workspace 相対)。
+    let inherited = workspace
+        .get("dependencies")
+        .and_then(toml::Value::as_table);
+    let admitted = |candidate: &str| {
+        let inside =
+            root.is_empty() || candidate == root || candidate.starts_with(&format!("{root}/"));
+        inside
+            && !excluded.iter().any(|excluded| {
+                candidate == excluded || candidate.starts_with(&format!("{excluded}/"))
+            })
+            && std::path::Path::new(dir)
+                .join(manifest_path(candidate))
+                .is_file()
+    };
+    let mut truncated = false;
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for pattern in list("members") {
+        let (candidates, cut) = expand_member_glob(dir, &pattern);
+        truncated |= cut;
+        for candidate in candidates {
+            if admitted(&candidate) && found.insert(candidate.clone()) {
+                queue.push(candidate);
+            }
+        }
+    }
+    // workspace の root の package の path 依存も。
+    if manifest.contains_key("package") {
+        queue.push(root.to_owned());
+    }
+    while let Some(member) = queue.pop() {
+        let Some(member_manifest) = read(&manifest_path(&member)) else {
+            continue;
+        };
+        for table in dependency_tables(&member_manifest) {
+            for (name, dependency) in table {
+                let candidate =
+                    if dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                        inherited
+                            .and_then(|dependencies| dependencies.get(name))
+                            .and_then(|dependency| dependency.get("path"))
+                            .and_then(toml::Value::as_str)
+                            .and_then(|relative| join_path(root, relative))
+                    } else {
+                        dependency
+                            .get("path")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|relative| join_path(&member, relative))
+                    };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                if admitted(&candidate) && found.insert(candidate.clone()) {
+                    queue.push(candidate);
+                }
+            }
+        }
+    }
+    (found.into_iter().collect(), truncated)
+}
+
+/// 展開する glob の `**` がたどるディレクトリの上限 (超えれば列挙し切れなかったとする)。
+const MAX_MEMBER_DIRECTORIES: usize = 10_000;
+
+/// workspace の member の glob `pattern` (`dir` 相対、`/` 区切り) に合うディレクトリ (`dir` 相対) と、`**` の
+/// 上限で列挙し切れなかったか。
+fn expand_member_glob(dir: &str, pattern: &str) -> (Vec<String>, bool) {
+    let join = |base: &str, name: &str| {
+        if base.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{base}/{name}")
+        }
+    };
+    // ディレクトリ `base` の子のディレクトリの名前。
+    let children = |base: &str| -> Vec<String> {
+        std::fs::read_dir(std::path::Path::new(dir).join(base))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut truncated = false;
+    let mut current: Vec<String> = vec![String::new()];
+    for component in pattern.split('/').filter(|component| !component.is_empty()) {
+        let mut next = Vec::new();
+        for base in &current {
+            if component == "." {
+                next.push(base.clone());
+            } else if component == "**" {
+                // 0 個以上のディレクトリ。
+                let mut stack = vec![base.clone()];
+                let mut visited = 0usize;
+                while let Some(found) = stack.pop() {
+                    visited += 1;
+                    if visited > MAX_MEMBER_DIRECTORIES {
+                        truncated = true;
+                        break;
+                    }
+                    stack.extend(children(&found).iter().map(|name| join(&found, name)));
+                    next.push(found);
+                }
+            } else if component.contains(['*', '?', '[']) {
+                let wanted: Vec<char> = component.chars().collect();
+                for name in children(base) {
+                    if glob_component_matches(&wanted, &name.chars().collect::<Vec<_>>()) {
+                        next.push(join(base, &name));
+                    }
+                }
+            } else {
+                next.push(join(base, component));
+            }
+        }
+        next.sort();
+        next.dedup();
+        current = next;
+    }
+    (current, truncated)
+}
+
+/// glob の 1 要素の字句。
+enum GlobToken {
+    /// `*`
+    Star,
+    /// `?`
+    Any,
+    /// `[...]` (文字の範囲, `!` で否定するか)
+    Class(Vec<(char, char)>, bool),
+    Literal(char),
+}
+
+/// glob の 1 要素 `pattern` (`*`・`?`・`[...]`・`[!...]`) に名前 `name` が合うか。最後の `*` へ戻る貪欲な
+/// 照合で、名前とパターンの長さの積で終わる。
+fn glob_component_matches(pattern: &[char], name: &[char]) -> bool {
+    let mut tokens: Vec<GlobToken> = Vec::new();
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            '*' => {
+                tokens.push(GlobToken::Star);
+                index += 1;
+            }
+            '?' => {
+                tokens.push(GlobToken::Any);
+                index += 1;
+            }
+            '[' => {
+                // 閉じの `]` (1 文字目の `]` は文字そのもの)。無ければ `[` を文字そのものとする。
+                let negated = pattern.get(index + 1) == Some(&'!');
+                let body = if negated { index + 2 } else { index + 1 };
+                let close = pattern
+                    .get(body..)
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .position(|c| *c == ']')
+                    .map(|at| body + 1 + at);
+                let Some(close) = close else {
+                    tokens.push(GlobToken::Literal('['));
+                    index += 1;
+                    continue;
+                };
+                let class = &pattern[body..close];
+                let mut ranges = Vec::new();
+                let mut at = 0;
+                while at < class.len() {
+                    if at + 2 < class.len() && class[at + 1] == '-' {
+                        ranges.push((class[at], class[at + 2]));
+                        at += 3;
+                    } else {
+                        ranges.push((class[at], class[at]));
+                        at += 1;
+                    }
+                }
+                tokens.push(GlobToken::Class(ranges, negated));
+                index = close + 1;
+            }
+            c => {
+                tokens.push(GlobToken::Literal(c));
+                index += 1;
+            }
+        }
+    }
+    let one = |token: &GlobToken, c: char| match token {
+        GlobToken::Star => false,
+        GlobToken::Any => true,
+        GlobToken::Class(ranges, negated) => {
+            ranges.iter().any(|(low, high)| *low <= c && c <= *high) != *negated
+        }
+        GlobToken::Literal(literal) => *literal == c,
+    };
+    let (mut at_pattern, mut at_name) = (0, 0);
+    // 最後の `*` の位置と、それが飲んだ名前の終わり。
+    let mut star: Option<(usize, usize)> = None;
+    while at_name < name.len() {
+        match tokens.get(at_pattern) {
+            Some(GlobToken::Star) => {
+                star = Some((at_pattern, at_name));
+                at_pattern += 1;
+            }
+            Some(token) if one(token, name[at_name]) => {
+                at_pattern += 1;
+                at_name += 1;
+            }
+            _ => {
+                let Some((star_pattern, star_name)) = star else {
+                    return false;
+                };
+                at_pattern = star_pattern + 1;
+                at_name = star_name + 1;
+                star = Some((star_pattern, star_name + 1));
+            }
+        }
+    }
+    tokens[at_pattern..]
+        .iter()
+        .all(|token| matches!(token, GlobToken::Star))
+}
+
+/// パス `path` が package の `Cargo.toml` なら、その package (ディレクトリ。lib crate の有無は問わない)。
+fn manifest_package(dir: &str, path: &str) -> Option<String> {
+    let package = if path == "Cargo.toml" {
+        String::new()
+    } else {
+        path.strip_suffix("/Cargo.toml")?.to_owned()
+    };
+    std::path::Path::new(dir)
+        .join(manifest_path(&package))
+        .is_file()
+        .then_some(package)
 }
 
 /// package の `Cargo.toml` のパス。
@@ -839,4 +1330,36 @@ fn library_root_in(package: &str, manifest: Option<&[u8]>) -> Option<String> {
         }
     };
     join_path(package, &relative)
+}
+
+#[cfg(test)]
+mod member_glob_tests {
+    use super::glob_component_matches;
+
+    #[test]
+    fn member_globs_follow_cargo_patterns() {
+        let matches = |pattern: &str, name: &str| {
+            glob_component_matches(
+                &pattern.chars().collect::<Vec<_>>(),
+                &name.chars().collect::<Vec<_>>(),
+            )
+        };
+        assert!(matches("member*", "member"));
+        assert!(matches("member*", "member-two"));
+        assert!(!matches("member*", "other"));
+        assert!(matches("m?mber", "member"));
+        assert!(matches("crate-[ab]", "crate-a"));
+        assert!(!matches("crate-[ab]", "crate-c"));
+        assert!(matches("crate-[!ab]", "crate-c"));
+        assert!(matches("crate-[a-c]", "crate-b"));
+        assert!(matches("*", "anything"));
+        assert!(matches("[", "["));
+        assert!(matches("[]a]", "]"));
+        assert!(matches("[!]a]", "b"));
+        assert!(!matches("[!]a]", "]"));
+        // 長い `*` の並びも、名前とパターンの長さの積で終わる
+        let pattern = format!("{}z", "*a".repeat(20));
+        assert!(!matches(&pattern, &"a".repeat(40)));
+        assert!(matches(&pattern, &format!("{}z", "a".repeat(20))));
+    }
 }

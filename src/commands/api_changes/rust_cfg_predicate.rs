@@ -202,14 +202,19 @@ pub(super) fn string_value(literal: &str) -> Option<String> {
 
 /// 述語の原子の表。同じ字面の原子は同じ番号にする (旧新で共有する)。
 #[derive(Default)]
-pub(super) struct Atoms(Vec<Vec<String>>);
+pub(super) struct Atoms {
+    /// 番号 → 原子の字面。
+    list: Vec<Vec<String>>,
+    /// 原子の字面 → 番号 (原子の多い条件でも、登録が原子の数の 2 乗にならない)。
+    index: std::collections::HashMap<Vec<String>, usize>,
+}
 
 impl Atoms {
     /// 1 つの値しか取らない鍵ごとの、原子の番号のビット。値を解けない原子 (読めないエスケープ) は、
     /// 同じ値の別の書き方かもしれないので含めない。
     pub(super) fn exclusive(&self) -> Vec<u64> {
         let mut masks: BTreeMap<&str, u64> = BTreeMap::new();
-        for (index, atom) in self.0.iter().enumerate() {
+        for (index, atom) in self.list.iter().enumerate() {
             if let [key, equals, value] = atom.as_slice()
                 && equals == "="
                 && SINGLE_VALUED.contains(&key.as_str())
@@ -239,11 +244,12 @@ impl Atoms {
             _ => unrawn.clone(),
         };
         let tokens = normalized.as_slice();
-        let index = match self.0.iter().position(|atom| atom.as_slice() == tokens) {
-            Some(index) => index,
+        let index = match self.index.get(tokens) {
+            Some(&index) => index,
             None => {
-                self.0.push(tokens.to_vec());
-                self.0.len() - 1
+                self.list.push(tokens.to_vec());
+                self.index.insert(tokens.to_vec(), self.list.len() - 1);
+                self.list.len() - 1
             }
         };
         Predicate::Atom(index)
@@ -325,9 +331,16 @@ impl Atoms {
     }
 
     /// 原子の数。
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.0.len()
+        self.list.len()
+    }
+
+    /// 原子 `index` の字面 (`feature = "x"`・`unix` など)。
+    pub(super) fn text(&self, index: usize) -> String {
+        self.list
+            .get(index)
+            .map(|tokens| tokens.join(" "))
+            .unwrap_or_default()
     }
 
     /// 属性 (`#[cfg]` と、`cfg` を含む `#[cfg_attr]`) が全て付いたものが有る条件。
@@ -361,7 +374,7 @@ impl Atoms {
     /// 含み `unix` を除き、`unix` は `windows` を除く (無い原子のビットは 0)。
     fn implications(&self) -> Vec<(u64, u64, u64)> {
         let bit = |name: &str| {
-            self.0
+            self.list
                 .iter()
                 .position(|atom| matches!(atom.as_slice(), [only] if only == name))
                 .map_or(0, |index| 1u64 << index)
@@ -371,7 +384,7 @@ impl Atoms {
         if unix != 0 {
             implications.push((unix, 0, windows));
         }
-        for (index, atom) in self.0.iter().enumerate() {
+        for (index, atom) in self.list.iter().enumerate() {
             let [key, equals, value] = atom.as_slice() else {
                 continue;
             };
@@ -392,12 +405,12 @@ impl Atoms {
     /// 比べる設定 (原子の真偽の組み合わせのうち起こり得るもの)。原子が [`MAX_ATOMS`] を超えれば
     /// None (呼び出し側は壊す扱いにする)。
     pub(super) fn configs(&self) -> Option<impl Iterator<Item = u64> + use<>> {
-        if self.0.len() > MAX_ATOMS {
+        if self.list.len() > MAX_ATOMS {
             return None;
         }
         let exclusive = self.exclusive();
         let implications = self.implications();
-        Some((0..1u64 << self.0.len()).filter(move |config| {
+        Some((0..1u64 << self.list.len()).filter(move |config| {
             possible(*config, &exclusive)
                 && implications.iter().all(|&(atom, required, forbidden)| {
                     config & atom == 0 || (config & required == required && config & forbidden == 0)

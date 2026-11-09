@@ -128,6 +128,14 @@ pub(crate) fn detect_api_changes_with_renames(
     buckets
         .parse_truncations
         .extend(module_availability.truncations.iter().cloned());
+    // 再公開に効く `use` が変わった lib crate で、再公開した名前の有る設定を比べ直す (Issue #306・
+    // #318)。
+    let reexport_names =
+        rust_reexport_names::ReexportNames::new(dir, &rust_crates, diff_files, renames);
+    index_names.extend(reexport_names.index_names().cloned());
+    buckets
+        .parse_truncations
+        .extend(reexport_names.truncations.iter().cloned());
 
     // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった
     // 自由関数・定数は、削除と追加に割れた後で変更として判定し直す
@@ -166,6 +174,7 @@ pub(crate) fn detect_api_changes_with_renames(
         strip_internal: &strip_internal,
         rust_crates: &rust_crates,
         module_availability: &module_availability,
+        reexport_names: &reexport_names,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
@@ -327,6 +336,8 @@ pub(crate) fn detect_api_changes_with_renames(
     // module の宣言の条件が変わった module の項目の比べ直しの結果を、ファイルごとの比較と同じ区分に
     // 振り分ける (Issue #305)。
     record_module_availability(&inputs, &mut state);
+    // 再公開した名前の比べ直しの結果も、同じ区分に振り分ける (Issue #306・#318)。
+    record_reexport_names(&inputs, &mut state);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -347,6 +358,7 @@ pub(crate) fn detect_api_changes_with_renames(
     // ならなかった削除は、`old_path` 依存の帰属判定で片方だけ `removed_dead` へ落ちうる
     // ため、blocking と informational に割れたときだけ保守側 (blocking) へ寄せる
     // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
+    let reexport_removed = std::mem::take(&mut state.buckets.reexport_removed);
     let rust_packages =
         removed_cargo::RemovedRustPackages::new(dir, &base_blobs, diff_files, renames);
     let (mut removed_kept, removed_dead, removed_unresolved) = partition_removed_dead_candidates(
@@ -359,13 +371,25 @@ pub(crate) fn detect_api_changes_with_renames(
     removed_kept.extend(unverified_removed);
     // 有る設定の一部から消えた Rust の項目 (Issue #291) は、項目そのものは残るので移動の相殺に
     // かけず、名前の参照が repo に残れば removed、無ければ removed_dead にする。
-    let (cfg_removed_kept, cfg_removed_dead) =
-        partition_cfg_removals(dir, std::mem::take(&mut state.buckets.cfg_removed));
+    let (cfg_removed_kept, cfg_removed_dead) = partition_cfg_removals(
+        dir,
+        std::mem::take(&mut state.buckets.cfg_removed)
+            .into_iter()
+            .map(|(candidate, availability)| (candidate, Some(availability)))
+            .collect(),
+    );
+    // 再公開した名前の削除 (Issue #306・#318) も同じく分け、同じ名前の宣言自身の削除が同じか強い区分に
+    // 残るものは重ねない。
+    let (reexport_removed_kept, reexport_removed_dead) =
+        partition_reexport_removals(dir, reexport_removed, &removed_kept, &removed_dead);
     let cfg_added = std::mem::take(&mut state.buckets.cfg_added);
+    let reexport_added = std::mem::take(&mut state.buckets.reexport_added);
 
     // cfg の相補的な 2 分岐は公開名として 1 件。同一ファイルの新規候補だけを
     // move 照合が終わった後に畳み、シグネチャ別の対応付け材料は保持する。
     let added = collapse_exclusive_rust_const_additions(dir, added);
+    // 新しく再公開した名前は、名前の指す宣言自身の追加を報告するなら重ねない (Issue #306・#318)。
+    let reexport_added = uncovered_reexports(reexport_added, &[&added]);
 
     // api.add に確定した候補にだけ同一ファイル内参照数を添える。move 相殺 (`moved`) で
     // 抜けた候補には算出しないよう、reconcile 後のこの位置で 1 度だけ数える
@@ -379,6 +403,7 @@ pub(crate) fn detect_api_changes_with_renames(
                 .into_iter()
                 .map(|(c, availability)| (c, Some(availability))),
         )
+        .chain(reexport_added.into_iter().map(|c| (c, None)))
         .map(|(c, cfg_availability)| {
             let refs_internal =
                 count_internal_refs(&ref_index, dir, &c.file, &c.name, &mut closure_caches);
@@ -402,6 +427,7 @@ pub(crate) fn detect_api_changes_with_renames(
             .into_iter()
             .map(|c| c.into_api_symbol())
             .chain(cfg_removed_kept)
+            .chain(reexport_removed_kept)
             .collect(),
         modified: buckets.modified,
         moved,
@@ -410,6 +436,7 @@ pub(crate) fn detect_api_changes_with_renames(
             .into_iter()
             .map(|c| c.into_api_symbol())
             .chain(cfg_removed_dead)
+            .chain(reexport_removed_dead)
             .collect(),
         modified_closed_in_diff: buckets.modified_closed_in_diff,
         const_value_changes: buckets.const_value_changes,
@@ -421,25 +448,45 @@ pub(crate) fn detect_api_changes_with_renames(
     }
 }
 
-/// 有る設定の一部から消えた Rust の項目 (Issue #291) を、名前の参照 (定義を除く) が repo に残るもの
-/// (removed) と残らないもの (removed_dead) に分ける。項目は残るので、削除の区分の残った定義への
-/// 帰属 (`partition_removed_dead_candidates`) は使わない (残った定義は消えた設定の項目そのもの)。
-/// 同じ名前の別のものの参照も数える (保守側)。参照を探せなければ removed に残す。
-fn partition_cfg_removals(
+/// 新しく再公開した名前 (Issue #306・#318) のうち、名前の指す宣言のどれもが `reported` (宣言自身の追加の
+/// 候補) にあるものを除く (同じ項目を 2 度報告しない)。
+fn uncovered_reexports(
+    names: Vec<(ApiSymbolCandidate, Vec<rust_reexport_names::DeclarationId>)>,
+    reported: &[&[ApiSymbolCandidate]],
+) -> Vec<ApiSymbolCandidate> {
+    names
+        .into_iter()
+        .filter(|(_, targets)| {
+            targets.is_empty()
+                || !targets.iter().all(|(file, inline_module, name, kind)| {
+                    reported
+                        .iter()
+                        .flat_map(|list| list.iter())
+                        .any(|candidate| {
+                            candidate.file == *file
+                                && candidate.inline_module == *inline_module
+                                && candidate.name == *name
+                                && candidate.kind == *kind
+                        })
+                })
+        })
+        .map(|(candidate, _)| candidate)
+        .collect()
+}
+
+/// 名前 `candidates` のうち、参照 (定義を除く) が repo に残るもの。探せなければ None。
+fn referenced_names<'a>(
     dir: &str,
-    candidates: Vec<(ApiSymbolCandidate, crate::models::review::CfgAvailability)>,
-) -> (Vec<ApiSymbol>, Vec<ApiSymbol>) {
-    if candidates.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
+    candidates: impl Iterator<Item = &'a ApiSymbolCandidate>,
+) -> Option<HashSet<String>> {
     let mut names: Vec<String> = Vec::new();
-    for (candidate, _) in &candidates {
+    for candidate in candidates {
         let name = bare_name(&candidate.name).to_owned();
         if !names.contains(&name) {
             names.push(name);
         }
     }
-    let referenced: Option<HashSet<String>> = AppService::new()
+    AppService::new()
         .find_symbol_references_batch(&names, dir, None)
         .ok()
         .map(|results| {
@@ -452,7 +499,71 @@ fn partition_cfg_removals(
                 })
                 .map(|result| result.symbol)
                 .collect()
-        });
+        })
+}
+
+/// 再公開した名前の削除 (Issue #306・#318) を、[`partition_cfg_removals`] と同じく参照の有無で removed と
+/// removed_dead に分ける。名前と同じ名前の宣言を指していて、その宣言自身の削除が同じか強い区分 (removed は
+/// removed_dead より強い) に残るものは、同じ項目を 2 度報告しないよう除く (別名の削除は、別名の参照で
+/// 区分するので残す)。
+fn partition_reexport_removals(
+    dir: &str,
+    removals: Vec<(ApiSymbolCandidate, Vec<rust_reexport_names::DeclarationId>)>,
+    kept: &[ApiSymbolCandidate],
+    dead: &[ApiSymbolCandidate],
+) -> (Vec<ApiSymbol>, Vec<ApiSymbol>) {
+    if removals.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let referenced = referenced_names(dir, removals.iter().map(|(candidate, _)| candidate));
+    let covered = |lists: &[&[ApiSymbolCandidate]],
+                   candidate: &ApiSymbolCandidate,
+                   targets: &[rust_reexport_names::DeclarationId]| {
+        targets.iter().any(|(file, inline_module, name, kind)| {
+            *name == candidate.name
+                && lists
+                    .iter()
+                    .flat_map(|list| list.iter())
+                    .any(|declaration| {
+                        declaration.file == *file
+                            && declaration.inline_module == *inline_module
+                            && declaration.name == *name
+                            && declaration.kind == *kind
+                    })
+        })
+    };
+    let mut result_kept = Vec::new();
+    let mut result_dead = Vec::new();
+    for (candidate, targets) in removals {
+        let live = referenced
+            .as_ref()
+            .is_none_or(|names| names.contains(bare_name(&candidate.name)));
+        if live {
+            if !covered(&[kept], &candidate, &targets) {
+                result_kept.push(candidate.into_api_symbol());
+            }
+        } else if !covered(&[kept, dead], &candidate, &targets) {
+            result_dead.push(candidate.into_api_symbol());
+        }
+    }
+    (result_kept, result_dead)
+}
+
+/// 有る設定の一部から消えた Rust の項目 (Issue #291) を、名前の参照 (定義を除く) が repo に残るもの
+/// (removed) と残らないもの (removed_dead) に分ける。項目は残るので、削除の区分の残った定義への
+/// 帰属 (`partition_removed_dead_candidates`) は使わない (残った定義は消えた設定の項目そのもの)。
+/// 同じ名前の別のものの参照も数える (保守側)。参照を探せなければ removed に残す。
+fn partition_cfg_removals(
+    dir: &str,
+    candidates: Vec<(
+        ApiSymbolCandidate,
+        Option<crate::models::review::CfgAvailability>,
+    )>,
+) -> (Vec<ApiSymbol>, Vec<ApiSymbol>) {
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let referenced = referenced_names(dir, candidates.iter().map(|(candidate, _)| candidate));
     let mut kept = Vec::new();
     let mut dead = Vec::new();
     for (candidate, availability) in candidates {
@@ -460,7 +571,7 @@ fn partition_cfg_removals(
             .as_ref()
             .is_none_or(|names| names.contains(bare_name(&candidate.name)));
         let symbol = ApiSymbol {
-            cfg_availability: Some(availability),
+            cfg_availability: availability,
             ..candidate.into_api_symbol()
         };
         if live {
@@ -758,6 +869,7 @@ mod rust_dependencies;
 mod rust_enum_api;
 mod rust_module_availability;
 mod rust_public;
+mod rust_reexport_names;
 mod rust_ref_sites;
 mod rust_struct_api;
 mod rust_type_api;
