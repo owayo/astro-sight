@@ -872,14 +872,47 @@ fn collect_rust_modified_symbols(
             news.iter().map(|&j| declarations.new[j].clone()).collect();
         compare_dependencies(old_resolver, &old, new_resolver, &new, &modules).unverified_reason()
     };
+    // 囲む inherent impl の見出し (対象の型・型の引数の境界・`where`) は、メソッドと関連定数を使える型を
+    // 決める (Issue #307)。見出しの字句が変わった組だけ、旧新のソースを 1 度読んで比べる (読めなければ
+    // 壊すとする)。
+    let mut impl_headers: Option<Option<super::rust_declarations::ImplHeaders>> = None;
     for &(old_index, new_index) in &pairing.pairs {
         let (name, _, old_sig) = &facts.old_syms[old_index];
         let (_, kind, new_sig) = &facts.new_syms[new_index];
         let dependency = dependency(&[old_index], &[new_index]);
-        // signature が同じ組は、名指す名前の束縛も同じなら報告しない (型注釈と静的 container の
-        // 段階は TS・JS だけ)。
+        let impl_change = (declarations.old[old_index].container_header
+            != declarations.new[new_index].container_header)
+            .then(|| {
+                let headers = impl_headers.get_or_insert_with(|| {
+                    let old_source = inputs.base_blobs.read(&df.old_path)?;
+                    let new_source = load_new_source(inputs.dir, &df.new_path)?.to_vec();
+                    super::rust_declarations::ImplHeaders::new(old_source, new_source)
+                });
+                match headers {
+                    Some(headers) => headers.change(
+                        declarations.old[old_index].start,
+                        declarations.new[new_index].start,
+                    ),
+                    None => Some(super::rust_declarations::ImplHeaderChange::breaking()),
+                }
+            })
+            .flatten();
+        // 見出しの型の引数の名前を付け直すと signature が同じなら、signature の字面の違いは付け直しだけ。
+        let renamed = impl_change
+            .as_ref()
+            .is_some_and(|change| change.member_renamed);
+        // 関連定数の値のマクロの引数の中の型の引数の対応が変わったなら、signature の字面が同じでも値の変更。
+        let value_changed = impl_change
+            .as_ref()
+            .is_some_and(|change| change.value_changed);
+        let header = impl_change
+            .filter(|change| change.change != super::rust_type_api::ShapeChange::Unchanged);
+        // signature が同じ組は、名指す名前の束縛も囲む impl の見出しも同じなら報告しない (型注釈と静的
+        // container の段階は TS・JS だけ)。
         if dependency.is_none()
-            && (old_sig == new_sig || facts.parameter_pattern_only_names.contains(name))
+            && header.is_none()
+            && !value_changed
+            && (old_sig == new_sig || renamed || facts.parameter_pattern_only_names.contains(name))
         {
             continue;
         }
@@ -910,8 +943,18 @@ fn collect_rust_modified_symbols(
             dependency,
             availability_compared: !representative,
             shape_override,
+            impl_header: header.as_ref().map(|change| change.change),
+            impl_member_renamed: renamed,
+            impl_value_changed: value_changed,
         };
         let inline_module = declarations.new_inline_module(new_index);
+        // 見出しが変わったときは、signature に見出しを添えて示す。
+        let display = header.map(|change| {
+            (
+                format!("{} {{ {old_sig} }}", change.old_text),
+                format!("{} {{ {new_sig} }}", change.new_text),
+            )
+        });
         files.classify_rust(
             inputs,
             state,
@@ -921,6 +964,7 @@ fn collect_rust_modified_symbols(
             new_sig,
             site,
             inline_module,
+            display,
         );
     }
     // 同じ場所の分岐で変わっていないとみなしたものも、名指す名前の束縛は分岐ごとに比べる。
@@ -941,6 +985,9 @@ fn collect_rust_modified_symbols(
             dependency: Some(dependency),
             availability_compared: false,
             shape_override: None,
+            impl_header: None,
+            impl_member_renamed: false,
+            impl_value_changed: false,
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -952,6 +999,7 @@ fn collect_rust_modified_symbols(
             new_sig,
             site,
             inline_module,
+            None,
         );
     }
     if files.skip_for_binary_crate {
@@ -1364,6 +1412,17 @@ pub(crate) fn compare_moved_availability(
     let mut new_files: std::collections::HashMap<String, Facts> = std::collections::HashMap::new();
     // `#[cfg]` の分岐ごとに移動が並ぶ (signature ごとに 1 つ) ので、同じ項目は 1 度だけ比べる。
     let mut compared = std::collections::HashSet::new();
+    // ファイル → 囲む impl の見出しを比べる構文木 (旧新それぞれファイルごとに 1 度だけ作る。Issue #307)。
+    type Parsed = Option<std::rc::Rc<super::rust_declarations::ParsedSource>>;
+    let mut old_parsed: std::collections::HashMap<String, Parsed> =
+        std::collections::HashMap::new();
+    let mut new_parsed: std::collections::HashMap<String, Parsed> =
+        std::collections::HashMap::new();
+    // (移動元, 移動先) → 囲む impl の見出しの比較 (並べ替えの探索の結果を、同じファイルの組の移動で共有する)。
+    let mut moved_headers: std::collections::HashMap<
+        (String, String),
+        super::rust_declarations::ImplHeaders,
+    > = std::collections::HashMap::new();
     for symbol in moved {
         if !rust(&symbol.from) || !rust(&symbol.to) {
             continue;
@@ -1416,36 +1475,69 @@ pub(crate) fn compare_moved_availability(
         // 宣言は、型の書き方を変えた移動 (`crate::S<u8>` と `super::S<u8>`) として signature だけで組に
         // する。それでも一意に決まらず、条件の付いた (か読めない) 宣言があれば、比べられなかったものと
         // する。片方にしかない signature の宣言 (移動先に元からある別のメソッドなど) は比べない。
+        // impl の対象の型は、型の名前の前の経路を除き、impl の型の引数を位置の名前にそろえる
+        // (`impl<T> S<T, u16>` と `impl<V> crate::S<V, u16>` を同じ型にする。Issue #307)。
+        let has_owner = |side: &Declarations<'_>| {
+            side.iter()
+                .any(|(_, declaration)| !declaration.owner.is_empty())
+        };
+        let old_tree = if has_owner(&old_side) {
+            old_parsed
+                .entry(symbol.from.clone())
+                .or_insert_with(|| {
+                    super::rust_declarations::ParsedSource::parse(
+                        inputs.base_blobs.read(&symbol.from)?,
+                    )
+                })
+                .clone()
+        } else {
+            None
+        };
+        let new_tree = if has_owner(&new_side) {
+            new_parsed
+                .entry(symbol.to.clone())
+                .or_insert_with(|| {
+                    super::rust_declarations::ParsedSource::parse(
+                        load_new_source(inputs.dir, &symbol.to)?.to_vec(),
+                    )
+                })
+                .clone()
+        } else {
+            None
+        };
+        let old_owners = moved_owners(&old_side, old_tree.as_deref());
+        let new_owners = moved_owners(&new_side, new_tree.as_deref());
         type Key = (Vec<String>, String);
-        let keyed = |side: &Declarations<'_>| {
+        let keyed = |side: &Declarations<'_>, owners: &[Vec<String>]| {
             let mut keyed: std::collections::BTreeMap<Key, Vec<usize>> =
                 std::collections::BTreeMap::new();
-            for (index, (symbol, declaration)) in side.iter().enumerate() {
+            for (index, ((symbol, _), owner)) in side.iter().zip(owners).enumerate() {
                 keyed
-                    .entry((declaration.owner.clone(), symbol.2.clone()))
+                    .entry((owner.clone(), symbol.2.clone()))
                     .or_default()
                     .push(index);
             }
             keyed
         };
-        let (old_keyed, new_keyed) = (keyed(&old_side), keyed(&new_side));
+        let (old_keyed, new_keyed) = (keyed(&old_side, &old_owners), keyed(&new_side, &new_owners));
         // 移動先で同じ型の宣言が同じ設定に並び (移動元では並ばなかった)、その設定でビルドできない
         // なら、組を決められない変更として blocking にする。
+        /// `side` のうち、そろえた対象の型 (`owners`、同じ順) が `owner` の宣言。
+        fn of_owner<'a>(
+            side: &[(&'a (String, String, String), &'a RustDeclarationContext)],
+            owners: &[Vec<String>],
+            owner: &[String],
+        ) -> Vec<&'a RustDeclarationContext> {
+            side.iter()
+                .zip(owners)
+                .filter(|(_, key)| key.as_slice() == owner)
+                .map(|((_, declaration), _)| *declaration)
+                .collect()
+        }
         let duplicated = new_keyed.keys().map(|(owner, _)| owner).any(|owner| {
-            let of_owner = |side: &Declarations<'_>| {
-                side.iter()
-                    .filter(|(_, declaration)| declaration.owner == *owner)
-                    .count()
-            };
-            let new_owner = new_side
-                .iter()
-                .filter(|(_, declaration)| declaration.owner == *owner)
-                .map(|(_, declaration)| *declaration);
-            let old_owner = old_side
-                .iter()
-                .filter(|(_, declaration)| declaration.owner == *owner)
-                .map(|(_, declaration)| *declaration);
-            of_owner(&new_side) > 1
+            let new_owner = of_owner(&new_side, &new_owners, owner);
+            let old_owner = of_owner(&old_side, &old_owners, owner);
+            new_owner.len() > 1
                 && !exclusive_declarations(new_owner)
                 && exclusive_declarations(old_owner)
         });
@@ -1473,6 +1565,7 @@ pub(crate) fn compare_moved_availability(
             continue;
         }
         let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        let mut split = false;
         // signature ごとの、同じ組の無かった旧新の鍵。
         let mut unmatched: std::collections::BTreeMap<String, (Vec<&Key>, Vec<&Key>)> =
             std::collections::BTreeMap::new();
@@ -1511,13 +1604,166 @@ pub(crate) fn compare_moved_availability(
                 || news.iter().any(|&index| conditional(new_side[index].1))
             {
                 groups.push((olds, Vec::new()));
+            } else if olds
+                .iter()
+                .any(|&index| !old_side[index].1.owner.is_empty())
+            {
+                // 移動とともに 1 つの impl を複数の対象の型の impl に分けたか、まとめた (Issue #307)。
+                // どの宣言どうしを比べるか決められない。
+                split = true;
             }
+        }
+        if split {
+            let change = ApiSymbolChange {
+                inline_module: symbol.to_inline_module.clone(),
+                unverified: None,
+                name: symbol.name.clone(),
+                kind: symbol.kind.clone(),
+                file: symbol.to.clone(),
+                old_signature: Some(old_side[0].0.2.clone()),
+                new_signature: Some(new_side[0].0.2.clone()),
+                no_resolved_internal_callers: false,
+                contract_change: None,
+            };
+            record_signature_decision(
+                inputs,
+                state,
+                change,
+                SignatureDecision::Unverified(ApiModificationUnverified {
+                    reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
+                    first_unproven: None,
+                }),
+            );
+            continue;
         }
         for (olds, news) in groups {
             let old_declarations: Vec<&RustDeclarationContext> =
                 olds.iter().map(|&index| old_side[index].1).collect();
             let new_declarations: Vec<&RustDeclarationContext> =
                 news.iter().map(|&index| new_side[index].1).collect();
+            // 移動とともに囲む inherent impl の見出しを変えたなら、それも比べる (Issue #307)。片方が 1 つなら、
+            // それと他方のどれとも比べる (`#[cfg]` の分岐に分けた・まとめた)。両方が複数なら、有る条件の等しい
+            // 分岐どうしを比べ、1 対 1 に組めなければ、どれどうしを比べるか決められないので壊す。
+            let differs = old_declarations.iter().any(|old| {
+                new_declarations
+                    .iter()
+                    .any(|new| old.container_header != new.container_header)
+            });
+            if differs {
+                let old = old_parsed
+                    .entry(symbol.from.clone())
+                    .or_insert_with(|| {
+                        super::rust_declarations::ParsedSource::parse(
+                            inputs.base_blobs.read(&symbol.from)?,
+                        )
+                    })
+                    .clone();
+                let new = new_parsed
+                    .entry(symbol.to.clone())
+                    .or_insert_with(|| {
+                        super::rust_declarations::ParsedSource::parse(
+                            load_new_source(inputs.dir, &symbol.to)?.to_vec(),
+                        )
+                    })
+                    .clone();
+                let breaking = || {
+                    Some((
+                        super::rust_type_api::ShapeChange::Breaking,
+                        String::new(),
+                        String::new(),
+                    ))
+                };
+                let pairs: Option<Vec<(&RustDeclarationContext, &RustDeclarationContext)>> =
+                    if old_declarations.len() == 1 || new_declarations.len() == 1 {
+                        Some(
+                            old_declarations
+                                .iter()
+                                .flat_map(|old| {
+                                    new_declarations.iter().map(move |new| (*old, *new))
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        paired_by_availability(&old_declarations, &new_declarations)
+                    };
+                let header = match (old, new, pairs) {
+                    (Some(old), Some(new), Some(pairs)) => {
+                        let headers = moved_headers
+                            .entry((symbol.from.clone(), symbol.to.clone()))
+                            .or_insert_with(|| super::rust_declarations::ImplHeaders::of(old, new));
+                        let mut found: Option<(super::rust_type_api::ShapeChange, String, String)> =
+                            None;
+                        for (old_declaration, new_declaration) in pairs {
+                            let change = headers
+                                .change(old_declaration.start, new_declaration.start)
+                                .map_or(
+                                    (
+                                        super::rust_type_api::ShapeChange::Unchanged,
+                                        String::new(),
+                                        String::new(),
+                                    ),
+                                    |change| {
+                                        // 関連定数の値の型の引数の対応が変わったなら、値の変更を確かめられない
+                                        // ので壊す。
+                                        let header = if change.value_changed {
+                                            super::rust_type_api::ShapeChange::Breaking
+                                        } else {
+                                            change.change
+                                        };
+                                        (header, change.old_text, change.new_text)
+                                    },
+                                );
+                            if found.as_ref().is_none_or(|(worst, _, _)| change.0 > *worst) {
+                                found = Some(change);
+                            }
+                        }
+                        found
+                    }
+                    _ => breaking(),
+                };
+                if let Some((header, old_header, new_header)) = header
+                    && header != super::rust_type_api::ShapeChange::Unchanged
+                {
+                    let (old_sig, new_sig) = (
+                        &old_side[olds[0]].0.2,
+                        &new_side[news.first().copied().unwrap_or(0)].0.2,
+                    );
+                    let decision = if header == super::rust_type_api::ShapeChange::Compatible
+                        && old_sig == new_sig
+                    {
+                        SignatureDecision::Compatible(CompatibleApiModification {
+                            inline_module: symbol.to_inline_module.clone(),
+                            name: symbol.name.clone(),
+                            kind: symbol.kind.clone(),
+                            file: symbol.to.clone(),
+                            old_signature: Some(old_sig.clone()),
+                            new_signature: Some(new_sig.clone()),
+                            reason: "rust_impl_header_compatible".to_owned(),
+                        })
+                    } else {
+                        SignatureDecision::Blocking(None)
+                    };
+                    let shown = |header: String, signature: &String| {
+                        if header.is_empty() {
+                            signature.clone()
+                        } else {
+                            format!("{header} {{ {signature} }}")
+                        }
+                    };
+                    let change = ApiSymbolChange {
+                        inline_module: symbol.to_inline_module.clone(),
+                        unverified: None,
+                        name: symbol.name.clone(),
+                        kind: symbol.kind.clone(),
+                        file: symbol.to.clone(),
+                        old_signature: Some(shown(old_header, old_sig)),
+                        new_signature: Some(shown(new_header, new_sig)),
+                        no_resolved_internal_callers: false,
+                        contract_change: None,
+                    };
+                    record_signature_decision(inputs, state, change, decision);
+                }
+            }
             // 組を決められなかったとき (`news` が空) は、比べられなかったものとする。
             let change = if new_declarations.is_empty() {
                 super::rust_availability::AvailabilityChange::Unverified
@@ -1568,7 +1814,28 @@ pub(crate) fn process_moved_member_changes(
 ) {
     // (移動元, 移動先) ごとに文脈を 1 つ作り、型別名の読み込みなどを共有する。
     let mut files: Vec<ChangedSignatureFiles<'_>> = Vec::new();
+    let mut sources = MemberSources::default();
     for change in changes {
+        // 移動とともに囲む inherent impl の見出しを強めたなら、同じ差分の追随などの判定より先に blocking
+        // (Issue #307)。signature の字面の違いが見出しの型の引数の名前の付け直しだけでも、ここでは名指す名前の
+        // 束縛 (Issue #283) を比べないので、互換や変更なしとはせず、ほかの判定に任せる。
+        if moved_member_header(inputs, change, &mut sources).is_some_and(|header| {
+            header.change == super::rust_type_api::ShapeChange::Breaking || header.value_changed
+        }) {
+            let symbol = ApiSymbolChange {
+                inline_module: change.new.inline_module.clone(),
+                unverified: None,
+                name: change.new.name.clone(),
+                kind: change.new.kind.clone(),
+                file: change.new.file.clone(),
+                old_signature: Some(change.old.signature.clone()),
+                new_signature: Some(change.new.signature.clone()),
+                no_resolved_internal_callers: false,
+                contract_change: None,
+            };
+            record_signature_decision(inputs, state, symbol, SignatureDecision::Blocking(None));
+            continue;
+        }
         let (old_path, new_path) = (change.old.file.as_str(), change.new.file.as_str());
         let ix = match files
             .iter()
@@ -1597,6 +1864,147 @@ pub(crate) fn process_moved_member_changes(
             &change.new.signature,
         );
     }
+}
+
+/// 宣言ごとの、impl の対象の型を移動の組に使う形にそろえた字句 ([`ParsedSource::normalized_owner`])。
+/// impl の外の宣言は空。構文木を読めなければ、字面から型の名前の前の経路を除いたもの。
+///
+/// [`ParsedSource::normalized_owner`]: super::rust_declarations::ParsedSource::normalized_owner
+fn moved_owners(
+    side: &[(&(String, String, String), &RustDeclarationContext)],
+    parsed: Option<&super::rust_declarations::ParsedSource>,
+) -> Vec<Vec<String>> {
+    side.iter()
+        .map(|(_, declaration)| {
+            if declaration.owner.is_empty() {
+                return Vec::new();
+            }
+            parsed
+                .and_then(|parsed| parsed.normalized_owner(declaration.start))
+                .unwrap_or_else(|| {
+                    super::rust_declarations::last_segment(declaration.owner.clone())
+                })
+        })
+        .collect()
+}
+
+/// 両方が複数の宣言 (`#[cfg]` の分岐) を、有る条件がどの設定でも同じく成り立つものどうしの 1 対 1 の組に
+/// する (`#[cfg]` の書き方の違いは同じとみなす)。数が違うか、有る条件を読めないか、同じものが 1 つに決まら
+/// なければ None。
+fn paired_by_availability<'d>(
+    olds: &[&'d RustDeclarationContext],
+    news: &[&'d RustDeclarationContext],
+) -> Option<Vec<(&'d RustDeclarationContext, &'d RustDeclarationContext)>> {
+    if olds.len() != news.len() {
+        return None;
+    }
+    let mut used = vec![false; news.len()];
+    let mut pairs = Vec::with_capacity(olds.len());
+    for old in olds {
+        let mut matching = news
+            .iter()
+            .enumerate()
+            .filter(|(_, new)| super::rust_declarations::same_availability(old, new));
+        let (Some((at, new)), None) = (matching.next(), matching.next()) else {
+            return None;
+        };
+        if std::mem::replace(&mut used[at], true) {
+            return None;
+        }
+        pairs.push((*old, *new));
+    }
+    Some(pairs)
+}
+
+/// 移動したメンバーの見出しを比べるのに読んだ、ファイルごとの宣言の事実と構文木 (旧新それぞれ 1 度だけ)。
+#[derive(Default)]
+struct MemberSources {
+    facts: std::collections::HashMap<(bool, String), Option<MemberFacts>>,
+    parsed: std::collections::HashMap<
+        (bool, String),
+        Option<std::rc::Rc<super::rust_declarations::ParsedSource>>,
+    >,
+    /// (移動元, 移動先) → 囲む impl の見出しの比較 (並べ替えの探索の結果をメンバーの間で共有する)。
+    headers: std::collections::HashMap<(String, String), super::rust_declarations::ImplHeaders>,
+}
+
+/// ファイルの公開のシンボルと宣言の文脈。
+type MemberFacts = (ExportedSymbols, Vec<RustDeclarationContext>);
+
+/// 移動したメンバーの旧新の宣言 (名前・種類・signature・inline module で 1 つずつ引けたもの) を囲む
+/// inherent impl の見出しを比べた結果 (Issue #307)。Rust でないか、引けなければ None。
+fn moved_member_header(
+    inputs: &DetectionInputs<'_>,
+    change: &MovedMemberChange<'_>,
+    sources: &mut MemberSources,
+) -> Option<super::rust_declarations::ImplHeaderChange> {
+    let rust = |path: &str| {
+        crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok()
+            == Some(crate::language::LangId::Rust)
+    };
+    if !rust(&change.old.file) || !rust(&change.new.file) {
+        return None;
+    }
+    let read = |new: bool, path: &str| -> Option<Vec<u8>> {
+        if new {
+            load_new_source(inputs.dir, path).map(|source| source.to_vec())
+        } else {
+            inputs.base_blobs.read(path)
+        }
+    };
+    let mut find = |new: bool, candidate: &ApiSymbolCandidate| -> Option<RustDeclarationContext> {
+        let facts = sources
+            .facts
+            .entry((new, candidate.file.clone()))
+            .or_insert_with(|| {
+                let source = read(new, &candidate.file)?;
+                let (symbols, declarations) = extract_deleted_exported_facts(
+                    &candidate.file,
+                    &source,
+                    inputs.strip_internal,
+                )?;
+                Some((symbols, declarations?))
+            })
+            .as_ref()?;
+        let mut found = facts
+            .0
+            .iter()
+            .zip(&facts.1)
+            .filter(|((name, kind, signature), declaration)| {
+                *name == candidate.name
+                    && *kind == candidate.kind
+                    && *signature == candidate.signature
+                    && inline_module_of(declaration) == candidate.inline_module
+            })
+            .map(|(_, declaration)| declaration.clone());
+        match (found.next(), found.next()) {
+            (Some(declaration), None) => Some(declaration),
+            _ => None,
+        }
+    };
+    let old = find(false, &change.old)?;
+    let new = find(true, &change.new)?;
+    if old.container_header == new.container_header {
+        return None;
+    }
+    let mut parsed = |new: bool, path: &str| {
+        sources
+            .parsed
+            .entry((new, path.to_owned()))
+            .or_insert_with(|| super::rust_declarations::ParsedSource::parse(read(new, path)?))
+            .clone()
+    };
+    let (Some(old_parsed), Some(new_parsed)) = (
+        parsed(false, &change.old.file),
+        parsed(true, &change.new.file),
+    ) else {
+        return Some(super::rust_declarations::ImplHeaderChange::breaking());
+    };
+    sources
+        .headers
+        .entry((change.old.file.clone(), change.new.file.clone()))
+        .or_insert_with(|| super::rust_declarations::ImplHeaders::of(old_parsed, new_parsed))
+        .change(old.start, new.start)
 }
 
 /// 再公開の先と組にして比べる、Rust の宣言の種類。マクロ・module は扱わない (公開の規則が違う)。
@@ -1753,6 +2161,9 @@ fn reexport_site(
         dependency: None,
         availability_compared: false,
         shape_override: None,
+        impl_header: None,
+        impl_member_renamed: false,
+        impl_value_changed: false,
     }
 }
 
@@ -2054,11 +2465,17 @@ impl<'a> ChangedSignatureFiles<'a> {
         new_sig: &str,
         site: RustDeclarationSite,
         inline_module: Option<String>,
+        display: Option<(String, String)>,
     ) {
         self.rust_site = Some(site);
         let (mut change, decision) = self.decide(inputs, state, name, kind, old_sig, new_sig);
         self.rust_site = None;
         change.inline_module = inline_module;
+        // 互換の項目の signature は、impact の互換の証拠の照合に使うので書き換えない。
+        if let Some((old_signature, new_signature)) = display {
+            change.old_signature = Some(old_signature);
+            change.new_signature = Some(new_signature);
+        }
         record_signature_decision(inputs, state, change, decision);
     }
 
@@ -2141,10 +2558,13 @@ impl<'a> ChangedSignatureFiles<'a> {
         }
         // 値変更の方針は外部API面から独立。通常のRust定数変更だけ、公開面の抑制より先に残す。
         // 移動では公開面や型所有元の検査を省けないため、従来の判定経路を使う。
+        // 囲む inherent impl の見出しが変わった関連定数は、値だけの変更にしない (Issue #307)。
         if self.lang_id == Some(crate::language::LangId::Rust)
             && self.moved_from.is_none()
             && self.old_path == self.new_path
-            && is_const_value_only_change(old_sig, new_sig, kind, crate::language::LangId::Rust)
+            && self.rust_site.and_then(|site| site.impl_header).is_none()
+            && (is_const_value_only_change(old_sig, new_sig, kind, crate::language::LangId::Rust)
+                || self.rust_site.is_some_and(|site| site.impl_value_changed))
         {
             return (change, SignatureDecision::ConstValue);
         }
@@ -2160,6 +2580,43 @@ impl<'a> ChangedSignatureFiles<'a> {
             state.rust_public,
         ) {
             return (change, SignatureDecision::Omit);
+        }
+        // Rust の inherent impl の見出し (対象の型・型の引数の境界・`where`) の変更は、メソッドと関連定数を
+        // 使える型を変える (Issue #307)。中の利用を同じ差分で直しても外の利用者は直せないので、閉包や同じ
+        // ファイルの中だけの利用による除外より先に決める: 対象の型を変えるか境界を強めるか読めなければ
+        // blocking。境界を緩めるだけで signature が同じなら互換。signature も変わったなら、その判定に任せる。
+        if let Some(rust_site) = self.rust_site
+            && let Some(header) = rust_site.impl_header
+        {
+            use super::rust_type_api::ShapeChange;
+            match header {
+                ShapeChange::Breaking => return (change, SignatureDecision::Blocking(None)),
+                // signature の字面の違いが見出しの型の引数の名前の付け直しだけなら、同じ signature とする。
+                // 関連定数の値の対応も変わったなら、見出しが互換でも値の変更を確かめられないので blocking。
+                ShapeChange::Compatible if rust_site.impl_value_changed => {
+                    return (change, SignatureDecision::Blocking(None));
+                }
+                ShapeChange::Compatible if old_sig == new_sig || rust_site.impl_member_renamed => {
+                    let site = CompatibleModSite {
+                        dir,
+                        base: inputs.base,
+                        old_path: self.old_path,
+                        new_path: self.new_path,
+                        name,
+                        kind,
+                        old_sig,
+                        new_sig,
+                        lang_id: self.lang_id,
+                    };
+                    return (
+                        change,
+                        SignatureDecision::Compatible(
+                            site.compatible("rust_impl_header_compatible"),
+                        ),
+                    );
+                }
+                _ => {}
+            }
         }
         // Rust の公開構造体・enum・union の形の変更は、中の利用を同じ差分で直しても外の利用者
         // (構造体式・フィールドの読み書き・variant の構築と照合) を直せないので、閉包や同じファイルの

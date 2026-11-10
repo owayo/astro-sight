@@ -524,6 +524,51 @@ impl RustPairing {
                 }
             }
         }
+        // 囲む impl の対象の型だけが変わった項目 (`impl<T> S<T>` → `impl S<u8>`・型の引数の改名) は、
+        // 対象の型の字句がキーに入るので組にならない。残った削除と追加のうち、(inline module, 対象の型の
+        // 名前 (型の引数を除く), qualname, 種類) が同じで 1 つずつのものを組にし、見出しを比べる (Issue #307)。
+        let mut unpaired: std::collections::BTreeMap<Key<'_>, (Vec<usize>, Vec<usize>)> =
+            std::collections::BTreeMap::new();
+        for (i, ((name, kind, _), declaration)) in old.iter().zip(old_declarations).enumerate() {
+            if pairing.removed[i] && !declaration.owner.is_empty() {
+                let key = (
+                    declaration.inline_module.as_str(),
+                    owner_base(&declaration.owner),
+                    name.as_str(),
+                    kind.as_str(),
+                );
+                unpaired.entry(key).or_default().0.push(i);
+            }
+        }
+        for (j, ((name, kind, _), declaration)) in new.iter().zip(new_declarations).enumerate() {
+            if pairing.added[j] && !declaration.owner.is_empty() {
+                let key = (
+                    declaration.inline_module.as_str(),
+                    owner_base(&declaration.owner),
+                    name.as_str(),
+                    kind.as_str(),
+                );
+                unpaired.entry(key).or_default().1.push(j);
+            }
+        }
+        for (olds, news) in unpaired.into_values() {
+            match (olds.as_slice(), news.as_slice()) {
+                ([], _) | (_, []) => {}
+                ([i], [j]) => {
+                    pairing.removed[*i] = false;
+                    pairing.added[*j] = false;
+                    pairing.pairs.push((*i, *j));
+                    pairing.groups.push((vec![*i], vec![*j]));
+                }
+                // 1 つの impl を複数の対象の型の impl に分けたか、まとめた (`impl<T> S<T>` →
+                // `impl S<u8>` と `impl S<u16>`)。どの宣言どうしを比べるか決められないので blocking。
+                _ => {
+                    olds.iter().for_each(|&i| pairing.removed[i] = false);
+                    news.iter().for_each(|&j| pairing.added[j] = false);
+                    pairing.ambiguous.push((olds, news));
+                }
+            }
+        }
         // 出力の順を新しい版の宣言の順にそろえる。
         pairing.pairs.sort_by_key(|&(_, j)| j);
         pairing
@@ -536,6 +581,22 @@ impl RustPairing {
     pub(crate) fn name_is_shared(&self, name: &str) -> bool {
         self.shared_names.contains(name)
     }
+}
+
+/// impl の対象の型のトークン `owner` の、型の引数の前まで (`S<T>` の `S`)。先頭の `self::` は除く (同じ
+/// module の同じ名前)。ほかの経路は残す: 同じファイルの中で `a::S` を `b::S` に付け替えた impl は別の型の
+/// impl なので組にしない (経路の書き方だけを変えた impl も、同じ型と確かめられないので組にしない)。
+fn owner_base(owner: &[String]) -> &[String] {
+    let end = owner
+        .iter()
+        .position(|token| token == "<")
+        .unwrap_or(owner.len());
+    let start = if end > 2 && owner[0] == "self" && owner[1] == "::" {
+        2
+    } else {
+        0
+    };
+    &owner[start..end]
 }
 
 /// 同じキーの宣言 `indices` が、1 つか、どれも cfg の条件の付いた分岐か。
@@ -656,6 +717,14 @@ pub(crate) struct RustDeclarationSite {
     /// `#[cfg]` の分岐の代表の組で、構造体・enum・union の形を分岐の組ごとに比べた結果
     /// ([`branch_shape_change`])。あれば代表の組の形の比較に代える (Issue #293)。
     pub(crate) shape_override: Option<super::rust_type_api::ShapeChange>,
+    /// 囲む inherent impl の見出し (対象の型・型の引数・`where`) を旧新で比べた結果 ([`ImplHeaders`])。
+    /// 見出しの字句が変わったときだけ求める (Issue #307)。
+    pub(crate) impl_header: Option<super::rust_type_api::ShapeChange>,
+    /// 囲む inherent impl の見出しの型の引数の名前を付け直すと、signature の契約の部分が同じ (signature の
+    /// 字面の違いは付け直しと整形だけ。Issue #307)。
+    pub(crate) impl_member_renamed: bool,
+    /// 関連定数の値のマクロの引数の中の型の引数の対応が旧新で変わり、値が同じと言えない (Issue #307)。
+    pub(crate) impl_value_changed: bool,
 }
 
 /// 旧新の宣言が、ある設定で同時に有り得るか (読めない条件か、原子が多すぎれば有り得るとする)。
@@ -764,6 +833,1188 @@ fn item_at<'tree>(
         }
         node = node.parent()?;
     }
+}
+
+/// 構文木を作ったソース (囲む impl の見出しを比べるのに、ファイルごとに 1 度だけ作って共有する)。
+pub(crate) struct ParsedSource {
+    tree: tree_sitter::Tree,
+    source: Vec<u8>,
+    /// impl の始まりのバイト → 見出しと名前の付け直し (メソッドごとに作り直さない)。
+    impls: std::cell::RefCell<std::collections::HashMap<usize, ImplEntry>>,
+}
+
+/// inherent impl の見出しと名前の付け直し (読めなければ None)。
+type ImplEntry = Option<std::rc::Rc<(ImplHeader, ImplNames)>>;
+
+impl ParsedSource {
+    pub(crate) fn parse(source: Vec<u8>) -> Option<std::rc::Rc<Self>> {
+        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+        Some(std::rc::Rc::new(Self {
+            tree,
+            source,
+            impls: std::cell::RefCell::default(),
+        }))
+    }
+
+    /// `start` に始まる項目を囲む inherent impl の対象の型を、型の名前の前の経路を除き、impl の型の
+    /// 引数を位置の名前 ([`ImplNames`]) に置き換えた字句 (`impl<V> crate::S<V, u16>` の `S<#0, u16>`)。
+    /// 移動の組を、型の引数の名前と経路の書き方に依らずに作る。inherent impl の中に無いか、見出しを
+    /// 読めなければ None。
+    pub(crate) fn normalized_owner(&self, start: (usize, usize)) -> Option<Vec<String>> {
+        let item = inherent_impl_at(self.tree.root_node(), start)?;
+        let found = self.impl_names(item)?;
+        let (header, names) = &*found;
+        Some(last_segment(applied(&names.self_type, &header.self_type)))
+    }
+
+    /// inherent impl `item` の見出しと名前の付け直し (impl ごとに 1 度だけ作る)。読めなければ None。
+    fn impl_names(&self, item: tree_sitter::Node<'_>) -> ImplEntry {
+        let key = item.start_byte();
+        if let Some(found) = self.impls.borrow().get(&key) {
+            return found.clone();
+        }
+        let found = impl_header(item, &self.source).map(|header| {
+            let names = ImplNames::new(&header);
+            std::rc::Rc::new((header, names))
+        });
+        self.impls.borrow_mut().insert(key, found.clone());
+        found
+    }
+}
+
+/// 旧新のソースの、項目を囲む inherent impl の見出しを比べる (Issue #307)。
+pub(crate) struct ImplHeaders {
+    old: std::rc::Rc<ParsedSource>,
+    new: std::rc::Rc<ParsedSource>,
+    /// (旧新の impl の始まりのバイト, 旧新の対象の型・メンバーで番号の決まる引数の並び) → 見出しの変化の
+    /// 最も小さいもの (並べ替えの探索を 1 度だけにする)。
+    searched: std::cell::RefCell<std::collections::HashMap<SearchKey, Searched>>,
+}
+
+/// [`ImplHeaders::search`] の結果: 見出しの変化の最も小さいものと、それを与える新の並び (番号付けの並びの
+/// ままなら None)。
+type Searched = (super::rust_type_api::ShapeChange, Option<Vec<usize>>);
+
+/// [`ImplHeaders::search`] の結果を覚える鍵。
+type SearchKey = ((usize, usize), Vec<usize>, Vec<usize>);
+
+/// inherent impl の見出し: 対象の型の字句と、型の引数・`where`。
+struct ImplHeader {
+    self_type: super::rust_type_api::Tokens,
+    generics: super::rust_type_api::Generics,
+}
+
+/// impl の型の引数の名前の付け直し。引数は宣言の順ではなく対象の型に現れる順で番号を付け (`impl<U, T>
+/// S<T, U>` の並べ替えを変更にしない)、対象の型に現れない引数は境界と述語の中の位置で付ける。型の位置
+/// (`S<N>`・`Bound<N>` の `N`) に書いた const の引数は、同じ名前の型と区別できない (マクロや derive が作る型も
+/// ある) ので置き換えない (名前で比べ、改名すれば違いになる)。値の位置 (`{ N }`・`[u8; N]`) では置き換える。
+struct ImplNames {
+    /// 対象の型を比べる置き換え。
+    self_type: super::rust_type_api::Renaming,
+    /// 境界と述語を比べる置き換え。
+    bounds: super::rust_type_api::Renaming,
+    /// 引数の添字を、付け直した番号の順に並べたもの。
+    order: Vec<usize>,
+    /// `order` の先頭の、対象の型に現れる (対象の型で番号の決まる) 引数の数。
+    fixed: usize,
+    /// `order` の先頭の、使われる引数の数 (後ろは使われない寿命の引数で、比べない)。
+    used: usize,
+}
+
+/// 書き順に依らない番号付けをする、対象の型に現れない引数の数の上限 (超えれば宣言の順)。
+const MAX_REFINED_PARAMS: usize = 16;
+
+/// 旧に対する新の並びを入れ替えて比べる、対象の型に現れない引数の数の上限 (6! = 720 通り)。
+const MAX_PERMUTED_PARAMS: usize = 6;
+
+impl ImplNames {
+    fn new(header: &ImplHeader) -> Self {
+        Self::anchored(header, &[], &[])
+    }
+
+    /// 対象の型と `anchors` (メンバーの signature の字句) に現れる順に、次に `by_name` (`r#` と寿命の `'` を外した
+    /// 名前) の順に番号を付け、残りは境界と述語の中の形で付ける。メンバーの signature に現れる引数は、そこでの
+    /// 位置が呼び出し側から見た引数の同一性になる。マクロの引数の中に現れる引数は名前を付け直せないので、名前で
+    /// 組にする (`by_name` に渡す)。
+    fn anchored(
+        header: &ImplHeader,
+        anchors: &[&super::rust_type_api::Tokens],
+        by_name: &[OpaqueName],
+    ) -> Self {
+        use super::rust_type_api::{ParamKind, Role};
+        let params = &header.generics.params;
+        let index_of: std::collections::HashMap<&str, usize> = params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| (param.name.as_str(), index))
+            .collect();
+        // 番号を付けた引数の並び (`order`) と、引数ごとの番号 (`rank`)。
+        let mut order: Vec<usize> = Vec::new();
+        let mut rank: Vec<Option<usize>> = vec![None; params.len()];
+        // 1. 対象の型と `anchors` に現れる順。型の引数を名指し得る役割の字句だけを見る (`T::A` の関連型の
+        //    名前 `A` は、同じ名前の型の引数ではない)。
+        for tokens in std::iter::once(&header.self_type).chain(anchors.iter().copied()) {
+            for token in &tokens.0 {
+                if matches!(
+                    token.role,
+                    Role::TypeName | Role::ValueName | Role::Lifetime
+                ) && let Some(&index) = index_of.get(token.compared())
+                    && rank[index].is_none()
+                {
+                    rank[index] = Some(order.len());
+                    order.push(index);
+                }
+            }
+        }
+        for name in by_name {
+            if let Some(index) = params.iter().position(|param| is_named(param, name))
+                && rank[index].is_none()
+            {
+                rank[index] = Some(order.len());
+                order.push(index);
+            }
+        }
+        let fixed = order.len();
+        // 使われない寿命の引数 (対象の型・`anchors`・`by_name`・ほかの引数の境界・述語のどれにも現れない) は、
+        // どの寿命でも満たせるので比べない (番号を付けない)。`impl<'a> S` を `impl S` にしても変えない。
+        let appears_in = |tokens: &super::rust_type_api::Tokens, name: &str| {
+            tokens.0.iter().any(|token| token.compared() == name)
+        };
+        let unused: Vec<bool> = params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                param.kind == ParamKind::Lifetime
+                    && rank[index].is_none()
+                    && !params.iter().enumerate().any(|(other, other_param)| {
+                        other != index
+                            && other_param
+                                .bounds
+                                .iter()
+                                .any(|bound| appears_in(bound, &param.name))
+                    })
+                    && !header.generics.predicates.iter().any(|(left, bound)| {
+                        appears_in(left, &param.name) || appears_in(bound, &param.name)
+                    })
+            })
+            .collect();
+        // 2. 対象の型に現れない引数 (関連型の等式 `T: Tr<A = U>` で決まる、など) は、境界と述語の中の形で
+        //    番号を付ける。番号の無い引数ごとに、それが現れる境界・述語を、その引数を `*`、番号の付いた引数を
+        //    番号、ほかの番号の無い引数を `?` に置き換えた字面の集まり (整列) を作り、番号の付いた引数と同じ
+        //    境界に現れるものを先に、字面の集まりの小さい順に 1 つずつ番号を付ける。境界・述語の書き順に
+        //    依らない (字面の集まりまで同じ引数どうしだけ、宣言の順)。
+        let constraints: Vec<Vec<(&str, Option<usize>)>> = params
+            .iter()
+            .flat_map(|param| {
+                param.bounds.iter().map(move |bound| {
+                    std::iter::once(param.name.as_str())
+                        .chain(std::iter::once(":"))
+                        .chain(bound.0.iter().map(|token| token.compared()))
+                        .collect::<Vec<&str>>()
+                })
+            })
+            .chain(header.generics.predicates.iter().map(|(left, bound)| {
+                left.0
+                    .iter()
+                    .map(|token| token.compared())
+                    .chain(std::iter::once(":"))
+                    .chain(bound.0.iter().map(|token| token.compared()))
+                    .collect::<Vec<&str>>()
+            }))
+            .map(|texts| {
+                texts
+                    .into_iter()
+                    .map(|text| (text, index_of.get(text).copied()))
+                    .collect()
+            })
+            .collect();
+        let mut appears: Vec<Vec<usize>> = vec![Vec::new(); params.len()];
+        for (at, constraint) in constraints.iter().enumerate() {
+            for &(_, index) in constraint {
+                if let Some(index) = index
+                    && appears[index].last() != Some(&at)
+                {
+                    appears[index].push(at);
+                }
+            }
+        }
+        // 番号の無い引数を並べる鍵: 番号の付いた引数と一緒に現れる境界が無いか、その境界の整列した字面の集まり、
+        // 番号の無いほかの引数と一緒に現れる境界の集まり、その引数だけの境界の集まり。後ろの 2 つ
+        // (`V: AsRef<W>`・`U: Copy`) は足し外しされやすいので、同点を分けるのにだけ使う。
+        type Shape = (bool, Vec<Vec<String>>, Vec<Vec<String>>, Vec<Vec<String>>);
+        // 番号の無い引数が多ければ (書き順に依らない番号付けの手間が大きい)、宣言の順にする。
+        let refine = params.len() - fixed <= MAX_REFINED_PARAMS;
+        loop {
+            if !refine {
+                break;
+            }
+            let mut best: Option<(Shape, usize)> = None;
+            for candidate in 0..params.len() {
+                if rank[candidate].is_some() || appears[candidate].is_empty() || unused[candidate] {
+                    continue;
+                }
+                let mut numbered: Vec<Vec<String>> = Vec::new();
+                let mut related: Vec<Vec<String>> = Vec::new();
+                let mut own: Vec<Vec<String>> = Vec::new();
+                for &at in &appears[candidate] {
+                    let (mut others, mut anchor) = (false, false);
+                    let rendered: Vec<String> = constraints[at]
+                        .iter()
+                        .map(|&(text, index)| match index {
+                            Some(index) if index == candidate => "*".to_owned(),
+                            Some(index) => {
+                                others = true;
+                                match rank[index] {
+                                    Some(number) => {
+                                        anchor = true;
+                                        format!("@{number}")
+                                    }
+                                    None => "?".to_owned(),
+                                }
+                            }
+                            None => text.to_owned(),
+                        })
+                        .collect();
+                    if anchor {
+                        numbered.push(rendered);
+                    } else if others {
+                        related.push(rendered);
+                    } else {
+                        own.push(rendered);
+                    }
+                }
+                numbered.sort();
+                related.sort();
+                own.sort();
+                let key = (numbered.is_empty(), numbered, related, own);
+                if best.as_ref().is_none_or(|(best, _)| key < *best) {
+                    best = Some((key, candidate));
+                }
+            }
+            let Some((_, candidate)) = best else {
+                break;
+            };
+            rank[candidate] = Some(order.len());
+            order.push(candidate);
+        }
+        // 3. どこにも現れない引数は宣言の順。使われない寿命の引数は最後に (相手に無くてもよい)。
+        for (index, &unused) in unused.iter().enumerate() {
+            if !unused && !order.contains(&index) {
+                order.push(index);
+            }
+        }
+        let used = order.len();
+        order.extend(
+            unused
+                .iter()
+                .enumerate()
+                .filter(|(_, unused)| **unused)
+                .map(|(index, _)| index),
+        );
+        Self::with_order(header, order, fixed, used)
+    }
+
+    /// 引数に `order` の順に番号を付けた付け直し (`fixed` は先頭の、対象の型で番号の決まる引数の数)。
+    fn with_order(header: &ImplHeader, order: Vec<usize>, fixed: usize, used: usize) -> Self {
+        use super::rust_type_api::{ParamKind, Renaming};
+        let params = &header.generics.params;
+        let mut bounds = Renaming {
+            types: std::collections::HashMap::new(),
+            values: std::collections::HashMap::new(),
+            lifetimes: std::collections::HashMap::new(),
+        };
+        let (mut lifetimes, mut others) = (0usize, 0usize);
+        for &index in &order {
+            let param = &params[index];
+            match param.kind {
+                ParamKind::Lifetime => {
+                    bounds
+                        .lifetimes
+                        .insert(param.name.clone(), format!("'#{lifetimes}"));
+                    lifetimes += 1;
+                }
+                ParamKind::Type => {
+                    bounds
+                        .types
+                        .insert(param.name.clone(), format!("#{others}"));
+                    others += 1;
+                }
+                _ => {
+                    bounds
+                        .values
+                        .insert(param.name.clone(), format!("#{others}"));
+                    others += 1;
+                }
+            }
+        }
+        let self_type = Renaming {
+            types: bounds.types.clone(),
+            values: bounds.values.clone(),
+            lifetimes: bounds.lifetimes.clone(),
+        };
+        Self {
+            self_type,
+            bounds,
+            order,
+            fixed,
+            used,
+        }
+    }
+}
+
+impl ImplHeaders {
+    pub(crate) fn new(old: Vec<u8>, new: Vec<u8>) -> Option<Self> {
+        Some(Self::of(
+            ParsedSource::parse(old)?,
+            ParsedSource::parse(new)?,
+        ))
+    }
+
+    /// 作った構文木を共有して比べる。
+    pub(crate) fn of(old: std::rc::Rc<ParsedSource>, new: std::rc::Rc<ParsedSource>) -> Self {
+        Self {
+            old,
+            new,
+            searched: std::cell::RefCell::default(),
+        }
+    }
+
+    /// 旧新の `start` に始まる項目を囲む inherent impl (trait の impl は除く) の見出しを比べた結果と、
+    /// 旧新の見出しの字面 (表示用)。対象の型が (型の引数の付け直しと、型の名前の前の経路を除いて) 違えば
+    /// 壊す。型の引数と `where` は impl の規則で比べる ([`compare_impl_generics`])。どちらも inherent impl の
+    /// 中でなければ None。片方だけか、読めなければ壊す。
+    pub(crate) fn change(
+        &self,
+        old_start: (usize, usize),
+        new_start: (usize, usize),
+    ) -> Option<ImplHeaderChange> {
+        use super::rust_type_api::ShapeChange;
+        let old_impl = inherent_impl_at(self.old.tree.root_node(), old_start);
+        let new_impl = inherent_impl_at(self.new.tree.root_node(), new_start);
+        let (old_impl, new_impl) = match (old_impl, new_impl) {
+            (None, None) => return None,
+            (Some(old_impl), Some(new_impl)) => (old_impl, new_impl),
+            (old_impl, new_impl) => {
+                let text = |node: Option<tree_sitter::Node<'_>>, source: &[u8]| {
+                    node.map(|node| impl_header_text(node, source))
+                        .unwrap_or_default()
+                };
+                return Some(ImplHeaderChange {
+                    old_text: text(old_impl, &self.old.source),
+                    new_text: text(new_impl, &self.new.source),
+                    ..ImplHeaderChange::breaking()
+                });
+            }
+        };
+        let mut result = ImplHeaderChange {
+            old_text: impl_header_text(old_impl, &self.old.source),
+            new_text: impl_header_text(new_impl, &self.new.source),
+            ..ImplHeaderChange::breaking()
+        };
+        let (Some(old), Some(new)) = (self.old.impl_names(old_impl), self.new.impl_names(new_impl))
+        else {
+            return Some(result);
+        };
+        let ((old_header, old_names), (new_header, new_names)) = (&*old, &*new);
+        let self_type = |header: &ImplHeader, names: &ImplNames| {
+            last_segment(applied(&names.self_type, &header.self_type))
+        };
+        if self_type(old_header, old_names) != self_type(new_header, new_names) {
+            return Some(result);
+        }
+        // メンバーの signature の字句 (付け直す前)。
+        let old_member = member_at(self.old.tree.root_node(), old_start)
+            .and_then(|member| member_signature(member, &self.old.source));
+        let new_member = member_at(self.new.tree.root_node(), new_start)
+            .and_then(|member| member_signature(member, &self.new.source));
+        // マクロの引数の中 (字面のまま比べる) に現れる型の引数 (名前空間と、`r#` と寿命の `'` を外した名前。旧新
+        // どちらかに現れたもの) は名前を付け直せないので、名前で組にする。見出しとメンバーの契約の部分と、定数の
+        // 値に分ける。
+        let opaque = |old: Vec<&super::rust_type_api::Tokens>,
+                      new: Vec<&super::rust_type_api::Tokens>| {
+            opaque_params(old_header, old)
+                .into_iter()
+                .chain(opaque_params(new_header, new))
+                .collect::<std::collections::BTreeSet<OpaqueName>>()
+        };
+        let contract_opaque = opaque(
+            contract_tokens(old_header, &old_member),
+            contract_tokens(new_header, &new_member),
+        );
+        let value_opaque = opaque(value_tokens(&old_member), value_tokens(&new_member));
+        let by_name: Vec<OpaqueName> = contract_opaque.union(&value_opaque).cloned().collect();
+        // メンバーの signature に対象の型に現れない引数が現れるか、マクロの引数の中に型の引数が現れれば、そこでの
+        // 位置と名前で番号を付け直す (呼び出し側から見た引数の同一性)。どちらも無ければ impl ごとの付け直しのまま。
+        let member_names =
+            |member: &Option<MemberSignature>, header: &ImplHeader, base: &ImplNames| {
+                use super::rust_type_api::Role;
+                let pieces: Vec<&super::rust_type_api::Tokens> = member
+                    .as_ref()
+                    .map(|(pieces, ..)| pieces.iter().collect())
+                    .unwrap_or_default();
+                let fixed: std::collections::HashSet<usize> =
+                    base.order[..base.fixed].iter().copied().collect();
+                let free: std::collections::HashSet<&str> = header
+                    .generics
+                    .params
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !fixed.contains(index))
+                    .map(|(_, param)| param.name.as_str())
+                    .collect();
+                let mentions_free = pieces.iter().any(|piece| {
+                    piece.0.iter().any(|token| {
+                        matches!(
+                            token.role,
+                            Role::TypeName | Role::ValueName | Role::Lifetime
+                        ) && free.contains(token.compared())
+                    })
+                });
+                (mentions_free || !by_name.is_empty())
+                    .then(|| ImplNames::anchored(header, &pieces, &by_name))
+            };
+        let old_anchored = member_names(&old_member, old_header, old_names);
+        let new_anchored = member_names(&new_member, new_header, new_names);
+        let old_names = old_anchored.as_ref().unwrap_or(old_names);
+        let new_names = new_anchored.as_ref().unwrap_or(new_names);
+        let renamed = |member: &Option<MemberSignature>, names: &ImplNames| {
+            member.as_ref().map(|(pieces, value, _)| {
+                (
+                    pieces
+                        .iter()
+                        .map(|piece| applied(&names.bounds, piece))
+                        .collect::<Vec<_>>(),
+                    value.as_ref().map(|value| applied(&names.bounds, value)),
+                )
+            })
+        };
+        // 見出しの変化の最も小さい対応 (並べ替えの探索で採った新の並び) で、以下のマクロ・メンバー・値を比べる。
+        let (header_change, adopted) = self.search(
+            (old_impl.start_byte(), new_impl.start_byte()),
+            (old_header, old_names),
+            (new_header, new_names),
+        );
+        let adopted = adopted
+            .map(|order| ImplNames::with_order(new_header, order, new_names.fixed, new_names.used));
+        let new_names = adopted.as_ref().unwrap_or(new_names);
+        // 名前で組にした引数の番号が旧新で違えば (同じ名前が対象の型やメンバーの別の位置の引数を指す、片方にしか
+        // 無い)、対応を確かめられない。
+        let conflict = |names: &std::collections::BTreeSet<OpaqueName>| {
+            names.iter().any(|name| {
+                plain_number(old_names, old_header, name)
+                    != plain_number(new_names, new_header, name)
+            })
+        };
+        // マクロの呼び出しは、引数に書かない型の引数も呼び出し側の名前で使える (`macro_rules! ty { () => { T } }`)。
+        // 名前の付け直しが旧新で違えば (改名・並べ替え)、マクロの呼び出しを含む契約の部分は対応を確かめられない
+        // ので壊し、値は同じとしない (値の変更として別に比べる)。
+        let has_macro = |tokens: Vec<&super::rust_type_api::Tokens>| {
+            tokens.iter().any(|tokens| {
+                tokens
+                    .0
+                    .iter()
+                    .any(|token| token.role == super::rust_type_api::Role::Opaque)
+            })
+        };
+        let renaming_differs = !same_renaming(&old_names.bounds, &new_names.bounds);
+        let mut member_breaking = conflict(&contract_opaque)
+            || renaming_differs
+                && (has_macro(contract_tokens(old_header, &old_member))
+                    || has_macro(contract_tokens(new_header, &new_member)));
+        // 型の位置に書いた const の引数は名前のまま比べる (同じ名前の型と区別できない) ので、その名前の番号が旧新で
+        // 違えば (位置の入れ替え・片方にしか無い)、同じ字面が別の引数を指し、対応を確かめられない。見出しとメンバーの
+        // 契約の部分なら壊し、定数の値の中だけなら値が同じとはしない (値の変更として別に比べる)。
+        let typed_consts = |header: &ImplHeader, tokens: Vec<&super::rust_type_api::Tokens>| {
+            use super::rust_type_api::{ParamKind, Role};
+            let consts: std::collections::HashSet<&str> = header
+                .generics
+                .params
+                .iter()
+                .filter(|param| param.kind == ParamKind::Const)
+                .map(|param| param.name.as_str())
+                .collect();
+            tokens
+                .into_iter()
+                .flat_map(|tokens| tokens.0.iter())
+                .filter(|token| token.role == Role::TypeName && consts.contains(token.compared()))
+                .map(|token| token.compared().to_owned())
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+        let renumbered = |old: std::collections::BTreeSet<String>,
+                          new: std::collections::BTreeSet<String>| {
+            old.union(&new)
+                .any(|name| old_names.bounds.values.get(name) != new_names.bounds.values.get(name))
+        };
+        if renumbered(
+            typed_consts(old_header, contract_tokens(old_header, &old_member)),
+            typed_consts(new_header, contract_tokens(new_header, &new_member)),
+        ) {
+            member_breaking = true;
+        }
+        let value_renumbered = renumbered(
+            typed_consts(old_header, value_tokens(&old_member)),
+            typed_consts(new_header, value_tokens(&new_member)),
+        );
+        // メンバーの signature を付け直して比べる。契約の部分 (関数の本体と引数のパターンを除く部分、定数の型) が
+        // 同じなら、signature の字面の違いは付け直しと整形 (省略できるカンマなど) だけ (定数は値も同じとき)。
+        // 名前の付け直しが旧新で違えば字面は比べられないので、契約の部分が違うか読めなければ壊し、値が違えば
+        // signature の字面が同じでも値の変更にする。付け直しが同じなら、違いの判定は signature の比較に任せる。
+        if !member_breaking {
+            match (
+                renamed(&old_member, old_names),
+                renamed(&new_member, new_names),
+            ) {
+                (Some((old_contract, old_value)), Some((new_contract, new_value)))
+                    if old_contract == new_contract =>
+                {
+                    let value_same = old_value == new_value
+                        && !conflict(&value_opaque)
+                        && !value_renumbered
+                        && !(renaming_differs
+                            && (has_macro(value_tokens(&old_member))
+                                || has_macro(value_tokens(&new_member))));
+                    result.member_renamed = value_same;
+                    result.value_changed = renaming_differs && !value_same;
+                }
+                _ => member_breaking = renaming_differs,
+            }
+        }
+        // 戻り値が隠れた型 (`impl Trait`・`async`) の関数は、付け直しが同じでも引数と本体を (付け直して) 比べる。
+        // 違えば (局所の名前の改名だけでも) 隠れた型が同じと確かめられないので壊す。
+        let hidden = |member: &Option<MemberSignature>| {
+            member.as_ref().is_some_and(|(_, _, hidden)| *hidden)
+        };
+        if !member_breaking
+            && !renaming_differs
+            && (hidden(&old_member) || hidden(&new_member))
+            && renamed(&old_member, old_names).map(|(contract, _)| contract)
+                != renamed(&new_member, new_names).map(|(contract, _)| contract)
+        {
+            member_breaking = true;
+        }
+        // 隠れた型の関数は、見出しの境界を変えると本体の名前やメソッドの解決が変わり得る (境界の trait のメソッドが
+        // 先に選ばれる) ので、見出しが変われば (緩めても) 壊す。
+        if (hidden(&old_member) || hidden(&new_member)) && header_change != ShapeChange::Unchanged {
+            member_breaking = true;
+        }
+        result.change = if member_breaking {
+            ShapeChange::Breaking
+        } else {
+            header_change
+        };
+        Some(result)
+    }
+
+    /// 旧の見出しと付け直し `old` に対する、新の見出し `new` の変化の最も小さいもの (impl の組 `impls` と、
+    /// 対象の型・メンバーで番号の決まる引数の並びごとに 1 度だけ求める)。それ以外の引数 (関連型の等式など
+    /// で決まる) には書き方に依らない番号が無いので、6 個までなら新の並びを入れ替えて探す (境界を削っただけで
+    /// 番号が入れ替わり、強めたと読まない)。どう並べても壊すと分かれば ([`surely_breaking`]) 探さない。
+    fn search(
+        &self,
+        impls: (usize, usize),
+        (old_header, old_names): (&ImplHeader, &ImplNames),
+        (new_header, new_names): (&ImplHeader, &ImplNames),
+    ) -> Searched {
+        use super::rust_type_api::ShapeChange;
+        let key = (
+            impls,
+            old_names.order[..old_names.fixed].to_vec(),
+            new_names.order[..new_names.fixed].to_vec(),
+        );
+        if let Some(found) = self.searched.borrow().get(&key) {
+            return found.clone();
+        }
+        let header_change = |names: &ImplNames| {
+            compare_impl_generics(&old_header.generics, &new_header.generics, old_names, names)
+        };
+        let mut best = header_change(new_names);
+        let mut adopted = None;
+        let fixed = new_names.fixed;
+        let free = new_names.used - fixed;
+        if best != ShapeChange::Unchanged
+            && old_names.fixed == fixed
+            && old_names.used == new_names.used
+            && (2..=MAX_PERMUTED_PARAMS).contains(&free)
+            && !surely_breaking((old_header, old_names), (new_header, new_names))
+        {
+            let used = new_names.used;
+            let mut tail = new_names.order[fixed..used].to_vec();
+            for_each_permutation(&mut tail, |permuted| {
+                if permuted == &new_names.order[fixed..used] {
+                    return false;
+                }
+                let order: Vec<usize> = new_names.order[..fixed]
+                    .iter()
+                    .chain(permuted)
+                    .chain(&new_names.order[used..])
+                    .copied()
+                    .collect();
+                let names = ImplNames::with_order(new_header, order.clone(), fixed, used);
+                let change = header_change(&names);
+                if change < best {
+                    best = change;
+                    adopted = Some(order);
+                }
+                best == ShapeChange::Unchanged
+            });
+        }
+        self.searched
+            .borrow_mut()
+            .insert(key, (best, adopted.clone()));
+        (best, adopted)
+    }
+}
+
+/// 対象の型で番号の決まる引数の境界と述語のうち、対象の型に現れない引数を名指さないものを、新が旧に無いもの
+/// として足していれば真 (対象の型に現れない引数をどう並べても壊す)。
+fn surely_breaking(
+    (old_header, old_names): (&ImplHeader, &ImplNames),
+    (new_header, new_names): (&ImplHeader, &ImplNames),
+) -> bool {
+    use std::collections::{BTreeSet, HashSet};
+    let free_names = |header: &ImplHeader, names: &ImplNames| -> HashSet<String> {
+        names.order[names.fixed..names.used]
+            .iter()
+            .map(|&index| header.generics.params[index].name.clone())
+            .collect()
+    };
+    let (old_free, new_free) = (
+        free_names(old_header, old_names),
+        free_names(new_header, new_names),
+    );
+    let mentions = |tokens: &super::rust_type_api::Tokens, free: &HashSet<String>| {
+        tokens.0.iter().any(|token| free.contains(token.compared()))
+    };
+    for at in 0..new_names.fixed.min(old_names.fixed) {
+        let old_param = &old_header.generics.params[old_names.order[at]];
+        let new_param = &new_header.generics.params[new_names.order[at]];
+        let old_bounds: BTreeSet<Vec<String>> = old_param
+            .bounds
+            .iter()
+            .filter(|bound| !mentions(bound, &old_free))
+            .map(|bound| applied(&old_names.bounds, bound))
+            .collect();
+        if new_param
+            .bounds
+            .iter()
+            .filter(|bound| !mentions(bound, &new_free))
+            .any(|bound| !old_bounds.contains(&applied(&new_names.bounds, bound)))
+        {
+            return true;
+        }
+    }
+    let predicates = |header: &ImplHeader, names: &ImplNames, free: &HashSet<String>| {
+        header
+            .generics
+            .predicates
+            .iter()
+            .filter(|(left, bound)| !mentions(left, free) && !mentions(bound, free))
+            .map(|(left, bound)| applied(&names.bounds, &predicate_tokens(left, bound)))
+            .collect::<BTreeSet<_>>()
+    };
+    !predicates(new_header, new_names, &new_free)
+        .is_subset(&predicates(old_header, old_names, &old_free))
+}
+
+/// `tokens` に名前の付け直し `names` を当てた字句から、省略できる末尾のカンマ (型の引数の `>` の前と、並びの
+/// 最後の `,`) を除く。マクロの引数の中 (字面で照合される) のカンマと、`(u8,)` の 1 要素のタプルの印のカンマは
+/// 残す。
+fn applied(
+    names: &super::rust_type_api::Renaming,
+    tokens: &super::rust_type_api::Tokens,
+) -> Vec<String> {
+    use super::rust_type_api::Role;
+    let mut out: Vec<String> = Vec::with_capacity(tokens.0.len());
+    let mut removable = false;
+    for (token, text) in tokens.0.iter().zip(names.apply(tokens)) {
+        let opaque = token.role == Role::Opaque;
+        if text == ">" && !opaque && removable {
+            out.pop();
+        }
+        removable = text == "," && !opaque;
+        out.push(text);
+    }
+    if removable {
+        out.pop();
+    }
+    out
+}
+
+/// `items` の並べ替えを全て (今の並びから) `visit` に渡す (Heap の方法)。`visit` が真を返せば止める。
+fn for_each_permutation(items: &mut [usize], mut visit: impl FnMut(&[usize]) -> bool) {
+    let mut counters = vec![0usize; items.len()];
+    if visit(items) {
+        return;
+    }
+    let mut at = 1;
+    while at < items.len() {
+        if counters[at] < at {
+            if at % 2 == 0 {
+                items.swap(0, at);
+            } else {
+                items.swap(counters[at], at);
+            }
+            if visit(items) {
+                return;
+            }
+            counters[at] += 1;
+            at = 1;
+        } else {
+            counters[at] = 0;
+            at += 1;
+        }
+    }
+}
+
+/// 項目を囲む inherent impl の見出しを旧新で比べた結果 (Issue #307)。
+pub(crate) struct ImplHeaderChange {
+    /// 見出しの変化。見出しの型の引数の名前の付け直しが旧新で違い、付け直したメンバーの signature が
+    /// 違えば (読めなければ) 壊す。
+    pub(crate) change: super::rust_type_api::ShapeChange,
+    /// 見出しの型の引数の名前を付け直すと、メンバーの signature の契約の部分 (と定数の値) が同じ (signature
+    /// の字面の違いは付け直しと整形だけ)。
+    pub(crate) member_renamed: bool,
+    /// 関連定数の値のマクロの引数の中 (字面のまま比べる) に現れる型の引数の対応が旧新で変わり、値が同じと
+    /// 言えない (signature の字面が同じでも値の変更として比べる)。
+    pub(crate) value_changed: bool,
+    /// 旧新の見出しの字面 (表示用)。
+    pub(crate) old_text: String,
+    pub(crate) new_text: String,
+}
+
+impl ImplHeaderChange {
+    /// 見出しを読めないときの結果 (壊す)。
+    pub(crate) fn breaking() -> Self {
+        Self {
+            change: super::rust_type_api::ShapeChange::Breaking,
+            member_renamed: false,
+            value_changed: false,
+            old_text: String::new(),
+            new_text: String::new(),
+        }
+    }
+}
+
+/// 見出しとメンバー `member` の契約の部分の字句 (対象の型・境界・述語・メンバーの signature の切れ)。
+fn contract_tokens<'a>(
+    header: &'a ImplHeader,
+    member: &'a Option<MemberSignature>,
+) -> Vec<&'a super::rust_type_api::Tokens> {
+    std::iter::once(&header.self_type)
+        .chain(
+            header
+                .generics
+                .params
+                .iter()
+                .flat_map(|param| &param.bounds),
+        )
+        .chain(
+            header
+                .generics
+                .predicates
+                .iter()
+                .flat_map(|(left, bound)| [left, bound]),
+        )
+        .chain(member.iter().flat_map(|(pieces, ..)| pieces.iter()))
+        .collect()
+}
+
+/// メンバー `member` (関連定数) の値の字句。
+fn value_tokens(member: &Option<MemberSignature>) -> Vec<&super::rust_type_api::Tokens> {
+    member
+        .iter()
+        .flat_map(|(_, value, _)| value.iter())
+        .collect()
+}
+
+/// 型の引数の名前 (宣言の字面) から `r#` と寿命の `'` を外したもの (マクロの引数の中の字句と照らし合わせる)。
+fn plain_name(name: &str) -> &str {
+    super::rust_type_api::unraw(name.trim_start_matches('\''))
+}
+
+/// マクロの引数の中に現れる型の引数の名前: 寿命か (名前空間) と、[`plain_name`]。
+type OpaqueName = (bool, String);
+
+/// 型の引数 `param` が名前 `name` ([`OpaqueName`]) のものか。
+fn is_named(param: &super::rust_type_api::Param, (lifetime, plain): &OpaqueName) -> bool {
+    (param.kind == super::rust_type_api::ParamKind::Lifetime) == *lifetime
+        && plain_name(&param.name) == plain.as_str()
+}
+
+/// `tokens` のマクロの引数の中 (字面のまま比べる) に現れる、`header` の型の引数の名前 ([`OpaqueName`])。マクロの
+/// 引数の中の寿命は `'` と名前の 2 つの字句に分かれ、`r#` も残るので、それらを外して照らし合わせる (`'` が前に
+/// あれば寿命の名前空間)。
+fn opaque_params<'t>(
+    header: &ImplHeader,
+    tokens: impl IntoIterator<Item = &'t super::rust_type_api::Tokens>,
+) -> std::collections::HashSet<OpaqueName> {
+    use super::rust_type_api::Role;
+    let mut found = std::collections::HashSet::new();
+    for tokens in tokens {
+        for (at, token) in tokens.0.iter().enumerate() {
+            if token.role != Role::Opaque {
+                continue;
+            }
+            let text = token.compared();
+            let lifetime = text.starts_with('\'') || at > 0 && tokens.0[at - 1].compared() == "'";
+            let name = (lifetime, plain_name(text).to_owned());
+            if header
+                .generics
+                .params
+                .iter()
+                .any(|param| is_named(param, &name))
+            {
+                found.insert(name);
+            }
+        }
+    }
+    found
+}
+
+/// 付け直し `names` での、`header` の型の引数のうち名前が `name` ([`OpaqueName`]) のものの番号。
+fn plain_number<'n>(
+    names: &'n ImplNames,
+    header: &ImplHeader,
+    name: &OpaqueName,
+) -> Option<&'n String> {
+    let param = header
+        .generics
+        .params
+        .iter()
+        .find(|param| is_named(param, name))?;
+    let renaming = &names.bounds;
+    if param.name.starts_with('\'') {
+        renaming.lifetimes.get(&param.name)
+    } else {
+        renaming
+            .types
+            .get(&param.name)
+            .or_else(|| renaming.values.get(&param.name))
+    }
+}
+
+/// `node` か、その中に種類が `kind` の節があるか。
+fn contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    false
+}
+
+/// 述語 `left: bound` の字句 (左辺の `for<'a>` の束縛が境界にも及ぶよう、続けて付け直す)。
+fn predicate_tokens(
+    left: &super::rust_type_api::Tokens,
+    bound: &super::rust_type_api::Tokens,
+) -> super::rust_type_api::Tokens {
+    use super::rust_type_api::{Role, Token, Tokens};
+    let separator = Token {
+        text: ":".to_owned(),
+        spaced: false,
+        role: Role::Other,
+    };
+    Tokens(
+        left.0
+            .iter()
+            .cloned()
+            .chain(std::iter::once(separator))
+            .chain(bound.0.iter().cloned())
+            .collect(),
+    )
+}
+
+/// 名前の付け直しが同じか。
+fn same_renaming(
+    old: &super::rust_type_api::Renaming,
+    new: &super::rust_type_api::Renaming,
+) -> bool {
+    old.types == new.types && old.values == new.values && old.lifetimes == new.lifetimes
+}
+
+/// `start` に始まる、impl の本体 (`declaration_list`) の直下の項目 (メソッド・関連定数)。
+fn member_at(root: tree_sitter::Node<'_>, start: (usize, usize)) -> Option<tree_sitter::Node<'_>> {
+    let point = tree_sitter::Point {
+        row: start.0,
+        column: start.1,
+    };
+    let mut node = root.descendant_for_point_range(point, point)?;
+    loop {
+        if node.start_position() == point
+            && node
+                .parent()
+                .is_some_and(|body| body.kind() == "declaration_list")
+        {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// メソッド・関連定数の signature の字句: 契約になる部分の切れ (関数は本体と引数のパターンを除く部分、
+/// 定数は型) と、定数の値。
+type MemberSignature = (
+    Vec<super::rust_type_api::Tokens>,
+    Option<super::rust_type_api::Tokens>,
+    bool,
+);
+
+/// メソッド・関連定数の signature の字句 ([`MemberSignature`])。引数は型だけを見る (パターンの名前と束縛の
+/// `mut` は契約でない)。読めなければ None。
+fn member_signature(member: tree_sitter::Node<'_>, source: &[u8]) -> Option<MemberSignature> {
+    use super::rust_type_api::Tokens;
+    let comment =
+        |node: tree_sitter::Node<'_>| matches!(node.kind(), "line_comment" | "block_comment");
+    match member.kind() {
+        "function_item" => {
+            let body = member.child_by_field_name("body");
+            // 戻り値が `impl Trait` (マクロが返すかもしれない型を含む) か `async` の関数は、隠れた型と外に漏れる
+            // auto trait が本体で決まるので、本体も契約の部分にする。引数のパターンも本体の名前の型を決めるので、
+            // 引数はそのまま比べる。`async` は修飾子の構文の字句で見る (コメントが隣り合っても)。本体が参照する
+            // ほかの宣言の変更は比べない (Issue #323)。
+            let mut cursor = member.walk();
+            let hidden_return = member.child_by_field_name("return_type").is_some_and(|ty| {
+                contains_kind(ty, "abstract_type") || contains_kind(ty, "macro_invocation")
+            }) || member
+                .children(&mut cursor)
+                .any(|child| child.kind() == "function_modifiers" && contains_kind(child, "async"));
+            let mut pieces = Vec::new();
+            let mut cursor = member.walk();
+            for child in member.children(&mut cursor) {
+                if comment(child) {
+                    continue;
+                }
+                if Some(child) == body {
+                    if hidden_return {
+                        pieces.push(Tokens::of(child, source)?);
+                    }
+                    continue;
+                }
+                if child.kind() != "parameters" {
+                    pieces.push(Tokens::of(child, source)?);
+                    continue;
+                }
+                if hidden_return {
+                    // 引数をパターンも含めてそのまま比べる (省略できる最後のカンマは除く)。
+                    let mut cursor = child.walk();
+                    let mut parts: Vec<tree_sitter::Node<'_>> = child
+                        .children(&mut cursor)
+                        .filter(|part| !comment(*part))
+                        .collect();
+                    if parts.len() >= 2 && parts[parts.len() - 2].kind() == "," {
+                        parts.remove(parts.len() - 2);
+                    }
+                    pieces.push(Tokens::of_nodes(&parts, source)?);
+                    continue;
+                }
+                let mut cursor = child.walk();
+                for parameter in child.named_children(&mut cursor) {
+                    match parameter.kind() {
+                        "parameter" => {
+                            // `self: &Self` の `self` は受け手 (ほかの引数のパターンと違い契約の一部)。
+                            if let Some(pattern) = parameter.child_by_field_name("pattern")
+                                && pattern.kind() == "self"
+                            {
+                                pieces.push(Tokens::of(pattern, source)?);
+                            }
+                            pieces
+                                .push(Tokens::of(parameter.child_by_field_name("type")?, source)?);
+                        }
+                        // `mut self` の `mut` は束縛の側。
+                        "self_parameter" => {
+                            let tokens = Tokens::of(parameter, source)?;
+                            let start = usize::from(
+                                tokens
+                                    .0
+                                    .first()
+                                    .is_some_and(|token| token.compared() == "mut"),
+                            );
+                            pieces.push(Tokens(tokens.0[start..].to_vec()));
+                        }
+                        _ if comment(parameter) => {}
+                        _ => pieces.push(Tokens::of(parameter, source)?),
+                    }
+                }
+            }
+            Some((pieces, None, hidden_return))
+        }
+        "const_item" => Some((
+            vec![Tokens::of(member.child_by_field_name("type")?, source)?],
+            Some(Tokens::of(member.child_by_field_name("value")?, source)?),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+/// 旧新の宣言の有る条件が、どの設定でも同じく成り立つか (`#[cfg]` の書き方の違いは同じとみなす)。読めない
+/// 条件があるか、原子が多すぎれば false。
+pub(crate) fn same_availability(
+    old: &RustDeclarationContext,
+    new: &RustDeclarationContext,
+) -> bool {
+    use super::rust_cfg_predicate::{Atoms, Predicate};
+    let (Some(old_attributes), Some(new_attributes)) = (&old.availability, &new.availability)
+    else {
+        return false;
+    };
+    let mut atoms = Atoms::default();
+    let mut predicate = |attributes: &[AvailabilityAttr]| {
+        Predicate::All(
+            attributes
+                .iter()
+                .map(|attribute| atoms.presence(&attribute.key))
+                .collect(),
+        )
+    };
+    let (old_predicate, new_predicate) = (predicate(old_attributes), predicate(new_attributes));
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    configs.all(|config| old_predicate.holds(config) == new_predicate.holds(config))
+}
+
+/// 対象の型の字句から、型の名前の前の経路 (`crate::S<T>` の `crate::`) を除く (同じ型の書き方の違い)。
+pub(crate) fn last_segment(tokens: Vec<String>) -> Vec<String> {
+    let arguments = tokens
+        .iter()
+        .position(|token| token == "<")
+        .unwrap_or(tokens.len());
+    match tokens[..arguments].iter().rposition(|token| token == "::") {
+        Some(separator) => tokens[separator + 1..].to_vec(),
+        None => tokens,
+    }
+}
+
+/// impl の型の引数と `where` を比べる (Issue #307)。impl の見出しは項目を使える型の条件なので、構造体の
+/// 型の引数 (暗黙の寿命の境界を保つ) とは違い、引数ごとの境界 (寿命も) と `where` の述語が旧い版の部分集合
+/// なら緩めるだけ (互換)、等しければ同じ、それ以外は強める (壊す)。`?Sized` を足せば緩め、外せば強める。
+/// 引数は対象の型に現れる順で組にし ([`ImplNames`])、数・種類・const の型が違えば壊す。
+fn compare_impl_generics(
+    old: &super::rust_type_api::Generics,
+    new: &super::rust_type_api::Generics,
+    old_names: &ImplNames,
+    new_names: &ImplNames,
+) -> super::rust_type_api::ShapeChange {
+    use super::rust_type_api::{Param, Renaming, ShapeChange, Tokens};
+    use std::collections::BTreeSet;
+    fn contains<T: Ord>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> ShapeChange {
+        if old == new {
+            ShapeChange::Unchanged
+        } else if new.is_subset(old) {
+            ShapeChange::Compatible
+        } else {
+            ShapeChange::Breaking
+        }
+    }
+    // 使われない寿命の引数 (並びの後ろ) は、どの寿命でも満たせるので比べない。使われる引数の数が違えば壊す
+    // (`T: 'a + 'b, 'a: 'b` から `T: 'b` のように、寿命の関係から同じになることは確かめない)。
+    if old_names.used != new_names.used {
+        return ShapeChange::Breaking;
+    }
+    let renamed = |names: &Renaming, tokens: &Option<Tokens>| {
+        tokens.as_ref().map(|tokens| applied(names, tokens))
+    };
+    let bounds = |param: &Param, names: &Renaming| -> BTreeSet<Vec<String>> {
+        param
+            .bounds
+            .iter()
+            .map(|bound| applied(names, bound))
+            .collect()
+    };
+    // 大きさの決まらない型を許す (`?Sized` で、`Sized` を書いていない)。
+    let unsized_allowed = |param: &Param| param.relaxed && !param.sized_written;
+    let mut change = ShapeChange::Unchanged;
+    for (&old_index, &new_index) in old_names.order[..old_names.used]
+        .iter()
+        .zip(&new_names.order[..new_names.used])
+    {
+        let (old_param, new_param) = (&old.params[old_index], &new.params[new_index]);
+        if old_param.kind != new_param.kind
+            || renamed(&old_names.bounds, &old_param.const_type)
+                != renamed(&new_names.bounds, &new_param.const_type)
+        {
+            return ShapeChange::Breaking;
+        }
+        change = change.max(contains(
+            &bounds(old_param, &old_names.bounds),
+            &bounds(new_param, &new_names.bounds),
+        ));
+        match (unsized_allowed(old_param), unsized_allowed(new_param)) {
+            (true, false) => return ShapeChange::Breaking,
+            (false, true) => change = change.max(ShapeChange::Compatible),
+            _ => {}
+        }
+    }
+    let predicates = |generics: &super::rust_type_api::Generics, names: &Renaming| {
+        generics
+            .predicates
+            .iter()
+            .map(|(left, bound)| applied(names, &predicate_tokens(left, bound)))
+            .collect::<BTreeSet<_>>()
+    };
+    change.max(contains(
+        &predicates(old, &old_names.bounds),
+        &predicates(new, &new_names.bounds),
+    ))
+}
+
+/// `start` に始まる項目を、本体 (`declaration_list`) の直下に持つ inherent impl (trait の impl は None)。
+fn inherent_impl_at(
+    root: tree_sitter::Node<'_>,
+    start: (usize, usize),
+) -> Option<tree_sitter::Node<'_>> {
+    let point = tree_sitter::Point {
+        row: start.0,
+        column: start.1,
+    };
+    let mut node = root.descendant_for_point_range(point, point)?;
+    loop {
+        if node.start_position() == point
+            && let Some(body) = node.parent()
+            && body.kind() == "declaration_list"
+            && let Some(container) = body.parent()
+            && container.kind() == "impl_item"
+        {
+            return container
+                .child_by_field_name("trait")
+                .is_none()
+                .then_some(container);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// inherent impl `item` の見出し (読めなければ None)。
+fn impl_header(item: tree_sitter::Node<'_>, source: &[u8]) -> Option<ImplHeader> {
+    let self_type = super::rust_type_api::Tokens::of(item.child_by_field_name("type")?, source)?;
+    let mut cursor = item.walk();
+    let where_clause = item
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "where_clause");
+    let generics = super::rust_type_api::Generics::parse(
+        item.child_by_field_name("type_parameters"),
+        where_clause,
+        source,
+    )?;
+    Some(ImplHeader {
+        self_type,
+        generics,
+    })
+}
+
+/// impl `item` の見出しの字面 (本体の前まで。空白を 1 つに詰める)。
+fn impl_header_text(item: tree_sitter::Node<'_>, source: &[u8]) -> String {
+    let end = item
+        .child_by_field_name("body")
+        .map_or(item.end_byte(), |body| body.start_byte());
+    String::from_utf8_lossy(&source[item.start_byte()..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `source` の `start` に始まる構造体の形。
