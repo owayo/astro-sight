@@ -119,6 +119,28 @@ pub(crate) fn compare(
     }
 }
 
+/// 旧新の宣言 (同じ鍵の宣言をまとめて) が、原子を独立に扱った (組み込みの cfg の関係を使わない。
+/// `--cfg` で上書きした設定も含む) 全ての設定で、同じく有るか (Issue #312)。読めない属性があるか、
+/// 原子が多すぎれば偽。
+pub(crate) fn same_in_every_config(
+    old: &[&RustDeclarationContext],
+    new: &[&RustDeclarationContext],
+) -> bool {
+    let (Some(old_keys), Some(new_keys)) = (availability_keys(old), availability_keys(new)) else {
+        return false;
+    };
+    if old_keys == new_keys {
+        return true;
+    }
+    let mut atoms = Atoms::independent();
+    let old_predicate = side_predicate(&mut atoms, &old_keys);
+    let new_predicate = side_predicate(&mut atoms, &new_keys);
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    configs.all(|config| old_predicate.holds(config) == new_predicate.holds(config))
+}
+
 /// 出力に添える旧新の有る条件 (宣言ごとの属性の表示)。読めない属性のある宣言は、cfg の属性の
 /// トークンをそのまま並べる。
 pub(crate) fn describe(

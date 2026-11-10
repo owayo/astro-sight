@@ -7,7 +7,9 @@
 //! 比べる (エスケープを解く。解けない値の原子は、ほかの値と同時に真になり得るものとする)。
 //! `target_family = "unix"`・`"windows"` は `unix`・`windows` と同じ原子にし、rustc の組み込みの
 //! target で確かめた含意 (Unix 系の `target_os` は `unix`、`target_os = "windows"` は `windows` を
-//! 含み、`unix` と `windows` は同時に真にならない) の無い組み合わせは比べない。
+//! 含み、`unix` と `windows` は同時に真にならない) の無い組み合わせは比べない。組み込みの cfg は
+//! `--cfg` で上書きできる (`explicit_builtin_cfgs_in_flags` を許せば) ので、見逃しを避ける判定には、
+//! これらの関係を使わない表 ([`Atoms::independent`]) を使う。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -207,9 +209,22 @@ pub(super) struct Atoms {
     list: Vec<Vec<String>>,
     /// 原子の字面 → 番号 (原子の多い条件でも、登録が原子の数の 2 乗にならない)。
     index: std::collections::HashMap<Vec<String>, usize>,
+    /// 組み込みの cfg の関係 (1 つの値しか取らない鍵、`target_family` と `unix`・`windows`、target の
+    /// 含意) を使わず、原子をそれぞれ独立に扱うか ([`Self::independent`])。
+    independent: bool,
 }
 
 impl Atoms {
+    /// 原子をそれぞれ独立に扱う表。組み込みの cfg は `--cfg` で上書きでき (`unix` と `windows` が同時に
+    /// 真、`target_os` が 2 つの値を持つ、など)、その関係で除いた組み合わせも起こり得るので、見逃しを
+    /// 避ける判定 (Issue #312 の枝の絞り込み) に使う。
+    pub(super) fn independent() -> Self {
+        Self {
+            independent: true,
+            ..Self::default()
+        }
+    }
+
     /// 1 つの値しか取らない鍵ごとの、原子の番号のビット。値を解けない原子 (読めないエスケープ) は、
     /// 同じ値の別の書き方かもしれないので含めない。
     pub(super) fn exclusive(&self) -> Vec<u64> {
@@ -234,7 +249,9 @@ impl Atoms {
             [key, equals, value] if equals == "=" => match string_value(value) {
                 // `target_family = "unix"` は `unix` (`windows` も同じ)。
                 Some(value)
-                    if key == "target_family" && matches!(value.as_str(), "unix" | "windows") =>
+                    if !self.independent
+                        && key == "target_family"
+                        && matches!(value.as_str(), "unix" | "windows") =>
                 {
                     vec![value]
                 }
@@ -408,8 +425,11 @@ impl Atoms {
         if self.list.len() > MAX_ATOMS {
             return None;
         }
-        let exclusive = self.exclusive();
-        let implications = self.implications();
+        let (exclusive, implications) = if self.independent {
+            (Vec::new(), Vec::new())
+        } else {
+            (self.exclusive(), self.implications())
+        };
         Some((0..1u64 << self.list.len()).filter(move |config| {
             possible(*config, &exclusive)
                 && implications.iter().all(|&(atom, required, forbidden)| {
@@ -575,6 +595,21 @@ mod tests {
         atoms.predicate(&tokens("target_os = \"wasi\""));
         atoms.predicate(&tokens("unix"));
         assert_eq!(configs(&atoms), vec![0b00, 0b01, 0b10, 0b11]);
+    }
+
+    /// 原子を独立に扱う表は、組み込みの cfg の関係を使わない (`--cfg` で上書きした設定も比べる)。
+    #[test]
+    fn independent_atoms_ignore_builtin_relations() {
+        let tokens = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
+        let configs = |atoms: &Atoms| -> Vec<u64> { atoms.configs().expect("configs").collect() };
+        let mut atoms = Atoms::independent();
+        atoms.predicate(&tokens("target_os = \"linux\""));
+        atoms.predicate(&tokens("target_os = \"macos\""));
+        atoms.predicate(&tokens("unix"));
+        atoms.predicate(&tokens("windows"));
+        atoms.predicate(&tokens("target_family = \"unix\""));
+        assert_eq!(atoms.len(), 5);
+        assert_eq!(configs(&atoms), (0..1u64 << 5).collect::<Vec<_>>());
     }
 
     #[test]

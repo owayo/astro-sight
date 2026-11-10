@@ -6,6 +6,7 @@
 //! 字面 (`crate:`・`mod-file:`) で識別する。
 
 use super::*;
+use crate::commands::api_changes::rust_cfg_predicate::{Atoms, Predicate};
 use std::rc::Rc;
 
 /// 共有するファイルの索引。
@@ -74,6 +75,11 @@ pub(crate) struct Candidate {
     /// 候補の条件 (cfg のトークン)。外側の条件から順に並ぶ。
     pub(crate) conditions: Vec<String>,
     pub(crate) target: Target,
+    /// 名前を引いたスコープ (か同じファイルの祖先のスコープ) で見つけた型別名・定数・static・項目の
+    /// 定義で、項目を置き換え得る属性が無いか (Issue #312)。条件 `conditions` がそのまま定義の有る条件
+    /// なので、宣言の有る設定を覆うかの証明に使える。`use`・glob・module の経路・ほかのファイルを
+    /// 通った候補は、経路の条件や先の有無が欠け得るので使わない。
+    pub(crate) direct: bool,
 }
 
 impl Candidate {
@@ -81,6 +87,17 @@ impl Candidate {
         Self {
             conditions: conditions.to_vec(),
             target,
+            direct: false,
+        }
+    }
+
+    /// 名前を引いたスコープの定義の候補。`opaque` は覆いの証明に使えないか (項目を置き換え得る属性が
+    /// 付いている、値の名前で引いた名前付きのフィールドの構造体)。
+    fn definition(conditions: &[String], target: Target, opaque: bool) -> Self {
+        Self {
+            conditions: conditions.to_vec(),
+            target,
+            direct: !opaque,
         }
     }
 }
@@ -103,6 +120,8 @@ impl Resolved {
                 let mut all = conditions.to_vec();
                 all.append(&mut candidate.conditions);
                 candidate.conditions = all;
+                // 経路 (`use`・glob・module) を通った候補は、名前を引いたスコープの定義ではない。
+                candidate.direct = false;
                 candidate
             })
             .collect()
@@ -127,6 +146,184 @@ pub(crate) struct Resolver<'c> {
     active: std::cell::RefCell<Vec<LookupKey>>,
     /// 経路を解いている最中の glob。その経路の module の区切りを、同じ glob から引かない。
     visiting_globs: std::cell::RefCell<Vec<GlobKey>>,
+    /// 束縛を解いている宣言の有る条件 (Issue #312。[`Self::declaration_dependencies`] の間だけ)。
+    availability: std::cell::RefCell<Option<Rc<AvailabilityFilter>>>,
+    /// 候補の条件のトークン → 有る条件の属性の鍵 ([`condition_keys`]。読めなければ None)。
+    condition_keys: std::cell::RefCell<HashMap<Vec<String>, Option<ConditionKeys>>>,
+    /// 型別名・定数の右辺を描かずに候補を集める下見の最中か ([`Self::resolve_candidates`])。
+    skip_renders: std::cell::Cell<bool>,
+}
+
+/// 有る条件の属性の鍵の並び (`cfg` と、`cfg` だけに絞った `cfg_attr`)。
+type ConditionKeys = Vec<Vec<String>>;
+
+/// [`Resolver::swap_filter`] で差し替えた宣言の有る条件を、落ちるときに戻す (`?` で抜けても戻す)。
+struct FilterGuard<'a> {
+    cell: &'a std::cell::RefCell<Option<Rc<AvailabilityFilter>>>,
+    saved: Option<Rc<AvailabilityFilter>>,
+}
+
+impl Drop for FilterGuard<'_> {
+    fn drop(&mut self) {
+        *self.cell.borrow_mut() = self.saved.take();
+    }
+}
+
+/// [`Resolver::skipping_renders`] で右辺を描かないようにした状態を、落ちるときに戻す。
+struct SkipGuard<'a> {
+    cell: &'a std::cell::Cell<bool>,
+    saved: bool,
+}
+
+impl Drop for SkipGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.saved);
+    }
+}
+
+/// 宣言の有る条件 (Issue #312)。宣言の有る設定と、どの設定でも両立しない条件の束縛の候補は、
+/// その宣言からは使われないので比べない (`#[cfg(not(x))] pub fn run(_: Text)` は、
+/// `#[cfg(x)] type Text = ..;` の枝を使わない)。条件の読み方は項目の有る設定 (Issue #291) と同じ
+/// (`rust_cfg_predicate`) だが、組み込みの cfg の関係 (`unix` と `windows` は同時に真にならない、など)
+/// は `--cfg` で上書きでき得るので使わない ([`Atoms::independent`])。両立するかを決められない (読めない
+/// 属性・原子が多すぎる) 候補は残す。
+///
+/// 宣言の有る条件は宣言自身の条件だけ (親の module の条件は含めないので、実際に有る設定を含む)。
+/// 宣言の有る設定が旧新で変わるときは、呼び出し側が絞らない (`compare_dependencies`)。
+pub(crate) struct AvailabilityFilter {
+    /// 宣言自身の有る条件の属性の鍵 (`cfg` と、`cfg` だけに絞った `cfg_attr`。全て成り立つ)。
+    own: ConditionKeys,
+}
+
+impl AvailabilityFilter {
+    /// 宣言自身の有る条件の属性 `own` の。条件が無いか読めなければ (絞らないので) None。
+    pub(crate) fn new(own: Option<&[AvailabilityAttr]>) -> Option<Self> {
+        let own: ConditionKeys = own?.iter().map(|attribute| attribute.key.clone()).collect();
+        (!own.is_empty()).then_some(Self { own })
+    }
+
+    /// 宣言の有る設定の述語。
+    fn predicate(&self, atoms: &mut Atoms) -> Predicate {
+        Predicate::All(self.own.iter().map(|key| atoms.presence(key)).collect())
+    }
+
+    /// 有る条件の属性の鍵 `keys` (候補の条件。読めなければ None) の付いた束縛が、宣言の有るどれかの
+    /// 設定で有り得るか。決められなければ真。
+    fn compatible(&self, keys: Option<&ConditionKeys>) -> bool {
+        let Some(keys) = keys else {
+            return true;
+        };
+        if keys.is_empty() {
+            return true;
+        }
+        // 組み込みの cfg は `--cfg` で上書きでき得るので、その関係は使わない (見逃しを避ける)。
+        let mut atoms = Atoms::independent();
+        let declaration = self.predicate(&mut atoms);
+        let candidate = Predicate::All(keys.iter().map(|key| atoms.presence(key)).collect());
+        let Some(mut configs) = atoms.configs() else {
+            return true;
+        };
+        configs.any(|config| declaration.holds(config) && candidate.holds(config))
+    }
+
+    /// 有る条件の属性の鍵の並び `branches` (残す候補の条件) のどれかが、宣言の有る全ての設定で
+    /// 成り立つか。決められなければ偽。
+    fn covered(&self, branches: &[ConditionKeys]) -> bool {
+        if branches.iter().any(Vec::is_empty) {
+            return true;
+        }
+        let mut atoms = Atoms::independent();
+        let declaration = self.predicate(&mut atoms);
+        let present = Predicate::Any(
+            branches
+                .iter()
+                .map(|keys| Predicate::All(keys.iter().map(|key| atoms.presence(key)).collect()))
+                .collect(),
+        );
+        let Some(mut configs) = atoms.configs() else {
+            return false;
+        };
+        !configs.any(|config| declaration.holds(config) && !present.holds(config))
+    }
+}
+
+/// 条件のトークン (`cfg`・`cfg_attr` の属性 (`#[..]`・`#![..]`) を [`push_tokens`] で並べたもの) の、
+/// 有る条件に効く属性の鍵 (`project_attribute` で `cfg` に絞ったもの。`cfg` を含まない `cfg_attr` は
+/// 入れない)。属性ごとに字面へ戻して読み直す。読めなければ None。
+fn condition_keys(conditions: &[String]) -> Option<ConditionKeys> {
+    let mut keys = Vec::new();
+    for attribute in condition_attributes(conditions)? {
+        // 内側の属性 (`#![..]`) は、外側の属性として読む (付く項目の有る条件は同じ)。
+        let tokens = match attribute {
+            [hash, bang, rest @ ..] if hash == "#" && bang == "!" => rest,
+            [hash, rest @ ..] if hash == "#" => rest,
+            _ => return None,
+        };
+        let mut text = String::from("#");
+        for token in tokens {
+            let (kind, plain) = token_text(token);
+            text.push(' ');
+            text.push_str(plain);
+            if kind == Some("line_comment") {
+                text.push('\n');
+            }
+        }
+        text.push_str("\nstruct AstroSightCondition;\n");
+        let source = text.as_bytes();
+        let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
+        let root = tree.root_node();
+        if root.has_error() || root.named_child_count() != 2 {
+            return None;
+        }
+        let item = root
+            .named_child(0)
+            .filter(|node| node.kind() == "attribute_item")?;
+        if let Some(attribute) =
+            super::super::rust_type_api::project_attribute(item, source, &["cfg"])?
+        {
+            keys.push(attribute.key);
+        }
+    }
+    Some(keys)
+}
+
+/// 条件のトークンを、属性 (`#` で始まる並び) ごとに分ける。括弧の中の `#` (`cfg_attr` の中の属性の
+/// 引数) では分けない。`#` で始まらなければ None。
+fn condition_attributes(conditions: &[String]) -> Option<Vec<&[String]>> {
+    if conditions.first().is_none_or(|first| first != "#") {
+        return None;
+    }
+    let mut attributes = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, token) in conditions.iter().enumerate() {
+        match token.as_str() {
+            "#" if depth == 0 && index > start => {
+                attributes.push(&conditions[start..index]);
+                start = index;
+            }
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    attributes.push(&conditions[start..]);
+    Some(attributes)
+}
+
+/// [`push_tokens`] のトークンの、名前付きの葉の種類 (`identifier:x` の `identifier`) と字面。
+fn token_text(token: &str) -> (Option<&str>, &str) {
+    match token.split_once(':') {
+        Some((kind, text))
+            if !kind.is_empty()
+                && kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            (Some(kind), text)
+        }
+        _ => (None, token),
+    }
 }
 
 /// 引いている束縛 (ファイル, ファイルの module の経路, スコープ, 名前, 名前空間, module の区切りか,
@@ -159,6 +356,9 @@ impl<'c> Resolver<'c> {
             changes,
             active: std::cell::RefCell::new(Vec::new()),
             visiting_globs: std::cell::RefCell::new(Vec::new()),
+            availability: std::cell::RefCell::new(None),
+            condition_keys: std::cell::RefCell::new(HashMap::new()),
+            skip_renders: std::cell::Cell::new(false),
         }
     }
 }
@@ -209,6 +409,65 @@ impl Resolver<'_> {
         self.place(file, scope)
     }
 
+    /// 条件 `conditions` (候補の cfg のトークン) の有る条件の属性の鍵 (読めなければ None)。
+    fn keys_of(&self, conditions: &[String]) -> Option<ConditionKeys> {
+        if conditions.is_empty() {
+            return Some(Vec::new());
+        }
+        self.condition_keys
+            .borrow_mut()
+            .entry(conditions.to_vec())
+            .or_insert_with(|| condition_keys(conditions))
+            .clone()
+    }
+
+    /// 宣言の有る条件 (絞り込み) を `filter` に差し替える。返すガードが落ちるときに元へ戻す。絞り込みは、
+    /// 直接の定義をたどる経路 ([`Self::resolve_candidates`] の祖先の枝と、[`Self::lookup_bindings`] の
+    /// 直接の定義の右辺) でだけ使い、ほかは外す (Issue #312)。
+    fn swap_filter(&self, filter: Option<Rc<AvailabilityFilter>>) -> FilterGuard<'_> {
+        let saved = std::mem::replace(&mut *self.availability.borrow_mut(), filter);
+        FilterGuard {
+            cell: &self.availability,
+            saved,
+        }
+    }
+
+    /// 候補 `candidates` のうち宣言の有る条件 `filter` と両立するもの (添字) が、全て直接の定義で、宣言の
+    /// 有る全ての設定を覆うなら、その添字。覆えば、その設定では明示の束縛が glob・prelude を隠すので、
+    /// 両立しない候補は使われず、残す候補の右辺も同じ設定で絞れる。覆わない・決められないときは、その
+    /// 設定で名前がほかで解け得るので None (全ての候補を、右辺も絞らずに比べる)。
+    fn covering(
+        &self,
+        filter: &AvailabilityFilter,
+        candidates: &[Candidate],
+    ) -> Option<Vec<usize>> {
+        let keys: Vec<Option<ConditionKeys>> = candidates
+            .iter()
+            .map(|candidate| self.keys_of(&candidate.conditions))
+            .collect();
+        let kept: Vec<usize> = (0..candidates.len())
+            .filter(|&index| filter.compatible(keys[index].as_ref()))
+            .collect();
+        // 覆いを証明できるのは、名前を引いたスコープの直接の定義だけ (条件がそのまま有る条件)。
+        if !kept.iter().all(|&index| candidates[index].direct) {
+            return None;
+        }
+        let branches = kept
+            .iter()
+            .map(|&index| keys[index].clone())
+            .collect::<Option<Vec<_>>>()?;
+        filter.covered(&branches).then_some(kept)
+    }
+
+    /// 型別名・定数の右辺を描かずに候補を集める下見にする。返すガードが落ちるときに元へ戻す。
+    fn skipping_renders(&self) -> SkipGuard<'_> {
+        let saved = self.skip_renders.replace(true);
+        SkipGuard {
+            cell: &self.skip_renders,
+            saved,
+        }
+    }
+
     /// 候補の、条件を前置きした識別の字面。
     fn identity(&self, candidate: &Candidate) -> String {
         let identity = match &candidate.target {
@@ -230,11 +489,13 @@ impl Resolver<'_> {
     }
 
     /// 比べるファイルの、`start` (行, 列) に始まる宣言の契約が名指す名前の、字面ごとの束縛 (解け
-    /// なければ None の要素)。宣言を引けなければ None。
+    /// なければ None の要素)。宣言を引けなければ None。`availability` は宣言の有る条件 (Issue #312)。
+    /// 両立しない条件の束縛の候補は、残りが宣言の有る設定を覆うときに比べない。
     pub(crate) fn declaration_dependencies(
         &self,
         start: (usize, usize),
         inline_module: &str,
+        availability: Option<Rc<AvailabilityFilter>>,
     ) -> Option<HashMap<String, Vec<Option<String>>>> {
         let file = &self.current;
         let declaration = declaration_at(file.tree.root_node(), start)?;
@@ -255,27 +516,39 @@ impl Resolver<'_> {
             .cloned()
             .collect();
         let textual = Resolver::textual(file.clone());
+        *self.availability.borrow_mut() = availability.clone();
+        *textual.availability.borrow_mut() = availability;
         let mut found: HashMap<String, Vec<Option<String>>> = HashMap::new();
         for reference in contract_references(declaration, &file.source) {
             // 束縛の変わり得る名前や module に触れないパスは、旧新で同じ束縛なので字面で比べる
             // (無関係なパスの解けない経路を、比べる対象に持ち込まない)。
             let touches =
                 |changes: &ChangeSet| changes.affects(&reference.segments, &declaration_module);
-            let identity = match (self.crate_files, self.changes) {
+            let identities = match (self.crate_files, self.changes) {
                 (Some(_), Some(changes)) if touches(changes) => {
-                    self.resolve_path(&module, &reference, 0)
+                    self.resolve_identities(&module, &reference)
                 }
-                (Some(_), None) => self.resolve_path(&module, &reference, 0),
+                (Some(_), None) => self.resolve_identities(&module, &reference),
                 // 比べるファイルの module を決められない (版の crate で解けない) とき、変わった束縛に
                 // 触れるパスは同じと言えない。
                 (None, Some(changes)) if touches(changes) => None,
-                _ => textual.resolve_path(&module, &reference, 0),
+                _ => textual.resolve_identities(&module, &reference),
             };
+            // 候補ごとの識別の集まりで持つ (宣言を cfg の分岐に分けて、分岐ごとに絞っても同じになる)。
             let entry = found.entry(reference.text()).or_default();
-            if !entry.contains(&identity) {
-                entry.push(identity);
+            match identities {
+                Some(identities) => {
+                    for identity in identities.into_iter().map(Some) {
+                        if !entry.contains(&identity) {
+                            entry.push(identity);
+                        }
+                    }
+                }
+                None if !entry.contains(&None) => entry.push(None),
+                None => {}
             }
         }
+        *self.availability.borrow_mut() = None;
         for identities in found.values_mut() {
             identities.sort();
         }
@@ -289,27 +562,128 @@ impl Resolver<'_> {
         reference: &Reference,
         depth: usize,
     ) -> Option<String> {
+        let candidates = self.resolve_candidates(module, reference, depth)?;
+        Some(self.joined_identity(&candidates))
+    }
+
+    /// パス `reference` を解いた候補ごとの識別の字面 (並べ替えて重なりを除く)。解けなければ None。
+    fn resolve_identities(&self, module: &ModuleRef, reference: &Reference) -> Option<Vec<String>> {
+        let candidates = self.resolve_candidates(module, reference, 0)?;
+        let mut identities: Vec<String> = candidates
+            .iter()
+            .map(|candidate| self.identity(candidate))
+            .collect();
+        identities.sort();
+        identities.dedup();
+        Some(identities)
+    }
+
+    /// スコープ `module` で、パス `reference` を解いた候補 (宣言の有る条件で絞ったもの)。解けなければ
+    /// (候補が多すぎるときも) None。
+    fn resolve_candidates(
+        &self,
+        module: &ModuleRef,
+        reference: &Reference,
+        depth: usize,
+    ) -> Option<Vec<Candidate>> {
+        // 絞り込みは、直接の定義をたどる経路でだけ使う (経路の module の部分を解く間や、`use`・glob・
+        // ほかのファイルを通る枝では外す)。局所の束縛を作り得る式の中の参照は、局所の `use`・項目が
+        // 名前を隠し得るので、候補の右辺を描く先まで絞らない。
+        let filter = self
+            .availability
+            .borrow()
+            .clone()
+            .filter(|_| !reference.local);
+        let _off = self.swap_filter(None);
+        // 覆いを証明できるかを、右辺を描かずに候補の条件だけで先に決める (描かないので再帰の手間は
+        // 増えない)。証明できるときだけ、残す直接の定義の右辺も絞って描く。覆わずに全ての候補を残す
+        // とき、右辺を絞ると main が比べていた枝を落とす。
+        let filter = match filter {
+            Some(filter) => {
+                let candidates = {
+                    let _skip = self.skipping_renders();
+                    self.branch_candidates(module, reference, depth, None)?
+                };
+                self.covering(&filter, &candidates)
+                    .is_some()
+                    .then_some(filter)
+            }
+            None => None,
+        };
+        let candidates = self.branch_candidates(module, reference, depth, filter.clone())?;
+        let candidates = match filter {
+            Some(filter) => match self.covering(&filter, &candidates) {
+                Some(kept) => candidates
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| kept.contains(index))
+                    .map(|(_, candidate)| candidate)
+                    .collect(),
+                // 下見で決めた覆いが崩れた (起きないはず) なら、絞らずに解き直す。
+                None => self.branch_candidates(module, reference, depth, None)?,
+            },
+            None => candidates,
+        };
+        (candidates.len() <= MAX_CANDIDATES).then_some(candidates)
+    }
+
+    /// スコープ `module` で、パス `reference` を解いた候補 (除かない)。`filter` は、同じファイルの祖先
+    /// (か自身) のスコープを `self`・`super`・`crate` だけで名指した枝で、直接の定義の右辺を描くときの
+    /// 宣言の有る条件。
+    fn branch_candidates(
+        &self,
+        module: &ModuleRef,
+        reference: &Reference,
+        depth: usize,
+        filter: Option<Rc<AvailabilityFilter>>,
+    ) -> Option<Vec<Candidate>> {
         let (name, prefix) = reference.segments.split_last()?;
         if name.starts_with("<macro ") {
-            return Some(format!(
-                "{name}{SEPARATOR}{}",
-                module.file.macro_definitions.join(" ")
-            ));
+            return Some(vec![Candidate::new(
+                &[],
+                Target::Identity(format!(
+                    "{name}{SEPARATOR}{}",
+                    module.file.macro_definitions.join(" ")
+                )),
+            )]);
         }
+        // パスの module の部分が `self`・`super`・`crate` だけ (か無い) なら、`use` や module の
+        // 束縛を通らずにスコープを決める。
+        let keywords = prefix
+            .iter()
+            .all(|segment| matches!(segment.as_str(), "self" | "super" | "crate"));
         let mut candidates = Vec::new();
         for branch in self.resolve_module_prefix(module, prefix, depth)? {
             match branch.target {
-                Target::Module(target) => candidates.extend(
-                    self.resolve_name(&target, name, reference.namespace, depth)?
-                        .under(&branch.conditions),
-                ),
+                Target::Module(target) => {
+                    // 同じファイルの祖先 (か自身) のスコープを `self::`・`super::`・`crate::` だけで
+                    // 名指す経路は、定義の有る条件を変えないので、直接の定義はそのまま (Issue #312)。
+                    // その直接の定義の右辺も絞って描く。
+                    let ancestor = keywords
+                        && branch.conditions.is_empty()
+                        && target.file.path == module.file.path
+                        && target.file.file_module == module.file.file_module
+                        && module.scope.starts_with(&target.scope);
+                    if ancestor {
+                        let resolved = {
+                            let _on = self.swap_filter(filter.clone());
+                            self.resolve_name(&target, name, reference.namespace, depth)?
+                        };
+                        candidates.extend(resolved.0);
+                    } else {
+                        candidates.extend(
+                            self.resolve_name(&target, name, reference.namespace, depth)?
+                                .under(&branch.conditions),
+                        );
+                    }
+                }
                 Target::Identity(outside) => candidates.push(Candidate::new(
                     &branch.conditions,
                     Target::Identity(outside_path(&outside, std::slice::from_ref(name))),
                 )),
             }
         }
-        (candidates.len() <= MAX_CANDIDATES).then(|| self.joined_identity(&candidates))
+        Some(candidates)
     }
 
     /// スコープ `module` からパスの module の部分 `segments` (`crate`・`self`・`super`・`::` で
@@ -440,6 +814,7 @@ impl Resolver<'_> {
                                 &identity,
                                 &segments[index + 1..],
                             )),
+                            direct: false,
                         }),
                     }
                 }
@@ -475,6 +850,8 @@ impl Resolver<'_> {
                 return Some(found);
             }
         }
+        // glob・マクロ・prelude の候補は直接の定義でないので、その先は絞らない。
+        let _off = self.swap_filter(None);
         let Some(bindings) = module.file.scopes.get(&module.scope) else {
             return Some(Resolved::single(Target::Identity(format!(
                 "outside:{}::{name}",
@@ -714,6 +1091,15 @@ impl Resolver<'_> {
             return Some(None);
         };
         let place = |name: &str| self.definition_place(file, scope, name);
+        // 絞り込みは、このスコープで直接見つけた型別名・定数のうち、項目を置き換え得る属性の無いものの
+        // 右辺を描くときだけ使う (`use` の先などは絞らない)。
+        let filter = self.availability.borrow().clone();
+        let _off = self.swap_filter(None);
+        let direct_filter = |definition: &Definition| {
+            (!definition.opaque_attributes)
+                .then(|| filter.clone())
+                .flatten()
+        };
         let mut found: Vec<Candidate> = Vec::new();
         if namespace == Namespace::Type {
             let declarations: Vec<&ModuleDeclaration> = bindings
@@ -773,10 +1159,16 @@ impl Resolver<'_> {
                 if !visible(&alias.visibility) {
                     continue;
                 }
-                let rendered = self.render_definition(file, scope, alias, depth + 1)?;
-                found.push(Candidate::new(
+                let rendered = if self.skip_renders.get() {
+                    String::new()
+                } else {
+                    let _on = self.swap_filter(direct_filter(alias));
+                    self.render_definition(file, scope, alias, depth + 1)?
+                };
+                found.push(Candidate::definition(
                     &alias.conditions,
                     Target::Identity(format!("alias:{}#{name}:{rendered}", place(name))),
+                    alias.opaque_attributes,
                 ));
             }
         } else {
@@ -784,18 +1176,26 @@ impl Resolver<'_> {
                 if !visible(&constant.visibility) {
                     continue;
                 }
-                let rendered = self.render_definition(file, scope, constant, depth + 1)?;
-                found.push(Candidate::new(
+                let rendered = if self.skip_renders.get() {
+                    String::new()
+                } else {
+                    let _on = self.swap_filter(direct_filter(constant));
+                    self.render_definition(file, scope, constant, depth + 1)?
+                };
+                found.push(Candidate::definition(
                     &constant.conditions,
                     Target::Identity(format!("const:{}#{name}:{rendered}", place(name))),
+                    constant.opaque_attributes,
                 ));
             }
         }
         for item in bindings.items.get(name).into_iter().flatten() {
             if visible(&item.visibility) && item_namespaces(item.kind).contains(&namespace) {
-                found.push(Candidate::new(
+                // 名前付きのフィールドの構造体は値を作らない (値の覆いの証明に使わない)。
+                found.push(Candidate::definition(
                     &item.conditions,
                     Target::Identity(format!("item:{}#{name}:{}", place(name), item.kind)),
+                    item.opaque_attributes || (namespace == Namespace::Value && item.named_fields),
                 ));
             }
         }
@@ -858,6 +1258,7 @@ impl Resolver<'_> {
                     Target::Identity(prefix) => found.push(Candidate {
                         conditions,
                         target: Target::Identity(outside_path(&prefix, &[item.to_owned()])),
+                        direct: false,
                     }),
                 }
             }
@@ -914,15 +1315,16 @@ impl Resolver<'_> {
         depth: usize,
         tokens: &mut Vec<String>,
     ) -> Option<()> {
+        // ノードと名前空間と、局所の束縛を作り得る式の中か ([`local_scope`])。
         enum Work<'tree> {
-            Node(tree_sitter::Node<'tree>, Namespace),
+            Node(tree_sitter::Node<'tree>, Namespace, bool),
             Marker(&'static str),
         }
         let source = &module.file.source;
-        let mut stack = vec![Work::Node(node, namespace)];
+        let mut stack = vec![Work::Node(node, namespace, false)];
         while let Some(work) = stack.pop() {
-            let (node, namespace) = match work {
-                Work::Node(node, namespace) => (node, namespace),
+            let (node, namespace, local) = match work {
+                Work::Node(node, namespace, local) => (node, namespace, local),
                 Work::Marker(marker) => {
                     tokens.push(marker.to_owned());
                     continue;
@@ -951,6 +1353,7 @@ impl Resolver<'_> {
                         &Reference {
                             segments,
                             namespace: reference_namespace,
+                            local,
                         },
                         depth + 1,
                     )?);
@@ -961,11 +1364,11 @@ impl Resolver<'_> {
                 "line_comment" | "block_comment" => continue,
                 "array_type" => {
                     if let Some(length) = node.child_by_field_name("length") {
-                        stack.push(Work::Node(length, Namespace::Value));
+                        stack.push(Work::Node(length, Namespace::Value, local));
                         stack.push(Work::Marker("<length>"));
                     }
                     if let Some(element) = node.child_by_field_name("element") {
-                        stack.push(Work::Node(element, Namespace::Type));
+                        stack.push(Work::Node(element, Namespace::Type, local));
                     }
                     continue;
                 }
@@ -976,13 +1379,14 @@ impl Resolver<'_> {
                 push_tokens(node, source, tokens);
                 continue;
             }
+            let local = local || local_scope(node.kind());
             let mut cursor = node.walk();
             let children: Vec<_> = node.children(&mut cursor).collect();
             stack.extend(
                 children
                     .into_iter()
                     .rev()
-                    .map(|child| Work::Node(child, children_namespace)),
+                    .map(|child| Work::Node(child, children_namespace, local)),
             );
         }
         Some(())
@@ -1055,5 +1459,86 @@ impl Resolver<'_> {
             }
         }
         (Some(identities.join("||")), modules)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 属性 `attributes` (ソースの先頭に並べたもの) を [`push_tokens`] で並べた条件。
+    fn conditions(attributes: &str) -> Vec<String> {
+        let source = format!("{attributes}\nstruct S;\n");
+        let tree = parser::parse_source(source.as_bytes(), crate::language::LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let mut tokens = Vec::new();
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            if matches!(child.kind(), "attribute_item" | "inner_attribute_item") {
+                push_tokens(child, source.as_bytes(), &mut tokens);
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn condition_tokens_are_read_back_as_cfg_keys() {
+        let keys = condition_keys(&conditions(
+            "#![cfg(unix)]\n#[cfg(all(feature = \"x\", not(r#test)))]\n#[cfg_attr(windows, derive(Debug))]\n#[cfg_attr(target_os = \"linux\", cfg(a::b), allow(dead_code))]",
+        ))
+        .expect("keys");
+        let shown: Vec<String> = keys.iter().map(|key| key.join(" ")).collect();
+        assert_eq!(
+            shown,
+            [
+                "cfg ( unix )",
+                "cfg ( all ( feature = \"x\" , not ( r#test ) ) )",
+                "cfg_attr ( target_os = \"linux\" , cfg ( a :: b ) )",
+            ],
+            "{keys:?}"
+        );
+        // `#` で始まらない並びは読めない
+        assert_eq!(condition_keys(&["cfg".to_owned()]), None);
+        assert_eq!(
+            token_text("identifier:feature"),
+            (Some("identifier"), "feature")
+        );
+        assert_eq!(token_text("::"), (None, "::"));
+        assert_eq!(
+            token_text("string_literal:\"a:b\""),
+            (Some("string_literal"), "\"a:b\"")
+        );
+    }
+
+    #[test]
+    fn availability_filter_keeps_compatible_and_unreadable_conditions() {
+        let key = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
+        let narrow = AvailabilityAttr {
+            key: key("cfg ( not ( feature = \"wide\" ) )"),
+            shown: "cfg(not(feature = \"wide\"))".to_owned(),
+        };
+        let filter = AvailabilityFilter::new(Some(std::slice::from_ref(&narrow))).expect("filter");
+        let compatible =
+            |attributes: &[String]| filter.compatible(condition_keys(attributes).as_ref());
+        assert!(!compatible(&conditions("#[cfg(feature = \"wide\")]")));
+        assert!(compatible(&conditions("#[cfg(not(feature = \"wide\"))]")));
+        assert!(compatible(&conditions("#[cfg(unix)]")));
+        assert!(filter.compatible(Some(&Vec::new())));
+        // 読めない条件は残す
+        assert!(compatible(&["#".to_owned(), "[".to_owned()]));
+        // 残す枝が宣言の有る設定を覆うか
+        assert!(filter.covered(&[vec![key("cfg ( not ( feature = \"wide\" ) )")]]));
+        assert!(!filter.covered(&[vec![key("cfg ( unix )")]]));
+        assert!(filter.covered(&[vec![]]));
+        // 原子を独立に扱う (`unix` と `windows` は同時に真になり得る)
+        let unix = AvailabilityAttr {
+            key: key("cfg ( unix )"),
+            shown: "cfg(unix)".to_owned(),
+        };
+        let filter = AvailabilityFilter::new(Some(std::slice::from_ref(&unix))).expect("filter");
+        assert!(filter.compatible(condition_keys(&conditions("#[cfg(windows)]")).as_ref()));
+        // 条件の無い宣言と、読めない条件の宣言は絞らない
+        assert!(AvailabilityFilter::new(Some(&[])).is_none());
+        assert!(AvailabilityFilter::new(None).is_none());
     }
 }

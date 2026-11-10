@@ -39,6 +39,11 @@ pub(crate) struct RustDeclarationContext {
     pub(crate) availability_raw: Vec<String>,
     /// 宣言を囲む inline module が全て `pub` (制限なし) か (Issue #305)。ファイルの module の直下なら真。
     pub(crate) inline_public: bool,
+    /// 宣言自身か、それを囲む項目 (impl・trait・inline module・extern ブロック) に、置き換え得る属性
+    /// (属性マクロなど。[`opaque_preceding_attributes`]) が付いているか (Issue #312)。囲む項目の中の
+    /// `#[cfg]` は展開の後に評価され、宣言自身も別の項目やスコープへ置き換えられ得るので、宣言の有る
+    /// 条件と名前を解くスコープが変わり得る。
+    pub(crate) macro_attributes: bool,
 }
 
 /// 宣言の有る条件の属性 1 つ (`cfg(..)` か、`cfg` だけに絞った `cfg_attr(..)`)。
@@ -116,6 +121,106 @@ pub(crate) fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -
         push_tokens(attribute, source, &mut tokens);
     }
     tokens
+}
+
+/// 項目を置き換えない (中身の分かる) 組み込みの属性の名前 (Issue #312)。組み込みの属性は、同じ名前の
+/// マクロを取り込むと曖昧さのエラーになるので、別のマクロを指さない。`derive`・`test` のような prelude
+/// のマクロと、ツールの属性 (`rustfmt::skip`) は、同じ名前の取り込みに隠れ得るので入れない。
+const INERT_ATTRIBUTES: [&str; 22] = [
+    "cfg",
+    "doc",
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "deprecated",
+    "must_use",
+    "inline",
+    "cold",
+    "repr",
+    "non_exhaustive",
+    "track_caller",
+    "automatically_derived",
+    "no_mangle",
+    "export_name",
+    "link_section",
+    "used",
+    "path",
+    "macro_use",
+    "macro_export",
+];
+
+/// `item` の直前に並ぶ外側の属性に、項目を置き換え得るもの ([`INERT_ATTRIBUTES`] に無い属性。属性
+/// マクロなど。`cfg_attr` で付けるものも) があるか (Issue #312)。
+pub(crate) fn opaque_preceding_attributes(item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    preceding_attribute_items(item)
+        .into_iter()
+        .any(|attribute_item| !inert_attribute_item(attribute_item, source))
+}
+
+/// 外側の属性 (`attribute_item`) が、項目を置き換えない組み込みの属性か。
+fn inert_attribute_item(attribute_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = attribute_item.walk();
+    attribute_item
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+        .is_some_and(|attribute| inert_attribute(attribute, source))
+}
+
+/// 識別子 `node` の字面 (`r#` を外す)。識別子でなければ None。
+fn plain_identifier<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    (node.kind() == "identifier")
+        .then(|| node.utf8_text(source).ok())
+        .flatten()
+        .map(|text| text.strip_prefix("r#").unwrap_or(text))
+}
+
+/// 属性 (`attribute_item` の中の `attribute`) が項目を置き換えないか。
+fn inert_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match attribute
+        .named_child(0)
+        .and_then(|path| plain_identifier(path, source))
+    {
+        Some("cfg_attr") => attribute
+            .child_by_field_name("arguments")
+            .is_some_and(|arguments| inert_cfg_attr(arguments, source)),
+        Some(name) => INERT_ATTRIBUTES.contains(&name),
+        None => false,
+    }
+}
+
+/// `cfg_attr(述語, 属性, ..)` の引数 (`token_tree`) の、付ける属性がどれも項目を置き換えないか。
+fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = arguments.walk();
+    let children: Vec<tree_sitter::Node<'_>> = arguments
+        .children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+        return false;
+    };
+    let mut groups: Vec<Vec<tree_sitter::Node<'_>>> = vec![Vec::new()];
+    for child in inner {
+        if child.kind() == "," {
+            groups.push(Vec::new());
+        } else if let Some(group) = groups.last_mut() {
+            group.push(*child);
+        }
+    }
+    groups.iter().skip(1).all(|group| match group.as_slice() {
+        [] => true,
+        // 経路の属性 (`a::b`) は組み込みでない
+        [_, separator, ..] if separator.kind() == "::" => false,
+        [first, rest @ ..] => match plain_identifier(*first, source) {
+            Some("cfg_attr") => {
+                matches!(rest, [nested] if nested.kind() == "token_tree")
+                    && rest.iter().all(|nested| inert_cfg_attr(*nested, source))
+            }
+            Some(name) => INERT_ATTRIBUTES.contains(&name),
+            None => false,
+        },
+    })
 }
 
 /// `item` の直前に並ぶ外側の属性 (`attribute_item`) のノード (内側から。コメントは飛ばす)。
@@ -329,6 +434,17 @@ pub(crate) fn rust_declaration_context(
         _ => Vec::new(),
     };
     let mut conditions: Vec<Vec<String>> = vec![own_inner, preceding_conditions(item, source)];
+    context.macro_attributes = opaque_preceding_attributes(item, source);
+    // trait の関連項目 (関連型の境界・関連定数の型は trait の契約) に付いた属性マクロも、その項目を
+    // 置き換え得る。
+    if item.kind() == "trait_item"
+        && let Some(body) = item.child_by_field_name("body")
+    {
+        let mut cursor = body.walk();
+        context.macro_attributes |= body.named_children(&mut cursor).any(|member| {
+            member.kind() == "attribute_item" && !inert_attribute_item(member, source)
+        });
+    }
     // 有る条件の属性のノードも、内側から集める (宣言自身の本体の内側、宣言の外側、囲む項目の
     // 中身の内側と外側、ファイルの先頭の内側の順)。
     let mut attributes: Vec<tree_sitter::Node<'_>> =
@@ -346,6 +462,7 @@ pub(crate) fn rust_declaration_context(
         };
         conditions.push(inner_conditions(body, source));
         conditions.push(preceding_conditions(container, source));
+        context.macro_attributes |= opaque_preceding_attributes(container, source);
         if matches!(container.kind(), "impl_item" | "trait_item") && !header_found {
             header_found = true;
             context.container_header = header_tokens(container, source);
