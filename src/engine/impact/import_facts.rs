@@ -241,6 +241,15 @@ pub(super) fn extract_rust_ref_facts(source: &[u8]) -> Option<(HashSet<String>, 
     // parse 失敗 (判定不能) は `None` を返し、呼び出し側で high 維持する (fail-closed)。
     // 空 facts を返すと「証拠なし → low」に倒れ、本物の参照を取りこぼす false negative になる。
     let tree = parser::parse_source(source, LangId::Rust).ok()?;
+    Some(rust_ref_facts_of_tree(tree.root_node(), source))
+}
+
+/// [`extract_rust_ref_facts`] の、構文解析を済ませた木から集める部分 (標準のマクロの写しの
+/// 証拠にも使う)。
+pub(super) fn rust_ref_facts_of_tree(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> (HashSet<String>, bool) {
     let mut names = HashSet::new();
     let mut has_glob = false;
     // 1) qualified path (`render::json`) の末尾セグメントを raw byte 走査で拾う。tree-sitter は
@@ -250,8 +259,8 @@ pub(super) fn extract_rust_ref_facts(source: &[u8]) -> Option<(HashSet<String>, 
     //    high 維持側で fail-closed)。
     collect_qualified_path_names(source, &mut names);
     // 2) use list (`use a::{json, html}`) の要素・alias と glob (`use a::*`) は AST で拾う。
-    walk_for_rust_evidence(tree.root_node(), source, &mut names, &mut has_glob);
-    Some((names, has_glob))
+    walk_for_rust_evidence(root, source, &mut names, &mut has_glob);
+    (names, has_glob)
 }
 
 /// raw source を走査し、`::` 直後 (空白を挟む可能性も考慮) の ASCII identifier を `names` に集める。

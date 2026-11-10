@@ -386,7 +386,7 @@ impl RustPathOwnerIndex {
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
     ) -> Option<PathBuf> {
-        if blake3::hash(source) != self.source_hash || has_uncertain_ancestor(node) {
+        if !self.same_source(source) || has_uncertain_ancestor(node) {
             return None;
         }
         let parent = node.parent()?;
