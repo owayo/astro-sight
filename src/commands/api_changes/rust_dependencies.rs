@@ -67,6 +67,17 @@ struct Reference {
     /// パスの区切り (`a::b::Text` なら `a`・`b`・`Text`。先頭の `::` は `::`)。
     segments: Vec<String>,
     namespace: Namespace,
+    /// 局所の束縛を作り得る式 ([`local_scope`]) の中の参照か。名前は外の module のスコープで解くが、
+    /// 実際は局所の `use`・項目・束縛が隠し得るので、外の定義で覆いを証明しない (Issue #312)。
+    local: bool,
+}
+
+/// 構文木の種類 `kind` の式が、中に局所の束縛 (`use`・項目・`let`・パターン・引数) を作り得るか。
+fn local_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "block" | "closure_expression" | "match_expression" | "let_condition" | "let_chain"
+    )
 }
 
 impl Reference {
@@ -185,6 +196,10 @@ fn modifier_visibility(
 #[derive(Debug)]
 struct Definition {
     conditions: Vec<String>,
+    /// 自身か囲む inline module に、項目を置き換え得る属性 (属性マクロなど。
+    /// [`opaque_preceding_attributes`]) が付いているか (Issue #312)。同じ名前の inline module の束縛は
+    /// 1 つのスコープにまとめるので、宣言を囲まない (属性マクロで消える) 本体の定義もあり得る。
+    opaque_attributes: bool,
     /// 宣言のノードのバイトの範囲。
     range: (usize, usize),
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
@@ -196,6 +211,12 @@ struct Definition {
 struct ItemDeclaration {
     kind: &'static str,
     conditions: Vec<String>,
+    /// 自身か囲む inline module に、項目を置き換え得る属性 (属性マクロなど。
+    /// [`opaque_preceding_attributes`]) が付いているか (Issue #312)。同じ名前の inline module の束縛は
+    /// 1 つのスコープにまとめるので、宣言を囲まない (属性マクロで消える) 本体の定義もあり得る。
+    opaque_attributes: bool,
+    /// 名前付きのフィールドの構造体か (値の名前空間に名前を作らない)。
+    named_fields: bool,
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
     visibility: Visibility,
 }
@@ -504,14 +525,17 @@ impl DependencyIndex {
         let mut scopes = Vec::new();
         let mut definitions = Vec::new();
         // 深い入れ子の inline module でもスタックを溢れさせないよう、明示のスタックで下りる。
-        let mut pending = vec![(root, Vec::new(), Vec::new(), false)];
-        while let Some((scope, path, inherited, path_attribute)) = pending.pop() {
+        let mut pending = vec![ChildScope {
+            body: root,
+            path: Vec::new(),
+            conditions: Vec::new(),
+            path_attribute: false,
+            opaque: false,
+        }];
+        while let Some(scope) = pending.pop() {
             pending.extend(collect_scope(
                 scope,
                 &index.source,
-                path,
-                &inherited,
-                path_attribute,
                 index.file_module.as_deref(),
                 &mut scopes,
                 &mut definitions,
@@ -617,7 +641,7 @@ impl DependencyIndex {
                     ("value", Namespace::Value),
                 ] {
                     if let Some(child) = node.child_by_field_name(field) {
-                        collect_references(child, &self.source, namespace, &mut references);
+                        collect_references(child, &self.source, namespace, false, &mut references);
                     }
                 }
                 paths.extend(references.into_iter().map(|reference| reference.segments));
@@ -873,8 +897,19 @@ impl DependencyIndex {
     }
 }
 
-/// 子の inline module の中身と、その経路と条件と、`#[path]` が付いているか。
-type ChildScope<'tree> = (tree_sitter::Node<'tree>, Vec<String>, Vec<String>, bool);
+/// 束縛を集める module のスコープ (ファイルの `source_file` か inline module の中身)。
+struct ChildScope<'tree> {
+    body: tree_sitter::Node<'tree>,
+    /// ファイルの中の経路。
+    path: Vec<String>,
+    /// 囲む module の条件。
+    conditions: Vec<String>,
+    /// スコープの inline module に `#[path]` が付いているか。
+    path_attribute: bool,
+    /// スコープの inline module か、それを囲む inline module に、中身を置き換え得る属性 (属性マクロ
+    /// など。[`opaque_preceding_attributes`]) が付いているか (Issue #312)。
+    opaque: bool,
+}
 
 /// 旧い版の宣言 (`old_declarations`、旧い版の文脈 `old`) と新しい版の宣言 (`new_declarations`、
 /// 新しい版の文脈 `new`) の契約が名指す名前の束縛を比べる。旧新の両方に現れる名前だけを比べる。
@@ -886,11 +921,30 @@ pub(crate) fn compare_dependencies(
     new_declarations: &[RustDeclarationContext],
     files: &DiffModules<'_>,
 ) -> DependencyComparison {
+    // 枝を絞るのは、宣言 (同じ鍵の宣言をまとめて) が、原子を独立に扱った全ての設定で旧新に同じく
+    // 有るときだけ (Issue #312)。有る設定が変わったら、その増減の報告はほかの比較 (項目の有る設定) の
+    // 読み方に頼ることになるので、絞らずに全ての枝を比べる。宣言自身か囲む項目に属性マクロがあれば、
+    // 宣言の有る条件と名前を解くスコープが展開で変わり得るので、やはり絞らない。
+    let old_refs: Vec<&RustDeclarationContext> = old_declarations.iter().collect();
+    let new_refs: Vec<&RustDeclarationContext> = new_declarations.iter().collect();
+    let narrowing = !old_declarations
+        .iter()
+        .chain(new_declarations)
+        .any(|declaration| declaration.macro_attributes)
+        && super::rust_availability::same_in_every_config(&old_refs, &new_refs);
     let collect = |resolver: &Resolver<'_>, declarations: &[RustDeclarationContext]| {
         let mut merged: HashMap<String, Vec<Option<String>>> = HashMap::new();
         for declaration in declarations {
-            let found =
-                resolver.declaration_dependencies(declaration.start, &declaration.inline_module)?;
+            // 宣言自身の有る条件で絞る (親の module の条件を含めなくても、実際に有る設定を含む)。
+            let filter = narrowing
+                .then(|| resolver::AvailabilityFilter::new(declaration.availability.as_deref()))
+                .flatten()
+                .map(std::rc::Rc::new);
+            let found = resolver.declaration_dependencies(
+                declaration.start,
+                &declaration.inline_module,
+                filter,
+            )?;
             for (text, identities) in found {
                 let entry = merged.entry(text).or_default();
                 for identity in identities {
@@ -1177,19 +1231,25 @@ impl<'a> DiffModules<'a> {
 }
 
 /// module のスコープ `scope` (ファイルの `source_file` か inline module の `declaration_list`) の
-/// 束縛を集め、子の inline module を返す。`inherited` は囲む module の条件、`path_attribute` は
-/// スコープの inline module に `#[path]` が付いているか。
-#[allow(clippy::too_many_arguments)]
+/// 束縛を集め、子の inline module を返す。
 fn collect_scope<'tree>(
-    scope: tree_sitter::Node<'tree>,
+    scope: ChildScope<'tree>,
     source: &[u8],
-    path: Vec<String>,
-    inherited: &[String],
-    path_attribute: bool,
     file_module: Option<&[String]>,
     scopes: &mut Vec<(Vec<String>, ScopeBindings)>,
     definitions: &mut Vec<String>,
 ) -> Vec<ChildScope<'tree>> {
+    let ChildScope {
+        body: scope,
+        path,
+        conditions: inherited,
+        path_attribute,
+        opaque,
+    } = scope;
+    let inherited = inherited.as_slice();
+    // 定義に、項目を置き換え得る属性 (自身か囲む inline module のもの) が付いているか (Issue #312)。
+    let opaque_attributes =
+        |item: tree_sitter::Node<'_>| opaque || opaque_preceding_attributes(item, source);
     let mut bindings = ScopeBindings {
         path_attribute,
         ..ScopeBindings::default()
@@ -1292,6 +1352,7 @@ fn collect_scope<'tree>(
                 if let Some(name) = name() {
                     bindings.aliases.entry(name).or_default().push(Definition {
                         conditions: conditions(),
+                        opaque_attributes: opaque_attributes(item),
                         range: (item.start_byte(), item.end_byte()),
                         visibility: visibility(item, source, &current_module),
                     });
@@ -1305,6 +1366,7 @@ fn collect_scope<'tree>(
                         .or_default()
                         .push(Definition {
                             conditions: conditions(),
+                            opaque_attributes: opaque_attributes(item),
                             range: (item.start_byte(), item.end_byte()),
                             visibility: visibility(item, source, &current_module),
                         });
@@ -1326,13 +1388,25 @@ fn collect_scope<'tree>(
                         "trait_item" => "trait_item",
                         _ => "function_item",
                     };
+                    // 関数・trait の本体の先頭の `#![cfg]` は、その項目自身に効く (Issue #312)。
+                    let mut item_conditions = conditions();
+                    if matches!(item.kind(), "function_item" | "trait_item")
+                        && let Some(body) = item.child_by_field_name("body")
+                    {
+                        item_conditions.extend(inner_conditions(body, source));
+                    }
                     bindings
                         .items
                         .entry(name)
                         .or_default()
                         .push(ItemDeclaration {
                             kind,
-                            conditions: conditions(),
+                            conditions: item_conditions,
+                            opaque_attributes: opaque_attributes(item),
+                            named_fields: item.kind() == "struct_item"
+                                && item
+                                    .child_by_field_name("body")
+                                    .is_some_and(|body| body.kind() == "field_declaration_list"),
                             visibility: visibility(item, source, &current_module),
                         });
                 }
@@ -1367,7 +1441,13 @@ fn collect_scope<'tree>(
                     child.push(name);
                     let mut child_conditions = conditions();
                     child_conditions.extend(inner_conditions(body, source));
-                    children.push((body, child, child_conditions, path_attribute));
+                    children.push(ChildScope {
+                        body,
+                        path: child,
+                        conditions: child_conditions,
+                        path_attribute,
+                        opaque: opaque_attributes(item),
+                    });
                 }
             }
             "macro_invocation" | "expression_statement" => {
@@ -1588,9 +1668,13 @@ fn declaration_at(
 fn contract_references(declaration: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Reference> {
     let mut generics = generic_parameter_names(declaration, source);
     let mut references = Vec::new();
+    // 宣言自身がブロックなど局所の束縛を作り得る式の中にあれば (`const _: () = { use a::LEN; .. };`
+    // の中の impl など)、名前は局所の `use`・項目が隠し得る。
+    let local = std::iter::successors(declaration.parent(), |node| node.parent())
+        .any(|node| local_scope(node.kind()));
     let push = |node: Option<tree_sitter::Node<'_>>, references: &mut Vec<Reference>| {
         if let Some(node) = node {
-            collect_references(node, source, Namespace::Type, references);
+            collect_references(node, source, Namespace::Type, local, references);
         }
     };
     let mut ancestor = declaration.parent();
@@ -1812,16 +1896,19 @@ fn path_segments(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<Strin
     Some(segments)
 }
 
-/// `node` の中の、型 (と配列の長さ・const ジェネリクスの引数の値) として名指す名前を集める。
+/// `node` の中の、型 (と配列の長さ・const ジェネリクスの引数の値) として名指す名前を集める。`local` は
+/// `node` が局所の束縛を作り得る式の中にあるか。
 fn collect_references(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     namespace: Namespace,
+    local: bool,
     references: &mut Vec<Reference>,
 ) {
     // 深い入れ子の型 (`Option<Option<…>>`) でもスタックを溢れさせないよう、明示のスタックでたどる。
-    let mut stack = vec![(node, namespace)];
-    while let Some((node, namespace)) = stack.pop() {
+    // 局所の束縛を作り得る式の中かも持つ。
+    let mut stack = vec![(node, namespace, local)];
+    while let Some((node, namespace, local)) = stack.pop() {
         match node.kind() {
             // 型の名前は値の式の中 (`{ size_of::<T>() }`) でも型の名前空間で引く。
             "type_identifier" | "scoped_type_identifier" => {
@@ -1829,11 +1916,12 @@ fn collect_references(
                     references.push(Reference {
                         segments,
                         namespace: Namespace::Type,
+                        local,
                     });
                 } else if let Some(path) = node.child_by_field_name("path") {
                     // `<() as Selected>::Item`・`Vec<T>::Assoc` は、末尾の関連型の名前でなく、経路の
                     // 中の名前を集める。
-                    stack.push((path, Namespace::Type));
+                    stack.push((path, Namespace::Type, local));
                 }
                 continue;
             }
@@ -1842,6 +1930,7 @@ fn collect_references(
                     references.push(Reference {
                         segments,
                         namespace,
+                        local,
                     });
                 }
                 continue;
@@ -1851,23 +1940,24 @@ fn collect_references(
                 references.push(Reference {
                     segments: vec![format!("<macro {}>", tokens_of(node, source).join(" "))],
                     namespace,
+                    local,
                 });
                 continue;
             }
             "lifetime" | "line_comment" | "block_comment" => continue,
             "array_type" => {
                 if let Some(element) = node.child_by_field_name("element") {
-                    stack.push((element, Namespace::Type));
+                    stack.push((element, Namespace::Type, local));
                 }
                 if let Some(length) = node.child_by_field_name("length") {
-                    stack.push((length, Namespace::Value));
+                    stack.push((length, Namespace::Value, local));
                 }
                 continue;
             }
             "type_binding" => {
                 // `Item = Text` の `Item` は関連型の名前で、束縛ではない。
                 if let Some(ty) = node.child_by_field_name("type") {
-                    stack.push((ty, namespace));
+                    stack.push((ty, namespace, local));
                 }
                 continue;
             }
@@ -1889,16 +1979,17 @@ fn collect_references(
                     } else {
                         Namespace::Type
                     };
-                    stack.push((*child, namespace));
+                    stack.push((*child, namespace, local));
                 }
                 continue;
             }
             _ => {}
         }
+        let local = local || local_scope(node.kind());
         let mut cursor = node.walk();
         stack.extend(
             node.named_children(&mut cursor)
-                .map(|child| (child, namespace)),
+                .map(|child| (child, namespace, local)),
         );
     }
 }
@@ -1943,9 +2034,10 @@ mod tests {
                         conditions: Vec::new(),
                         start: (start.row, start.column),
                         container_header: Vec::new(),
-                        availability: Some(Vec::new()),
+                        availability: item_availability(node, source.as_bytes()).0,
                         availability_raw: Vec::new(),
                         inline_public: true,
+                        macro_attributes: false,
                     };
                 }
                 let mut cursor = node.walk();
@@ -2357,5 +2449,24 @@ mod tests {
             ),
             Changed
         );
+    }
+
+    /// `use` と glob で、版の crate を開かずに字面で識別したファイル (`mod-file:`) を通る候補は、通る
+    /// module の条件が欠け得るので、覆いの証明に使わない (#312 の 5 回目のレビュー)。
+    #[test]
+    fn candidates_through_unopened_files_do_not_prove_coverage() {
+        let source = |base: &str| {
+            format!(
+                "type Base = {base};\n\nmod bridge {{\n    mod defaults {{\n        pub mod selected {{\n            pub type Text = crate::Base;\n        }}\n    }}\n    use self::defaults::*;\n    mod selected;\n    pub use self::selected::*;\n}}\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\nuse self::bridge::Text;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+            )
+        };
+        assert_eq!(compare(&source("u8"), &source("u16"), "run"), Changed);
+        // Issue #312 の再現 (この crate の中の定義だけで覆う) は絞る
+        let issue = |wide: &str| {
+            format!(
+                "#[cfg(feature = \"wide\")]\ntype Text = {wide};\n#[cfg(not(feature = \"wide\"))]\ntype Text = u8;\n\n#[cfg(not(feature = \"wide\"))]\npub fn run(_: Text) {{}}\n"
+            )
+        };
+        assert_eq!(compare(&issue("u32"), &issue("u64"), "run"), Same);
     }
 }

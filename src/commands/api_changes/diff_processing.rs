@@ -879,7 +879,23 @@ fn collect_rust_modified_symbols(
     for &(old_index, new_index) in &pairing.pairs {
         let (name, _, old_sig) = &facts.old_syms[old_index];
         let (_, kind, new_sig) = &facts.new_syms[new_index];
-        let dependency = dependency(&[old_index], &[new_index]);
+        let representative = pairing
+            .branch_representatives
+            .contains(&(old_index, new_index));
+        // `#[cfg]` の分岐の代表の組は、同じ鍵の宣言の全てで束縛を比べる (分岐ごとに宣言の有る条件で
+        // 絞るので、代表だけではほかの分岐の束縛を比べない。Issue #312)。
+        let group = representative
+            .then(|| {
+                pairing
+                    .groups
+                    .iter()
+                    .find(|(olds, news)| olds.contains(&old_index) && news.contains(&new_index))
+            })
+            .flatten();
+        let dependency = match group {
+            Some((olds, news)) => dependency(olds, news),
+            None => dependency(&[old_index], &[new_index]),
+        };
         let impl_change = (declarations.old[old_index].container_header
             != declarations.new[new_index].container_header)
             .then(|| {
@@ -916,9 +932,6 @@ fn collect_rust_modified_symbols(
         {
             continue;
         }
-        let representative = pairing
-            .branch_representatives
-            .contains(&(old_index, new_index));
         // `#[cfg]` の分岐の代表の組の構造体・enum・union は、分岐の組ごとに形を比べる (Issue #293)。
         let shape_override =
             (representative && matches!(kind.as_str(), "struct" | "enum" | "union"))

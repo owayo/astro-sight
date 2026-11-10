@@ -1210,3 +1210,477 @@ fn single_name_uses_and_test_modules() {
     assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
     assert!(api.parse_truncations.is_empty(), "{api:?}");
 }
+
+/// Issue #312: 宣言の有る条件と両立しない cfg の枝だけを変えても、契約の束縛の変化にしない。両立する
+/// 枝の変化と、両立するか決められない枝は今までどおり比べる。
+#[test]
+fn incompatible_condition_branches_are_not_compared() {
+    let source = |wide: &str, narrow: &str, declaration: &str| {
+        format!(
+            "#[cfg(feature = \"wide\")]\ntype Text = {wide};\n#[cfg(not(feature = \"wide\"))]\ntype Text = {narrow};\n\n{declaration}\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    for (declaration, wide_change, narrow_change) in [
+        // Issue の再現: 宣言は `wide` を有効にしない設定にだけ有る
+        ("#[cfg(not(feature = \"wide\"))]", None, changed),
+        // `all(..)` と、`cfg_attr` で `cfg` を足す書き方
+        ("#[cfg(all(unix, not(feature = \"wide\")))]", None, changed),
+        ("#[cfg_attr(feature = \"wide\", cfg(any()))]", None, changed),
+        // 宣言がどの設定にも有る・両立する条件 (`unix`) は、どちらの枝の変化も変化
+        ("", changed, changed),
+        ("#[cfg(unix)]", changed, changed),
+        // `wide` の設定にだけ有る宣言は、`wide` でない枝を使わない
+        ("#[cfg(feature = \"wide\")]", changed, None),
+    ] {
+        let api = api_changes(
+            &source("u32", "u8", declaration),
+            &source("u64", "u8", declaration),
+        );
+        assert_eq!(
+            dependency_reason(&api, "run"),
+            wide_change,
+            "{declaration} wide: {api:?}"
+        );
+        let api = api_changes(
+            &source("u32", "u8", declaration),
+            &source("u32", "u16", declaration),
+        );
+        assert_eq!(
+            dependency_reason(&api, "run"),
+            narrow_change,
+            "{declaration} narrow: {api:?}"
+        );
+    }
+
+    // 囲む inline module の条件
+    let module = |wide: &str| {
+        format!(
+            "#[cfg(feature = \"wide\")]\ntype Text = {wide};\n#[cfg(not(feature = \"wide\"))]\ntype Text = u8;\n\n#[cfg(not(feature = \"wide\"))]\npub mod inner {{\n    pub fn run(_: super::Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&module("u32"), &module("u64"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+
+    // 別名の連鎖の奥の枝も、宣言の有る条件で比べる
+    let chain = |wide: &str, narrow: &str| {
+        format!(
+            "#[cfg(feature = \"wide\")]\ntype Inner = {wide};\n#[cfg(not(feature = \"wide\"))]\ntype Inner = {narrow};\ntype Text = Inner;\n\n#[cfg(not(feature = \"wide\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&chain("u32", "u8"), &chain("u64", "u8"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+    let api = api_changes(&chain("u32", "u8"), &chain("u32", "u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+}
+
+/// 両立しない枝を除くのは、残った枝が宣言の有る全ての設定を覆うときだけ (#312 のレビュー)。覆わなければ、
+/// 残りの設定で名前がほかで解け得るので、今までどおり全ての枝を、右辺の中も絞らずに比べる (11 回目)。
+/// 宣言の有る設定は、旧新の両方で宣言の有る設定にそろえる。
+#[test]
+fn branches_are_narrowed_only_when_the_rest_covers_the_declaration() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    // 明示の `wide` の枝を除くと、`wide` でない設定を覆う枝が残らない (glob の先で解ける) ので、全て比べる
+    let uncovered = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub type Text = super::Base;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"wide\")]\ntype Text = Base;\n\n#[cfg(not(feature = \"wide\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&uncovered("u8"), &uncovered("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 覆わずに残す枝 (`Text`) の右辺 (`Inner`) も絞らない。型別名と定数
+    let alias = |changed_type: &str| {
+        format!(
+            "type Changed = {changed_type};\n\nmod fallback {{\n    pub type Text = crate::Changed;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\ntype Inner = Changed;\n#[cfg(not(feature = \"x\"))]\ntype Inner = u32;\n\n#[cfg(feature = \"x\")]\ntype Text = Inner;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&alias("u8"), &alias("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    let constant = |changed_value: &str| {
+        format!(
+            "const CHANGED: usize = {changed_value};\n\nmod fallback {{\n    pub const LEN: usize = crate::CHANGED;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\nconst INNER: usize = CHANGED;\n#[cfg(not(feature = \"x\"))]\nconst INNER: usize = 3;\n\n#[cfg(feature = \"x\")]\nconst LEN: usize = INNER;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; LEN]) {{}}\n"
+        )
+    };
+    let api = api_changes(&constant("1"), &constant("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 残る枝が宣言の有る設定を覆えば、glob の先は隠れる
+    let covered = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub type Text = super::Base;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"wide\")]\ntype Text = Base;\n#[cfg(not(feature = \"wide\"))]\ntype Text = u32;\n\n#[cfg(not(feature = \"wide\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&covered("u8"), &covered("u16"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+    // 除く枝の右辺 (`Inner`) は、宣言から使われないので、変えても解けないことにならない
+    let inner = |inner: &str| {
+        format!(
+            "#[cfg(feature = \"wide\")]\ntype Inner = {inner};\n#[cfg(feature = \"wide\")]\ntype Text = Inner;\n#[cfg(not(feature = \"wide\"))]\ntype Text = u16;\n\n#[cfg(not(feature = \"wide\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&inner("u8"), &inner("u32"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+    // 宣言の有る設定を広げるだけでは、束縛の変化にしない (有る設定の増減は別に比べる)
+    let branches = "#[cfg(feature = \"wide\")]\ntype Text = u8;\n#[cfg(not(feature = \"wide\"))]\ntype Text = u16;\n\n";
+    let api = api_changes(
+        &format!("{branches}#[cfg(feature = \"wide\")]\npub fn run(_: Text) {{}}\n"),
+        &format!("{branches}pub fn run(_: Text) {{}}\n"),
+    );
+    assert_ne!(dependency_reason(&api, "run"), changed, "{api:?}");
+    assert_ne!(
+        dependency_reason(&api, "run"),
+        Some(Reason::RustSignatureDependencyUnresolved),
+        "{api:?}"
+    );
+}
+
+/// 枝を絞っても、同じ鍵のほかの宣言 (`#[cfg]` の分岐) の使う枝は比べる。宣言を `#[cfg]` の分岐に
+/// 分けただけでは束縛の変化にしない (#312 の 3 回目のレビュー)。
+#[test]
+fn narrowing_keeps_other_declarations_of_the_key() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    // `#[cfg]` の分岐に分けた構造体は、どちらの分岐の束縛も比べる (代表の組だけで比べない)
+    let note = |narrow: &str, extra: &str| {
+        format!(
+            "#[cfg(feature = \"x\")]\ntype Text = u8;\n#[cfg(not(feature = \"x\"))]\ntype Text = {narrow};\n\n#[cfg(feature = \"x\")]\npub struct Note {{\n    pub text: Text,\n    hidden: u8,{extra}\n}}\n#[cfg(not(feature = \"x\"))]\npub struct Note {{\n    pub text: Text,\n    hidden: u8,{extra}\n}}\n"
+        )
+    };
+    let api = api_changes(&note("u16", ""), &note("u32", "\n    pub extra: u8,"));
+    assert_eq!(dependency_reason(&api, "Note"), changed, "{api:?}");
+    // 宣言を `#[cfg]` の分岐に分けるだけでは、束縛の変化にしない
+    let branches = "#[cfg(feature = \"x\")]\ntype Text = u8;\n#[cfg(not(feature = \"x\"))]\ntype Text = u16;\n\n";
+    let api = api_changes(
+        &format!("{branches}pub fn run(_: Text) {{}}\n"),
+        &format!(
+            "{branches}#[cfg(feature = \"x\")]\npub fn run(_: Text) {{}}\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        ),
+    );
+    assert_ne!(dependency_reason(&api, "run"), changed, "{api:?}");
+}
+
+/// `use`・module の経路・ほかのファイルを通った候補は、通る module の有る条件 (宣言の `#[cfg]`、
+/// 中身の先頭や別のファイルの先頭の `#![cfg]`) が候補の条件に入らないので、覆いの証明に使わず、その
+/// 右辺の中も絞らない。
+/// `#[cfg]` で分けた同じ名前の inline module を何段たどっても、候補が増えて解けなくなることはない
+/// (#312 の 3・4 回目のレビュー)。
+#[test]
+fn candidates_through_paths_do_not_prove_coverage() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    // 条件付きの空の inline module (`x` でない設定では glob の先の `selected` が使われる)
+    let module = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub mod selected {{\n        pub type Text = crate::Base;\n    }}\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\nmod selected {{}}\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\nuse selected::Text;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&module("u8"), &module("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // `use` を通って同じスコープへ戻る経路 (`use` が消えれば glob の先の `selected` が使われる。7 回目)
+    let back = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub mod selected {{\n        pub type Text = crate::Base;\n    }}\n}}\n\npub mod m {{\n    use crate::fallback::*;\n    #[eraser::erase]\n    use crate::m as selected;\n\n    #[cfg(feature = \"x\")]\n    type Text = crate::Base;\n    #[cfg(not(feature = \"x\"))]\n    type Text = u32;\n\n    #[cfg(not(feature = \"x\"))]\n    pub fn run(_: selected::Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&back("u8"), &back("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // inline module の中身の先頭の `#![cfg]`
+    let inner = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub mod selected {{\n        pub type Text = crate::Base;\n    }}\n}}\nuse fallback::*;\n\nmod selected {{\n    #![cfg(feature = \"x\")]\n}}\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\nuse selected::Text;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&inner("u8"), &inner("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 別のファイルの先頭の `#![cfg]`
+    let lib = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod selected;\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\nuse selected::Text;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let selected = "#![cfg(feature = \"x\")]\npub type Text = u32;\n";
+    let api = api_changes_of_files(
+        &[("src/lib.rs", &lib("u8")), ("src/selected.rs", selected)],
+        &[("src/lib.rs", &lib("u16"))],
+    );
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 別のファイルを通る候補の右辺の中の名前も絞らない (`x` でない設定では glob の先の `selected`
+    // が使われる。10 回目)
+    let lib = |changed_type: &str| {
+        format!(
+            "type Changed = {changed_type};\n\nmod fallback {{\n    pub(crate) mod selected {{\n        pub(crate) type Text = crate::Changed;\n    }}\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\nmod selected;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: selected::Text) {{}}\n"
+        )
+    };
+    let selected = "pub(crate) type Text = Inner;\n\n#[cfg(feature = \"x\")]\ntype Inner = crate::Changed;\n#[cfg(not(feature = \"x\"))]\ntype Inner = u32;\n";
+    let api = api_changes_of_files(
+        &[("src/lib.rs", &lib("u8")), ("src/selected.rs", selected)],
+        &[("src/lib.rs", &lib("u16"))],
+    );
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // `#[cfg]` で分けた同じ名前の inline module を何段たどっても解ける
+    let nested = "pub mod b { pub mod c { pub mod d { pub mod e { pub mod f { pub mod g { pub type Text = u8; } } } } } }";
+    let source = |body: &str| {
+        format!(
+            "#[cfg(feature = \"x\")]\nmod a {{ {nested} }}\n#[cfg(not(feature = \"x\"))]\nmod a {{ {nested} }}\n\npub fn run(_: a::b::c::d::e::f::g::Text) {{{body}}}\n"
+        )
+    };
+    let api = api_changes(&source(""), &source(" let _ = 0; "));
+    assert_ne!(
+        dependency_reason(&api, "run"),
+        Some(Reason::RustSignatureDependencyUnresolved),
+        "{api:?}"
+    );
+    assert_ne!(dependency_reason(&api, "run"), changed, "{api:?}");
+}
+
+/// 覆いを証明できるのは条件の分かる定義だけ。どの設定でも無い明示の束縛 (`#[cfg(any())]`) を除いて、
+/// 隠れていた glob の束縛を見ないまま同じとみなさない。関数の本体の先頭の `#![cfg]` も項目の条件に
+/// 入れる (#312 の 5 回目のレビュー)。
+#[test]
+fn narrowing_needs_definitions_with_known_conditions() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    let never = |base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub type Text = crate::Base;\n}}\nuse fallback::*;\n\n#[cfg(any())]\ntype Text = Base;\n\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&never("u8"), &never("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    let function = |base: &str| {
+        format!(
+            "const BASE: usize = {base};\n\nmod fallback {{\n    pub const LEN: usize = crate::BASE;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\nconst LEN: usize = BASE;\n\n#[allow(non_snake_case)]\nfn LEN() {{\n    #![cfg(any())]\n}}\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; LEN]) {{}}\n"
+        )
+    };
+    let api = api_changes(&function("1"), &function("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 名前付きのフィールドの構造体は値の名前空間に名前を作らない (7 回目)
+    let named = |base: &str| {
+        format!(
+            "const BASE: usize = {base};\n\nmod fallback {{\n    pub const LEN: usize = crate::BASE;\n}}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\nconst LEN: usize = BASE;\n\n#[cfg(not(feature = \"x\"))]\nstruct LEN {{\n    hidden: (),\n}}\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; LEN]) {{}}\n"
+        )
+    };
+    let api = api_changes(&named("1"), &named("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+}
+
+/// 覆いを証明できるのは、項目を置き換え得る属性の無い定義だけ。属性マクロ (`cfg_attr` で付けるものも)
+/// は定義を空に置き換えられ、囲む inline module に付けば中身ごと置き換えられる。`derive` とツールの
+/// 属性は、取り込みで別のマクロに隠れ得る。そのような定義の右辺の中も絞らない。同じ名前でまとめた
+/// inline module の、宣言を囲まない本体の属性マクロも同じ。`doc`・lint の属性のような組み込みの属性
+/// だけなら絞る (#312 の 6・7・10・13 回目のレビュー)。
+#[test]
+fn definitions_under_attribute_macros_do_not_prove_coverage() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    let fallback = "mod fallback {\n    pub type Text = crate::Base;\n}\nuse fallback::*;\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n";
+    for (imports, attribute) in [
+        ("", "#[eraser::erase]"),
+        ("", "#[cfg_attr(unix, eraser::erase)]"),
+        ("use eraser::erase as derive;\n", "#[derive]"),
+        (
+            "mod rustfmt {\n    pub use eraser::erase as skip;\n}\n",
+            "#[rustfmt::skip]",
+        ),
+    ] {
+        let source = |base: &str| {
+            format!(
+                "{imports}type Base = {base};\n\n{fallback}#[cfg(not(feature = \"x\"))]\n{attribute}\ntype Text = u32;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+            )
+        };
+        let api = api_changes(&source("u8"), &source("u16"));
+        assert_eq!(
+            dependency_reason(&api, "run"),
+            changed,
+            "{attribute}: {api:?}"
+        );
+    }
+    // 囲む inline module の属性マクロ
+    let module = |base: &str| {
+        format!(
+            "type Base = {base};\n\npub mod fallback {{\n    pub type Text = crate::Base;\n}}\n\n#[eraser::rewrite]\npub mod m {{\n    use crate::fallback::*;\n\n    #[cfg(feature = \"x\")]\n    type Text = crate::Base;\n    #[cfg(not(feature = \"x\"))]\n    type Text = u32;\n\n    #[cfg(not(feature = \"x\"))]\n    pub fn run(_: Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&module("u8"), &module("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 同じ名前の inline module の、属性マクロで消える方の本体の定義 (束縛は 1 つのスコープにまとまる。
+    // 13 回目)
+    let merged = |changed_type: &str| {
+        format!(
+            "type Changed = {changed_type};\n\nmod fallback {{\n    pub type Text = crate::Changed;\n}}\n\n#[eraser::erase]\nmod m {{\n    #[cfg(feature = \"x\")]\n    type Text = crate::Changed;\n    #[cfg(not(feature = \"x\"))]\n    type Text = u32;\n}}\n\npub mod m {{\n    use crate::fallback::*;\n\n    #[cfg(not(feature = \"x\"))]\n    pub fn run(_: Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&merged("u8"), &merged("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 属性マクロの付いた別名の右辺の中の名前も絞らない (10 回目)
+    let rhs = |changed_type: &str| {
+        format!(
+            "type Changed = {changed_type};\n\n#[cfg(feature = \"x\")]\ntype Selected = Changed;\n#[cfg(not(feature = \"x\"))]\ntype Selected = u32;\n\nmod fallback {{\n    pub(crate) type Selected = crate::Changed;\n}}\n\n#[wrap::in_scope]\npub(crate) type Text = Selected;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&rhs("u8"), &rhs("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 項目を置き換えない組み込みの属性だけなら絞る
+    let inert = |base: &str| {
+        format!(
+            "type Base = {base};\n\n#[cfg(feature = \"x\")]\n#[doc = \"wide\"]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\n#[allow(dead_code)]\n#[cfg_attr(unix, allow(unused), doc = \"narrow\")]\ntype Text = u32;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(&inert("u8"), &inert("u16"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+}
+
+/// 宣言を囲む項目 (inline module・impl・trait) に属性マクロがあれば、中の `#[cfg]` は展開の後に
+/// 評価され、宣言の有る条件が変わり得るので、枝を除かない。宣言自身の属性マクロも、宣言を別の
+/// スコープへ置き換え得るので同じ。trait の契約に入る関連項目の属性マクロも同じ (#312 の 7・9・12 回目の
+/// レビュー)。
+#[test]
+fn declarations_under_attribute_macros_are_not_narrowed() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    let module = |wide: &str| {
+        format!(
+            "#[cfg(feature = \"x\")]\ntype Text = {wide};\n#[cfg(not(feature = \"x\"))]\ntype Text = u32;\n\n#[rewriter::expand]\npub mod m {{\n    #[cfg(not(feature = \"x\"))]\n    pub fn run(_: super::Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&module("u8"), &module("u16"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 組み込みの属性だけなら絞る
+    let inert = |wide: &str| {
+        format!(
+            "#[cfg(feature = \"x\")]\ntype Text = {wide};\n#[cfg(not(feature = \"x\"))]\ntype Text = u32;\n\n#[allow(dead_code)]\npub mod m {{\n    #[cfg(not(feature = \"x\"))]\n    pub fn run(_: super::Text) {{}}\n}}\n"
+        )
+    };
+    let api = api_changes(&inert("u8"), &inert("u16"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+    // 宣言自身の属性マクロ
+    let own = |attribute: &str, base: &str| {
+        format!(
+            "type Base = {base};\n\nmod fallback {{\n    pub type Text = crate::Base;\n}}\n\n#[cfg(feature = \"x\")]\ntype Text = Base;\n#[cfg(not(feature = \"x\"))]\ntype Text = u32;\n\n#[cfg(not(feature = \"x\"))]\n{attribute}\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(
+        &own("#[wrap::with_text]", "u8"),
+        &own("#[wrap::with_text]", "u16"),
+    );
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 組み込みの属性だけなら絞る
+    let api = api_changes(
+        &own("#[inline]\n#[doc = \"run\"]", "u8"),
+        &own("#[inline]\n#[doc = \"run\"]", "u16"),
+    );
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+    // trait の関連型の属性マクロ (関連型の境界は trait の契約。12 回目)
+    let associated = |attribute: &str, changed_type: &str| {
+        format!(
+            "type Changed = {changed_type};\n\n#[cfg(feature = \"x\")]\ntype Text = Changed;\n#[cfg(not(feature = \"x\"))]\ntype Text = u32;\n\n#[cfg(not(feature = \"x\"))]\npub trait Api {{\n    {attribute}\n    type Item: Into<Text>;\n}}\n"
+        )
+    };
+    let api = api_changes(
+        &associated("#[rewriter::bind]", "u8"),
+        &associated("#[rewriter::bind]", "u16"),
+    );
+    assert_eq!(dependency_reason(&api, "Api"), changed, "{api:?}");
+    let api = api_changes(
+        &associated("#[doc = \"item\"]", "u8"),
+        &associated("#[doc = \"item\"]", "u16"),
+    );
+    assert_eq!(dependency_reason(&api, "Api"), None, "{api:?}");
+}
+
+/// 局所の束縛を作り得る式 (ブロックなど) の中の名前は、局所の `use`・項目が隠し得るので、外の module の
+/// 定義で覆いを証明しない。宣言の契約の中も、定数の右辺の中も、局所の名前の候補の右辺を描く先も、
+/// 宣言自身がブロックの中にあるときも同じ (#312 の 8・9 回目のレビュー)。
+#[test]
+fn references_in_local_scopes_are_not_narrowed() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    let branches = "#[cfg(feature = \"x\")]\nconst LEN: usize = BASE;\n#[cfg(not(feature = \"x\"))]\nconst LEN: usize = 3;\n";
+    // 宣言の配列の長さのブロックの中の `use`
+    let declaration = |base: &str| {
+        format!(
+            "const BASE: usize = {base};\n\nmod fallback {{\n    pub const LEN: usize = super::BASE;\n}}\n\n{branches}\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; {{\n    use crate::fallback::{{LEN}};\n    LEN\n}}]) {{}}\n"
+        )
+    };
+    let api = api_changes(&declaration("1"), &declaration("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 定数の右辺のブロックの中の glob
+    let constant = |base: &str| {
+        format!(
+            "const BASE: usize = {base};\n\nmod fallback {{\n    pub const LEN: usize = super::BASE;\n}}\n\n{branches}\nconst SIZE: usize = {{\n    use crate::fallback::*;\n    LEN\n}};\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; SIZE]) {{}}\n"
+        )
+    };
+    let api = api_changes(&constant("1"), &constant("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 局所の名前の候補 (`LEN`) の右辺の中の名前 (`BASE`) も絞らない
+    let nested = |changed_value: &str| {
+        format!(
+            "const CHANGED: usize = {changed_value};\n\n#[cfg(feature = \"x\")]\nconst BASE: usize = CHANGED;\n#[cfg(not(feature = \"x\"))]\nconst BASE: usize = 3;\n\nmod fallback {{\n    pub const LEN: usize = super::CHANGED;\n}}\n\n#[cfg(feature = \"x\")]\nconst LEN: usize = BASE;\n#[cfg(not(feature = \"x\"))]\nconst LEN: usize = 3;\n\n#[cfg(not(feature = \"x\"))]\npub fn run(_: [u8; {{\n    use crate::fallback::*;\n    LEN\n}}]) {{}}\n"
+        )
+    };
+    let api = api_changes(&nested("1"), &nested("2"));
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 宣言自身が const のブロックの中にある
+    let block = |base: &str| {
+        format!(
+            "const BASE: usize = {base};\n\nmod fallback {{\n    pub const LEN: usize = super::BASE;\n}}\n\n{branches}\npub struct S;\n\nconst _: () = {{\n    use crate::fallback::LEN;\n\n    #[cfg(not(feature = \"x\"))]\n    impl S {{\n        pub fn run(_: [u8; LEN]) {{}}\n    }}\n}};\n"
+        )
+    };
+    let api = api_changes(&block("1"), &block("2"));
+    assert_eq!(dependency_reason(&api, "S.run"), changed, "{api:?}");
+}
+
+/// 組み込みの cfg は `--cfg` で上書きできる (`explicit_builtin_cfgs_in_flags` を許せば、`unix` と
+/// `windows` が同時に真になり、`target_os` が 2 つの値を持つ) ので、その関係で枝を除かない。上書きした
+/// 設定でだけ宣言が消えるときは、旧新で共通の設定に絞らない (#312 の 14・15 回目のレビュー)。
+#[test]
+fn builtin_cfg_relations_are_not_used_for_narrowing() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    for (branch, declaration) in [
+        ("windows", "unix"),
+        ("target_os = \"macos\"", "target_os = \"linux\""),
+    ] {
+        let source = |overridden: &str| {
+            format!(
+                "#[cfg({branch})]\ntype Text = {overridden};\n#[cfg(not({branch}))]\ntype Text = u32;\n\n#[cfg({declaration})]\npub fn run(_: Text) {{}}\n"
+            )
+        };
+        let api = api_changes(&source("u8"), &source("u16"));
+        assert_eq!(dependency_reason(&api, "run"), changed, "{branch}: {api:?}");
+    }
+    // 宣言の有る設定が旧新で変わるときは絞らない。上書きした設定でだけ宣言が消える (項目の有る設定の
+    // 比較は組み込みの cfg の関係を使うので報告しない) ときも、変化を拾う (15 回目)
+    let source = |macos: &str, declaration: &str| {
+        format!(
+            "#[cfg(target_os = \"macos\")]\ntype Text = {macos};\n#[cfg(not(target_os = \"macos\"))]\ntype Text = u32;\n\n#[cfg({declaration})]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let api = api_changes(
+        &source("u8", "target_os = \"linux\""),
+        &source(
+            "u16",
+            "all(target_os = \"linux\", not(target_os = \"macos\"))",
+        ),
+    );
+    assert_eq!(dependency_reason(&api, "run"), changed, "{api:?}");
+    // 親の module の条件と宣言の条件を一緒に変える (項目の有る設定の比較は、親の module の条件を入れる
+    // 比べ直しに任され、組み込みの cfg の関係で同じとみなす。16 回目)
+    let api = |text_type: &str, declaration: &str| {
+        format!(
+            "#[cfg(all(target_os = \"macos\", not(feature = \"x\")))]\ntype Text = {text_type};\n#[cfg(not(all(target_os = \"macos\", not(feature = \"x\"))))]\ntype Text = u32;\n\n#[cfg({declaration})]\npub fn run(_: Text) {{}}\n"
+        )
+    };
+    let result = api_changes_of_files(
+        &[
+            (
+                "src/lib.rs",
+                "#[cfg(target_os = \"linux\")]\npub mod api;\n",
+            ),
+            (
+                "src/api.rs",
+                &api("u8", "any(feature = \"x\", target_os = \"macos\")"),
+            ),
+        ],
+        &[
+            (
+                "src/lib.rs",
+                "#[cfg(all(target_os = \"linux\", not(target_os = \"macos\")))]\npub mod api;\n",
+            ),
+            ("src/api.rs", &api("u16", "feature = \"x\"")),
+        ],
+    );
+    assert_eq!(dependency_reason(&result, "run"), changed, "{result:?}");
+}
