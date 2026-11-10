@@ -11,16 +11,27 @@ pub(super) struct Environment {
 }
 
 impl Environment {
-    fn merge(&mut self, other: Self) {
+    pub(super) fn merge(&mut self, other: Self) {
         self.imports.extend(other.imports);
         self.attributes.extend(other.attributes);
         self.used_macros.extend(other.used_macros);
     }
 
-    fn plain(&self, macro_name: &str) -> bool {
-        !self.imports.contains(macro_name)
-            && self.imports.is_disjoint(&self.attributes)
-            && self.imports.is_disjoint(&self.used_macros)
+    /// `macro_name` を差し替える import・定義が無く、import した名前が属性やほかの
+    /// マクロの名前と重ならないか。
+    pub(super) fn plain(&self, macro_name: &str) -> bool {
+        !self.imports.contains(macro_name) && self.consistent()
+    }
+
+    /// import した名前が、スコープの属性・derive や文の位置のマクロの名前と重ならないか (重なれば
+    /// それらは自作のものかもしれず、展開が名前の束縛を足し得る)。
+    pub(super) fn consistent(&self) -> bool {
+        self.imports.is_disjoint(&self.attributes) && self.imports.is_disjoint(&self.used_macros)
+    }
+
+    /// `names` のどれかを import・マクロの定義で差し替えているか。
+    pub(super) fn shadows_any(&self, names: &[String]) -> bool {
+        names.iter().any(|name| self.imports.contains(name))
     }
 }
 
@@ -42,17 +53,29 @@ fn is_parent_glob(item: Node<'_>) -> bool {
             .all(|node| matches!(node.kind(), "super" | "line_comment" | "block_comment"))
 }
 
-fn has_parent_glob(scope: Node<'_>) -> bool {
+pub(super) fn has_parent_glob(scope: Node<'_>) -> bool {
     let mut cursor = scope.walk();
     scope.named_children(&mut cursor).any(is_parent_glob)
 }
 
-fn environment(
+pub(super) fn environment(
     scope: Node<'_>,
     source: &[u8],
     approved: Option<usize>,
     imports_in_scope: bool,
 ) -> Option<Environment> {
+    let (result, glob) = environment_with_glob(scope, source, approved, imports_in_scope)?;
+    (!glob).then_some(result)
+}
+
+/// [`environment`] と同じ。ただし、名前を解けない glob の `use` があっても `None` にせず、その有無を
+/// 2 つ目の値で返す。
+pub(super) fn environment_with_glob(
+    scope: Node<'_>,
+    source: &[u8],
+    approved: Option<usize>,
+    imports_in_scope: bool,
+) -> Option<(Environment, bool)> {
     let mut result = Environment::default();
     let mut textual = HashSet::new();
     let mut glob = false;
@@ -71,12 +94,18 @@ fn environment(
             }
             "extern_crate_declaration" => return None,
             "attribute_item" | "inner_attribute_item" => {
-                if item
+                let name = item
                     .named_child(0)
                     .and_then(|node| node.named_child(0))
-                    .and_then(|node| node.utf8_text(source).ok())
-                    .is_some_and(|name| matches!(name, "global_allocator" | "path"))
-                {
+                    .and_then(|node| node.utf8_text(source).ok());
+                // `path` は組み込みの属性 (import と重なれば rustc が曖昧とする)。
+                if name == Some("path") {
+                    continue;
+                }
+                // `global_allocator` は prelude の属性のマクロなので、同じ名前の import で
+                // 差し替えられる。名前を数えて import との重なりを確かめる。
+                if name == Some("global_allocator") {
+                    result.attributes.insert("global_allocator".to_owned());
                     continue;
                 }
                 result
@@ -117,10 +146,9 @@ fn environment(
     // 親 module の use は子へ継承されないが、macro_rules! の字句スコープは届く。
     if !imports_in_scope && result.attributes.is_empty() && result.used_macros.is_empty() {
         result.imports = textual;
-    } else if glob {
-        return None;
+        return Some((result, false));
     }
-    Some(result)
+    Some((result, glob))
 }
 
 fn sibling(mut node: Node<'_>, previous: bool) -> Option<Node<'_>> {
@@ -238,7 +266,7 @@ impl RustPathOwnerIndex {
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
     ) -> bool {
-        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+        if !self.local_value_names.contains(name) || !self.same_source(source) {
             return false;
         }
         let Some((invocation, callee)) = argument_macro(node, source) else {
@@ -259,7 +287,7 @@ impl RustPathOwnerIndex {
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
     ) -> bool {
-        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+        if !self.local_value_names.contains(name) || !self.same_source(source) {
             return false;
         }
         let Some((invocation, callee, macro_name)) = capture_macro(tree, source) else {
@@ -286,10 +314,66 @@ impl RustPathOwnerIndex {
             && self.import_binding_safe_beside(callee, source, name, Some(invocation.id()))
     }
 
+    /// 標準のマクロの証明の土台: 参照ファイルとその祖先のファイル (crate root まで) の
+    /// マクロの名前の環境。ソースの配置と依存の置き換えが無いことも確かめる。`std`・`core`・
+    /// `alloc` という名前の依存は標準のマクロの入口 (prelude) を差し替え得るので、package の
+    /// manifest にあれば証明しない。参照ファイルごとに 1 度だけ作る。
+    pub(super) fn standard_macro_base(
+        &self,
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> Option<&Environment> {
+        self.format_environment
+            .get_or_init(|| {
+                if !project.allows_static_source_path(Path::new(ref_path)) {
+                    return None;
+                }
+                let (package, _, _) = source_module_path(dir, Path::new(ref_path))?;
+                if !project
+                    .cargo_configs
+                    .keeps_dependency_sources(&dir.join(&package))
+                {
+                    return None;
+                }
+                let manifest = read_input_text_file(&dir.join(&package).join("Cargo.toml"))?;
+                let value = toml::from_str::<toml::Value>(&manifest).ok()?;
+                if super::super::rust_std_origin::has_sysroot_dependency(&value, false) {
+                    return None;
+                }
+                let (chain, roots) = enum_owner::ancestor_chain(dir, ref_path)?;
+                let mut combined = Environment::default();
+                // 親 module の import は子へ継承されないが、`use super::*;` は親の名前を
+                // 持ち込む。参照ファイルから途切れずに持ち込まれる祖先の import は見える範囲に入れる。
+                let mut visible = true;
+                for (index, file) in chain.iter().chain(&roots).enumerate() {
+                    if !project.allows_static_source_path(file) {
+                        return None;
+                    }
+                    let source = read_input_file(&dir.join(file))?;
+                    let tree = parser::parse_source(&source, LangId::Rust).ok()?;
+                    let root = tree.root_node();
+                    if root.has_error() {
+                        return None;
+                    }
+                    combined.merge(environment(root, &source, None, visible)?);
+                    // crate root は module の連鎖の最上位の親。root どうしは持ち込まない。
+                    if index < chain.len() {
+                        visible = visible && has_parent_glob(root);
+                    }
+                }
+                // マクロ名ごとの判定は外側の block を合わせてから行う (`plain` は要素を
+                // 足すほど偽に寄るので、先に絞っても結果は変わらない)。
+                Some(combined)
+            })
+            .as_ref()
+    }
+
     /// `invocation` が標準の `macro_name!` を指すか。参照ファイルとその祖先、外側の block で
     /// マクロ名を import・定義で差し替えておらず、ソースの配置と依存の置き換えも無いことを
-    /// 確かめる。`#[macro_export]` は crate root の名前を差し替えるので、属性の付いた同名の
-    /// `macro_rules!` がプロジェクトのどこかにあれば標準とみなさない。
+    /// 確かめる ([`Self::standard_macro_base`])。`#[macro_export]` は crate root の名前を
+    /// 差し替えるので、属性の付いた同名の `macro_rules!` がプロジェクトのどこかにあれば
+    /// 標準とみなさない。
     fn standard_macro_call(
         &self,
         invocation: Node<'_>,
@@ -303,45 +387,7 @@ impl RustPathOwnerIndex {
             if project.may_define_macro(macro_name) {
                 return None;
             }
-            let base = self
-                .format_environment
-                .get_or_init(|| {
-                    if !project.allows_static_source_path(Path::new(ref_path)) {
-                        return None;
-                    }
-                    let (package, _, _) = source_module_path(dir, Path::new(ref_path))?;
-                    if !project
-                        .cargo_configs
-                        .keeps_dependency_sources(&dir.join(&package))
-                    {
-                        return None;
-                    }
-                    let (chain, roots) = enum_owner::ancestor_chain(dir, ref_path)?;
-                    let mut combined = Environment::default();
-                    // 親 module の import は子へ継承されないが、`use super::*;` は親の名前を
-                    // 持ち込む。参照ファイルから途切れずに持ち込まれる祖先の import は見える範囲に入れる。
-                    let mut visible = true;
-                    for (index, file) in chain.iter().chain(&roots).enumerate() {
-                        if !project.allows_static_source_path(file) {
-                            return None;
-                        }
-                        let source = read_input_file(&dir.join(file))?;
-                        let tree = parser::parse_source(&source, LangId::Rust).ok()?;
-                        let root = tree.root_node();
-                        if root.has_error() {
-                            return None;
-                        }
-                        combined.merge(environment(root, &source, None, visible)?);
-                        // crate root は module の連鎖の最上位の親。root どうしは持ち込まない。
-                        if index < chain.len() {
-                            visible = visible && has_parent_glob(root);
-                        }
-                    }
-                    // マクロ名ごとの判定は外側の block を合わせてから行う (`plain` は要素を
-                    // 足すほど偽に寄るので、先に絞っても結果は変わらない)。
-                    Some(combined)
-                })
-                .as_ref()?;
+            let base = self.standard_macro_base(dir, ref_path, project)?;
             let mut combined = base.clone();
             let mut ancestor = invocation.parent();
             while let Some(scope) = ancestor {

@@ -75,6 +75,10 @@ pub(super) struct RefEventMini {
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
+    /// Rust: 標準のマクロの写し (`rust_path_owner::MacroCopy`) に対応した参照で、写しにこの名前を
+    /// 名指す import・glob・経路があるか。マクロの引数の中の `use` は元のファイルの証拠に
+    /// 現れないので、振り分けの証拠に足す。
+    pub(super) rust_macro_evidence: bool,
     /// Rust: 参照 identifier が `json!()` の callee 名そのものか。通常の関数/値シンボル変更では
     /// macro callee は別名前空間なので low に落とす一方、macro 引数は `ref_in_macro` で high 維持する。
     pub(super) rust_macro_callee: bool,
@@ -305,7 +309,7 @@ impl RouteDecisionContext<'_> {
                         self.import_facts_cache,
                     ) {
                         Some(has_evidence) => should_route_rust_ref_low(
-                            has_evidence,
+                            has_evidence || event.rust_macro_evidence,
                             // 関数向けの確定束縛は除外済み。行全体の推測で初期化子等を降格しない。
                             event.local_shadow_hint
                                 && !rust_function_only(file_context, symbol_name)
@@ -347,6 +351,9 @@ pub(super) struct ImpactCollector<'a> {
     /// 参照ファイルが差し替える標準マクロの名前 (`rust_const_value::LocalMacros`)。
     pub(super) rust_local_macros: std::cell::OnceCell<super::rust_const_value::LocalMacros>,
     pub(super) rust_path_owner: std::cell::OnceCell<super::rust_path_owner::RustPathOwnerIndex>,
+    /// 標準のマクロの呼び出しを普通の式に書き換えた写し (`rust_path_owner::MacroCopy`)。
+    /// 引数の中の参照の所有元の証明だけに使う。
+    pub(super) rust_macro_copy: std::cell::OnceCell<Option<super::rust_path_owner::MacroCopy>>,
     pub(super) rust_path_owner_project: &'a super::rust_path_owner::RustPathOwnerProjectProof,
     pub(super) rust_source_paths: &'a [Option<PathBuf>],
     pub(super) rust_path_owner_enabled: bool,
@@ -421,21 +428,73 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             return;
         }
 
+        // 書式の暗黙キャプチャには識別子のノードが無い。所有元の索引はキャプチャを含む
+        // token tree から作り、キャプチャ用の証明だけに使う。
+        let rust_format_capture =
+            rust_format_capture.filter(|_| self.ref_lang == Some(LangId::Rust));
+        let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
+            && self.rust_path_owner_enabled)
+            .then(|| {
+                node.or(rust_format_capture).map(|node| {
+                    self.rust_path_owner.get_or_init(|| {
+                        super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                    })
+                })
+            })
+            .flatten();
+        // 標準のマクロ (`matches!`・`assert!`・書式のマクロ・`vec!` など) と証明できた呼び出しの
+        // 引数の中の参照は、呼び出しを普通の式に書き換えたファイルの写しの構文木で、マクロの外と
+        // 同じ所有元の証明を回す (Issue #310)。囲むマクロのどれかを標準と証明できない・書き換えた
+        // 形が読めないときは、元の構文木のまま扱う。
+        let rust_macro_site = rust_owner_index
+            .zip(node)
+            .filter(|&(_, node)| {
+                !rust_macro_callee && super::rust_path_owner::MacroCopy::candidate(node, source)
+            })
+            .and_then(|(index, node)| {
+                let copy = self
+                    .rust_macro_copy
+                    .get_or_init(|| {
+                        super::rust_path_owner::MacroCopy::build(
+                            node,
+                            source,
+                            index,
+                            Path::new(self.dir),
+                            self.path_str,
+                            self.rust_path_owner_project,
+                        )
+                    })
+                    .as_ref()?;
+                let (site, in_use) = copy.site(node)?;
+                Some((copy, site, in_use))
+            });
+        // 所有元の証明に使う識別子・ソース・索引。写しに対応できた参照は写しのものを使う。
+        let (owner_node, owner_source, owner_index) = match rust_macro_site {
+            Some((copy, site, _)) => (Some(site), copy.source(), Some(copy.index())),
+            None => (node, source, rust_owner_index),
+        };
+
         // Stage 6 (import 行) の判定は文字列のままでないと行えないため、ここで即決する。
         // caller_name も context から抽出し、pool へ intern して ID にしてから push する。
         // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
         // context は trim 済み文字列のため、列は context_column (trim 相対) を渡す
         // (絶対列 `column` は AST point 照合用で座標系が異なる)。
-        let is_import = match filters::import_context_at(Some(context), context_column) {
-            filters::ImportContext::NotImport => false,
-            filters::ImportContext::Import => true,
-            // `= require(` を含む文を丸ごと import とみなすと、同じ文の実際の呼び出し
-            // (`require('./a').foo(1)`) まで import (情報提供) に落ちる。JS/TS は AST で
-            // CommonJS の束縛位置かを確かめ、確かめられなければ import としない。
-            filters::ImportContext::RequireOnly => {
-                !self.ref_lang.is_some_and(lang_is_ts_family)
-                    || node.is_some_and(|node| filters::is_commonjs_require_binding(node, source))
-            }
+        // 写しに対応した参照は、行の字面 (書式の文字列の `; use` などにも一致する) ではなく、写しの
+        // 構文木で `use` の宣言の中かを見る。
+        let is_import = match rust_macro_site {
+            Some((_, _, in_use)) => in_use,
+            None => match filters::import_context_at(Some(context), context_column) {
+                filters::ImportContext::NotImport => false,
+                filters::ImportContext::Import => true,
+                // `= require(` を含む文を丸ごと import とみなすと、同じ文の実際の呼び出し
+                // (`require('./a').foo(1)`) まで import (情報提供) に落ちる。JS/TS は AST で
+                // CommonJS の束縛位置かを確かめ、確かめられなければ import としない。
+                filters::ImportContext::RequireOnly => {
+                    !self.ref_lang.is_some_and(lang_is_ts_family)
+                        || node
+                            .is_some_and(|node| filters::is_commonjs_require_binding(node, source))
+                }
+            },
         };
         let unproven_module_ref = is_import
             && self.ref_lang.is_some_and(lang_is_ts_family)
@@ -514,14 +573,23 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
 
         // Rust の証拠なし bare identifier を low に落とす際、macro 引数だけは high 維持するため
         // context 行の macro 呼び出し有無を見ておく (non-Rust では使わないので Rust のみ算出)。
+        // 標準のマクロと証明して写しに対応できた引数は、展開で参照の形が変わらないので
+        // マクロの外と同じに振り分ける。
         let ref_in_macro = self.ref_lang == Some(LangId::Rust)
             && context_line_has_macro_invocation(context)
-            && !rust_macro_callee;
+            && !rust_macro_callee
+            && rust_macro_site.is_none();
+        // 行の字面の `let NAME` は書式の文字列にも一致するので、写しに対応した参照では使わない
+        // (束縛は写しの構文木の証明で確かめる)。
+        let local_shadow_hint = local_shadow_hint && rust_macro_site.is_none();
+        let rust_macro_evidence = rust_macro_site
+            .is_some_and(|(copy, _, _)| copy.has_symbol_evidence(&self.all_symbol_names[ix]));
         // 行内の別マクロ (`vec![...].into_iter().collect()`) で macro hint が立っても、
         // この識別子自身が receiver の field 位置なら自由関数を指すことはない。
-        // token_tree 内はマクロ展開で参照形が変わり得るため証明しない。
+        // token_tree 内はマクロ展開で参照形が変わり得るため証明しない (標準のマクロの写しでは
+        // 普通の式として確かめる)。
         let rust_receiver_member =
-            self.ref_lang == Some(LangId::Rust) && node.is_some_and(is_rust_receiver_member);
+            self.ref_lang == Some(LangId::Rust) && owner_node.is_some_and(is_rust_receiver_member);
         let private_method_target = self.ref_lang == Some(LangId::Rust)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
                 contexts.iter().any(|&fc_ix| {
@@ -535,7 +603,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // 素の関数呼び出しや import のように構文で否定できた参照だけで、ノードの無い参照は
         // 部分木・葉モジュールの判定へ進める (判定できなければ低確信度)。
         let rust_method_syntax = private_method_target
-            && node.is_none_or(|node| {
+            && owner_node.is_none_or(|node| {
                 is_rust_method_call_member(node)
                     || node.parent().is_some_and(|parent| {
                         parent.kind() == "scoped_identifier"
@@ -557,7 +625,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     }
             });
         let rust_explicit_method_owner_id = if private_method_target {
-            node.and_then(|node| rust_explicit_method_owner(node, source))
+            owner_node
+                .and_then(|node| rust_explicit_method_owner(node, owner_source))
                 .map_or(u32::MAX, |owner| {
                     self.pool
                         .lock()
@@ -606,40 +675,32 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
 
-        // 書式の暗黙キャプチャには識別子のノードが無い。所有元の索引はキャプチャを含む
-        // token tree から作り、キャプチャ用の証明だけに使う。
-        let rust_format_capture =
-            rust_format_capture.filter(|_| self.ref_lang == Some(LangId::Rust));
-        let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
-            && self.rust_path_owner_enabled)
-            .then(|| {
-                node.or(rust_format_capture).map(|node| {
-                    self.rust_path_owner.get_or_init(|| {
-                        super::rust_path_owner::RustPathOwnerIndex::build(node, source)
-                    })
-                })
-            })
-            .flatten();
-        let rust_owner = if let (Some(index), Some(node)) = (rust_owner_index, node) {
+        // 再公開の先の証明は元のソースの import を読むので、写しのノードでは使わない。
+        let original_site = rust_macro_site.is_none();
+        let rust_owner = if let (Some(index), Some(node)) = (owner_index, owner_node) {
             let path = Path::new(self.dir);
             let type_owner = || {
                 index
                     .type_owner(
                         node,
-                        source,
+                        owner_source,
                         path,
                         self.path_str,
                         self.rust_path_owner_project,
                     )
                     .or_else(|| {
-                        super::rust_reexport_owner::owner(
-                            node,
-                            source,
-                            path,
-                            self.path_str,
-                            self.rust_path_owner_project,
-                            super::rust_reexport_owner::Namespace::Type,
-                        )
+                        original_site
+                            .then(|| {
+                                super::rust_reexport_owner::owner(
+                                    node,
+                                    owner_source,
+                                    path,
+                                    self.path_str,
+                                    self.rust_path_owner_project,
+                                    super::rust_reexport_owner::Namespace::Type,
+                                )
+                            })
+                            .flatten()
                     })
                     .map(|owner| (owner, false))
             };
@@ -647,20 +708,24 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 index
                     .free_function_owner(
                         node,
-                        source,
+                        owner_source,
                         path,
                         self.path_str,
                         self.rust_path_owner_project,
                     )
                     .or_else(|| {
-                        super::rust_reexport_owner::owner(
-                            node,
-                            source,
-                            path,
-                            self.path_str,
-                            self.rust_path_owner_project,
-                            super::rust_reexport_owner::Namespace::Function,
-                        )
+                        original_site
+                            .then(|| {
+                                super::rust_reexport_owner::owner(
+                                    node,
+                                    owner_source,
+                                    path,
+                                    self.path_str,
+                                    self.rust_path_owner_project,
+                                    super::rust_reexport_owner::Namespace::Function,
+                                )
+                            })
+                            .flatten()
                     })
                     .map(|owner| (owner, true))
             };
@@ -679,7 +744,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 index
                     .enum_variant_owner(
                         node,
-                        source,
+                        owner_source,
                         path,
                         self.path_str,
                         self.rust_path_owner_project,
@@ -709,10 +774,10 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     self.rust_path_owner_project,
                 )
             });
-        let rust_associated_type_path = rust_owner_index.zip(node).is_some_and(|(index, node)| {
+        let rust_associated_type_path = owner_index.zip(owner_node).is_some_and(|(index, node)| {
             index.is_local_associated_path(
                 node,
-                source,
+                owner_source,
                 Path::new(self.dir),
                 self.path_str,
                 self.rust_path_owner_project,
@@ -720,7 +785,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         });
         let rust_plain_name = self.ref_lang == Some(LangId::Rust)
             && !rust_macro_callee
-            && node.is_some_and(|node| {
+            && owner_node.is_some_and(|node| {
                 matches!(node.kind(), "identifier" | "type_identifier")
                     && node.parent().is_none_or(|parent| {
                         !matches!(
@@ -730,12 +795,12 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     })
             });
         let rust_local_owner = (rust_plain_name
-            && rust_owner_index.zip(node).is_some_and(|(index, node)| {
-                index.plain_local_owner(node, source, &self.all_symbol_names[ix])
-                    || index.plain_local_value_owner(node, source, &self.all_symbol_names[ix])
+            && owner_index.zip(owner_node).is_some_and(|(index, node)| {
+                index.plain_local_owner(node, owner_source, &self.all_symbol_names[ix])
+                    || index.plain_local_value_owner(node, owner_source, &self.all_symbol_names[ix])
                     || index.format_local_value_owner(
                         node,
-                        source,
+                        owner_source,
                         &self.all_symbol_names[ix],
                         Path::new(self.dir),
                         self.path_str,
@@ -758,8 +823,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             index.is_tracked_direct_import_site(node, source, &self.all_symbol_names[ix])
         });
         let rust_import_binding_safe = (rust_plain_name
-            && rust_owner_index.zip(node).is_some_and(|(index, node)| {
-                index.plain_import_binding_safe(node, source, &self.all_symbol_names[ix])
+            && owner_index.zip(owner_node).is_some_and(|(index, node)| {
+                index.plain_import_binding_safe(node, owner_source, &self.all_symbol_names[ix])
             }))
             || rust_owner_index
                 .zip(rust_format_capture)
@@ -776,7 +841,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // 直接 import の証明は、参照と同じ名前空間の宣言が import の先にあることを求める。
         let rust_import_namespace = if rust_direct_import_site {
             super::rust_path_owner::ImportNamespace::Any
-        } else if node.is_some_and(|node| node.kind() == "type_identifier") {
+        } else if owner_node.is_some_and(|node| node.kind() == "type_identifier") {
             super::rust_path_owner::ImportNamespace::Type
         } else {
             super::rust_path_owner::ImportNamespace::Value
@@ -836,6 +901,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             local_shadow_hint,
             ts_import_binding_use,
             ref_in_macro,
+            rust_macro_evidence,
             rust_macro_callee,
             rust_receiver_member,
             rust_method_syntax,
@@ -1021,6 +1087,11 @@ impl<'a> ImpactCollector<'a> {
     /// (`candidate_decision`) → 振り分け先への集約 (`record_caller`) の順に行う。
     pub(super) fn finish_file(self) {
         let mut collector = self;
+        // 参照の走査で借りたソースはもう無い。索引が覚えたソースの場所を忘れる
+        // (`RustPathOwnerIndex::forget_verified_source`)。
+        if let Some(index) = collector.rust_path_owner.get() {
+            index.forget_verified_source();
+        }
         collector.record_definitions();
 
         // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す。
@@ -1594,6 +1665,7 @@ mod tests {
             local_shadow_hint: false,
             ts_import_binding_use: false,
             ref_in_macro: false,
+            rust_macro_evidence: false,
             rust_macro_callee: false,
             rust_receiver_member: false,
             rust_method_syntax: false,

@@ -24,6 +24,9 @@ use crate::models::impact::DiffFile;
 
 mod enum_owner;
 mod format_owner;
+mod macro_copy;
+
+pub(super) use macro_copy::MacroCopy;
 
 struct FileEvidence {
     types: HashSet<String>,
@@ -118,6 +121,22 @@ pub(super) struct RustPathOwnerIndex {
     enum_files: RefCell<HashMap<PathBuf, Option<enum_owner::EnumFile>>>,
     enum_owners: RefCell<HashMap<(String, String), Option<PathBuf>>>,
     format_environment: OnceLock<Option<format_owner::Environment>>,
+    /// スコープが名前を再束縛し得るかの判定の結果。同じスコープの中の参照ごとに部分木を
+    /// 走査し直さない (大きな関数の本体で参照の数に比例して遅くならないように)。
+    rebinds: RefCell<HashMap<(usize, Rebind, String), bool>>,
+    /// `source_hash` と一致を確かめたソースの場所と長さ。参照の走査の間 (ソースを借りたまま
+    /// 変えない) だけ使い、参照ごとにソース全体のハッシュを計算し直さない。走査が終わってソースを
+    /// 手放したら [`Self::forget_verified_source`] で忘れる。
+    verified_source: std::cell::Cell<Option<(usize, usize)>>,
+}
+
+/// 再束縛の判定の種類 (`rebinds` の鍵)。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Rebind {
+    /// [`scope_can_rebind_name`]
+    Type,
+    /// [`scope_can_rebind_import_name_beside`] と、標準と証明したマクロの呼び出し
+    Value(Option<usize>),
 }
 
 /// Module-relative paths need a unique compilation context for each source
@@ -812,13 +831,50 @@ impl RustPathOwnerIndex {
         })
     }
 
+    /// 一致を確かめたソースの場所を忘れる (そのソースを手放した後で、同じ場所に別のソースが
+    /// 置かれ得るため)。
+    pub(super) fn forget_verified_source(&self) {
+        self.verified_source.set(None);
+    }
+
+    /// `source` がこの索引を作ったソースか。一致を確かめたソースは場所と長さで覚える (覚えた
+    /// ソースを手放したら [`Self::forget_verified_source`] を呼ぶこと)。
+    fn same_source(&self, source: &[u8]) -> bool {
+        let key = (source.as_ptr() as usize, source.len());
+        if self.verified_source.get() == Some(key) {
+            return true;
+        }
+        let same = blake3::hash(source) == self.source_hash;
+        if same {
+            self.verified_source.set(Some(key));
+        }
+        same
+    }
+
+    /// `check` の結果を (スコープ, 種類, 名前) ごとに覚えて返す。
+    fn rebinds(
+        &self,
+        scope: Node<'_>,
+        kind: Rebind,
+        name: &str,
+        check: impl FnOnce() -> bool,
+    ) -> bool {
+        let key = (scope.id(), kind, name.to_owned());
+        if let Some(&found) = self.rebinds.borrow().get(&key) {
+            return found;
+        }
+        let found = check();
+        self.rebinds.borrow_mut().insert(key, found);
+        found
+    }
+
     /// A direct declaration in this file owns an unqualified reference unless
     /// a nested scope can rebind it. This does not require project-wide module
     /// evidence, so unrelated test modules do not disable the proof.
     pub(super) fn plain_local_owner(&self, node: Node<'_>, source: &[u8], name: &str) -> bool {
         if node.kind() != "type_identifier"
             || !self.local_type_names.contains(name)
-            || blake3::hash(source) != self.source_hash
+            || !self.same_source(source)
             || has_uncertain_ancestor(node)
         {
             return false;
@@ -831,7 +887,10 @@ impl RustPathOwnerIndex {
             if matches!(
                 scope.kind(),
                 "function_item" | "closure_expression" | "block"
-            ) && (has_attribute_prefix(scope) || scope_can_rebind_name(scope, source, name))
+            ) && (has_attribute_prefix(scope)
+                || self.rebinds(scope, Rebind::Type, name, || {
+                    scope_can_rebind_name(scope, source, name)
+                }))
             {
                 return false;
             }
@@ -861,7 +920,7 @@ impl RustPathOwnerIndex {
     ) -> bool {
         if node.kind() != "identifier"
             || !self.local_value_names.contains(name)
-            || blake3::hash(source) != self.source_hash
+            || !self.same_source(source)
             || has_uncertain_ancestor(node)
         {
             return false;
@@ -872,7 +931,9 @@ impl RustPathOwnerIndex {
                 scope.kind(),
                 "function_item" | "closure_expression" | "block" | "impl_item" | "trait_item"
             ) && (has_attribute_prefix(scope)
-                || scope_can_rebind_import_name_beside(scope, source, name, proven_macro))
+                || self.rebinds(scope, Rebind::Value(proven_macro), name, || {
+                    scope_can_rebind_import_name_beside(scope, source, name, proven_macro)
+                }))
             {
                 return false;
             }
@@ -924,7 +985,7 @@ impl RustPathOwnerIndex {
         proven_macro: Option<usize>,
     ) -> bool {
         if !self.direct_imports.contains_key(name)
-            || blake3::hash(source) != self.source_hash
+            || !self.same_source(source)
             || has_uncertain_ancestor(node)
         {
             return false;
@@ -935,7 +996,9 @@ impl RustPathOwnerIndex {
                 scope.kind(),
                 "function_item" | "closure_expression" | "block"
             ) && (has_attribute_prefix(scope)
-                || scope_can_rebind_import_name_beside(scope, source, name, proven_macro))
+                || self.rebinds(scope, Rebind::Value(proven_macro), name, || {
+                    scope_can_rebind_import_name_beside(scope, source, name, proven_macro)
+                }))
             {
                 return false;
             }
@@ -1052,6 +1115,8 @@ impl RustPathOwnerIndex {
             enum_files: RefCell::new(HashMap::new()),
             enum_owners: RefCell::new(HashMap::new()),
             format_environment: OnceLock::new(),
+            rebinds: RefCell::new(HashMap::new()),
+            verified_source: std::cell::Cell::new(None),
         }
     }
 

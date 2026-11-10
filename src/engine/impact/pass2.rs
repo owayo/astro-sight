@@ -464,6 +464,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             rust_std_origin: std::cell::OnceCell::new(),
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
+                            rust_macro_copy: std::cell::OnceCell::new(),
                             rust_path_owner_project: &rust_path_owner_project,
                             rust_source_paths: &rust_source_paths,
                             rust_path_owner_enabled: options.new_side
