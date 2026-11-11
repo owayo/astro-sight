@@ -60,6 +60,18 @@ unresolved cases retain the conservative classification. Python reflection and
 Rust macro expansion prevent these new binding proofs; Python stub/package
 variants of the removed module are treated as the same module.
 
+Shortening a Rust return type from `crate::model::Card` to `Card` with an explicit
+`use crate::model::Card` is reported as `rust_explicit_import_path` compatibility
+when both versions resolve to the same nominal definition and unconditional
+module placement. Related references in `review --hook` are informational.
+The initial proof requires a single changed file and no other token changes.
+Changed definitions or module wiring, type aliases, globs, `as`, attributes,
+macros, generics, and existing bare references to the imported name keep blocking.
+The target file must declare no child modules, inline or external: a new private
+import can change names used by a child's `use super::*`.
+Includes, their aliases, and opaque macros or attributes also keep blocking when
+source placement cannot be established throughout the project.
+
 ## ast: Extract AST Fragments
 
 ```bash
