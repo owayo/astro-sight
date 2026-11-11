@@ -419,11 +419,18 @@ fn collect_added_symbols(
             if is_binary_rust_crate {
                 continue;
             }
-            if is_rust_new_symbol_outside_public_api_surface(
+            // inherent impl の項目は impl の対象の型で決める (Issue #315)。
+            if rust_declaration_outside_public_api_surface(
+                inputs.rust_crates,
+                state.rust_public,
                 dir,
+                inputs.base_blobs,
+                false,
                 &df.new_path,
                 name,
-                state.rust_public,
+                facts
+                    .rust_declarations
+                    .and_then(|declarations| declarations.new.get(index)),
             ) {
                 continue;
             }
@@ -560,12 +567,18 @@ fn collect_removed_symbols(
             let inline_module = facts
                 .rust_declarations
                 .and_then(|declarations| declarations.old_inline_module(index));
-            if is_rust_old_symbol_outside_public_api_surface(
+            // inherent impl の項目は impl の対象の型で決める (Issue #315)。
+            if rust_declaration_outside_public_api_surface(
+                inputs.rust_crates,
+                state.rust_public,
                 dir,
                 base_blobs,
+                true,
                 &df.old_path,
                 name,
-                state.rust_public,
+                facts
+                    .rust_declarations
+                    .and_then(|declarations| declarations.old.get(index)),
             ) {
                 continue;
             }
@@ -976,6 +989,7 @@ fn collect_rust_modified_symbols(
             old_sig,
             new_sig,
             site,
+            &declarations.old[old_index],
             inline_module,
             display,
         );
@@ -1011,6 +1025,7 @@ fn collect_rust_modified_symbols(
             old_sig,
             new_sig,
             site,
+            &declarations.old[old_index],
             inline_module,
             None,
         );
@@ -1109,12 +1124,16 @@ fn collect_rust_availability_changes(
             file: df.new_path.clone(),
             signature: new_sig.clone(),
         };
-        let removable = !is_rust_old_symbol_outside_public_api_surface(
+        // inherent impl の項目は impl の対象の型で決める (Issue #315)。
+        let removable = !rust_declaration_outside_public_api_surface(
+            inputs.rust_crates,
+            state.rust_public,
             dir,
             base_blobs,
+            true,
             &df.old_path,
             name,
-            state.rust_public,
+            Some(&declarations.old[first_old]),
         );
         let item = AvailabilityItem {
             candidate,
@@ -1123,11 +1142,15 @@ fn collect_rust_availability_changes(
             removable,
         };
         record_availability_change(inputs, state, change, item, |state| {
-            !is_rust_new_symbol_outside_public_api_surface(
+            !rust_declaration_outside_public_api_surface(
+                inputs.rust_crates,
+                state.rust_public,
                 dir,
+                base_blobs,
+                false,
                 &df.new_path,
                 name,
-                state.rust_public,
+                Some(&declarations.new[first_new]),
             ) && !is_internally_connected(facts.in_file_callees, name)
                 && !is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths)
         });
@@ -2435,6 +2458,8 @@ struct ChangedSignatureFiles<'a> {
     rust_moved_const_additions: std::collections::HashSet<String>,
     /// 判定中の変更が、Rust の宣言を宣言の場所で組にしたものなら、その場所 (Issue #282)。
     rust_site: Option<RustDeclarationSite>,
+    /// 判定中の変更の旧い版の宣言の文脈 (Issue #315。inherent impl の項目の公開 API 面を対象の型で決める)。
+    rust_old_context: Option<RustDeclarationContext>,
 }
 
 impl<'a> ChangedSignatureFiles<'a> {
@@ -2461,6 +2486,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             rust_const_additions: None,
             rust_moved_const_additions: std::collections::HashSet::new(),
             rust_site: None,
+            rust_old_context: None,
         }
     }
 
@@ -2477,12 +2503,15 @@ impl<'a> ChangedSignatureFiles<'a> {
         old_sig: &str,
         new_sig: &str,
         site: RustDeclarationSite,
+        old_context: &RustDeclarationContext,
         inline_module: Option<String>,
         display: Option<(String, String)>,
     ) {
         self.rust_site = Some(site);
+        self.rust_old_context = Some(old_context.clone());
         let (mut change, decision) = self.decide(inputs, state, name, kind, old_sig, new_sig);
         self.rust_site = None;
+        self.rust_old_context = None;
         change.inline_module = inline_module;
         // 互換の項目の signature は、impact の互換の証拠の照合に使うので書き換えない。
         if let Some((old_signature, new_signature)) = display {
@@ -2551,12 +2580,15 @@ impl<'a> ChangedSignatureFiles<'a> {
         // 値だけの変更・互換・同じファイルの中だけ・追随済みとせず blocking にする (Issue #283)。
         if let Some(reason) = self.rust_site.and_then(|site| site.dependency) {
             if self.skip_for_binary_crate
-                || is_rust_old_symbol_outside_public_api_surface(
+                || rust_declaration_outside_public_api_surface(
+                    inputs.rust_crates,
+                    state.rust_public,
                     dir,
                     base_blobs,
+                    true,
                     self.old_path,
                     name,
-                    state.rust_public,
+                    self.rust_old_context.as_ref(),
                 )
             {
                 return (change, SignatureDecision::Omit);
@@ -2584,13 +2616,16 @@ impl<'a> ChangedSignatureFiles<'a> {
         if self.skip_for_binary_crate {
             return (change, SignatureDecision::Omit);
         }
-        // private module 抑制
-        if is_rust_old_symbol_outside_public_api_surface(
+        // private module 抑制 (inherent impl の項目は impl の対象の型で決める。Issue #315)
+        if rust_declaration_outside_public_api_surface(
+            inputs.rust_crates,
+            state.rust_public,
             dir,
             base_blobs,
+            true,
             self.old_path,
             name,
-            state.rust_public,
+            self.rust_old_context.as_ref(),
         ) {
             return (change, SignatureDecision::Omit);
         }
@@ -3752,13 +3787,17 @@ pub(crate) fn process_deleted_file(
         {
             continue;
         }
+        // inherent impl の項目は impl の対象の型で決める (Issue #315)。
         if !old_source_unverified
-            && is_rust_old_symbol_outside_public_api_surface(
+            && rust_declaration_outside_public_api_surface(
+                inputs.rust_crates,
+                state.rust_public,
                 dir,
                 base_blobs,
+                true,
                 &df.old_path,
                 name,
-                state.rust_public,
+                rust_declarations.and_then(|declarations| declarations.get(index)),
             )
         {
             continue;
@@ -3839,8 +3878,17 @@ pub(crate) fn process_added_file(
         if is_binary_rust_crate {
             continue;
         }
-        if is_rust_new_symbol_outside_public_api_surface(dir, &df.new_path, name, state.rust_public)
-        {
+        // inherent impl の項目は impl の対象の型で決める (Issue #315)。
+        if rust_declaration_outside_public_api_surface(
+            inputs.rust_crates,
+            state.rust_public,
+            dir,
+            inputs.base_blobs,
+            false,
+            &df.new_path,
+            name,
+            rust_declarations.and_then(|declarations| declarations.get(index)),
+        ) {
             continue;
         }
         if is_internally_connected(in_file_callees, name) {

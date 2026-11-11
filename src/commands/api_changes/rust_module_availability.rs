@@ -853,8 +853,11 @@ impl CrateComparison<'_, '_> {
                     }
                     let mut clauses = Vec::new();
                     let mut reexported: Option<bool> = None;
+                    // inherent impl の項目は、置き場で外でも、impl の対象の型が外と確かめられなければ公開
+                    // (決め切れなければ公開。Issue #315)。有る設定は置き場の条件のまま。
+                    let mut owner_public: Option<bool> = None;
                     for clause in &placement.clauses {
-                        let public = if clause.public && context.inline_public {
+                        let placed = if clause.public && context.inline_public {
                             true
                         } else if clause.public {
                             // 経路は公開で、宣言を囲む inline module が非公開: 同じファイルの公開の
@@ -877,6 +880,20 @@ impl CrateComparison<'_, '_> {
                                 self.reexported(version, &placement.file, name)
                             })
                         };
+                        let public = placed
+                            || (!context.owner.is_empty()
+                                && *owner_public.get_or_insert_with(|| {
+                                    super::inherent_member_surface(
+                                        self.crates,
+                                        self.rust_public,
+                                        self.dir,
+                                        self.base_blobs,
+                                        version == Version::Old,
+                                        &placement.file,
+                                        context,
+                                    )
+                                    .is_some_and(|surface| surface != super::OwnerSurface::Outside)
+                                }));
                         clauses.push((clause.clone(), public));
                     }
                     let key = (
@@ -991,20 +1008,39 @@ impl CrateComparison<'_, '_> {
     }
 
     /// 版 `version` のファイル `path` の公開の項目を、ファイルごとの比較がどれも公開 API 面の中として出すか
-    /// ([`Self::reexported`]。bin だけの package のファイルや、別の lib の非公開の module のファイルの項目は
+    /// ([`Self::reported_by_file`]。bin だけの package のファイルや、別の lib の非公開の module のファイルの項目は
     /// 出さない)。読めなければ出さないとする (Issue #314)。
     fn file_items_reported(&mut self, version: Version, path: &str) -> bool {
         let Some(facts) = self.facts(version, path) else {
             return false;
         };
-        let names: Vec<String> = facts
+        facts
             .symbols
             .iter()
-            .map(|(name, _, _)| name.clone())
-            .collect();
-        names
-            .iter()
-            .all(|name| self.reexported(version, path, name))
+            .zip(&facts.declarations)
+            .all(|((name, _, _), context)| self.reported_by_file(version, path, name, context))
+    }
+
+    /// 版 `version` のファイル `path` の宣言 `name` (文脈 `context`) を、ファイルごとの比較が公開 API 面の中と
+    /// して出すか。ファイルごとの比較と同じく、inherent impl の項目は impl の対象の型で決め、ほかはファイル単位の
+    /// `pub use` の判定で決める (Issue #315)。
+    fn reported_by_file(
+        &mut self,
+        version: Version,
+        path: &str,
+        name: &str,
+        context: &RustDeclarationContext,
+    ) -> bool {
+        !super::rust_declaration_outside_public_api_surface(
+            self.crates,
+            self.rust_public,
+            self.dir,
+            self.base_blobs,
+            version == Version::Old,
+            path,
+            name,
+            Some(context),
+        )
     }
 
     /// ファイル `path` が、版 `version` で、差分の中の package のどれかの lib crate の module のファイルとして、
@@ -1043,7 +1079,7 @@ impl CrateComparison<'_, '_> {
                 .is_some_and(|facts| !facts.keys.contains(&key));
         // ファイルごとの比較が公開 API 面の外として出さない削除・追加 (bin だけの package のファイルなど) は、
         // ここで比べる (Issue #314)。
-        explained && self.reexported(version, &entry.file, &entry.symbol.0)
+        explained && self.reported_by_file(version, &entry.file, &entry.symbol.0, &entry.context)
     }
 
     /// 片方の版にしか無い項目の宣言 `entries` (版 `version`) のうち、差分の中のファイルの中身の変化が説明

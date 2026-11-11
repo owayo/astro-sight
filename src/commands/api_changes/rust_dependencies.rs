@@ -44,8 +44,60 @@ pub(crate) mod use_scan;
 pub(crate) use crates::RustCrates;
 pub(crate) use dependents::{ChangeSet, MoveMap};
 pub(crate) use resolver::{
-    Candidate, CrateFiles, File, Opened, Resolver, Target, conditions_never_hold,
+    Candidate, CrateFiles, File, Opened, Resolver, Target, candidates_cover, conditions_never_hold,
 };
+
+/// inherent impl の対象の型のトークン `owner` (`crate::S<T>` など。名前は `type_identifier:S` のように
+/// 種類付き) の、型の引数の前までの経路の区切り (`crate`・`S`)。経路で書かれていない型 (`dyn Trait`・
+/// 参照・タプル・配列・基本型など) や、外の crate からの経路 (`::a::S`) は None。
+fn owner_path_segments(owner: &[String]) -> Option<Vec<String>> {
+    let end = owner
+        .iter()
+        .position(|token| token == "<")
+        .unwrap_or(owner.len());
+    let mut segments = Vec::new();
+    for (index, token) in owner[..end].iter().enumerate() {
+        if index % 2 == 1 {
+            if token != "::" {
+                return None;
+            }
+            continue;
+        }
+        let (kind, text) = token.split_once(':')?;
+        let name = match kind {
+            "identifier" | "type_identifier" => unraw(text),
+            "crate" | "self" | "super" if index == 0 || kind == "super" => text,
+            _ => return None,
+        };
+        if name == "Self" {
+            return None;
+        }
+        segments.push(name.to_owned());
+    }
+    (end % 2 == 1).then_some(segments)
+}
+
+/// 版の crate `krate` で、ファイル `path` の inline module の経路 `scope` (直下なら空) の中の inherent impl の
+/// 対象の型 `owner` (トークン) を、そのスコープの名前解決で解いた候補と、ファイル `path` を置く条件の枝
+/// (crate root からたどれなければ条件の無い枝 1 つ。Issue #315)。経路で書かれていない型や、ファイルを 1 つの
+/// module に決められない・経路を解けないときは None。
+pub(crate) fn impl_owner_candidates(
+    krate: &crates::CrateVersion<'_>,
+    path: &str,
+    scope: &[String],
+    owner: &[String],
+) -> Option<(Vec<Candidate>, Vec<Vec<String>>)> {
+    let segments = owner_path_segments(owner)?;
+    let Opened::File(file) = krate.open_file(path) else {
+        return None;
+    };
+    let resolver = Resolver::new(Some(krate as &dyn CrateFiles), file.clone(), None, None);
+    let candidates = resolver.resolve_type_path(&file, scope, &segments)?;
+    let placements = resolver
+        .placement_branches(&file)
+        .unwrap_or_else(|| vec![Vec::new()]);
+    Some((candidates, placements))
+}
 
 /// 束縛を解く深さの上限 (別名の連鎖・module の経路・glob をたどる回数)。超えれば解けない。
 const MAX_DEPTH: usize = 32;
@@ -227,6 +279,9 @@ struct ItemDeclaration {
     named_fields: bool,
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
     visibility: Visibility,
+    /// 自身か囲む inline module に、項目そのもの (種類・名前・公開範囲) を置き換え得る属性 (属性マクロなど。
+    /// 項目を足すだけの `derive` は数えない。[`item_replacing_preceding_attributes`]) が付いているか (Issue #315)。
+    replacing_attributes: bool,
 }
 
 /// `mod` の宣言 (Issue #300)。
@@ -1533,6 +1588,8 @@ fn collect_scope<'tree>(
                                     .child_by_field_name("body")
                                     .is_some_and(|body| body.kind() == "field_declaration_list"),
                             visibility: visibility(item, source, &current_module),
+                            replacing_attributes: !opaque.is_empty()
+                                || item_replacing_preceding_attributes(item, source),
                         });
                 }
             }
@@ -2201,6 +2258,7 @@ mod tests {
                         availability_raw: Vec::new(),
                         inline_public: true,
                         macro_attributes: false,
+                        container_macro_attributes: false,
                     };
                 }
                 let mut cursor = node.walk();

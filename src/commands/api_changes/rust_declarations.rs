@@ -44,6 +44,10 @@ pub(crate) struct RustDeclarationContext {
     /// `#[cfg]` は展開の後に評価され、宣言自身も別の項目やスコープへ置き換えられ得るので、宣言の有る
     /// 条件と名前を解くスコープが変わり得る。
     pub(crate) macro_attributes: bool,
+    /// 宣言を囲む項目 (impl・trait・inline module・extern ブロック) に、置き換え得る属性 (属性マクロなど。
+    /// [`opaque_preceding_attributes`]) が付いているか (Issue #315)。展開が impl の見出し (対象の型) や囲む
+    /// module を書き換え得るので、impl の対象の型を決めない。宣言自身の属性は数えない (対象の型は変えない)。
+    pub(crate) container_macro_attributes: bool,
 }
 
 /// 宣言の有る条件の属性 1 つ (`cfg(..)` か、`cfg` だけに絞った `cfg_attr(..)`)。
@@ -174,6 +178,30 @@ const INERT_ATTRIBUTES: [&str; 39] = [
 /// 判定 ([`replaceable_attribute_conditions`]) では数えないが、名前解決 (#312) では中の名前を決め切れない
 /// ものとする ([`opaque_preceding_attributes`])。
 const RESOLUTION_ATTRIBUTES: [&str; 1] = ["no_implicit_prelude"];
+
+/// 付いた項目そのもの (種類・名前・公開範囲) を変えない属性のうち、[`INERT_ATTRIBUTES`] に無いもの (Issue #315)。
+/// `derive` は項目を足すだけで付いた項目は変えず、`no_implicit_prelude` は中の名前の解き方だけを変える。
+const ITEM_KEEPING_ATTRIBUTES: [&str; 2] = ["derive", "no_implicit_prelude"];
+
+/// `item` の直前に並ぶ外側の属性に、付いた項目そのもの (種類・名前・公開範囲) を置き換え得るもの (属性
+/// マクロなど。[`INERT_ATTRIBUTES`] にも [`ITEM_KEEPING_ATTRIBUTES`] にも無い属性。`cfg_attr` の中も) があるか
+/// (Issue #315)。
+pub(crate) fn item_replacing_preceding_attributes(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    preceding_attribute_items(item)
+        .into_iter()
+        .any(|attribute_item| {
+            let mut cursor = attribute_item.walk();
+            !attribute_item
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "attribute")
+                .is_some_and(|attribute| {
+                    inert_attribute_with(attribute, source, &ITEM_KEEPING_ATTRIBUTES)
+                })
+        })
+}
 
 /// `item` の直前に並ぶ外側の属性に、項目を置き換え得るもの ([`INERT_ATTRIBUTES`] に無い属性。属性
 /// マクロなど。`cfg_attr` で付けるものも) があるか (Issue #312)。
@@ -363,18 +391,23 @@ fn plain_identifier<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option
 
 /// 属性 (`attribute_item` の中の `attribute`) が項目を置き換えず、中の名前の解き方も変えないか (#312)。
 fn inert_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    inert_attribute_with(attribute, source, &[])
+}
+
+/// 属性 (`attribute_item` の中の `attribute`) が、[`INERT_ATTRIBUTES`] か `extra` の属性だけか (`cfg_attr` の中も)。
+fn inert_attribute_with(attribute: tree_sitter::Node<'_>, source: &[u8], extra: &[&str]) -> bool {
     let Some(path) = attribute.named_child(0) else {
         return false;
     };
     let arguments = attribute.child_by_field_name("arguments");
     if plain_identifier(path, source) == Some("cfg_attr") {
-        return arguments.is_some_and(|arguments| inert_cfg_attr(arguments, source));
+        return arguments.is_some_and(|arguments| inert_cfg_attr(arguments, source, extra));
     }
-    inert_plain(path, arguments.as_slice(), source, &[])
+    inert_plain(path, arguments.as_slice(), source, extra)
 }
 
 /// `cfg_attr(述語, 属性, ..)` の引数 (`token_tree`) の、付ける属性がどれも項目を置き換えないか。
-fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8], extra: &[&str]) -> bool {
     let mut cursor = arguments.walk();
     let children: Vec<tree_sitter::Node<'_>> = arguments
         .children(&mut cursor)
@@ -398,10 +431,10 @@ fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
         if nested_cfg_attr(*first, rest, source) {
             return matches!(
                 rest,
-                [nested] if nested.kind() == "token_tree" && inert_cfg_attr(*nested, source)
+                [nested] if nested.kind() == "token_tree" && inert_cfg_attr(*nested, source, extra)
             );
         }
-        inert_plain(*first, rest, source, &[])
+        inert_plain(*first, rest, source, extra)
     })
 }
 
@@ -644,7 +677,9 @@ pub(crate) fn rust_declaration_context(
         };
         conditions.push(inner_conditions(body, source));
         conditions.push(preceding_conditions(container, source));
-        context.macro_attributes |= opaque_preceding_attributes(container, source);
+        let container_opaque = opaque_preceding_attributes(container, source);
+        context.macro_attributes |= container_opaque;
+        context.container_macro_attributes |= container_opaque;
         if matches!(container.kind(), "impl_item" | "trait_item") && !header_found {
             header_found = true;
             context.container_header = header_tokens(container, source);
