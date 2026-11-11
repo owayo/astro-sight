@@ -250,6 +250,189 @@ fn optional_props_removal_issue_repro_is_mod_compat() {
     assert!(impact.status.success(), "{impact:?}");
 }
 
+const LOCAL_ALIAS_BEFORE: &str = "type Args = { label: string; legacy?: string };\nexport function Panel({ label, legacy }: Args) { return <b>{legacy ?? label}</b>; }\n";
+const LOCAL_ALIAS_AFTER: &str = "type Args = { label: string };\nexport function Panel({ label }: Args) { return <b>{label}</b>; }\n";
+const LOCAL_ALIAS_SCREEN: &str = "import { Panel } from './panel';\nexport function Screen() { return <Panel label=\"Open\" />; }\n";
+
+fn assert_local_alias_blocking(repo: &TestRepo, context: &str) {
+    let (output, json) = hook(repo);
+    assert_eq!(output.status.code(), Some(1), "{context}: {json}");
+    // 公開の別名では Args 自身の契約変更が代表になり、Panel の api.mod が省かれる。
+    assert!(
+        json["api"]["mod"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "{context}: {json}"
+    );
+    assert!(
+        !lists(&json["api"]["mod_compat"], "Panel"),
+        "{context}: {json}"
+    );
+}
+
+#[test]
+fn optional_props_alias_removal_matches_inline_and_preserves_call_evidence() {
+    let repo = props_repo(
+        LOCAL_ALIAS_BEFORE,
+        LOCAL_ALIAS_AFTER,
+        &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)],
+    );
+    let json = assert_compatible(&repo, "Panel", "same-file private alias");
+    assert!(has_ref(&json["impact_info"], "src/screen.tsx", 1), "{json}");
+    let review = repo.run_json("review", &["--git"]);
+    assert!(
+        review["api_changes"]["compatible_modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["name"] == "Panel"
+                && change["reason"] == "optional_object_props_removed"),
+        "{review}"
+    );
+    let inline = props_repo(
+        "export function Panel({ label, legacy }: { label: string; legacy?: string }) { return <b>{legacy ?? label}</b>; }\n",
+        "export function Panel({ label }: { label: string }) { return <b>{label}</b>; }\n",
+        &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)],
+    );
+    assert_compatible(&inline, "Panel", "inline control");
+    let identifier = props_repo(
+        &LOCAL_ALIAS_BEFORE
+            .replace("{ label, legacy }", "props")
+            .replace("{legacy ?? label}", "{props.legacy ?? props.label}"),
+        &LOCAL_ALIAS_AFTER
+            .replace("{ label }", "props")
+            .replace("{label}", "{props.label}"),
+        &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)],
+    );
+    assert_compatible(&identifier, "Panel", "unchanged named props parameter");
+}
+
+#[test]
+fn optional_props_alias_removal_rejects_supplied_spread_and_type_level_uses() {
+    for usage in [
+        "export function Screen() { return <Panel label=\"Open\" legacy=\"hint\" />; }",
+        "export function Screen() { return <Panel label=\"Open\" legacy={undefined} />; }",
+        "const props = { label: 'Open' }; export function Screen() { return <Panel {...props} />; }",
+        "type Used = React.ComponentProps<typeof Panel>['legacy']; export function Screen() { return <Panel label=\"Open\" />; }",
+        "type Used = Parameters<typeof Panel>[0]['legacy']; export function Screen() { return <Panel label=\"Open\" />; }",
+        "export function Forward({ legacy }: { legacy?: string }) { return <Panel label=\"Open\" legacy={legacy} />; }",
+    ] {
+        let screen = format!("import {{ Panel }} from './panel';\n{usage}\n");
+        let repo = props_repo(
+            LOCAL_ALIAS_BEFORE,
+            LOCAL_ALIAS_AFTER,
+            &[("src/screen.tsx", &screen)],
+        );
+        assert_local_alias_blocking(&repo, usage);
+    }
+    for extra in [
+        "type Hint = Args['legacy'];",
+        "type Keys = keyof Args;",
+        "const value: Args = { label: 'x' };",
+        "function Other(props: Args) { return <b>{props.label}</b>; }",
+        "export type { Args };",
+    ] {
+        let repo = props_repo(
+            &format!("{LOCAL_ALIAS_BEFORE}{extra}\n"),
+            &format!("{LOCAL_ALIAS_AFTER}{extra}\n"),
+            &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)],
+        );
+        assert_local_alias_blocking(&repo, extra);
+    }
+    for (before, after) in [
+        (
+            LOCAL_ALIAS_BEFORE.replace("type Args", "export type Args"),
+            LOCAL_ALIAS_AFTER.replace("type Args", "export type Args"),
+        ),
+        (
+            LOCAL_ALIAS_BEFORE.replace("type Args =", "interface Args"),
+            LOCAL_ALIAS_AFTER.replace("type Args =", "interface Args"),
+        ),
+        (
+            LOCAL_ALIAS_BEFORE.replace("type Args =", "type Args<T = string> ="),
+            LOCAL_ALIAS_AFTER.replace("type Args =", "type Args<T = string> ="),
+        ),
+        (
+            LOCAL_ALIAS_BEFORE.replace("string };", "string } & {};"),
+            LOCAL_ALIAS_AFTER.replace("string };", "string } & {};"),
+        ),
+        (
+            LOCAL_ALIAS_BEFORE.replace("legacy?:", "['legacy']?:"),
+            LOCAL_ALIAS_AFTER.to_owned(),
+        ),
+        (
+            format!(
+                "type Label = string;\n{}",
+                LOCAL_ALIAS_BEFORE.replace("label: string", "label: Label")
+            ),
+            format!(
+                "type Label = number;\n{}",
+                LOCAL_ALIAS_AFTER.replace("label: string", "label: Label")
+            ),
+        ),
+    ] {
+        let repo = props_repo(&before, &after, &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)]);
+        assert_local_alias_blocking(&repo, &after);
+    }
+    let imported_before = LOCAL_ALIAS_BEFORE.replace(
+        "type Args = { label: string; legacy?: string };",
+        "import type { Args } from './args';",
+    );
+    let imported_after = LOCAL_ALIAS_AFTER.replace(
+        "type Args = { label: string };",
+        "import type { Args } from './args';",
+    );
+    let repo = props_repo(
+        &imported_before,
+        &imported_after,
+        &[
+            ("src/screen.tsx", LOCAL_ALIAS_SCREEN),
+            (
+                "src/args.ts",
+                "export type Args = { label: string; legacy?: string };\n",
+            ),
+        ],
+    );
+    repo.write("src/args.ts", "export type Args = { label: string };\n");
+    assert_local_alias_blocking(&repo, "imported props alias");
+    let external_before = format!(
+        "import type {{ Label }} from './label';\n{}",
+        LOCAL_ALIAS_BEFORE.replace("label: string", "label: Label")
+    );
+    let external_after = format!(
+        "import type {{ Label }} from './label';\n{}",
+        LOCAL_ALIAS_AFTER.replace("label: string", "label: Label")
+    );
+    let repo = props_repo(
+        &external_before,
+        &external_after,
+        &[
+            ("src/screen.tsx", LOCAL_ALIAS_SCREEN),
+            ("src/label.ts", "export type Label = string;\n"),
+        ],
+    );
+    repo.write("src/label.ts", "export type Label = number;\n");
+    assert_local_alias_blocking(&repo, "retained imported field type changes");
+}
+
+#[test]
+fn optional_props_alias_removal_changed_and_staged_callers_keep_removed_key_obligations() {
+    let bad = LOCAL_ALIAS_SCREEN.replace("label=\"Open\"", "label=\"Changed\" legacy=\"hint\"");
+    let repo = props_repo(
+        LOCAL_ALIAS_BEFORE,
+        LOCAL_ALIAS_AFTER,
+        &[("src/screen.tsx", LOCAL_ALIAS_SCREEN)],
+    );
+    repo.write("src/screen.tsx", &bad);
+    assert_blocking(&repo, "Panel", "changed caller still passes removed key");
+    repo.git(["add", "."]);
+    repo.write("src/screen.tsx", LOCAL_ALIAS_SCREEN);
+    let (output, json) = hook_with(&repo, &["--staged"]);
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert!(lists(&json["api"]["mod"], "Panel"), "{json}");
+    assert!(!lists(&json["api"]["mod_closed"], "Panel"), "{json}");
+}
+
 #[test]
 fn optional_props_removal_supplied_or_spread_callers_stay_blocking() {
     let props = "const props = { label: \"Open\", onDone: () => {} };";

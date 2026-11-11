@@ -7274,10 +7274,56 @@ fn rust_binding_mut_only_change_does_not_block_hooks() {
         } else {
             assert_eq!(impact.status.code(), Some(0), "{label}: {impact_stderr}");
             assert_eq!(review.status.code(), Some(0), "{label}: {review_stderr}");
-            assert!(
-                review_stderr.trim().is_empty(),
-                "{label}: 束縛の mut だけの変更は報告しない: {review_stderr}"
-            );
+            if matches!(label, "mut x" | "mut in pattern") {
+                let mut json: serde_json::Value =
+                    serde_json::from_str(review_stderr.trim()).expect("review hook json");
+                let evidence = json
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("change_evidence")
+                    .expect("proven syntax changes");
+                assert_eq!(
+                    json,
+                    serde_json::json!({
+                        "blocking_categories": [],
+                        "hint": "False positives? Run astro-sight-triage skill."
+                    }),
+                    "{label}: 契約の変更・影響を追加しない: {review_stderr}"
+                );
+                let name = if label == "mut x" { "add" } else { "sum" };
+                assert_eq!(
+                    evidence,
+                    serde_json::json!([{
+                        "f": "src/a.rs", "n": name, "k": "function",
+                        "change_evidence": {
+                            "analysis": "known", "changed_parts": ["params", "body"],
+                            "annotation_only": false, "call_shape_unchanged": false
+                        }
+                    }]),
+                    "{label}: 構文の変更だけを情報提供する: {review_stderr}"
+                );
+            } else {
+                assert!(
+                    review_stderr.trim().is_empty(),
+                    "{label}: 未確定の証拠だけでは通知しない: {review_stderr}"
+                );
+                let context = repo.run_json("context", &["--git"]);
+                let symbols = context["changes"][0]["affected_symbols"]
+                    .as_array()
+                    .unwrap();
+                let method = symbols
+                    .iter()
+                    .find(|symbol| symbol["name"] == "take")
+                    .unwrap();
+                assert_eq!(
+                    method["change_evidence"]["analysis"], "unknown",
+                    "{context}"
+                );
+                assert_eq!(
+                    method["change_evidence"]["unknown_reason"], "unsupported_syntax",
+                    "{context}"
+                );
+            }
         }
     }
 }

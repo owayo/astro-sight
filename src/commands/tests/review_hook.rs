@@ -18,8 +18,101 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn change_evidence_hook_requires_proven_change_or_existing_detection() {
+    use crate::models::change_evidence::{
+        ChangeAnalysis, ChangeEvidence, ChangeUnknownReason, ChangedPart,
+    };
+    use crate::models::impact::{AffectedSymbol, ContextResult, FileImpact};
+    let result = |evidence| ReviewResult {
+        impact: ContextResult {
+            changes: vec![FileImpact {
+                path: "a.rs".into(),
+                hunks: Vec::new(),
+                affected_symbols: vec![AffectedSymbol {
+                    name: "helper".into(),
+                    kind: "function".into(),
+                    change_type: "modified".into(),
+                    change_evidence: Some(evidence),
+                }],
+                signature_changes: Vec::new(),
+                impacted_callers: Vec::new(),
+                low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let unknown = ChangeEvidence::unknown(ChangeUnknownReason::UnsupportedSyntax);
+    let empty = ChangeEvidence {
+        analysis: ChangeAnalysis::Known,
+        changed_parts: Vec::new(),
+        annotation_only: Some(false),
+        call_shape_unchanged: Some(true),
+        unknown_reason: None,
+    };
+    for evidence in [unknown.clone(), empty] {
+        let build = build_review_hook_json(&result(evidence), ".", false);
+        assert!(build.value.is_none());
+        assert!(!build.is_blocking);
+    }
+    let mut reported = result(unknown.clone());
+    reported.impact.changes[0]
+        .affected_symbols
+        .push(AffectedSymbol {
+            name: "main".into(),
+            kind: "function".into(),
+            change_type: "modified".into(),
+            change_evidence: Some(ChangeEvidence {
+                analysis: ChangeAnalysis::Known,
+                changed_parts: vec![ChangedPart::Body],
+                annotation_only: Some(false),
+                call_shape_unchanged: Some(true),
+                unknown_reason: None,
+            }),
+        });
+    let build = build_review_hook_json(&reported, ".", false);
+    assert!(!build.is_blocking);
+    let value = build.value.expect("proven body change is informational");
+    assert_eq!(value["blocking_categories"], serde_json::json!([]));
+    assert_eq!(value["change_evidence"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["change_evidence"][0]["change_evidence"],
+        serde_json::to_value(&unknown).unwrap()
+    );
+    assert_eq!(
+        value["change_evidence"][1]["change_evidence"]["changed_parts"],
+        serde_json::json!(["body"])
+    );
+
+    let mut blocking = result(unknown.clone());
+    blocking.api_changes.removed.push(ApiSymbol {
+        name: "removed".into(),
+        inline_module: None,
+        kind: "function".into(),
+        file: "b.rs".into(),
+        refs_internal: 0,
+        cfg_availability: None,
+    });
+    let build = build_review_hook_json(&blocking, ".", false);
+    assert!(build.is_blocking);
+    let value = build.value.expect("existing API removal remains blocking");
+    assert_eq!(value["blocking_categories"], serde_json::json!(["api.rm"]));
+    assert_eq!(
+        value["api"]["rm"],
+        serde_json::json!([{"n": "removed", "f": "b.rs"}])
+    );
+    assert_eq!(value["change_evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["change_evidence"][0]["change_evidence"],
+        serde_json::to_value(unknown).unwrap()
+    );
+}
+
 fn test_only_api_fixture(const_value: bool) -> ReviewResult {
     let change = ApiSymbolChange {
+        change_evidence: None,
         inline_module: None,
         unverified: None,
         name: "PAGE_URL".into(),
@@ -27,22 +120,28 @@ fn test_only_api_fixture(const_value: bool) -> ReviewResult {
         file: "e2e/pages.ts".into(),
         old_signature: None,
         new_signature: None,
+        reference_evidence: None,
         no_resolved_internal_callers: false,
         contract_change: None,
     };
     ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         api_changes: if const_value {
             ApiChanges {
+                type_change_evidence: Vec::new(),
                 const_value_changes: vec![change],
                 ..Default::default()
             }
         } else {
             ApiChanges {
+                type_change_evidence: Vec::new(),
                 modified: vec![change],
                 ..Default::default()
             }
         },
         test_only_symbols: vec![crate::models::review::DeadSymbol {
+            reference_evidence: None,
             name: "PAGE_URL".into(),
             kind: "variable".into(),
             file: "e2e/pages.ts".into(),
@@ -141,7 +240,10 @@ fn test_only_api_proof_requires_same_identity_and_complete_analysis() {
 fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
     use crate::models::review::{CallbackBodyChange, CallbackBodyChangeReason};
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -149,6 +251,7 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
             unchanged_type_annotations: Vec::new(),
             callback_body_changes: vec![CallbackBodyChange {
                 change: ApiSymbolChange {
+                    change_evidence: None,
                     inline_module: None,
                     unverified: None,
                     name: "store".into(),
@@ -158,6 +261,7 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
                         "export const store = create(() => ({ a: 1, b: 2 }))".into(),
                     ),
                     new_signature: Some("export const store = create(() => ({ a: 1 }))".into()),
+                    reference_evidence: None,
                     no_resolved_internal_callers: false,
                     contract_change: None,
                 },
@@ -207,6 +311,8 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
 fn build_review_hook_json_compatible_modified_is_informational() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -215,6 +321,8 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -232,7 +340,9 @@ fn build_review_hook_json_compatible_modified_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                change_evidence: None,
                 inline_module: None,
                 name: "ScheduleItem".to_string(),
                 kind: "constant".to_string(),
@@ -282,11 +392,14 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
     .expect("write caller file");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "TaskDetailHeader.tsx".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    change_evidence: None,
                     name: "TaskDetailHeader".to_string(),
                     kind: "function".to_string(),
                     change_type: "modified".to_string(),
@@ -308,6 +421,8 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -325,7 +440,9 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                change_evidence: None,
                 inline_module: None,
                 name: "TaskDetailHeader".to_string(),
                 kind: "function".to_string(),
@@ -374,17 +491,21 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
     .expect("write caller file");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "TaskDetailHeader.tsx".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "TaskDetailHeader".to_string(),
                         kind: "function".to_string(),
                         change_type: "modified".to_string(),
                     },
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "loadTask".to_string(),
                         kind: "function".to_string(),
                         change_type: "modified".to_string(),
@@ -407,6 +528,8 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -418,6 +541,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "loadTask".to_string(),
@@ -427,6 +551,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
                 new_signature: Some(
                     "export function loadTask(id: string, required: boolean)".to_string(),
                 ),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             }],
@@ -436,7 +561,9 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                change_evidence: None,
                 inline_module: None,
                 name: "TaskDetailHeader".to_string(),
                 kind: "function".to_string(),
@@ -487,6 +614,8 @@ fn build_review_hook_json_cochange_only_is_informational() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -504,6 +633,8 @@ fn build_review_hook_json_cochange_only_is_informational() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -521,6 +652,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -558,6 +690,8 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -575,6 +709,8 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -592,6 +728,7 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -615,6 +752,8 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
 fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -632,6 +771,8 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -649,6 +790,7 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -684,11 +826,14 @@ fn build_review_hook_json_impact_info_only_is_informational() {
     .expect("write caller file");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "src/lib.ts".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    change_evidence: None,
                     name: "compute".to_string(),
                     kind: "function".to_string(),
                     change_type: "modified".to_string(),
@@ -710,6 +855,8 @@ fn build_review_hook_json_impact_info_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -727,6 +874,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -757,6 +905,8 @@ fn build_review_hook_json_api_add_only_is_informational() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -765,6 +915,8 @@ fn build_review_hook_json_api_add_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -789,6 +941,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -812,6 +965,8 @@ fn build_review_hook_json_api_add_only_is_informational() {
 fn build_review_hook_json_api_add_carries_extraction_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty_api = || ApiChanges {
+        type_change_evidence: Vec::new(),
+        added_reference_summary: Vec::new(),
         type_dependency_symbols: Default::default(),
         unresolved_modified_callers: vec![],
         unchanged_static_consts: Vec::new(),
@@ -829,9 +984,12 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
         removed_dead: Vec::new(),
         modified_closed_in_diff: Vec::new(),
         const_value_changes: Vec::new(),
+        import_rebindings: Vec::new(),
         compatible_modified: Vec::new(),
     };
     let review_with = |api_changes: ApiChanges| ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -847,6 +1005,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
     };
 
     let with_add = review_with(ApiChanges {
+        type_change_evidence: Vec::new(),
         unchanged_static_consts: Vec::new(),
         type_annotation_changes: Vec::new(),
         unchanged_type_annotations: Vec::new(),
@@ -872,6 +1031,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
 
     // `add` が空なら `add_scope` も出さない (無意味なトークンを増やさない)
     let without_add = review_with(ApiChanges {
+        type_change_evidence: Vec::new(),
         unchanged_static_consts: Vec::new(),
         type_annotation_changes: Vec::new(),
         unchanged_type_annotations: Vec::new(),
@@ -908,6 +1068,8 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
 fn build_review_hook_json_api_add_carries_internal_ref_count() {
     let dir = tempfile::tempdir().expect("tempdir");
     let review_with_added = |added: Vec<ApiSymbol>| ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -916,6 +1078,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -981,6 +1144,8 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
 fn build_review_hook_json_reports_truncations_without_blocking() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![
             crate::models::truncation::TruncationInfo::untracked_file_too_large(
                 "generated.rs",
@@ -1022,6 +1187,8 @@ fn build_review_hook_json_api_removed_is_blocking() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1030,6 +1197,8 @@ fn build_review_hook_json_api_removed_is_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1054,6 +1223,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1073,6 +1243,8 @@ fn build_review_hook_json_api_modified_is_blocking() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1081,6 +1253,8 @@ fn build_review_hook_json_api_modified_is_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1092,6 +1266,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "foo".to_string(),
@@ -1099,6 +1274,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
                 file: "a.rs".to_string(),
                 old_signature: Some("fn foo()".to_string()),
                 new_signature: Some("fn foo(x: u32)".to_string()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             }],
@@ -1108,6 +1284,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1133,6 +1310,8 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1141,6 +1320,8 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1152,6 +1333,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "Payload".to_string(),
@@ -1159,6 +1341,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
                 file: "models.py".to_string(),
                 old_signature: Some("class Payload(TypedDict, total=False):".to_string()),
                 new_signature: Some("class Payload(TypedDict):".to_string()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: Some(crate::models::review::ApiContractChange {
                     kind: crate::models::review::ApiContractChangeKind::TypedDictTotalFalseRemoved,
@@ -1171,6 +1354,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1203,6 +1387,8 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1211,6 +1397,8 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1222,6 +1410,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "foo".to_string(),
@@ -1229,6 +1418,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
                 file: "a.rs".to_string(),
                 old_signature: Some("fn foo()".to_string()),
                 new_signature: Some("fn foo(x: u32)".to_string()),
+                reference_evidence: None,
                 no_resolved_internal_callers: true,
                 contract_change: None,
             }],
@@ -1238,6 +1428,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1268,6 +1459,8 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
 fn build_review_hook_json_removed_dead_only_is_not_blocking() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1276,6 +1469,8 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1310,6 +1505,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1333,6 +1529,8 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
 fn build_review_hook_json_const_value_only_is_informational() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1341,6 +1539,8 @@ fn build_review_hook_json_const_value_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1358,6 +1558,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "ENEMY_SPEED".to_string(),
@@ -1365,9 +1566,11 @@ fn build_review_hook_json_const_value_only_is_informational() {
                 file: "src/constants.rs".to_string(),
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             }],
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1390,6 +1593,8 @@ fn build_review_hook_json_const_value_only_is_informational() {
 fn build_review_hook_json_const_value_is_blocking_under_strict() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1398,6 +1603,8 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1415,6 +1622,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: "ENEMY_SPEED".to_string(),
@@ -1422,9 +1630,11 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
                 file: "src/constants.rs".to_string(),
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             }],
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1448,11 +1658,14 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
     fs::write(src_dir.join("main.rs"), "fn main() { compute(); }\n").expect("write caller");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "src/lib.rs".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    change_evidence: None,
                     name: "compute".to_string(),
                     kind: "function".to_string(),
                     change_type: "modified".to_string(),
@@ -1477,6 +1690,8 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1494,6 +1709,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1529,22 +1745,27 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
     // PRIVATE_CONST と unchanged_export は cross-file 検索で is_symbol_exported に
     // 弾かれて caller.symbols には含まれないため、hook の syms にも出てはならない。
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "src/a.rs".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "foo".to_string(),
                         kind: "function".to_string(),
                         change_type: "modified".to_string(),
                     },
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "PRIVATE_CONST".to_string(),
                         kind: "constant".to_string(),
                         change_type: "modified".to_string(),
                     },
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "unchanged_export".to_string(),
                         kind: "function".to_string(),
                         change_type: "modified".to_string(),
@@ -1567,6 +1788,8 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1584,6 +1807,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1625,11 +1849,14 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
     .unwrap();
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "src/constants.rs".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    change_evidence: None,
                     name: "FOO".to_string(),
                     kind: "constant".to_string(),
                     change_type: "added".to_string(),
@@ -1651,6 +1878,8 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1668,6 +1897,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1713,23 +1943,28 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         .unwrap();
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "src/a.rs".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "modified_fn".to_string(),
                         kind: "function".to_string(),
                         change_type: "modified".to_string(),
                     },
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "NEW_CONST".to_string(),
                         kind: "constant".to_string(),
                         change_type: "added".to_string(),
                     },
                     // 別 owner の同名追加が後続しても、先の modified を失わない。
                     crate::models::impact::AffectedSymbol {
+                        change_evidence: None,
                         name: "modified_fn".to_string(),
                         kind: "function".to_string(),
                         change_type: "added".to_string(),
@@ -1752,6 +1987,8 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1769,6 +2006,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1805,6 +2043,8 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
@@ -1813,6 +2053,8 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1824,26 +2066,30 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![
-                ApiSymbolChange { inline_module: None,
+                ApiSymbolChange {
+                    change_evidence: None, inline_module: None,
                     unverified: None,
                     name: "Payload.y".to_string(),
                     kind: "field".to_string(),
                     file: "models.py".to_string(),
                     old_signature: Some("optional str".to_string()),
                     new_signature: Some("required str".to_string()),
+                    reference_evidence: None,
                     no_resolved_internal_callers: false,
                     contract_change: Some(crate::models::review::ApiContractChange {
                         kind: crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired,
                         breaks: crate::models::review::ApiContractSide::Producer,
                     }),
                 },
-                ApiSymbolChange { inline_module: None,
+                ApiSymbolChange {
+                    change_evidence: None, inline_module: None,
                     unverified: None,
                     name: "Mode".to_string(),
                     kind: "type".to_string(),
                     file: "models.py".to_string(),
                     old_signature: Some("Literal['read', 'write']".to_string()),
                     new_signature: Some("Literal['read']".to_string()),
+                    reference_evidence: None,
                     no_resolved_internal_callers: false,
                     contract_change: Some(crate::models::review::ApiContractChange {
                         kind: crate::models::review::ApiContractChangeKind::LiteralValuesNarrowed,
@@ -1857,6 +2103,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -1911,11 +2158,14 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
     )
     .expect("script");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         impact: crate::models::impact::ContextResult {
             changes: vec![crate::models::impact::FileImpact {
                 path: "util.py".to_string(),
                 hunks: Vec::new(),
                 affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    change_evidence: None,
                     name: "helper".to_string(),
                     kind: "function".to_string(),
                     change_type: "modified".to_string(),
@@ -1937,6 +2187,8 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_change_evidence: Vec::new(),
+            added_reference_summary: Vec::new(),
             type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
@@ -1954,6 +2206,7 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
+            import_rebindings: Vec::new(),
             compatible_modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
@@ -2013,6 +2266,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         cfg_availability: None,
     };
     let change = || ApiSymbolChange {
+        change_evidence: None,
         inline_module: None,
         unverified: None,
         name: "item".into(),
@@ -2020,6 +2274,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         file: "changed.ts".into(),
         old_signature: None,
         new_signature: None,
+        reference_evidence: None,
         no_resolved_internal_callers: false,
         contract_change: None,
     };
@@ -2051,6 +2306,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
             path: "changed.ts".into(),
             hunks: vec![],
             affected_symbols: vec![AffectedSymbol {
+                change_evidence: None,
                 name: "changed".into(),
                 kind: "function".into(),
                 change_type: if mask & 1 != 0 { "modified" } else { "added" }.into(),
@@ -2077,6 +2333,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         }
         if mask & 16 != 0 {
             result.dead_symbols.push(DeadSymbol {
+                reference_evidence: None,
                 name: "unused".into(),
                 kind: "function".into(),
                 file: "unused.ts".into(),
@@ -2152,6 +2409,8 @@ fn build_review_hook_json_preserves_unanalyzable_source_detail() {
     use crate::models::truncation::TruncationInfo;
     let dir = tempfile::tempdir().unwrap();
     let mut result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![
             TruncationInfo::unanalyzable_source("vue", 12, &["a.vue".into(), "b.vue".into()]),
             TruncationInfo::unanalyzable_source("svelte", 2, &[]),
@@ -2218,6 +2477,8 @@ fn build_review_hook_json_cochange_interpretation_is_unassessed_for_both_evidenc
         assert_eq!(full["interpretation"], expected);
         assert_eq!(full["ranking_score"], serde_json::json!(6.0 / 14.0));
         let result = ReviewResult {
+            rename_candidates: Vec::new(),
+            rename_candidate_diagnostics: Vec::new(),
             missing_cochanges: vec![item],
             ..Default::default()
         };
@@ -2258,6 +2519,8 @@ fn build_review_hook_json_cochange_omits_non_finite_ranking_without_losing_candi
         assert_eq!(full["confidence"], 0.9);
         let build = build_review_hook_json(
             &ReviewResult {
+                rename_candidates: Vec::new(),
+                rename_candidate_diagnostics: Vec::new(),
                 missing_cochanges: vec![item],
                 ..Default::default()
             },
@@ -2277,6 +2540,8 @@ fn build_review_hook_json_cochange_omits_non_finite_ranking_without_losing_candi
 fn build_review_hook_json_diff_base_mismatch_blocks_without_symbols() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![crate::models::truncation::TruncationInfo::new(
             Some("src/old.rs".to_string()),
             crate::models::truncation::TruncationReason::DiffBaseMismatch,
@@ -2325,6 +2590,8 @@ fn build_review_hook_json_reports_cfg_availability() {
 fn build_review_hook_json_blocks_incomplete_rust_dependents() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![crate::models::truncation::TruncationInfo::new(
             Some("src/lib.rs".to_string()),
             crate::models::truncation::TruncationReason::RustDependentsIncomplete,
@@ -2353,6 +2620,8 @@ fn build_review_hook_json_blocks_incomplete_rust_dependents() {
 fn build_review_hook_json_blocks_incomplete_rust_module_availability() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![crate::models::truncation::TruncationInfo::new(
             Some("src/lib.rs".to_string()),
             crate::models::truncation::TruncationReason::RustModuleAvailabilityIncomplete,
@@ -2381,6 +2650,8 @@ fn build_review_hook_json_blocks_incomplete_rust_module_availability() {
 fn build_review_hook_json_blocks_incomplete_rust_reexports() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = ReviewResult {
+        rename_candidates: Vec::new(),
+        rename_candidate_diagnostics: Vec::new(),
         truncations: vec![crate::models::truncation::TruncationInfo::new(
             Some("src/lib.rs".to_string()),
             crate::models::truncation::TruncationReason::RustReexportsIncomplete,

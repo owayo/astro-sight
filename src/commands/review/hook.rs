@@ -74,7 +74,17 @@ struct HookImpact<'a> {
 }
 
 #[derive(Serialize)]
+struct HookChangeEvidence<'a> {
+    f: &'a str,
+    n: &'a str,
+    k: &'a str,
+    change_evidence: &'a crate::models::change_evidence::ChangeEvidence,
+}
+
+#[derive(Serialize)]
 struct HookNameFile<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_evidence: Option<&'a crate::models::change_evidence::ChangeEvidence>,
     n: &'a str,
     /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
     #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
@@ -114,6 +124,10 @@ struct HookAddedSymbol<'a> {
 /// では算出していないため (`HookAddedSymbol` の `ri` と同じ理由)。
 #[derive(Serialize)]
 struct HookModifiedSymbol<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_evidence: Option<&'a crate::models::change_evidence::ChangeEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_evidence: Option<&'a crate::models::reference_evidence::ReferenceEvidence>,
     n: &'a str,
     /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
     #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
@@ -142,6 +156,8 @@ struct HookModifiedSymbol<'a> {
 /// dead / test_only だけで、api 系シンボル (add/rm/mod) は行を持たないため。
 #[derive(Serialize)]
 struct HookDeadSymbol<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_evidence: Option<&'a crate::models::reference_evidence::ReferenceEvidence>,
     n: &'a str,
     f: &'a str,
     /// 宣言行 (0-indexed)。解決できなかった場合のみ省略。
@@ -151,6 +167,8 @@ struct HookDeadSymbol<'a> {
 
 #[derive(Serialize)]
 struct HookCompatibleModification<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_evidence: Option<&'a crate::models::change_evidence::ChangeEvidence>,
     n: &'a str,
     /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
     #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
@@ -161,6 +179,8 @@ struct HookCompatibleModification<'a> {
 
 #[derive(Serialize)]
 struct HookCallbackBodyChange<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_evidence: Option<&'a crate::models::change_evidence::ChangeEvidence>,
     n: &'a str,
     f: &'a str,
     reason: crate::models::review::CallbackBodyChangeReason,
@@ -168,6 +188,8 @@ struct HookCallbackBodyChange<'a> {
 
 #[derive(Serialize)]
 struct HookTypeAnnotationChange<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_evidence: Option<&'a crate::models::change_evidence::ChangeEvidence>,
     n: &'a str,
     f: &'a str,
     reason: crate::models::review::TypeAnnotationChangeReason,
@@ -269,6 +291,8 @@ struct HookFieldOwner<'a> {
 
 #[derive(Serialize)]
 struct HookApi<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    import_rebindings: Vec<&'a crate::models::python_import_rebinding::PythonImportRebinding>,
     #[serde(rename = "rm_unresolved", skip_serializing_if = "Vec::is_empty")]
     removed_unresolved: Vec<HookUnresolvedRemoval<'a>>,
     #[serde(rename = "rm_unverified", skip_serializing_if = "Vec::is_empty")]
@@ -301,6 +325,8 @@ struct HookApi<'a> {
     callback_body_changes: Vec<HookCallbackBodyChange<'a>>,
     #[serde(rename = "mod_compat", skip_serializing_if = "Vec::is_empty")]
     compatible_modified: Vec<HookCompatibleModification<'a>>,
+    #[serde(skip_serializing_if = "<[crate::models::review::TypeChangeEvidence]>::is_empty")]
+    type_change_evidence: &'a [crate::models::review::TypeChangeEvidence],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     moved: Vec<HookMovedSymbol<'a>>,
     #[serde(rename = "rm_dead", skip_serializing_if = "Vec::is_empty")]
@@ -313,6 +339,7 @@ impl<'a> HookApi<'a> {
     fn from_api_changes(api: &'a ApiChanges) -> Self {
         let name_file =
             |name: &'a String, inline_module: Option<&'a str>, file: &'a String| HookNameFile {
+                change_evidence: None,
                 n: name.as_str(),
                 inline_module,
                 f: file.as_str(),
@@ -332,6 +359,7 @@ impl<'a> HookApi<'a> {
         let added_scope = (!added.is_empty()).then_some("no_cross_file_refs_in_diff");
         Self {
             added,
+            import_rebindings: api.import_rebindings.iter().collect(),
             removed_unresolved: api
                 .removed_unresolved
                 .iter()
@@ -385,6 +413,8 @@ impl<'a> HookApi<'a> {
                 .modified
                 .iter()
                 .map(|change| HookModifiedSymbol {
+                    change_evidence: change.change_evidence.as_ref(),
+                    reference_evidence: change.reference_evidence.as_ref(),
                     n: change.name.as_str(),
                     inline_module: change.inline_module.as_deref(),
                     f: change.file.as_str(),
@@ -396,21 +426,24 @@ impl<'a> HookApi<'a> {
             modified_closed_in_diff: api
                 .modified_closed_in_diff
                 .iter()
-                .map(|change| {
-                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                .map(|change| HookNameFile {
+                    change_evidence: change.change_evidence.as_ref(),
+                    ..name_file(&change.name, change.inline_module.as_deref(), &change.file)
                 })
                 .collect(),
             const_value_changes: api
                 .const_value_changes
                 .iter()
-                .map(|change| {
-                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                .map(|change| HookNameFile {
+                    change_evidence: change.change_evidence.as_ref(),
+                    ..name_file(&change.name, change.inline_module.as_deref(), &change.file)
                 })
                 .collect(),
             type_annotation_changes: api
                 .type_annotation_changes
                 .iter()
                 .map(|change| HookTypeAnnotationChange {
+                    change_evidence: change.change.change_evidence.as_ref(),
                     n: change.change.name.as_str(),
                     f: change.change.file.as_str(),
                     reason: change.reason,
@@ -421,16 +454,19 @@ impl<'a> HookApi<'a> {
                 .compatible_modified
                 .iter()
                 .map(|change| HookCompatibleModification {
+                    change_evidence: change.change_evidence.as_ref(),
                     n: change.name.as_str(),
                     inline_module: change.inline_module.as_deref(),
                     f: change.file.as_str(),
                     reason: change.reason.as_str(),
                 })
                 .collect(),
+            type_change_evidence: &api.type_change_evidence,
             callback_body_changes: api
                 .callback_body_changes
                 .iter()
                 .map(|entry| HookCallbackBodyChange {
+                    change_evidence: entry.change.change_evidence.as_ref(),
                     n: &entry.change.name,
                     f: &entry.change.file,
                     reason: entry.reason,
@@ -464,7 +500,8 @@ impl<'a> HookApi<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        self.added.is_empty()
+        self.import_rebindings.is_empty()
+            && self.added.is_empty()
             && self.removed_unresolved.is_empty()
             && self.uncertain_removals.is_empty()
             && self.removed.is_empty()
@@ -474,6 +511,7 @@ impl<'a> HookApi<'a> {
             && self.type_annotation_changes.is_empty()
             && self.callback_body_changes.is_empty()
             && self.compatible_modified.is_empty()
+            && self.type_change_evidence.is_empty()
             && self.moved.is_empty()
             && self.removed_dead.is_empty()
             && self.property_to_field.is_empty()
@@ -603,6 +641,16 @@ pub(crate) fn build_review_hook_json_for_diff(
         )
         .collect();
     informational_modified_api_symbols.extend(annotation_info_symbols.iter().copied());
+    let import_rebinding_info_symbols: std::collections::HashSet<(&str, &str)> = result
+        .api_changes
+        .import_rebindings
+        .iter()
+        .filter(|entry| {
+            entry.equivalence
+                == crate::models::python_import_rebinding::RebindingEquivalence::Proven
+        })
+        .map(|entry| (entry.file.as_str(), entry.name.as_str()))
+        .collect();
     // 省略可能な引数・props の削除は、リポジトリ内の利用の証拠に基づく分類なので、
     // 証拠にした呼び出し箇所を確認箇所として残す。
     let optional_removal_info_symbols: std::collections::HashSet<(&str, &str)> = result
@@ -697,11 +745,12 @@ pub(crate) fn build_review_hook_json_for_diff(
             &resolution,
             dir,
             |sym| {
-                affected_change_types
+                (affected_change_types
                     .get(sym)
                     .is_some_and(|flags| flags.has_modified)
                     && (annotation_info_symbols.contains(&(change.path.as_str(), sym))
-                        || optional_removal_info_symbols.contains(&(change.path.as_str(), sym)))
+                        || optional_removal_info_symbols.contains(&(change.path.as_str(), sym))))
+                    || import_rebinding_info_symbols.contains(&(change.path.as_str(), sym))
             },
         );
         // informational: modified 由来のみを低信号として残す。
@@ -755,6 +804,34 @@ pub(crate) fn build_review_hook_json_for_diff(
     let mut blocking_categories = Vec::new();
     let mut has_any_output = false;
 
+    // 呼び出し側を持たない本体変更も証拠を残す。停止カテゴリは従来の判定だけで決める。
+    let syntax_changes: Vec<_> = result
+        .impact
+        .changes
+        .iter()
+        .flat_map(|change| {
+            change.affected_symbols.iter().filter_map(|symbol| {
+                Some(HookChangeEvidence {
+                    f: &change.path,
+                    n: &symbol.name,
+                    k: &symbol.kind,
+                    change_evidence: symbol.change_evidence.as_ref()?,
+                })
+            })
+        })
+        .collect();
+    if !syntax_changes.is_empty() {
+        // 未確定・トークン不変だけでは通知を増やさず、既存の通知には証拠を残す。
+        has_any_output |= syntax_changes.iter().any(|change| {
+            change.change_evidence.analysis == crate::models::change_evidence::ChangeAnalysis::Known
+                && !change.change_evidence.changed_parts.is_empty()
+        });
+        hook_obj.insert(
+            "change_evidence".into(),
+            serde_json::to_value(syntax_changes).expect("hook syntax evidence should serialize"),
+        );
+    }
+
     // impacts: [{src,syms,refs:[{p,ln,s}]}]
     if !unresolved.is_empty() {
         blocking_categories.push(HookBlockingCategory::Impacts);
@@ -791,6 +868,22 @@ pub(crate) fn build_review_hook_json_for_diff(
         hook_obj.insert(
             "cochange".into(),
             serde_json::to_value(cochanges).expect("hook cochange DTO should serialize"),
+        );
+    }
+
+    if !result.rename_candidates.is_empty() {
+        has_any_output = true;
+        hook_obj.insert(
+            "rename_candidates".into(),
+            serde_json::to_value(&result.rename_candidates).expect("rename candidates serialize"),
+        );
+    }
+    if !result.rename_candidate_diagnostics.is_empty() {
+        has_any_output = true;
+        hook_obj.insert(
+            "rename_candidate_diagnostics".into(),
+            serde_json::to_value(&result.rename_candidate_diagnostics)
+                .expect("rename diagnostics serialize"),
         );
     }
 
@@ -860,6 +953,15 @@ pub(crate) fn build_review_hook_json_for_diff(
         hook_obj.insert(
             "api".into(),
             serde_json::to_value(api).expect("hook API DTO should serialize"),
+        );
+    }
+
+    if !result.api_changes.added_reference_summary.is_empty() {
+        has_any_output = true;
+        hook_obj.insert(
+            "added_reference_summary".into(),
+            serde_json::to_value(&result.api_changes.added_reference_summary)
+                .expect("added reference summary should serialize"),
         );
     }
 
@@ -960,6 +1062,7 @@ pub(crate) fn build_review_hook_json_for_diff(
             .dead_symbols
             .iter()
             .map(|symbol| HookDeadSymbol {
+                reference_evidence: symbol.reference_evidence.as_ref(),
                 n: symbol.name.as_str(),
                 f: symbol.file.as_str(),
                 line: symbol.line,
@@ -969,6 +1072,28 @@ pub(crate) fn build_review_hook_json_for_diff(
             "dead".into(),
             serde_json::to_value(dead).expect("hook dead-symbol DTO should serialize"),
         );
+    }
+
+    if result
+        .test_only_symbols
+        .iter()
+        .any(|symbol| symbol.reference_evidence.is_some())
+    {
+        let evidence: Vec<_> = result
+            .test_only_symbols
+            .iter()
+            .map(|symbol| HookDeadSymbol {
+                reference_evidence: symbol.reference_evidence.as_ref(),
+                n: &symbol.name,
+                f: &symbol.file,
+                line: symbol.line,
+            })
+            .collect();
+        hook_obj.insert(
+            "test_only".to_owned(),
+            serde_json::to_value(evidence).expect("test-only evidence serializes"),
+        );
+        has_any_output = true;
     }
 
     if !has_any_output {

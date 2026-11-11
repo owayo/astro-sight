@@ -587,6 +587,7 @@ fn collect_affected_symbols(
                         (
                             sym,
                             AffectedSymbol {
+                                change_evidence: None,
                                 name: sym.name.clone(),
                                 kind: if lang_id == LangId::Rust
                                     && rust_impl_owner::is_impl_owner(root, sym)
@@ -702,6 +703,7 @@ fn collect_affected_symbols(
                 {
                     originals.push(original);
                     affected.push(AffectedSymbol {
+                        change_evidence: None,
                         name: original.name.clone(),
                         kind: symbol_kind_str(original.kind).to_owned(),
                         change_type: "modified".to_owned(),
@@ -975,6 +977,19 @@ fn collect_affected_symbols(
             } else {
                 HashMap::new()
             };
+        let syntax_evidence = crate::engine::change_evidence::ChangeEvidenceIndex::from_diff(
+            file_diff,
+            &df.new_path,
+            root,
+            &source,
+            lang_id,
+        );
+        for symbol in &mut affected {
+            if symbol.change_type == "modified" {
+                symbol.change_evidence =
+                    Some(syntax_evidence.get(&symbol.name, &symbol.kind, lang_id));
+            }
+        }
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
@@ -1115,6 +1130,7 @@ fn find_affected_symbols(
     syms.iter()
         .filter_map(|sym| {
             classify_symbol_change(sym, hunks, facts).map(|change_type| AffectedSymbol {
+                change_evidence: None,
                 name: sym.name.clone(),
                 kind: symbol_kind_str(sym.kind).to_string(),
                 change_type: change_type.to_string(),

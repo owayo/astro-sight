@@ -458,6 +458,7 @@ mod tests {
         // hunk old=1,new=2。本体先頭に `+++ b/x`、その後に foo の signature 変更。
         let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,1 +1,2 @@\n+++ b/x\n-fn foo(a: i32) {}\n+fn foo(a: i32, b: i32) {}\n";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "foo".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -668,6 +669,7 @@ mod tests {
             "`def self.create` の変更行はシンボル `create` の変更として扱う"
         );
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "create".to_string(),
             kind: "method".to_string(),
             change_type: "modified".to_string(),
@@ -690,6 +692,7 @@ mod tests {
      \"hello\".to_string()
  }";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "greet".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -713,6 +716,7 @@ mod tests {
      // 変更はボディのみ
  }";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "greet".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -732,6 +736,7 @@ mod tests {
 +fn detect_api_changes_modified_includes_multiline_signature_change() {
  }";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "detect_api_changes".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -753,6 +758,7 @@ mod tests {
 -struct Foo { x: i32 }
 +struct Foo { x: i32, y: i32 }";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "Foo".to_string(),
             kind: "struct".to_string(),
             change_type: "modified".to_string(),
@@ -771,6 +777,7 @@ mod tests {
 -fn greet() {
 +fn greet(x: i32) {";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "greet".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -801,6 +808,7 @@ mod tests {
 -    moved();
 -}";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "greet".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),
@@ -884,6 +892,7 @@ mod tests {
     fn signature_detection_reads_header_paths_with_git_tab_suffix() {
         let diff = "--- a/src/my util.ts\t\n+++ b/src/my util.ts\t\n@@ -1,3 +1,3 @@\n-export function helper(a: number): number {\n+export function helper(a: number, b: number): number {\n   return a;\n }\n";
         let affected = vec![AffectedSymbol {
+            change_evidence: None,
             name: "helper".to_string(),
             kind: "function".to_string(),
             change_type: "modified".to_string(),

@@ -20,6 +20,10 @@ pub struct ReviewResult {
     #[serde(skip_serializing_if = "CoChangeDiagnostics::is_empty", default)]
     pub cochange_diagnostics: CoChangeDiagnostics,
     pub api_changes: ApiChanges,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rename_candidates: Vec<super::rename_candidate::RenameCandidate>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rename_candidate_diagnostics: Vec<super::rename_candidate::RenameCandidateDiagnostic>,
     pub dead_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub test_only_symbols: Vec<DeadSymbol>,
@@ -82,6 +86,9 @@ pub struct MissingCochange {
 /// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ApiChanges {
+    /// 新規公開名の参照状況。added の絞り込み・分類には使わない。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub added_reference_summary: Vec<crate::models::added_reference_summary::AddedReferenceSummary>,
     /// 同じファイルの型変更から導いた公開宣言の影響。review の通常の影響一覧へ合流する。
     #[serde(skip)]
     #[doc(hidden)]
@@ -146,6 +153,54 @@ pub struct ApiChanges {
     /// (Issue 2026-06-02-react-memo / 2026-06-02-provider-avatar 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub compatible_modified: Vec<CompatibleApiModification>,
+    /// null の増減と利用方向。証拠自体は互換性の保証ではない。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub type_change_evidence: Vec<TypeChangeEvidence>,
+    /// 無条件の明示 import によって公開名が残る Python の定義元変更。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub import_rebindings: Vec<super::python_import_rebinding::PythonImportRebinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeChangeEvidence {
+    pub file: String,
+    pub name: String,
+    pub kind: String,
+    pub changes: Vec<NullableTypeChange>,
+    pub usage: TypeChangeUsage,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NullableTypeChange {
+    pub position: TypeChangePosition,
+    /// 0-based の引数位置。戻り値では省略する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<usize>,
+    pub property_path: Vec<String>,
+    pub direction: TypeChangeDirection,
+    pub member: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeChangePosition {
+    Input,
+    Return,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeChangeDirection {
+    Widening,
+    Narrowing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeChangeUsage {
+    DirectCallsProven,
+    Unproven,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +327,11 @@ pub(crate) fn is_false(value: &bool) -> bool {
 /// シグネチャが変更された公開シンボル。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiSymbolChange {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_evidence: Option<crate::models::change_evidence::ChangeEvidence>,
+    /// 参照の観測と外部入口の登録の証拠。既存の分類・blocking から独立している。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_evidence: Option<crate::models::reference_evidence::ReferenceEvidence>,
     pub name: String,
     /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (`a::b`)。同じファイルの
     /// 別々の inline module にある同じ名前の項目を区別する (Issue #282)。
@@ -329,6 +389,7 @@ pub struct ApiModificationUnverified {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiModificationUnverifiedReason {
+    PythonImportRebindingUnverified,
     UnsupportedTypeChange,
     TypeMemberProofFailed,
     LiteralUnionProofFailed,
@@ -410,6 +471,8 @@ pub enum ApiContractSide {
 /// 判定した根拠を示す。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompatibleApiModification {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_evidence: Option<crate::models::change_evidence::ChangeEvidence>,
     pub name: String,
     /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (`a::b`)。同じファイルの
     /// 別々の inline module にある同じ名前の項目を区別する (Issue #282)。
@@ -463,6 +526,9 @@ pub enum TypeAnnotationCompatibility {
 /// 参照カウント 0 の公開シンボル。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeadSymbol {
+    /// 走査範囲で見つけた参照と、明示的な外部入口の登録を分けて示す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_evidence: Option<crate::models::reference_evidence::ReferenceEvidence>,
     pub name: String,
     pub kind: String,
     pub file: String,

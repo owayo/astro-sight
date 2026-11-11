@@ -237,6 +237,19 @@ fn detect_dead_symbols_with_budget(
         python_tests.unobserved_files(),
         classified.unverified.len(),
     );
+    let evidence_diagnostics: Vec<_> = unanalyzable
+        .iter()
+        .chain(uncounted.iter())
+        .cloned()
+        .collect();
+    super::reference_evidence::attach_dead(
+        dir,
+        &scan.files,
+        &mut classified.dead,
+        &mut classified.test_only,
+        &mut classified.unverified,
+        &evidence_diagnostics,
+    );
     DeadCodeDetection {
         dead: classified.dead,
         test_only: classified.test_only,
@@ -920,7 +933,7 @@ struct DeadCodeNameIndex {
 /// Bash は qualname を作らない一方、関数名に `.` を使える (`utils.log() { … }`)。
 /// 末尾で畳むと呼び出し `utils.log` を `log` で探して 0 件になり、呼ばれている関数を
 /// dead と報告していたので、名前全体を検索キーにする (API 差分の参照索引と同じ扱い)。
-fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
+pub(super) fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
     let key = if lang == crate::language::LangId::Bash {
         name
     } else {
@@ -1173,6 +1186,7 @@ fn classify_dead_symbols(
             (prod || default_prod, test || default_test || python_test)
         };
         let symbol = || DeadSymbol {
+            reference_evidence: None,
             name: name.clone(),
             kind: kind.clone(),
             file: file.clone(),
@@ -2229,6 +2243,7 @@ mod uncounted_tests {
 
     fn sym(name: &str) -> DeadSymbol {
         DeadSymbol {
+            reference_evidence: None,
             name: name.to_string(),
             kind: "function".to_string(),
             file: "a.ts".to_string(),

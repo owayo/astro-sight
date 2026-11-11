@@ -8,7 +8,7 @@ use crate::models::review::{ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, 
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
-use super::api_changes::{api_diff_files, detect_api_changes_with_renames};
+use super::api_changes::{api_diff_files, detect_api_changes_with_renames_and_blobs};
 use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
@@ -26,6 +26,7 @@ pub mod hook;
 mod index_snapshot;
 pub(crate) mod missing_cochange;
 mod recent_cochange;
+mod rename_candidates;
 #[cfg(test)]
 mod retry_tests;
 
@@ -320,19 +321,32 @@ fn review_attempt_with_swift_protocols(
     };
 
     // 型依存で変わった契約を impact の起点にするため、API 差分を先に求める。
-    let mut api_changes = timed("api_changes", || {
-        detect_api_changes_with_renames(
-            analysis_dir,
-            analysis_base,
-            &api_diff_files(&diff_files, &diff_input),
-            &crate::engine::diff::parse_hunkless_changes(&diff_input),
-        )
-    });
+    let (mut api_changes, rename_report) = {
+        let base_blobs = super::git_input::GitBlobBatch::new(analysis_dir, analysis_base);
+        let api_changes = timed("api_changes", || {
+            detect_api_changes_with_renames_and_blobs(
+                analysis_dir,
+                analysis_base,
+                &api_diff_files(&diff_files, &diff_input),
+                &crate::engine::diff::parse_hunkless_changes(&diff_input),
+                &base_blobs,
+            )
+        });
+        let rename_report = timed("rename_candidates", || {
+            rename_candidates::collect_rename_candidates(analysis_dir, &diff_files, &base_blobs)
+        });
+        (api_changes, rename_report)
+    };
     if keep_reference_downgrades_blocking {
         keep_reference_based_downgrades_blocking(&mut api_changes);
     }
+    super::api_changes::added_reference_summary::apply_source(
+        &mut api_changes.added_reference_summary,
+        new_side,
+        snapshot.is_some(),
+    );
 
-    let impact = timed_ok("context", || {
+    let mut impact = timed_ok("context", || {
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
         // 両方に作用させる (v26.5.117 で挙動を統一)。
         // staged は changed file / refs / API / dead-code を同じ raw index tree から読む。
@@ -348,6 +362,9 @@ fn review_attempt_with_swift_protocols(
         };
         service.analyze_context(&diff_input, analysis_dir, &context_options)
     })?;
+    if matches!(new_side, crate::models::impact::DiffNewSide::Index) && snapshot.is_none() {
+        invalidate_staged_syntax_evidence(&mut api_changes, &mut impact);
+    }
 
     // 3. diff に含まれるファイルリストを収集
     let changed_file_set: HashSet<String> = diff_files
@@ -421,7 +438,9 @@ fn review_attempt_with_swift_protocols(
     }
     let truncations = unique;
 
-    let result = ReviewResult {
+    let mut result = ReviewResult {
+        rename_candidates: rename_report.candidates,
+        rename_candidate_diagnostics: rename_report.diagnostics,
         impact,
         missing_cochanges: cochange_report.missing,
         cochange_diagnostics: cochange_report.diagnostics,
@@ -432,6 +451,8 @@ fn review_attempt_with_swift_protocols(
         truncations,
     };
 
+    super::reference_evidence::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
+    rename_candidates::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
     before_check(&result, analysis_dir);
     ensure_review_diff_unchanged(
         dir,
@@ -569,11 +590,16 @@ fn working_tree_matches_index(dir: &str) -> bool {
 /// 集める。作業ツリーに未ステージの変更があると、その参照は commit される内容と一致しない
 /// ため、「呼び出し側が追随済み」「互換」「参照が残っていない」の証明にならない。
 fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
+    // index のソースを確かめられないとき、作業ツリーの型差分も index の証拠にはしない。
+    api.type_change_evidence.clear();
+    // 再束縛先と利用箇所は作業ツリーの証拠なので、index の事実として残さない。
+    api.import_rebindings.clear();
     let closed = std::mem::take(&mut api.modified_closed_in_diff);
     api.modified.extend(closed);
     let compatible = std::mem::take(&mut api.compatible_modified);
     api.modified
         .extend(compatible.into_iter().map(|change| ApiSymbolChange {
+            change_evidence: change.change_evidence,
             inline_module: change.inline_module,
             unverified: None,
             name: change.name,
@@ -581,6 +607,7 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
             file: change.file,
             old_signature: change.old_signature,
             new_signature: change.new_signature,
+            reference_evidence: None,
             no_resolved_internal_callers: false,
             contract_change: None,
         }));
@@ -596,11 +623,226 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
     super::api_changes::fill_modification_diagnostics(&mut api.modified);
 }
 
+fn invalidate_staged_syntax_evidence(
+    api: &mut ApiChanges,
+    impact: &mut crate::models::impact::ContextResult,
+) {
+    use crate::models::change_evidence::{ChangeEvidence, ChangeUnknownReason};
+    for change in api
+        .modified
+        .iter_mut()
+        .chain(&mut api.modified_closed_in_diff)
+        .chain(&mut api.const_value_changes)
+        .chain(
+            api.type_annotation_changes
+                .iter_mut()
+                .map(|entry| &mut entry.change),
+        )
+        .chain(
+            api.callback_body_changes
+                .iter_mut()
+                .map(|entry| &mut entry.change),
+        )
+    {
+        change.change_evidence = Some(ChangeEvidence::unknown(
+            ChangeUnknownReason::SourceUnavailable,
+        ));
+    }
+    for change in &mut api.compatible_modified {
+        change.change_evidence = Some(ChangeEvidence::unknown(
+            ChangeUnknownReason::SourceUnavailable,
+        ));
+    }
+    for file in &mut impact.changes {
+        for symbol in &mut file.affected_symbols {
+            if symbol.change_evidence.is_some() {
+                symbol.change_evidence = Some(ChangeEvidence::unknown(
+                    ChangeUnknownReason::SourceUnavailable,
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn unavailable_snapshot_discards_worktree_nullable_type_evidence() {
+        let mut api = ApiChanges {
+            type_change_evidence: vec![crate::models::review::TypeChangeEvidence {
+                file: "render.ts".to_owned(),
+                name: "word".to_owned(),
+                kind: "function".to_owned(),
+                changes: vec![crate::models::review::NullableTypeChange {
+                    position: crate::models::review::TypeChangePosition::Input,
+                    parameter: Some(0),
+                    property_path: Vec::new(),
+                    direction: crate::models::review::TypeChangeDirection::Widening,
+                    member: "null".to_owned(),
+                }],
+                usage: crate::models::review::TypeChangeUsage::DirectCallsProven,
+                scope: "repository".to_owned(),
+            }],
+            ..ApiChanges::default()
+        };
+        keep_reference_based_downgrades_blocking(&mut api);
+        assert!(api.type_change_evidence.is_empty());
+    }
+
+    #[test]
+    fn change_evidence_staged_fallback_does_not_keep_worktree_proof() {
+        use crate::models::change_evidence::{ChangeAnalysis, ChangeUnknownReason, ChangedPart};
+        use crate::models::impact::{ContextAnalysisOptions, DiffNewSide};
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        crate::commands::tests::common::init_git_repo_for_test(repo);
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        fs::write(
+            repo.join("convert.py"),
+            "def enabled(value):\n    return bool(value)\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("entry.py"),
+            "from convert import enabled\nprint(enabled(1))\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("rename.py"),
+            "def before(value):\n    return value\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let base = base.trim();
+        fs::write(
+            repo.join("convert.py"),
+            "def enabled(value) -> bool:\n    return bool(value)\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("rename.py"),
+            "def after(value):\n    return value\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        fs::write(
+            repo.join("convert.py"),
+            "def enabled(value) -> bool:\n    return not value\n",
+        )
+        .unwrap();
+        let dir = repo.to_str().unwrap();
+        let diff = run_git_diff(dir, base, true).unwrap();
+        let fallback = prepare_staged_source(
+            dir,
+            base,
+            &diff,
+            index_snapshot::SnapshotBudget {
+                files: 1,
+                bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(fallback.snapshot.is_none());
+        assert!(fallback.keep_reference_downgrades_blocking);
+        let files = crate::engine::diff::parse_unified_diff(&diff);
+        let mut api = crate::commands::api_changes::detect_api_changes(dir, base, &files);
+        let proof = api.modified[0].change_evidence.as_ref().unwrap();
+        assert_eq!(proof.analysis, ChangeAnalysis::Known);
+        assert!(proof.changed_parts.contains(&ChangedPart::Body));
+        let mut impact = AppService::new()
+            .analyze_context(
+                &diff,
+                dir,
+                &ContextAnalysisOptions {
+                    new_side: DiffNewSide::Index,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            impact.changes[0].affected_symbols[0]
+                .change_evidence
+                .as_ref()
+                .unwrap()
+                .annotation_only,
+            Some(true)
+        );
+        invalidate_staged_syntax_evidence(&mut api, &mut impact);
+        assert_eq!(api.modified.len(), 1);
+        for proof in [
+            api.modified[0].change_evidence.as_ref().unwrap(),
+            impact.changes[0].affected_symbols[0]
+                .change_evidence
+                .as_ref()
+                .unwrap(),
+        ] {
+            assert_eq!(proof.analysis, ChangeAnalysis::Unknown);
+            assert_eq!(
+                proof.unknown_reason,
+                Some(ChangeUnknownReason::SourceUnavailable)
+            );
+            assert_eq!(proof.annotation_only, None);
+            assert_eq!(proof.call_shape_unchanged, None);
+        }
+        let base_blobs = super::super::git_input::GitBlobBatch::new(dir, base);
+        let rename_report = rename_candidates::collect_rename_candidates(dir, &files, &base_blobs);
+        assert!(
+            rename_report.candidates.iter().any(|candidate| {
+                candidate.old.name == "before" && candidate.new.name == "after"
+            })
+        );
+        let mut result = ReviewResult {
+            api_changes: api,
+            impact,
+            rename_candidates: rename_report.candidates,
+            rename_candidate_diagnostics: rename_report.diagnostics,
+            ..Default::default()
+        };
+        let original_count = result.rename_candidates.len();
+        let blocking = super::hook::build_review_hook_json(&result, dir, false).is_blocking;
+        rename_candidates::clear_staged_fallback(&mut result, DiffNewSide::WorkingTree, false);
+        assert_eq!(result.rename_candidates.len(), original_count);
+        rename_candidates::clear_staged_fallback(&mut result, DiffNewSide::Index, true);
+        assert_eq!(result.rename_candidates.len(), original_count);
+        rename_candidates::clear_staged_fallback(&mut result, DiffNewSide::Index, false);
+        assert!(result.rename_candidates.is_empty());
+        assert_eq!(result.rename_candidate_diagnostics.len(), 1);
+        let diagnostic = &result.rename_candidate_diagnostics[0];
+        assert!(matches!(
+            diagnostic.reason,
+            crate::models::rename_candidate::RenameDiagnosticReason::SourceUnavailable
+        ));
+        assert!(
+            diagnostic.file.is_none() && diagnostic.side.is_none() && diagnostic.omitted.is_none()
+        );
+        assert_eq!(
+            super::hook::build_review_hook_json(&result, dir, false).is_blocking,
+            blocking
+        );
+    }
 
     #[test]
     fn swift_protocol_over_budget_staged_review_rejects_worktree_evidence() {
@@ -861,6 +1103,183 @@ mod snapshot_tests {
         assert!(!ready.keep_reference_downgrades_blocking);
     }
 
+    #[test]
+    fn reference_evidence_staged_fallback_clears_worktree_facts_without_changing_blocking() {
+        use std::process::Command;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(
+            repo.join("pkg/api.py"),
+            "def entry(value):\n    return value\ndef unused():\n    return 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("tests/test_api.py"),
+            "from pkg.api import entry\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            "[project.scripts]\ndemo = 'pkg.api:entry'\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(
+            repo.join("pkg/api.py"),
+            "def entry(value) -> int:\n    return value\ndef unused():\n    return 0\n",
+        )
+        .unwrap();
+        git(&["add", "pkg/api.py"]);
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            "[project.scripts]\ndemo = 'pkg.api:other'\n",
+        )
+        .unwrap();
+        let dir = repo.to_str().unwrap();
+        let diff = run_git_diff(dir, &base, true).unwrap();
+        let fallback = prepare_staged_source(
+            dir,
+            &base,
+            &diff,
+            index_snapshot::SnapshotBudget {
+                files: 1,
+                bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(fallback.snapshot.is_none());
+        let diff_files = crate::engine::diff::parse_unified_diff(&diff);
+        let api = crate::commands::api_changes::detect_api_changes(dir, &base, &diff_files);
+        let detection = detect_dead_symbols_with_swift_protocols(
+            dir,
+            &[repo.join("pkg/api.py")],
+            false,
+            &SwiftProtocolMethods::default(),
+        )
+        .unwrap();
+        let mut result = ReviewResult {
+            api_changes: api,
+            dead_symbols: detection.dead,
+            test_only_symbols: detection.test_only,
+            truncations: vec![fallback.notice.unwrap()],
+            ..Default::default()
+        };
+        assert!(
+            result
+                .api_changes
+                .modified
+                .iter()
+                .any(|change| change.reference_evidence.is_some())
+        );
+        assert!(
+            result
+                .dead_symbols
+                .iter()
+                .any(|symbol| symbol.reference_evidence.is_some())
+        );
+        assert!(
+            result
+                .test_only_symbols
+                .iter()
+                .any(|symbol| symbol.reference_evidence.is_some())
+        );
+        let blocking = hook::build_review_hook_json(&result, dir, false)
+            .value
+            .unwrap()["blocking_categories"]
+            .clone();
+        let counts = (
+            result.api_changes.modified.len(),
+            result.dead_symbols.len(),
+            result.test_only_symbols.len(),
+        );
+        let original = result.clone();
+        let ready =
+            prepare_staged_source(dir, &base, &diff, index_snapshot::SnapshotBudget::DEFAULT)
+                .unwrap();
+        assert!(ready.snapshot.is_some());
+        super::super::reference_evidence::clear_staged_fallback(
+            &mut result,
+            crate::models::impact::DiffNewSide::Index,
+            ready.snapshot.is_some(),
+        );
+        assert!(
+            result
+                .api_changes
+                .modified
+                .iter()
+                .any(|change| change.reference_evidence.is_some())
+        );
+        super::super::reference_evidence::clear_staged_fallback(
+            &mut result,
+            crate::models::impact::DiffNewSide::WorkingTree,
+            false,
+        );
+        assert!(
+            result
+                .dead_symbols
+                .iter()
+                .any(|symbol| symbol.reference_evidence.is_some())
+        );
+        super::super::reference_evidence::clear_staged_fallback(
+            &mut result,
+            crate::models::impact::DiffNewSide::Index,
+            false,
+        );
+        assert!(
+            result
+                .api_changes
+                .modified
+                .iter()
+                .all(|change| change.reference_evidence.is_none())
+        );
+        assert!(
+            result
+                .dead_symbols
+                .iter()
+                .chain(&result.test_only_symbols)
+                .all(|symbol| symbol.reference_evidence.is_none())
+        );
+        assert_eq!(
+            counts,
+            (
+                result.api_changes.modified.len(),
+                result.dead_symbols.len(),
+                result.test_only_symbols.len()
+            )
+        );
+        assert_eq!(
+            result.api_changes.modified[0].no_resolved_internal_callers,
+            original.api_changes.modified[0].no_resolved_internal_callers
+        );
+        assert_eq!(
+            hook::build_review_hook_json(&result, dir, false)
+                .value
+                .unwrap()["blocking_categories"],
+            blocking
+        );
+    }
+
     /// 縮退時は、参照の状況を根拠にした降格 (mod_closed / mod_compat / rm_dead) を
     /// blocking のバケットへ戻す。それ以外のバケットは動かさない。
     #[test]
@@ -878,6 +1297,7 @@ mod snapshot_tests {
             cfg_availability: None,
         };
         let change = |name: &str| ApiSymbolChange {
+            change_evidence: None,
             inline_module: None,
             unverified: None,
             name: name.into(),
@@ -885,6 +1305,7 @@ mod snapshot_tests {
             file: "a.ts".into(),
             old_signature: Some(format!("{name}(a)")),
             new_signature: Some(format!("{name}(a, b)")),
+            reference_evidence: None,
             no_resolved_internal_callers: false,
             contract_change: None,
         };
@@ -892,6 +1313,7 @@ mod snapshot_tests {
             modified: vec![change("modified")],
             modified_closed_in_diff: vec![change("closed")],
             compatible_modified: vec![CompatibleApiModification {
+                change_evidence: None,
                 inline_module: None,
                 name: "compatible".into(),
                 kind: "function".into(),

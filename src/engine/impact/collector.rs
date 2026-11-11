@@ -1692,6 +1692,7 @@ mod tests {
     fn js_signature_route_requires_each_source_and_reference_boundary() {
         let mut context = file_context(
             vec![AffectedSymbol {
+                change_evidence: None,
                 name: "target".to_owned(),
                 kind: "function".to_owned(),
                 change_type: "modified".to_owned(),
@@ -1830,6 +1831,7 @@ mod tests {
     #[test]
     fn rust_scope_kind_proof_is_per_context_and_requires_all_same_named_kinds() {
         let symbol = |kind: &str| AffectedSymbol {
+            change_evidence: None,
             name: "comments".to_owned(),
             kind: kind.to_owned(),
             change_type: "modified".to_owned(),
@@ -1887,6 +1889,7 @@ mod tests {
 
         let modified = file_context(
             vec![AffectedSymbol {
+                change_evidence: None,
                 name: "target".to_string(),
                 kind: "function".to_string(),
                 change_type: "modified".to_string(),

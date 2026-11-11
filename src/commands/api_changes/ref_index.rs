@@ -127,6 +127,7 @@ impl OldRefIndex {
 /// 各判定ヘルパーが per-symbol 時代の検索失敗時と同じ保守側ポリシーに倒す
 /// (false negative を起こさない)。
 pub(crate) struct ApiRefIndex {
+    pub(super) added_reference_scan: crate::models::added_reference_summary::AddedReferenceScan,
     /// 検索キー (exact name / bare name) → HEAD ツリー全体の参照 (`dir` 相対パス)。
     /// batch 検索済みの name は参照 0 件でもエントリを持つ (「未検索」と区別するため)。
     refs: std::collections::HashMap<String, Vec<crate::models::reference::SymbolReference>>,
@@ -144,6 +145,7 @@ impl ApiRefIndex {
         let mut sorted: Vec<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
         sorted.sort_unstable();
         let mut index = Self {
+            added_reference_scan: Default::default(),
             refs: std::collections::HashMap::new(),
             failed: HashSet::new(),
             incomplete: HashSet::new(),
@@ -155,12 +157,23 @@ impl ApiRefIndex {
         // 検索失敗時と同じ保守側ポリシー (cross_file/blocking → true) に倒れる
         // (false negative を起こさない)。
         let service = AppService::new();
-        match service.find_symbol_references_batch(&sorted, dir, None) {
-            Ok(results) => {
+        match service.find_symbol_references_batch_with_diagnostics(&sorted, dir, None) {
+            Ok((results, parse_error_files)) => {
+                index.added_reference_scan.parse_error_files = parse_error_files;
                 let mut incomplete_input = false;
                 for r in results {
                     if r.failed_files > 0 || !r.truncations.is_empty() || r.skipped.is_some() {
                         incomplete_input = true;
+                    }
+                    index.added_reference_scan.failed_files =
+                        index.added_reference_scan.failed_files.max(r.failed_files);
+                    for truncation in r.truncations {
+                        if !index.added_reference_scan.truncations.contains(&truncation) {
+                            index.added_reference_scan.truncations.push(truncation);
+                        }
+                    }
+                    if r.skipped.is_some() {
+                        index.added_reference_scan.generated_files_skipped = r.skipped;
                     }
                     index.refs.insert(r.symbol, r.references);
                 }
@@ -169,7 +182,10 @@ impl ApiRefIndex {
                     index.incomplete.extend(sorted.iter().cloned());
                 }
             }
-            Err(_) => index.failed.extend(sorted),
+            Err(_) => {
+                index.added_reference_scan.scan_failed = true;
+                index.failed.extend(sorted);
+            }
         }
         index
     }

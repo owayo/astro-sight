@@ -1096,12 +1096,14 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
     use crate::models::review::{ApiSymbol, DeadSymbol};
     let dead = vec![
         DeadSymbol {
+            reference_evidence: None,
             name: "matchAssigneeName".to_string(),
             kind: "function".to_string(),
             file: "src/notes.ts".to_string(),
             line: None,
         },
         DeadSymbol {
+            reference_evidence: None,
             name: "legacyUnused".to_string(),
             kind: "function".to_string(),
             file: "src/legacy.ts".to_string(),
@@ -1131,6 +1133,7 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
 fn filter_dead_by_wip_added_keeps_widened_existing_items() {
     use crate::models::review::{ApiSymbol, CfgAvailability, DeadSymbol};
     let dead = vec![DeadSymbol {
+        reference_evidence: None,
         name: "widened".to_string(),
         kind: "function".to_string(),
         file: "src/lib.rs".to_string(),
@@ -1157,6 +1160,7 @@ fn filter_dead_by_wip_added_keeps_widened_existing_items() {
 fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
     use crate::models::review::{ApiSymbol, DeadSymbol};
     let dead = vec![DeadSymbol {
+        reference_evidence: None,
         name: "helper".to_string(),
         kind: "function".to_string(),
         file: "src/a.ts".to_string(),
@@ -1181,6 +1185,7 @@ fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
 fn filter_dead_by_wip_added_passes_through_when_added_is_empty() {
     use crate::models::review::DeadSymbol;
     let dead = vec![DeadSymbol {
+        reference_evidence: None,
         name: "foo".to_string(),
         kind: "function".to_string(),
         file: "src/foo.rs".to_string(),

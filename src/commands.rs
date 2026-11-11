@@ -11,6 +11,7 @@ use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
 mod common;
+mod reference_evidence;
 
 pub use crate::output::{OutputFormat, OutputOptions, serialize_cli_document, serialize_document};
 #[cfg(test)]

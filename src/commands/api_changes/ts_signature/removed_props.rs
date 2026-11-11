@@ -50,19 +50,23 @@ pub(crate) fn removed_parameter_props(
     let new_parameters = parameters(new_fn).ok_or(())?;
     let mut result = Vec::new();
     for (parameter, old) in old_parameters.iter().enumerate() {
-        let Some(old_type) = old.child_by_field_name("type").and_then(inline_object_type) else {
+        let Some(old_type) = old.child_by_field_name("type").and_then(|annotation| {
+            parameter_props_type(old_tree.root_node(), &src.old, annotation)
+        }) else {
             continue;
         };
         let new_type = new_parameters
             .get(parameter)
             .and_then(|n| n.child_by_field_name("type"))
-            .and_then(inline_object_type)
+            .and_then(|annotation| parameter_props_type(new_tree.root_node(), &src.new, annotation))
             .ok_or(())?;
-        if node_signature_tokens(old_type, &src.old) == node_signature_tokens(new_type, &src.new) {
+        if node_signature_tokens(old_type.object, &src.old)
+            == node_signature_tokens(new_type.object, &src.new)
+        {
             continue;
         }
-        let old = members(old_type, &src.old).ok_or(())?;
-        let new: HashSet<_> = members(new_type, &src.new)
+        let old = members(old_type.object, &src.old).ok_or(())?;
+        let new: HashSet<_> = members(new_type.object, &src.new)
             .ok_or(())?
             .into_iter()
             .map(|m| m.name)
@@ -135,6 +139,27 @@ pub(crate) fn detect_optional_object_props_removed_compatible_mod(
     cache: &mut OptionalRemovalCache,
     diff_files: &[DiffFile],
 ) -> Option<CompatibleApiModification> {
+    detect_props_removed(index, site, sources, cache, diff_files, false)
+}
+
+pub(crate) fn detect_local_alias_props_removed_compatible_mod(
+    index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    cache: &mut OptionalRemovalCache,
+    diff_files: &[DiffFile],
+) -> Option<CompatibleApiModification> {
+    detect_props_removed(index, site, sources, cache, diff_files, true)
+}
+
+fn detect_props_removed(
+    index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    cache: &mut OptionalRemovalCache,
+    diff_files: &[DiffFile],
+    local_alias_only: bool,
+) -> Option<CompatibleApiModification> {
     if site.kind != "function" || site.name.contains('.') || site.old_path != site.new_path {
         return None;
     }
@@ -143,6 +168,9 @@ pub(crate) fn detect_optional_object_props_removed_compatible_mod(
     let (old_tree, new_tree) = src.parse_pair(lang)?;
     let (old_root, new_root) = (old_tree.root_node(), new_tree.root_node());
     let removal = props_removal(old_root, &src.old, new_root, &src.new, site.name)?;
+    if local_alias_only && !removal.local_alias {
+        return None;
+    }
     let refs = index.complete_refs_for(site.name)?;
     if refs.is_empty() {
         return None;
@@ -202,6 +230,7 @@ pub(crate) fn detect_optional_object_props_removed_compatible_mod(
 }
 
 struct PropsRemoval<'tree> {
+    local_alias: bool,
     /// 消した省略可能プロパティの名前。
     removed: HashSet<String>,
     /// 旧新で同じ明示の戻り値型がある。直接呼び出しは、このときだけ証明に使う。
@@ -258,8 +287,15 @@ fn props_removal<'tree>(
     let new_pattern = new_param.child_by_field_name("pattern")?;
     let old_annotation = old_param.child_by_field_name("type")?;
     let new_annotation = new_param.child_by_field_name("type")?;
-    let old_type = inline_object_type(old_annotation)?;
-    let new_type = inline_object_type(new_annotation)?;
+    let old_type = parameter_props_type(old_root, old_source, old_annotation)?;
+    let new_type = parameter_props_type(new_root, new_source, new_annotation)?;
+    if old_type.annotation.kind() != new_type.annotation.kind()
+        || (old_type.annotation.kind() == "type_identifier"
+            && node_signature_tokens(old_type.annotation, old_source)?
+                != node_signature_tokens(new_type.annotation, new_source)?)
+    {
+        return None;
+    }
     // 束縛と型の外 (修飾子・区切り・`:`) は変えない。
     for (old_start, old_end, new_start, new_end) in [
         (
@@ -270,14 +306,14 @@ fn props_removal<'tree>(
         ),
         (
             old_pattern.end_byte(),
-            old_type.start_byte(),
+            old_type.annotation.start_byte(),
             new_pattern.end_byte(),
-            new_type.start_byte(),
+            new_type.annotation.start_byte(),
         ),
         (
-            old_type.end_byte(),
+            old_type.annotation.end_byte(),
             old_param.end_byte(),
-            new_type.end_byte(),
+            new_type.annotation.end_byte(),
             new_param.end_byte(),
         ),
     ] {
@@ -287,7 +323,8 @@ fn props_removal<'tree>(
             return None;
         }
     }
-    let removed = removed_optional_members(old_type, old_source, new_type, new_source)?;
+    let removed =
+        removed_optional_members(old_type.object, old_source, new_type.object, new_source)?;
     if !pattern_drops_only(old_pattern, old_source, new_pattern, new_source, &removed) {
         return None;
     }
@@ -314,9 +351,10 @@ fn props_removal<'tree>(
             return None;
         }
     }
-    let mut type_roots = vec![new_type];
+    let mut type_roots = vec![new_type.object];
     type_roots.extend(new_return);
     Some(PropsRemoval {
+        local_alias: new_type.annotation.kind() == "type_identifier",
         removed,
         explicit_return,
         type_roots,
@@ -350,6 +388,71 @@ fn inline_object_type(annotation: Node<'_>) -> Option<Node<'_>> {
         return None;
     };
     (ty.kind() == "object_type").then_some(*ty)
+}
+
+struct ParameterPropsType<'tree> {
+    annotation: Node<'tree>,
+    object: Node<'tree>,
+}
+
+/// private な root の単純な別名は、宣言名とこの props 注釈以外に同名の出現が無いときだけ解く。
+fn parameter_props_type<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    annotation: Node<'tree>,
+) -> Option<ParameterPropsType<'tree>> {
+    if let Some(object) = inline_object_type(annotation) {
+        return Some(ParameterPropsType {
+            annotation: object,
+            object,
+        });
+    }
+    if annotation.kind() != "type_annotation" {
+        return None;
+    }
+    let mut cursor = annotation.walk();
+    let types: Vec<_> = annotation
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .collect();
+    let [ty] = types.as_slice() else {
+        return None;
+    };
+    if ty.kind() != "type_identifier" {
+        return None;
+    }
+    // 対象は唯一の props 引数だけ。多数の別名を持つ引数列を繰り返し走査しない。
+    let parameter = annotation.parent()?;
+    let function = parameter.parent()?.parent()?;
+    if only_parameter(function)?.id() != parameter.id() {
+        return None;
+    }
+    let name = ty.utf8_text(source).ok()?;
+    let object = *type_dependencies::local_type_aliases(root, source)?.get(name)?;
+    let declaration = object.parent()?;
+    if object.kind() != "object_type"
+        || declaration.kind() != "type_alias_declaration"
+        || declaration.parent()?.id() != root.id()
+    {
+        return None;
+    }
+    let declared_name = declaration.child_by_field_name("name")?;
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    let exclusive = walk_preorder(root, Children::Named, |node, _| {
+        if node.kind().contains("identifier")
+            && node.utf8_text(source).ok() == Some(name)
+            && node.id() != ty.id()
+            && node.id() != declared_name.id()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(Walk::Descend)
+    })
+    .is_continue();
+    exclusive.then_some(ParameterPropsType {
+        annotation: *ty,
+        object,
+    })
 }
 
 struct Member<'tree> {
@@ -482,6 +585,80 @@ mod tests {
 
     const OLD: &str = "export function Panel({ label, legacy, onDone }: { label: string; legacy?: { id: string }; onDone: () => void }) { return <b>{label}</b>; }";
     const NEW: &str = "export function Panel({ label, onDone }: { label: string; onDone: () => void }) { return <b>{label}</b>; }";
+
+    #[test]
+    fn optional_props_alias_removal_resolves_only_private_single_use_objects() {
+        let old = "type Args = { label: string; legacy?: string }; export function Panel({ label, legacy }: Args) { return <b>{legacy ?? label}</b>; }";
+        let new = "type Args = { label: string }; export function Panel({ label }: Args) { return <b>{label}</b>; }";
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            let (old, new) = if lang == LangId::Typescript {
+                (
+                    old.replace("<b>{legacy ?? label}</b>", "'old'"),
+                    new.replace("<b>{label}</b>", "'new'"),
+                )
+            } else {
+                (old.to_owned(), new.to_owned())
+            };
+            assert_eq!(
+                removal(&old, &new, lang).unwrap().0,
+                BTreeSet::from(["legacy".to_owned()])
+            );
+            for (old, new) in [
+                (
+                    old.replace("type Args", "export type Args"),
+                    new.replace("type Args", "export type Args"),
+                ),
+                (
+                    format!("{old} export type {{ Args }};"),
+                    format!("{new} export type {{ Args }};"),
+                ),
+                (
+                    format!("{old} type Hint = Args['legacy'];"),
+                    format!("{new} type Hint = Args['legacy'];"),
+                ),
+                (
+                    format!("{old} function Other(props: Args) {{}}"),
+                    format!("{new} function Other(props: Args) {{}}"),
+                ),
+                (
+                    old.replace("type Args =", "interface Args"),
+                    new.replace("type Args =", "interface Args"),
+                ),
+                (
+                    old.replace("type Args =", "type Args<T = string> ="),
+                    new.replace("type Args =", "type Args<T = string> ="),
+                ),
+                (
+                    old.replace("string };", "string } & {};"),
+                    new.replace("string };", "string } & {};"),
+                ),
+                (
+                    format!(
+                        "type Other = {{ label: string; legacy?: string }}; {}",
+                        old.replace(
+                            "type Args = { label: string; legacy?: string };",
+                            "type Args = Other;"
+                        )
+                    ),
+                    format!(
+                        "type Other = {{ label: string }}; {}",
+                        new.replace("type Args = { label: string };", "type Args = Other;")
+                    ),
+                ),
+                (
+                    old.clone(),
+                    new.replace(": Args)", ": Other)")
+                        .replace("type Args", "type Other"),
+                ),
+                (old.replace("legacy?:", "['legacy']?:"), new.clone()),
+            ] {
+                assert!(
+                    removal(&old, &new, lang).is_none(),
+                    "{lang:?}: {old} -> {new}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn optional_props_removal_accepts_only_optional_property_removal() {
@@ -668,6 +845,8 @@ mod tests {
                 "(function_declaration parameters: (formal_parameters (optional_parameter pattern: (identifier))))",
                 "(function_declaration return_type: (type_annotation))",
                 "(property_signature name: (property_identifier) type: (type_annotation))",
+                "(type_alias_declaration name: (type_identifier) value: (object_type))",
+                "(required_parameter type: (type_annotation (type_identifier)))",
                 "(method_signature)",
                 "(call_signature)",
                 "(construct_signature)",
