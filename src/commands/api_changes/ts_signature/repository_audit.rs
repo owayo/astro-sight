@@ -1340,6 +1340,7 @@ fn override_names(key: &str) -> Option<Vec<String>> {
 
 /// package.json の、この証明に要る部分。
 struct Manifest {
+    external_consumers: bool,
     name: Option<String>,
     workspaces: bool,
     /// 型とモジュールの入口 (`types`・`typings`・`main`・`module`・`exports`・`typesVersions`・
@@ -1472,6 +1473,19 @@ impl Manifest {
             }
         }
         Some(Self {
+            external_consumers: [
+                "types",
+                "typings",
+                "main",
+                "module",
+                "exports",
+                "typesVersions",
+                "imports",
+            ]
+            .iter()
+            .any(|field| object.contains_key(*field))
+                || (name.is_some()
+                    && object.get("private").and_then(serde_json::Value::as_bool) != Some(true)),
             name,
             workspaces: object.contains_key("workspaces"),
             entry_targets,
@@ -1485,6 +1499,7 @@ impl Manifest {
 
 /// bare specifier が registry の依存を指すかを決める材料。
 pub(super) struct PackageBoundary {
+    external_consumers: bool,
     root: PathBuf,
     /// package.json の `name` (ワークスペースのパッケージと、`exports` による自己参照)。
     workspace_names: BTreeSet<String>,
@@ -1623,6 +1638,7 @@ impl PackageBoundary {
     /// 読めないものや、外にワークスペースの定義があれば None。
     fn load(files: &RepositoryFiles, configs: &ConfigScan) -> Option<Self> {
         let mut boundary = Self {
+            external_consumers: false,
             root: files.root.clone(),
             workspace_names: BTreeSet::new(),
             package_dirs: BTreeMap::new(),
@@ -1714,6 +1730,7 @@ impl PackageBoundary {
             boundary.non_registry.extend(config.patched.iter().cloned());
         }
         for (directory, manifest) in &manifests {
+            boundary.external_consumers |= manifest.external_consumers;
             boundary.record(directory, manifest, &files.root)?;
         }
         Some(boundary)
@@ -1911,6 +1928,11 @@ impl PackageBoundary {
     /// すれば、監査しないファイルが TypeScript のプログラムに入り、React の型を差し替え得る。
     pub(super) fn entries_stay_inside(&self) -> bool {
         !self.entries_escape
+    }
+
+    /// 公開 package の入口を持つときは、リポジトリ内の利用だけで閉じたとは証明しない。
+    pub(super) fn consumers_are_local(&self) -> bool {
+        !self.external_consumers
     }
 
     /// JSX の証明が頼る React (自動の runtime の `react/jsx-runtime`・`react/jsx-dev-runtime` と、

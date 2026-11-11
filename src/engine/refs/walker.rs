@@ -501,6 +501,27 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
     }
 }
 
+/// 位置と定義フラグだけを渡す。行文字列と caller 用の補助索引は作らない。
+pub(crate) struct PositionSink<'a, F> {
+    pub(crate) callback: &'a mut F,
+}
+
+impl<F: FnMut(usize, usize, usize, bool)> RawRefSink for PositionSink<'_, F> {
+    const NEEDS_LINE_INDEX: bool = false;
+    const INCLUDES_SHELL_VARS: bool = false;
+    const EXCLUDES_NON_CALLABLE_FIELDS: bool = true;
+
+    fn on_hit(&mut self, hit: RawRefHit<'_, '_>, _env: &RefEnvironment<'_>) {
+        hit.matches.for_each_index(|ix| {
+            (self.callback)(ix, hit.line, hit.column, hit.is_def);
+        });
+    }
+}
+
+const _: () = assert!(
+    !<PositionSink<'static, fn(usize, usize, usize, bool)> as RawRefSink>::NEEDS_LINE_INDEX
+);
+
 /// 非 Definition 参照の件数のみ index 別に加算する sink。context を作らないため
 /// NEEDS_LINE_INDEX=false で、呼び出し側の LineIndex 構築を省ける。
 pub(crate) struct CountSink<'a> {

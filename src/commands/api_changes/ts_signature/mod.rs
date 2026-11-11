@@ -17,6 +17,7 @@ mod constructor_params;
 mod dependency_changes;
 mod function_params;
 mod literal_union;
+mod nullable_input;
 mod object_members;
 mod outside;
 mod pattern_extension;
@@ -40,6 +41,9 @@ pub(crate) use callback_contract::{
 };
 pub(crate) use function_params::*;
 pub(crate) use literal_union::*;
+pub(crate) use nullable_input::{
+    collect_nullable_type_evidence, detect_nullable_input_compatible_mod,
+};
 pub(crate) use object_members::*;
 pub(crate) use react::*;
 pub(crate) use react_memo::ReactMemoCache;
@@ -47,13 +51,17 @@ pub(crate) use removed_params::{
     OptionalRemovalCache, detect_trailing_optional_params_removed_compatible_mod,
     optional_removal_words,
 };
-pub(crate) use removed_props::detect_optional_object_props_removed_compatible_mod;
 pub(crate) use removed_props::{
     RemovedParameterProps, call_omits_removed_props, removed_parameter_props,
 };
+pub(crate) use removed_props::{
+    detect_local_alias_props_removed_compatible_mod,
+    detect_optional_object_props_removed_compatible_mod,
+};
 pub(crate) use type_members::{
     classify_member_property_removal, classify_member_type_narrowing,
-    classify_required_member_addition, detect_type_members_compatible_mod,
+    classify_required_member_addition, detect_trailing_default_type_params_compatible_mod,
+    detect_type_members_compatible_mod,
 };
 
 /// TS/TSX/JS 全体を対象にする判定器の言語ゲート。

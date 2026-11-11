@@ -77,6 +77,18 @@ pub(crate) fn detect_api_changes_with_renames(
     diff_files: &[crate::models::impact::DiffFile],
     renames: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
+    let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
+    detect_api_changes_with_renames_and_blobs(dir, base, diff_files, renames, &base_blobs)
+}
+
+/// 同じ review の base 読み手を、API 差分と改名候補の解析で共有する。
+pub(crate) fn detect_api_changes_with_renames_and_blobs(
+    dir: &str,
+    base: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+    renames: &[crate::models::impact::DiffFile],
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+) -> ApiChanges {
     let mut buckets = ApiChangeBuckets::default();
     let mut rust_public = RustPublicApiContext::default();
 
@@ -91,11 +103,9 @@ pub(crate) fn detect_api_changes_with_renames(
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
 
-    // 変更 / 削除ファイルの旧版はここで 1 プロセスの `git cat-file --batch` から読む。
-    let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
     // 差分の中の package の Rust の lib crate (Issue #300)。束縛が変わった package だけ、旧新の
     // module のファイルを必要になったときに開く。
-    let rust_crates = RustCrates::new(dir, diff_files, renames, &base_blobs);
+    let rust_crates = RustCrates::new(dir, diff_files, renames, base_blobs);
     // Phase 0: diff ファイルごとの事実と、ApiRefIndex で検索する名前を先に集める。
     let PreparedDiff {
         files: prepared,
@@ -109,7 +119,7 @@ pub(crate) fn detect_api_changes_with_renames(
         diff_files,
         renames,
         canonical_dir.as_deref(),
-        &base_blobs,
+        base_blobs,
         &rust_crates,
     );
     buckets.parse_truncations.extend(parse_truncations);
@@ -123,7 +133,7 @@ pub(crate) fn detect_api_changes_with_renames(
     let module_availability = rust_module_availability::ModuleAvailability::new(
         dir,
         &rust_crates,
-        &base_blobs,
+        base_blobs,
         &strip_internal,
         diff_files,
         renames,
@@ -145,6 +155,9 @@ pub(crate) fn detect_api_changes_with_renames(
     let member_files = MemberFileFacts::new(diff_files, &prepared);
     member_files.collect_index_names(&mut index_names);
     member_files.collect_moved_symbol_index_names(&mut index_names);
+    index_names.extend(python_import_rebinding::index_names(
+        dir, diff_files, &prepared,
+    ));
     let ref_index = ApiRefIndex::build(dir, &index_names);
     let old_ref_index = std::cell::OnceCell::new();
 
@@ -176,7 +189,7 @@ pub(crate) fn detect_api_changes_with_renames(
         old_ref_index: &old_ref_index,
         index_names: &index_names,
         prepared: &prepared,
-        base_blobs: &base_blobs,
+        base_blobs,
         strip_internal: &strip_internal,
         rust_crates: &rust_crates,
         module_availability: &module_availability,
@@ -276,6 +289,8 @@ pub(crate) fn detect_api_changes_with_renames(
         std::mem::take(&mut state.buckets.removed)
             .into_iter()
             .partition(|candidate| !unverified_deleted_paths.contains(&candidate.file));
+    let (verified_removed, import_rebindings) =
+        python_import_rebinding::partition(&inputs, state.buckets, verified_removed);
     let (added, removed, moved, ambiguous_relation_keys) = reconcile_with_moves(
         std::mem::take(&mut state.buckets.added),
         verified_removed,
@@ -371,10 +386,10 @@ pub(crate) fn detect_api_changes_with_renames(
     // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
     let reexport_removed = std::mem::take(&mut state.buckets.reexport_removed);
     let rust_packages =
-        removed_cargo::RemovedRustPackages::new(dir, &base_blobs, diff_files, renames);
+        removed_cargo::RemovedRustPackages::new(dir, base_blobs, diff_files, renames);
     let (mut removed_kept, removed_dead, removed_unresolved) = partition_removed_dead_candidates(
         dir,
-        &base_blobs,
+        base_blobs,
         &rust_packages,
         removed,
         &ambiguous_relation_keys,
@@ -443,7 +458,15 @@ pub(crate) fn detect_api_changes_with_renames(
 
     let type_dependency_symbols = type_dependency_symbols::collect(&inputs, &buckets.modified);
     fill_modification_diagnostics(&mut buckets.modified);
-    ApiChanges {
+    let added_reference_summary = added_reference_summary::collect(
+        &buckets.added_reference_candidates,
+        &added,
+        &moved,
+        &ref_index,
+        &diff_new_paths,
+    );
+    let mut api = ApiChanges {
+        added_reference_summary,
         type_dependency_symbols,
         unresolved_modified_callers: closure_caches.unresolved_modified_callers,
         removed_unresolved,
@@ -472,6 +495,121 @@ pub(crate) fn detect_api_changes_with_renames(
         unchanged_type_annotations: buckets.unchanged_type_annotations,
         callback_body_changes: buckets.callback_body_changes,
         compatible_modified: buckets.compatible_modified,
+        import_rebindings,
+        type_change_evidence: Vec::new(),
+    };
+    api.type_change_evidence =
+        ts_signature::collect_nullable_type_evidence(dir, base, &api, base_blobs, &strip_internal);
+    super::reference_evidence::attach_api(
+        dir,
+        &mut api.modified,
+        |name| ref_index.refs_for(name),
+        |name| {
+            let scan = &ref_index.added_reference_scan;
+            ref_index.complete_refs_for(name).is_some()
+                && scan.failed_files == 0
+                && scan.parse_error_files == 0
+                && !scan.scan_failed
+                && scan.unknown_references == 0
+                && scan.truncations.is_empty()
+                && scan.generated_files_skipped.is_none()
+                && ref_index.refs_for(name).is_some_and(|references| {
+                    references.iter().all(|reference| {
+                        reference.kind != Some(crate::models::reference::RefKind::Unknown)
+                    })
+                })
+        },
+    );
+    attach_syntax_evidence(&mut api, dir, base_blobs, diff_files);
+    api
+}
+
+fn attach_syntax_evidence(
+    api: &mut ApiChanges,
+    dir: &str,
+    blobs: &super::git_input::GitBlobBatch,
+    diff_files: &[crate::models::impact::DiffFile],
+) {
+    use crate::engine::change_evidence::ChangeEvidenceIndex;
+    let paths: std::collections::BTreeSet<_> = api
+        .modified
+        .iter()
+        .chain(&api.modified_closed_in_diff)
+        .chain(&api.const_value_changes)
+        .chain(
+            api.type_annotation_changes
+                .iter()
+                .map(|entry| &entry.change),
+        )
+        .chain(api.callback_body_changes.iter().map(|entry| &entry.change))
+        .map(|change| change.file.clone())
+        .chain(
+            api.compatible_modified
+                .iter()
+                .map(|change| change.file.clone()),
+        )
+        .collect();
+    for path in paths {
+        let lang = crate::language::LangId::from_path(camino::Utf8Path::new(&path)).ok();
+        let old_path = diff_files
+            .iter()
+            .find(|file| file.new_path == path)
+            .map_or(path.as_str(), |file| file.old_path.as_str());
+        let index = lang
+            .and_then(|lang| {
+                if !crate::engine::impact::is_safe_diff_path(old_path) {
+                    return None;
+                }
+                let root = std::fs::canonicalize(dir).ok()?;
+                let current = std::fs::canonicalize(root.join(&path)).ok()?;
+                if !current.starts_with(&root) {
+                    return None;
+                }
+                let old = blobs.read(old_path)?;
+                let new = source_pair::load_new_source(dir, &path)?;
+                Some(ChangeEvidenceIndex::from_sources(&old, &new, lang))
+            })
+            .unwrap_or_else(ChangeEvidenceIndex::unavailable);
+        for change in api
+            .modified
+            .iter_mut()
+            .chain(&mut api.modified_closed_in_diff)
+            .chain(&mut api.const_value_changes)
+            .chain(
+                api.type_annotation_changes
+                    .iter_mut()
+                    .map(|entry| &mut entry.change),
+            )
+            .chain(
+                api.callback_body_changes
+                    .iter_mut()
+                    .map(|entry| &mut entry.change),
+            )
+            .filter(|change| change.file == path)
+        {
+            change.change_evidence = Some(lang.map_or_else(
+                || {
+                    crate::models::change_evidence::ChangeEvidence::unknown(
+                        crate::models::change_evidence::ChangeUnknownReason::UnsupportedLanguage,
+                    )
+                },
+                |lang| index.get(&change.name, &change.kind, lang),
+            ));
+        }
+        for change in api
+            .compatible_modified
+            .iter_mut()
+            .filter(|change| change.file == path)
+        {
+            change.change_evidence = Some(lang.map_or_else(
+                || {
+                    crate::models::change_evidence::ChangeEvidence::unknown(
+                        crate::models::change_evidence::ChangeUnknownReason::UnsupportedLanguage,
+                    )
+                },
+                |lang| index.get(&change.name, &change.kind, lang),
+            ));
+        }
     }
 }
 
@@ -847,6 +985,7 @@ pub(crate) fn fill_modification_diagnostics(changes: &mut [ApiSymbolChange]) {
     }
 }
 
+pub(crate) mod added_reference_summary;
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
@@ -871,6 +1010,7 @@ mod python_call_arity;
 mod python_contract;
 pub(crate) mod python_module_path;
 
+mod python_import_rebinding;
 mod python_literal;
 mod python_member_origin;
 mod python_optional_removal;

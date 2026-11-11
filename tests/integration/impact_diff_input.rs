@@ -273,9 +273,23 @@ fn impact_hook_detects_signature_change_of_function_moved_within_file() {
     );
     let context = repo.run_json("context", &["--git"]);
     let affected = &context["changes"][0]["affected_symbols"];
+    let mut core_affected = affected.clone();
+    for symbol in core_affected.as_array_mut().expect("affected symbols") {
+        symbol.as_object_mut().unwrap().remove("change_evidence");
+    }
     assert_eq!(
-        affected,
-        &serde_json::json!([{"name": "helper", "kind": "function", "change_type": "modified"}]),
+        core_affected,
+        serde_json::json!([{"name": "helper", "kind": "function", "change_type": "modified"}]),
+        "{context}"
+    );
+    assert_eq!(
+        affected[0]["change_evidence"],
+        serde_json::json!({
+            "analysis": "known",
+            "changed_parts": ["param_annotation", "params", "body"],
+            "annotation_only": false,
+            "call_shape_unchanged": false
+        }),
         "{context}"
     );
     let (ok, stderr) = impact_hook(&repo, &[]);

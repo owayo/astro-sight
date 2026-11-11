@@ -561,6 +561,7 @@ mod tests {
 
     fn affected(name: &str, kind: &str, change_type: &str) -> AffectedSymbol {
         AffectedSymbol {
+            change_evidence: None,
             name: name.to_string(),
             kind: kind.to_string(),
             change_type: change_type.to_string(),

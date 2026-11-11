@@ -2071,7 +2071,7 @@ fn function_returns(body: Node<'_>) -> Vec<Node<'_>> {
 
 /// 本体が引数 `name` へ書き込むか、`var` で束縛し直すか、`typeof name` で型を取り出すか。
 /// 入れ子の関数の中も見る (クロージャからの再代入もある)。
-fn body_rebinds_or_queries(
+pub(super) fn body_rebinds_or_queries(
     body: Node<'_>,
     source: &[u8],
     name: &str,

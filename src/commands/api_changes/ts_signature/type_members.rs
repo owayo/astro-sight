@@ -9,10 +9,12 @@ mod addition;
 mod narrowing;
 mod properties;
 mod removal;
+mod trailing_parameters;
 pub(crate) use addition::classify_required_member_addition;
 pub(crate) use narrowing::classify_member_type_narrowing;
 use properties::{is_scalar_atom, simple_annotation_type};
 pub(crate) use removal::classify_member_property_removal;
+pub(crate) use trailing_parameters::detect_trailing_default_type_params_compatible_mod;
 
 pub(crate) fn declaration_signature(
     symbol: &Symbol,

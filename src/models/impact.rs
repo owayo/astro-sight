@@ -15,6 +15,8 @@ pub struct HunkInfo {
 /// 変更の影響を受けるシンボル。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedSymbol {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_evidence: Option<crate::models::change_evidence::ChangeEvidence>,
     pub name: String,
     pub kind: String,
     pub change_type: String,

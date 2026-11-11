@@ -455,6 +455,7 @@ mod tests {
             cfg_availability: None,
         };
         let change = |name: &str, no_callers: bool| ApiSymbolChange {
+            change_evidence: None,
             inline_module: None,
             unverified: None,
             name: name.into(),
@@ -462,6 +463,7 @@ mod tests {
             file: "lib/base.ts".into(),
             old_signature: Some(format!("function {name}(a)")),
             new_signature: Some(format!("function {name}(a, b)")),
+            reference_evidence: None,
             no_resolved_internal_callers: no_callers,
             contract_change: None,
         };

@@ -658,6 +658,7 @@ mod explicit_tests {
             let patch = format!("--- a/src/item.rs\n+++ b/src/item.rs\n@@ -1 +1 @@\n-{old}+{new}");
             let tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
             let changed = [AffectedSymbol {
+                change_evidence: None,
                 name: "Item".into(),
                 kind: "function".into(),
                 change_type: "modified".into(),
@@ -727,6 +728,7 @@ mod explicit_tests {
         let changed = names
             .iter()
             .map(|name| AffectedSymbol {
+                change_evidence: None,
                 name: (*name).into(),
                 kind: "function".into(),
                 change_type: "modified".into(),

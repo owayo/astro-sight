@@ -74,6 +74,7 @@ pub(crate) fn should_skip_diff_file(
 /// `partition_removed_dead_candidates` で最終分類する前の中間状態。
 #[derive(Default)]
 pub(crate) struct ApiChangeBuckets {
+    pub(crate) added_reference_candidates: Vec<ApiSymbolCandidate>,
     pub(crate) added: Vec<ApiSymbolCandidate>,
     pub(crate) removed: Vec<ApiSymbolCandidate>,
     pub(crate) uncertain_removals: Vec<crate::models::review::UncertainApiRemoval>,

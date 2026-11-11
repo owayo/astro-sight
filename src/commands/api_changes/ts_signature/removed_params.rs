@@ -268,6 +268,17 @@ impl<'a> InventoryView<'a> {
             .chain(self.extra.iter().map(|(path, file)| (path, file.as_ref())))
     }
 
+    pub(super) fn parsed(&self) -> impl Iterator<Item = (&str, &[u8], Node<'_>, LangId)> {
+        self.files().map(|(path, file)| {
+            (
+                path.as_str(),
+                file.source.as_ref(),
+                file.tree.root_node(),
+                file.lang,
+            )
+        })
+    }
+
     /// 在庫に読んだ `path` の内容が `source` と同じか。
     pub(super) fn has_source(&self, path: &str, source: &[u8]) -> bool {
         self.base
@@ -453,7 +464,7 @@ pub(crate) fn detect_trailing_optional_params_removed_compatible_mod(
     Some(site.compatible("trailing_optional_params_removed"))
 }
 
-fn checked_nodes(root: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub(super) fn checked_nodes(root: Node<'_>) -> Option<Vec<Node<'_>>> {
     if root.has_error() {
         return None;
     }
@@ -582,7 +593,7 @@ fn removal_arity(
     Some(new_parts.params.len())
 }
 
-fn dependency_target(
+pub(super) fn dependency_target(
     node: Node<'_>,
     source: &[u8],
     path: &str,
@@ -601,7 +612,7 @@ fn dependency_target(
 
 /// 対象と別の名前だけを、通常の named import で束縛する文か。default・namespace・文字列の
 /// 名前・`default as X`・対象と同じ名前 (import する名前か別名) を含む文は、解決して確かめる。
-fn imports_only_unrelated_names(statement: Node<'_>, source: &[u8], name: &str) -> bool {
+pub(super) fn imports_only_unrelated_names(statement: Node<'_>, source: &[u8], name: &str) -> bool {
     let mut cursor = statement.walk();
     let Some(clause) = statement
         .named_children(&mut cursor)
@@ -977,7 +988,7 @@ pub(super) fn object_omits(object: Node<'_>, source: &[u8], removed: &HashSet<St
     })
 }
 
-fn dynamic_execution_entry(node: Node<'_>, source: &[u8]) -> bool {
+pub(super) fn dynamic_execution_entry(node: Node<'_>, source: &[u8]) -> bool {
     if matches!(node.kind(), "identifier" | "property_identifier")
         && matches!(node.utf8_text(source).ok(), Some("eval" | "Function"))
     {

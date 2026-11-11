@@ -44,8 +44,8 @@ pub(crate) use walker::{RefVisitEvent, RefVisitor};
 use definition::definition_node_kinds;
 use lexer_path::{count_refs_in_file_via_lexer, find_refs_batch_via_lexer, find_refs_via_lexer};
 use walker::{
-    CountSink, IndexedMatcher, NamespaceReferenceSink, OccurrenceReferenceSink, SingleMatcher,
-    VisitorAdapter, build_name_index, run_ref_walk,
+    CountSink, IndexedMatcher, NamespaceReferenceSink, OccurrenceReferenceSink, PositionSink,
+    SingleMatcher, VisitorAdapter, build_name_index, run_ref_walk,
 };
 
 /// `find_references` / `find_references_batch` 用の最大並列ワーカー数。
@@ -232,6 +232,8 @@ impl<'n> SingleNamePrefilter<'n> {
 #[derive(Debug)]
 pub struct RefScan<T> {
     pub references: T,
+    /// 復旧した AST に ERROR があったファイル数。参照の既存分類には使わない。
+    pub(crate) parse_error_files: usize,
     /// 生成物として走査から外したファイル (出力の `skipped`)。
     pub skipped: Option<SkippedFiles>,
     /// 走査対象に選んだが、読み込み・parse に失敗して参照を数えられなかったファイル数。
@@ -365,6 +367,7 @@ pub fn find_references_with_scan(
 
     Ok(RefScan {
         references: all_refs,
+        parse_error_files: 0,
         skipped,
         failed_files,
         unanalyzable,
@@ -604,6 +607,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
     if symbol_names.is_empty() {
         return Ok(RefScan {
             references: HashMap::new(),
+            parse_error_files: 0,
             skipped: None,
             failed_files: 0,
             unanalyzable: Vec::new(),
@@ -635,35 +639,40 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
     // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
     // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える
     // (どの名前の参照が欠けたかは分からないので、全名前の入力が不完全になる)。
-    let (mut buckets, failed_files): (Vec<Vec<SymbolReference>>, usize) = pool.install(|| {
+    let (mut buckets, failed_files, parse_error_files) = pool.install(|| {
         files
             .par_iter()
             .fold(
-                || (vec![Vec::new(); symbol_names.len()], 0usize),
-                |(mut local, mut failed), path| {
+                || (vec![Vec::new(); symbol_names.len()], 0usize, 0usize),
+                |(mut local, mut failed, mut parse_errors), path| {
                     let scanned = path.to_str().and_then(|path_str| {
                         let utf8_path = camino::Utf8Path::new(path_str);
-                        find_refs_batch_in_file_indexed::<SHELL_VARS>(symbol_names, &acs, utf8_path)
-                            .ok()
+                        find_refs_batch_with_syntax_status::<SHELL_VARS>(
+                            symbol_names,
+                            &acs,
+                            utf8_path,
+                        )
+                        .ok()
                     });
                     match scanned {
-                        Some(per_file) => {
+                        Some((per_file, has_parse_error)) => {
+                            parse_errors += usize::from(has_parse_error);
                             for (ix, mut refs) in per_file.into_iter().enumerate() {
                                 local[ix].append(&mut refs);
                             }
                         }
                         None => failed += 1,
                     }
-                    (local, failed)
+                    (local, failed, parse_errors)
                 },
             )
             .reduce(
-                || (vec![Vec::new(); symbol_names.len()], 0usize),
-                |(mut acc, acc_failed), (mut local, local_failed)| {
+                || (vec![Vec::new(); symbol_names.len()], 0usize, 0usize),
+                |(mut acc, acc_failed, acc_errors), (mut local, local_failed, local_errors)| {
                     for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
                         acc_refs.append(local_refs);
                     }
-                    (acc, acc_failed + local_failed)
+                    (acc, acc_failed + local_failed, acc_errors + local_errors)
                 },
             )
     });
@@ -691,6 +700,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
 
     Ok(RefScan {
         references: merged,
+        parse_error_files,
         skipped,
         failed_files,
         unanalyzable,
@@ -1082,13 +1092,54 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     Ok(())
 }
 
+/// 件数集計と同じフィルタで位置を返し、エラーノードの有無を申告する。
+pub(crate) fn visit_ref_positions_in_file(
+    symbol_names: &[String],
+    ac: &aho_corasick::AhoCorasick,
+    path: &camino::Utf8Path,
+    callback: &mut impl FnMut(usize, usize, usize, bool),
+) -> Result<bool> {
+    let source = parser::read_file(path)?;
+    let mut present_indices = ac_present_indices(ac, source.as_bytes(), symbol_names.len());
+    extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
+    if present_indices.is_empty() {
+        return Ok(true);
+    }
+    let (tree, lang_id) = parser::parse_file(path, &source)?;
+    let root = tree.root_node();
+    let name_index = build_name_index(lang_id, symbol_names, &present_indices);
+    let matcher = IndexedMatcher {
+        name_index: &name_index,
+    };
+    let mut sink = PositionSink { callback };
+    run_ref_walk(
+        root,
+        &source,
+        lang_id,
+        definition_node_kinds(lang_id),
+        &matcher,
+        &mut sink,
+    );
+    Ok(!root.has_error())
+}
+
 /// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
 /// find_references_batch の fold/reduce から呼ばれる。
+#[cfg(test)]
 pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
     symbol_names: &[String],
     acs: &[(usize, aho_corasick::AhoCorasick)],
     path: &camino::Utf8Path,
 ) -> Result<Vec<Vec<SymbolReference>>> {
+    find_refs_batch_with_syntax_status::<SHELL_VARS>(symbol_names, acs, path)
+        .map(|(references, _)| references)
+}
+
+fn find_refs_batch_with_syntax_status<const SHELL_VARS: bool>(
+    symbol_names: &[String],
+    acs: &[(usize, aho_corasick::AhoCorasick)],
+    path: &camino::Utf8Path,
+) -> Result<(Vec<Vec<SymbolReference>>, bool)> {
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
@@ -1096,19 +1147,16 @@ pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
     let mut present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
     extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
     if present_indices.is_empty() {
-        return Ok(vec![Vec::new(); num]);
+        return Ok((vec![Vec::new(); num], false));
     }
 
     // lexer-only 言語は parse_file を呼ばず lexer 経路で identifier 列挙する。
     if let Ok(lang) = LangId::from_path(path)
         && let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected()
     {
-        return Ok(find_refs_batch_via_lexer(
-            symbol_names,
-            &present_indices,
-            &source,
-            path,
-            lexer_lang,
+        return Ok((
+            find_refs_batch_via_lexer(symbol_names, &present_indices, &source, path, lexer_lang),
+            false,
         ));
     }
 
@@ -1137,7 +1185,7 @@ pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
         &mut sink,
     );
 
-    Ok(result)
+    Ok((result, root.has_error()))
 }
 
 /// 件数集計のためにファイルを開く (64KB 超は mmap で、開いただけではページに触れない)。

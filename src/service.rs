@@ -605,6 +605,7 @@ impl AppService {
             glob,
             include_generated,
             RefSearchAudience::User,
+            None,
         )
     }
 
@@ -621,7 +622,26 @@ impl AppService {
             glob,
             false,
             RefSearchAudience::Internal,
+            None,
         )
+    }
+
+    pub(crate) fn find_symbol_references_batch_with_diagnostics(
+        &self,
+        names: &[String],
+        dir: &str,
+        glob: Option<&str>,
+    ) -> Result<(Vec<RefsResult>, usize)> {
+        let mut parse_error_files = 0;
+        let results = self.find_references_batch_with_generated_policy::<false>(
+            names,
+            dir,
+            glob,
+            false,
+            RefSearchAudience::Internal,
+            Some(&mut parse_error_files),
+        )?;
+        Ok((results, parse_error_files))
     }
 
     fn find_references_batch_with_generated_policy<const SHELL_VARS: bool>(
@@ -631,6 +651,7 @@ impl AppService {
         glob: Option<&str>,
         include_generated: bool,
         audience: RefSearchAudience,
+        parse_error_files: Option<&mut usize>,
     ) -> Result<Vec<RefsResult>> {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
@@ -646,6 +667,9 @@ impl AppService {
                 refs::RefCoverage::AllSources
             },
         )?;
+        if let Some(parse_error_files) = parse_error_files {
+            *parse_error_files = scan.parse_error_files;
+        }
         if audience == RefSearchAudience::User {
             reject_unsupported_only_scope(scan.unsupported_only.as_ref())?;
         }

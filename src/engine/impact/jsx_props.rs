@@ -397,6 +397,7 @@ mod tests {
             lang,
             &syms,
             &[AffectedSymbol {
+                change_evidence: None,
                 name: "ControlPanel".into(),
                 kind: "function".into(),
                 change_type: "modified".into(),

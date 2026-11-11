@@ -625,14 +625,93 @@ fn added_names(api_changes: &serde_json::Value) -> Vec<&str> {
 
 #[test]
 fn review_staged_relative_pub_use_in_child_module_matches_self_form() {
+    let reexports = ["pub use value::NewValue;", "pub use self::value::NewValue;"];
+    let columns = reexports.map(|source| source.find("NewValue").unwrap());
+    assert_eq!(columns, [15, 21]);
     for edition in ["2018", "2024"] {
-        let bare = staged_api_changes(edition, "pub use value::NewValue;");
-        let anchored = staged_api_changes(edition, "pub use self::value::NewValue;");
+        let mut bare = staged_api_changes(edition, reexports[0]);
+        let mut anchored = staged_api_changes(edition, reexports[1]);
         assert_eq!(
             added_names(&bare),
             ["NewValue", "NewValue.amount"],
             "{edition}: {bare}"
         );
+        let mut summaries = [&mut bare, &mut anchored].map(|api| {
+            api.as_object_mut()
+                .unwrap()
+                .remove("added_reference_summary")
+                .expect("new export reference summary")
+        });
+        for (summaries, column) in summaries.iter_mut().zip(columns) {
+            let summaries = summaries.as_array_mut().unwrap();
+            assert_eq!(summaries.len(), 3, "{edition}: {summaries:?}");
+            for (summary, (file, name, kind)) in summaries.iter_mut().zip([
+                ("src/reader.rs", "NewValue", "struct"),
+                ("src/reader/value.rs", "NewValue", "struct"),
+                ("src/reader/value.rs", "NewValue.amount", "function"),
+            ]) {
+                assert_eq!(summary["file"], file, "{edition}: {summary}");
+                assert_eq!(summary["name"], name, "{edition}: {summary}");
+                assert_eq!(summary["kind"], kind, "{edition}: {summary}");
+                assert_eq!(
+                    summary["scope"],
+                    serde_json::json!({
+                        "new_side": "index",
+                        "partition": "diff_files",
+                        "references": "non_definition_identifier_occurrences",
+                        "attribution": "name_match",
+                        "selection": "refs_default_workspace_scan"
+                    }),
+                    "{edition}: {summary}"
+                );
+                assert_eq!(
+                    summary["scan"],
+                    serde_json::json!({
+                        "failed_files": 0,
+                        "parse_error_files": 0,
+                        "scan_failed": false,
+                        "unknown_references": 0,
+                        "truncations": []
+                    }),
+                    "{edition}: {summary}"
+                );
+                let (observed, locations) = if name == "NewValue" {
+                    (
+                        2,
+                        serde_json::json!([
+                            {"path": "src/reader.rs", "line": 1, "column": column},
+                            {"path": "src/reader/value.rs", "line": 2, "column": 5}
+                        ]),
+                    )
+                } else {
+                    (0, serde_json::json!([]))
+                };
+                // 表記が長い分だけ位置は変わる。実位置を確かめてから件数・分類を比べる。
+                let actual_locations = summary["in_diff"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("references")
+                    .expect("in-diff reference locations");
+                assert_eq!(actual_locations, locations, "{edition}: {summary}");
+                assert_eq!(
+                    summary["in_diff"],
+                    serde_json::json!({
+                        "observed": observed, "total": observed,
+                        "complete": true, "omitted": 0
+                    }),
+                    "{edition}: {summary}"
+                );
+                assert_eq!(
+                    summary["outside_diff"],
+                    serde_json::json!({
+                        "observed": 0, "total": 0, "complete": true,
+                        "references": [], "omitted": 0
+                    }),
+                    "{edition}: {summary}"
+                );
+            }
+        }
+        assert_eq!(summaries[0], summaries[1], "{edition}: reference metadata");
         assert_eq!(bare, anchored, "{edition}");
     }
 }

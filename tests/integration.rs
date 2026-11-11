@@ -6,10 +6,12 @@
 //!  `tests/integration/` を module ディレクトリにするインライン `mod integration` で包む)
 
 mod integration {
+    mod added_reference_summary;
     mod support;
 
     mod ast_symbols;
     mod bash_grammar;
+    mod change_evidence;
     mod cli_basics;
     mod cochange;
     mod constructor_optional_params;
@@ -57,16 +59,20 @@ mod integration {
     mod moved_compatible_change;
     mod moved_member_signature;
     mod multiline_declaration_signature;
+    mod nullable_input;
     mod optional_param_removal;
     mod optional_props_removal;
     mod output_format;
     mod php_member_liveness;
     mod property_removal_arrays;
+    mod python_import_rebinding;
     mod python_member_removal;
     mod python_optional_removal;
     mod python_private_owner_removal;
+    mod reference_evidence;
     mod refs;
     mod refs_declaration_budget;
+    mod rename_candidates;
     mod required_type_members;
     mod review;
     mod review_dead_scope;
@@ -85,6 +91,7 @@ mod integration {
     mod signature_type_dependencies;
     mod static_const_values;
     mod swift_grammar;
+    mod trailing_type_parameters;
     mod tree_sitter_generated;
     mod ts_extension_changes;
     mod ts_import_alias;

@@ -3253,6 +3253,7 @@ mod tests {
         );
         let tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
         let changed = [crate::models::impact::AffectedSymbol {
+            change_evidence: None,
             name: "parse".into(),
             kind: "function".into(),
             change_type: "modified".into(),

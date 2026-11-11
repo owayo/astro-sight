@@ -63,6 +63,7 @@ pub(crate) fn compatible_impact_names(
             for change in api.modified_closed_in_diff {
                 if proof.covers(&change.file, &change.name) {
                     changes.push(CompatibleApiModification {
+                        change_evidence: None,
                         inline_module: change.inline_module,
                         name: change.name,
                         kind: change.kind,
@@ -93,13 +94,28 @@ pub(crate) fn compatible_impact_names(
     let mut result = BTreeMap::new();
     let mut unverified = BTreeSet::new();
     for file in diff_files {
-        let Some((old, new)) = file_declarations(dir, &root, &blobs, file, &names) else {
+        let Some((old, mut new)) = file_declarations(dir, &root, &blobs, file, &names) else {
             return BTreeMap::new();
         };
         let compatible = candidates
             .get(&file.new_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        // import へ置き換えた関数は宣言抽出に現れない。同値証明済みの公開束縛だけ補う。
+        for change in compatible
+            .iter()
+            .filter(|change| change.reason == "python_import_rebinding")
+        {
+            let name = bare_name(&change.name).to_owned();
+            if !new.all.contains_key(&name)
+                && let Some(signature) = &change.new_signature
+            {
+                let declaration =
+                    vec![(change.name.clone(), change.kind.clone(), signature.clone())];
+                new.all.insert(name.clone(), declaration.clone());
+                new.public.insert(name, declaration);
+            }
+        }
         let old_keys = compatible
             .iter()
             .filter_map(|change| {

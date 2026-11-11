@@ -1,5 +1,7 @@
+pub mod added_reference_summary;
 pub mod ast_node;
 pub mod call;
+pub mod change_evidence;
 pub mod cochange;
 pub mod dead_code;
 pub mod dependency_files;
@@ -8,7 +10,10 @@ pub mod impact;
 pub mod import;
 pub mod lint;
 pub mod location;
+pub mod python_import_rebinding;
 pub mod reference;
+pub mod reference_evidence;
+pub mod rename_candidate;
 pub mod request;
 pub mod response;
 pub mod result_summary;

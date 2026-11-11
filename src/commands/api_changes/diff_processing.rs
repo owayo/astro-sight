@@ -138,6 +138,7 @@ fn collect_python_contract_changes(
             parsed.new_source,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: change.name,
@@ -146,6 +147,7 @@ fn collect_python_contract_changes(
                 old_signature: Some(change.old_signature),
                 new_signature: Some(change.new_signature),
                 // 疑似シンボルを bare 名で解決すると、無関係な同名変数を呼び出し元にしてしまう。
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: change.contract,
             });
@@ -214,6 +216,7 @@ fn collect_python_typed_dict_field_changes(
             class_name,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: change.name,
@@ -223,6 +226,7 @@ fn collect_python_typed_dict_field_changes(
                 new_signature: Some(change.new_signature),
                 // 疑似シンボルなので呼び出し元の解決はしない。`field` を bare 名で引くと
                 // 無関係な同名フィールド / ローカル変数に当たる。
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: Some(change.contract),
             });
@@ -434,6 +438,10 @@ fn collect_added_symbols(
             ) {
                 continue;
             }
+            state
+                .buckets
+                .added_reference_candidates
+                .push(candidate.clone());
             if is_internally_connected(in_file_callees, name) {
                 continue;
             }
@@ -590,6 +598,7 @@ fn collect_removed_symbols(
                     // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
                     if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {
                         state.buckets.modified.push(ApiSymbolChange {
+                            change_evidence: None,
                             inline_module: None,
                             unverified: None,
                             name: name.clone(),
@@ -600,6 +609,7 @@ fn collect_removed_symbols(
                                 .as_ref()
                                 .and_then(|map| map.get(name))
                                 .cloned(),
+                            reference_evidence: None,
                             no_resolved_internal_callers: false,
                             contract_change: None,
                         });
@@ -773,7 +783,13 @@ fn collect_modified_symbols(
             let decision = if facts.type_dependencies.get(name)
                 == Some(&super::ts_signature::DependencyStatus::Changed)
             {
-                SignatureDecision::Blocking(None)
+                local_props_alias_removal_decision(
+                    inputs,
+                    state.closure_caches,
+                    &site,
+                    &mut sources,
+                )
+                .unwrap_or(SignatureDecision::Blocking(None))
             } else {
                 match type_annotation_decision(&site, &mut sources) {
                     Some(decision) => decision,
@@ -782,6 +798,7 @@ fn collect_modified_symbols(
                 }
             };
             let change = ApiSymbolChange {
+                change_evidence: None,
                 inline_module: None,
                 unverified: None,
                 name: name.clone(),
@@ -789,6 +806,7 @@ fn collect_modified_symbols(
                 file: df.new_path.clone(),
                 old_signature: Some(old_sig.to_string()),
                 new_signature: Some(new_sig.clone()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             };
@@ -1039,6 +1057,7 @@ fn collect_rust_modified_symbols(
         };
         let (name, kind, _) = &facts.old_syms[first];
         let change = ApiSymbolChange {
+            change_evidence: None,
             inline_module: declarations.old_inline_module(first),
             unverified: None,
             name: name.clone(),
@@ -1046,6 +1065,7 @@ fn collect_rust_modified_symbols(
             file: df.new_path.clone(),
             old_signature: None,
             new_signature: None,
+            reference_evidence: None,
             no_resolved_internal_callers: false,
             contract_change: None,
         };
@@ -1154,7 +1174,7 @@ fn collect_rust_availability_changes(
             removable,
         };
         record_availability_change(inputs, state, change, item, |state| {
-            !rust_declaration_outside_public_api_surface(
+            let public = !rust_declaration_outside_public_api_surface(
                 inputs.rust_crates,
                 state.rust_public,
                 dir,
@@ -1163,8 +1183,13 @@ fn collect_rust_availability_changes(
                 &df.new_path,
                 name,
                 Some(&declarations.new[first_new]),
-            ) && !is_internally_connected(facts.in_file_callees, name)
-                && !is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths)
+            );
+            (
+                public,
+                public
+                    && !is_internally_connected(facts.in_file_callees, name)
+                    && !is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths),
+            )
         });
     }
 }
@@ -1192,7 +1217,7 @@ fn record_availability_change(
     state: &mut DetectionState<'_>,
     change: super::rust_availability::AvailabilityChange,
     item: AvailabilityItem,
-    addable: impl FnOnce(&mut DetectionState<'_>) -> bool,
+    addable: impl FnOnce(&mut DetectionState<'_>) -> (bool, bool),
 ) {
     use super::rust_availability::AvailabilityChange;
     let AvailabilityItem {
@@ -1209,6 +1234,7 @@ fn record_availability_change(
                 return;
             }
             let change = ApiSymbolChange {
+                change_evidence: None,
                 inline_module: candidate.inline_module,
                 unverified: None,
                 name: candidate.name,
@@ -1216,6 +1242,7 @@ fn record_availability_change(
                 file: candidate.file,
                 old_signature: Some(old_signature),
                 new_signature: Some(candidate.signature),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             };
@@ -1236,11 +1263,20 @@ fn record_availability_change(
                     .cfg_removed
                     .push((candidate.clone(), availability.clone()));
             }
-            if gained && addable(state) {
-                state
-                    .buckets
-                    .cfg_added
-                    .push((candidate, gained_availability.unwrap_or(availability)));
+            if gained {
+                let (public, unused_in_diff) = addable(state);
+                if public {
+                    state
+                        .buckets
+                        .added_reference_candidates
+                        .push(candidate.clone());
+                }
+                if unused_in_diff {
+                    state
+                        .buckets
+                        .cfg_added
+                        .push((candidate, gained_availability.unwrap_or(availability)));
+                }
             }
         }
     }
@@ -1316,14 +1352,17 @@ pub(crate) fn record_module_availability(
                         )
                         .callees
                     });
-                    !is_internally_connected(callees, &name)
-                        && !is_used_in_diff_paths(
-                            inputs.ref_index,
-                            inputs.dir,
-                            &name,
-                            &file,
-                            inputs.diff_new_paths,
-                        )
+                    (
+                        true,
+                        !is_internally_connected(callees, &name)
+                            && !is_used_in_diff_paths(
+                                inputs.ref_index,
+                                inputs.dir,
+                                &name,
+                                &file,
+                                inputs.diff_new_paths,
+                            ),
+                    )
                 });
             }
             Outcome::Ambiguous {
@@ -1331,6 +1370,7 @@ pub(crate) fn record_module_availability(
                 old_signature,
             } => {
                 let change = ApiSymbolChange {
+                    change_evidence: None,
                     inline_module: candidate.inline_module.clone(),
                     unverified: None,
                     name: candidate.name.clone(),
@@ -1338,6 +1378,7 @@ pub(crate) fn record_module_availability(
                     file: candidate.file.clone(),
                     old_signature: Some(old_signature.clone()),
                     new_signature: Some(candidate.signature.clone()),
+                    reference_evidence: None,
                     no_resolved_internal_callers: false,
                     contract_change: None,
                 };
@@ -1401,7 +1442,9 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                     lost: *lost,
                     gained: *gained,
                 };
-                record_availability_change(inputs, state, change, item, |_| addable(candidate));
+                record_availability_change(inputs, state, change, item, |_| {
+                    (true, addable(candidate))
+                });
             }
             NameOutcome::Removed(candidate, targets) => {
                 state
@@ -1410,6 +1453,10 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                     .push((candidate.clone(), targets.clone()));
             }
             NameOutcome::Added(candidate, targets) => {
+                state
+                    .buckets
+                    .added_reference_candidates
+                    .push(candidate.clone());
                 if addable(candidate) {
                     state
                         .buckets
@@ -1422,6 +1469,7 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                 old_signature,
             } => {
                 let change = ApiSymbolChange {
+                    change_evidence: None,
                     inline_module: candidate.inline_module.clone(),
                     unverified: None,
                     name: candidate.name.clone(),
@@ -1429,6 +1477,7 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                     file: candidate.file.clone(),
                     old_signature: Some(old_signature.clone()),
                     new_signature: Some(candidate.signature.clone()),
+                    reference_evidence: None,
                     no_resolved_internal_callers: false,
                     contract_change: None,
                 };
@@ -1600,6 +1649,7 @@ pub(crate) fn compare_moved_availability(
         });
         if duplicated {
             let change = ApiSymbolChange {
+                change_evidence: None,
                 inline_module: symbol.to_inline_module.clone(),
                 unverified: None,
                 name: symbol.name.clone(),
@@ -1607,6 +1657,7 @@ pub(crate) fn compare_moved_availability(
                 file: symbol.to.clone(),
                 old_signature: Some(old_side[0].0.2.clone()),
                 new_signature: Some(new_side[0].0.2.clone()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             };
@@ -1672,6 +1723,7 @@ pub(crate) fn compare_moved_availability(
         }
         if split {
             let change = ApiSymbolChange {
+                change_evidence: None,
                 inline_module: symbol.to_inline_module.clone(),
                 unverified: None,
                 name: symbol.name.clone(),
@@ -1679,6 +1731,7 @@ pub(crate) fn compare_moved_availability(
                 file: symbol.to.clone(),
                 old_signature: Some(old_side[0].0.2.clone()),
                 new_signature: Some(new_side[0].0.2.clone()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             };
@@ -1789,6 +1842,7 @@ pub(crate) fn compare_moved_availability(
                         && old_sig == new_sig
                     {
                         SignatureDecision::Compatible(CompatibleApiModification {
+                            change_evidence: None,
                             inline_module: symbol.to_inline_module.clone(),
                             name: symbol.name.clone(),
                             kind: symbol.kind.clone(),
@@ -1808,6 +1862,7 @@ pub(crate) fn compare_moved_availability(
                         }
                     };
                     let change = ApiSymbolChange {
+                        change_evidence: None,
                         inline_module: symbol.to_inline_module.clone(),
                         unverified: None,
                         name: symbol.name.clone(),
@@ -1815,6 +1870,7 @@ pub(crate) fn compare_moved_availability(
                         file: symbol.to.clone(),
                         old_signature: Some(shown(old_header, old_sig)),
                         new_signature: Some(shown(new_header, new_sig)),
+                        reference_evidence: None,
                         no_resolved_internal_callers: false,
                         contract_change: None,
                     };
@@ -1861,12 +1917,15 @@ pub(crate) fn compare_moved_availability(
                 removable: true,
             };
             record_availability_change(inputs, state, change, item, |_| {
-                !is_used_in_diff_paths(
-                    inputs.ref_index,
-                    inputs.dir,
-                    &symbol.name,
-                    &symbol.to,
-                    inputs.diff_new_paths,
+                (
+                    true,
+                    !is_used_in_diff_paths(
+                        inputs.ref_index,
+                        inputs.dir,
+                        &symbol.name,
+                        &symbol.to,
+                        inputs.diff_new_paths,
+                    ),
                 )
             });
         }
@@ -1975,7 +2034,7 @@ pub(crate) fn compare_renamed_availability(
                 removable,
             };
             record_availability_change(inputs, state, change, item, |state| {
-                !rust_declaration_outside_public_api_surface(
+                let public = !rust_declaration_outside_public_api_surface(
                     inputs.rust_crates,
                     state.rust_public,
                     inputs.dir,
@@ -1984,12 +2043,17 @@ pub(crate) fn compare_renamed_availability(
                     &df.new_path,
                     &name,
                     Some(&declarations[first]),
-                ) && !is_used_in_diff_paths(
-                    inputs.ref_index,
-                    inputs.dir,
-                    &name,
-                    &df.new_path,
-                    inputs.diff_new_paths,
+                );
+                (
+                    public,
+                    public
+                        && !is_used_in_diff_paths(
+                            inputs.ref_index,
+                            inputs.dir,
+                            &name,
+                            &df.new_path,
+                            inputs.diff_new_paths,
+                        ),
                 )
             });
         }
@@ -2015,6 +2079,7 @@ pub(crate) fn process_moved_member_changes(
             header.change == super::rust_type_api::ShapeChange::Breaking || header.value_changed
         }) {
             let symbol = ApiSymbolChange {
+                change_evidence: None,
                 inline_module: change.new.inline_module.clone(),
                 unverified: None,
                 name: change.new.name.clone(),
@@ -2022,6 +2087,7 @@ pub(crate) fn process_moved_member_changes(
                 file: change.new.file.clone(),
                 old_signature: Some(change.old.signature.clone()),
                 new_signature: Some(change.new.signature.clone()),
+                reference_evidence: None,
                 no_resolved_internal_callers: false,
                 contract_change: None,
             };
@@ -2407,6 +2473,7 @@ pub(crate) fn process_reexported_removals(
     let mut moved_files = MovedSymbolFiles::new(inputs.dir, inputs.base_blobs);
     for ((old, reexporting_file), pair) in removals.iter().zip(&pairs) {
         let blocking = |new_signature: Option<String>, unverified: bool| ApiSymbolChange {
+            change_evidence: None,
             inline_module: None,
             unverified: unverified.then_some(ApiModificationUnverified {
                 reason: ApiModificationUnverifiedReason::ReexportTargetUnresolved,
@@ -2417,6 +2484,7 @@ pub(crate) fn process_reexported_removals(
             file: reexporting_file.clone(),
             old_signature: Some(old.signature.clone()),
             new_signature,
+            reference_evidence: None,
             no_resolved_internal_callers: false,
             contract_change: None,
         };
@@ -2720,6 +2788,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             ..
         } = inputs;
         let change = ApiSymbolChange {
+            change_evidence: None,
             inline_module: None,
             unverified: None,
             name: name.to_owned(),
@@ -2728,6 +2797,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             old_signature: Some(old_sig.to_owned()),
             new_signature: Some(new_sig.to_owned()),
             // blocking な api.mod に確定した時点でのみ算出する (record_signature_decision)。
+            reference_evidence: None,
             no_resolved_internal_callers: false,
             // 型契約変更として種別が確定した時点で埋める (record_signature_decision)。
             contract_change: None,
@@ -3055,7 +3125,27 @@ impl<'a> ChangedSignatureFiles<'a> {
         if self.type_dependencies.and_then(|types| types.get(name))
             == Some(&super::ts_signature::DependencyStatus::Changed)
         {
-            return (change, SignatureDecision::Blocking(None));
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            let mut sources =
+                SignatureSourceCache::with_base_blobs(base_blobs, inputs.strip_internal);
+            let decision = local_props_alias_removal_decision(
+                inputs,
+                state.closure_caches,
+                &site,
+                &mut sources,
+            )
+            .unwrap_or(SignatureDecision::Blocking(None));
+            return (change, decision);
         }
         // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
         //
@@ -3435,6 +3525,36 @@ fn python_contract_decision(
     }
 }
 
+/// props 専用の private alias からの削除だけは、型依存の変更そのものを証明の対象にする。
+fn local_props_alias_removal_decision(
+    inputs: &DetectionInputs<'_>,
+    caches: &mut ApiClosureCaches,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+) -> Option<SignatureDecision> {
+    if site.kind != "function"
+        || site.name.contains('.')
+        || super::js_public_name::published_names_for_diff_file(
+            site.dir,
+            inputs.base_blobs,
+            site.old_path,
+            site.new_path,
+            caches,
+        )
+        .is_some_and(|names| names.may_differ(site.name))
+    {
+        return None;
+    }
+    detect_local_alias_props_removed_compatible_mod(
+        inputs.ref_index,
+        site,
+        sources,
+        &mut caches.optional_removal,
+        inputs.diff_files,
+    )
+    .map(SignatureDecision::Compatible)
+}
+
 /// 呼び出し側を壊さない変更を、互換判定器を記述順に試して最初に当てはまったもので返す。
 /// 同じ変更に複数の判定器が当てはまるときは先の判定器の reason を採るので、順序を変えない。
 fn compatible_modification(
@@ -3463,9 +3583,31 @@ fn compatible_modification(
     if let Some(compat) = detect_type_members_compatible_mod(site, sources) {
         return Some(compat);
     }
+    if !public_name_differs
+        && let Some(compat) = detect_trailing_default_type_params_compatible_mod(
+            ref_index,
+            site,
+            sources,
+            &mut caches.optional_removal,
+            diff_files,
+        )
+    {
+        return Some(compat);
+    }
     // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
     // arity は変わらないため compatible_modified として扱う。
     if let Some(compat) = detect_trailing_optional_params_compatible_mod(site, sources) {
+        return Some(compat);
+    }
+    if !public_name_differs
+        && let Some(compat) = super::ts_signature::detect_nullable_input_compatible_mod(
+            ref_index,
+            site,
+            sources,
+            &mut caches.optional_removal,
+            diff_files,
+        )
+    {
         return Some(compat);
     }
     if !public_name_differs
@@ -4075,6 +4217,10 @@ pub(crate) fn process_added_file(
         ) {
             continue;
         }
+        state
+            .buckets
+            .added_reference_candidates
+            .push(candidate.clone());
         if is_internally_connected(in_file_callees, name) {
             continue;
         }

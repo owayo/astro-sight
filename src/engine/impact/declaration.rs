@@ -1836,6 +1836,7 @@ mod tests {
             let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
             if let Some(kind) = extra {
                 affected.push(AffectedSymbol {
+                    change_evidence: None,
                     name: "isOpen".into(),
                     kind: kind.into(),
                     change_type: "removed".into(),

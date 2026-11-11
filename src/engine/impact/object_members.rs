@@ -452,6 +452,7 @@ mod tests {
             LangId::Typescript,
             &syms,
             &[AffectedSymbol {
+                change_evidence: None,
                 name: "layout".to_string(),
                 kind: "variable".to_string(),
                 change_type: "modified".to_string(),
