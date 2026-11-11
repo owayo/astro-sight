@@ -1036,6 +1036,7 @@ mod rust_declarations;
 mod rust_dependencies;
 mod rust_enum_api;
 mod rust_impl_moves;
+mod rust_import_path;
 mod rust_module_availability;
 mod rust_opaque_return;
 mod rust_placement_availability;

@@ -42,6 +42,7 @@ use pass3::{
     demote_private_method_local_competitors,
 };
 use reexport_move::ReexportMoveIndex;
+pub(crate) use rust_path_owner::scan_ordinary_sources as rust_import_path_environment_is_closed;
 use signature::detect_signature_changes;
 use test_context::is_in_test_context;
 

@@ -677,8 +677,12 @@ fn collect_module_wiring(source: &[u8], ignore_builtin_body_macros: bool) -> Opt
         return None;
     }
     let mut declarations = Vec::new();
-    let mut pending = vec![root.to_owned()];
-    while let Some(node) = pending.pop() {
+    let mut pending = vec![Some(root)];
+    while let Some(step) = pending.pop() {
+        let Some(node) = step else {
+            declarations.push(b"}".to_vec());
+            continue;
+        };
         let safe_body_macro = ignore_builtin_body_macros
             && node.kind() == "macro_invocation"
             && node
@@ -698,12 +702,30 @@ fn collect_module_wiring(source: &[u8], ignore_builtin_body_macros: bool) -> Opt
                     | "macro_definition"
             )
         {
-            declarations.push(source.get(node.byte_range())?.to_vec());
+            if ignore_builtin_body_macros
+                && node.kind() == "mod_item"
+                && let Some(body) = node.child_by_field_name("body")
+            {
+                if source.get(body.start_byte()) != Some(&b'{')
+                    || source.get(body.end_byte().checked_sub(1)?) != Some(&b'}')
+                {
+                    return None;
+                }
+                // inline module の通常の関数本文は配置ではない。閉じ位置は名前のスコープを保つ。
+                declarations.push(
+                    source
+                        .get(node.start_byte()..body.start_byte() + 1)?
+                        .to_vec(),
+                );
+                pending.push(None);
+            } else {
+                declarations.push(source.get(node.byte_range())?.to_vec());
+            }
         }
         let mut cursor = node.walk();
         let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
         children.reverse();
-        pending.extend(children);
+        pending.extend(children.into_iter().map(Some));
     }
     Some(declarations)
 }
@@ -1569,7 +1591,7 @@ fn root_associated_paths_with_attributes(
         .collect()
 }
 
-fn scan_ordinary_sources(root: &Path) -> bool {
+pub(crate) fn scan_ordinary_sources(root: &Path) -> bool {
     scan_sources(root, source_can_retarget_modules)
 }
 
@@ -2789,14 +2811,61 @@ fn transforming_scope_attribute(node: Node<'_>, source: &[u8]) -> bool {
 mod tests {
     use super::{
         FileEvidence, ImportNamespace, RustPathOwnerIndex, RustPathOwnerProjectProof,
-        declares_in_namespace, scan_macro_definitions, scan_ordinary_sources,
-        scan_safe_private_import_environment, scan_static_module_placement,
+        declares_in_namespace, module_wiring, private_module_wiring, scan_macro_definitions,
+        scan_ordinary_sources, scan_safe_private_import_environment, scan_static_module_placement,
         source_can_retarget_modules, source_can_retarget_private_scope,
         source_defines_allowed_macro, source_has_external_child_module, source_has_include_macro,
         source_may_include_elsewhere, unconditional_declaration,
     };
     use crate::engine::parser;
     use crate::language::LangId;
+
+    #[test]
+    fn rust_private_function_inline_test_wiring_ignores_call_updates() {
+        let before = b"fn exists(_: &str) {} #[cfg(test)] mod tests { use super::*; #[test] fn sample() { assert!(exists(\"x\")); } }";
+        let after = b"fn exists(_: &Packet) {} #[cfg(test)] mod tests { use super::*; #[test] fn sample() { assert!(exists(&Packet { data: vec![1] })); } }";
+        assert_eq!(
+            private_module_wiring(before).unwrap(),
+            private_module_wiring(after).unwrap()
+        );
+        assert_ne!(
+            module_wiring(before).unwrap(),
+            module_wiring(after).unwrap()
+        );
+    }
+
+    #[test]
+    fn rust_private_function_inline_test_wiring_preserves_boundaries() {
+        for (before, after) in [
+            ("mod a { use crate::one; }", "mod a {} use crate::one;"),
+            ("mod a { mod b; }", "mod a {} mod b;"),
+            (
+                "mod a { #[cfg(test)] fn f() {} }",
+                "mod a {} #[cfg(test)] fn f() {}",
+            ),
+            ("#[cfg(test)] mod a {}", "#[cfg(unix)] mod a {}"),
+            ("mod a {}", "mod a;"),
+            ("mod a { use crate::one; }", "mod a { use crate::two; }"),
+            (
+                "mod a { fn f() { custom!(one); } }",
+                "mod a { fn f() { custom!(two); } }",
+            ),
+            (
+                "mod a { fn f() { include!(\"one.rs\"); } }",
+                "mod a { fn f() { include!(\"two.rs\"); } }",
+            ),
+            (
+                "mod a { macro_rules! m { () => { one } } }",
+                "mod a { macro_rules! m { () => { two } } }",
+            ),
+        ] {
+            assert_ne!(
+                private_module_wiring(before.as_bytes()).unwrap(),
+                private_module_wiring(after.as_bytes()).unwrap(),
+                "{before} -> {after}"
+            );
+        }
+    }
 
     /// 関数の本体のマクロは名前を問わず許し、crate の module の配置を変え得る構文だけを拒む。
     #[test]

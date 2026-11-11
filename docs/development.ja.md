@@ -21,6 +21,8 @@ Linux と macOS の CI は `make setup` と、`make ci` を構成するターゲ
 
 Rust の同名所有元の回帰は `impact_rust_private_helpers` にある。関数・非 leaf モジュールの定数・enum variant・標準 `format!` の引数を、実際の呼び出し元、再束縛、マクロの差し替え、`#[path]`、`include!` と対比する。変更元の関数の本体に標準でないマクロがある場合の、書式の暗黙キャプチャと crate 起点の import の回帰は `impact_rust_same_named_constants` にある。直接の staged 解析では追加証明を使わず、通常の解析だけで候補を除く。
 
+`rust_private_inline_test` は、inline test の呼び出し引数の追従が、private module の配置の証拠を無効にしないことを確認する。この比較は inline module のヘッダーと閉じ境界、import、属性、マクロを保ち、通常の関数本文を除く。未追従の実際の子孫 caller は blocking に残し、無関係な同名メソッドの出現も `refs` には残す。
+
 lint、テスト、6 ターゲットの配布用ビルドは独立して開始する。CI はテストを nextest の `--partition slice:<m>/<n>` で複数のランナーへ分ける。Linux と macOS は各 2 つ（`make test TEST_PARTITION=slice:<m>/2`）、Windows は 5 つで、Windows は `cargo nextest run` を直接呼ぶ。doctest は各 OS の 1 番目のランナーだけが回し、残りは `TEST_DOC=0` を渡す。macOS の 1 番目は `make ci` を呼び、macOS のランナーを増やさずに macOS の lint も兼ねる。ランナーの数は、どのランナーも配布用ビルド（約 7 分）と同じころに終わることを目安に決めている。macOS のランナーは速さのばらつきが大きく、lint も回す 1 番目は配布用ビルドより長くなることがある。
 
 テストの並列数は既定（CPU 数）のまま。テストの時間の大半は `git` と `astro-sight` のプロセスの起動で、CPU 数より増やすと 4 コアの Linux と Windows のランナーではかえって遅くなった。CPU 律速の Rust 影響解析・可視性パスのストレステスト（`deep_nesting::rust_impact_proofs_handle_deep_nesting` と `deep_nesting::rust_visibility_paths_handle_deep_nesting`。各コマンドに 300 秒の期限がある）は最初に始め、それぞれ2件分の枠を使う。 cfg と glob を含む公開経路の回帰2件も、複数の構成を通常・staged・hook で検証するため優先して開始し、各2件分の枠を使う。 型付き入力を既定値で埋める factory の回帰3件も、通常・staged・hook と複数の構成を検証するため、優先して開始し各2枠を使う。 型付き配列の回帰3件も同じ優先度と枠数で実行する。 判別 union の削除と値の流れを検証する回帰も同じ設定で実行する。Windows では一時ファイルを作業ツリーと同じドライブにある `runner.temp` に置く。既定の `TEMP`（C:）では同じテストが 1.6 倍かかった。テストのステップでは git の本体（`git --exec-path` が示すディレクトリの `git.exe`）も PATH の先頭に置く。PATH で見つかる `git.exe` は本体を別のプロセスとして起動するラッパーで、ラッパーを通さないと同じランナーでテストが 25% 前後縮んだ。

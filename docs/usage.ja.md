@@ -58,6 +58,17 @@ printf '%s\n' \
 Rust のマクロ展開がある場合は、この新しい束縛の証明を諦めます。削除モジュールと
 同じ名前の stub / package 配置も、同一モジュールとして慎重に扱います。
 
+Rust の戻り値を `crate::model::Card` から明示的な `use crate::model::Card` と `Card` に
+短縮しただけなら、同じ型の実定義と無条件の module 配置を旧新で証明できたときに
+`rust_explicit_import_path` の互換変更として報告します。`review --hook` の関連参照も
+非 blocking です。初期の対応範囲は、変更がそのファイル一つに閉じ、関数本体などの
+ほかのトークンが不変な場合に限ります。型定義・module 配置の変更、型別名、glob、
+`as`、属性・マクロ、ジェネリクス、既存の同名の短い参照などは blocking を維持します。
+対象ファイルは inline・外部の子 module を宣言しない場合に限ります。親に追加した
+private import が、子の `use super::*` などを通じて別の参照先を変える場合があるためです。
+別ファイルへの `include!` や、その別名・未展開のマクロ・属性などで、ソースの配置を
+プロジェクト全体で確定できない場合も blocking を維持します。
+
 ## ast - AST 断片抽出
 
 ```bash
