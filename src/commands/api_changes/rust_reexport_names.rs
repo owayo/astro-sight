@@ -83,6 +83,13 @@ pub(crate) struct ReexportNames {
     outcomes: Vec<NameOutcome>,
     pub(crate) truncations: Vec<crate::models::truncation::TruncationInfo>,
     names: Vec<String>,
+    /// 比べ切った crate root (上限や読めない置き場で止めていない。Issue #314)。
+    completed: HashSet<String>,
+    /// (crate root, 名前) のうち、どこかの設定で型の名前空間の束縛が取り込みで、比べたもの (報告したか、
+    /// 公開の有無と先が旧新で同じ。Issue #314)。
+    rebound: HashSet<(String, Key)>,
+    /// (crate root, 名前) のうち、上限で比べられなかったもの (Issue #314)。
+    unresolved: HashSet<(String, Key)>,
 }
 
 /// 探し切れなかったことの申告。
@@ -818,6 +825,8 @@ fn conditions(
 #[derive(Default)]
 struct Tally {
     imported: bool,
+    /// 型の名前空間 (module の名前) の束縛が、どこかの設定で取り込みか (Issue #314)。
+    imported_type: bool,
     undecided: bool,
     retarget: bool,
     lost: [bool; 3],
@@ -847,11 +856,13 @@ impl Tally {
             let (was, is) = (old.presence(key, namespace), new.presence(key, namespace));
             let (old_state, new_state) = (old.state(key, namespace), new.state(key, namespace));
             for state in [old_state, new_state] {
-                match state {
-                    State::Resolved(binding) => self.imported |= binding.imported,
-                    State::Ambiguous | State::Unknown | State::Foreign(..) => self.imported = true,
-                    State::Absent | State::Pending | State::Hidden | State::Opaque => {}
-                }
+                let imported = match state {
+                    State::Resolved(binding) => binding.imported,
+                    State::Ambiguous | State::Unknown | State::Foreign(..) => true,
+                    State::Absent | State::Pending | State::Hidden | State::Opaque => false,
+                };
+                self.imported |= imported;
+                self.imported_type |= namespace == 0 && imported;
             }
             // 同じ外部の項目の同じ束縛なら、名前空間が分からなくても旧新で同じ。
             let same_foreign = matches!(old_state, State::Foreign(..)) && old_state == new_state;
@@ -966,6 +977,18 @@ impl ReexportNames {
     /// 追加の候補の名前 (ApiRefIndex で引く)。
     pub(crate) fn index_names(&self) -> impl Iterator<Item = &String> {
         self.names.iter()
+    }
+
+    /// crate root `root` の module `module` の名前 `name` を、型の名前空間の取り込みの束縛として比べたか
+    /// (Issue #314)。比べた (報告したか、公開の有無と先が旧新で同じ) なら真、取り込みが作らない (比べる名前に
+    /// 入らない・どの設定でも型の名前空間に取り込みの束縛が無い) なら偽。crate を比べ切っていない・その名前を
+    /// 比べられなかったなら None。
+    pub(crate) fn rebinds(&self, root: &str, module: &[String], name: &str) -> Option<bool> {
+        let key = (root.to_owned(), (module.to_vec(), name.to_owned()));
+        if self.rebound.contains(&key) {
+            return Some(true);
+        }
+        (self.completed.contains(root) && !self.unresolved.contains(&key)).then_some(false)
     }
 
     fn compare_crate(
@@ -1086,6 +1109,7 @@ impl ReexportNames {
             return;
         }
         if changed.is_empty() && holes.is_empty() {
+            self.completed.insert(root.to_owned());
             return;
         }
         crate::commands::common::log_phase(
@@ -1112,13 +1136,17 @@ impl ReexportNames {
                 }
             }
             for name in &changed {
-                if !self.compare_group(root, &versions, &cones, std::slice::from_ref(name), &[])
-                    && may_be_public_import(&versions, name)
-                {
-                    self.unverified(&versions, name);
+                if !self.compare_group(root, &versions, &cones, std::slice::from_ref(name), &[]) {
+                    let key = (root.to_owned(), name.clone());
+                    if may_be_public_import(&versions, name) && self.unverified(&versions, name) {
+                        self.rebound.insert(key);
+                    } else {
+                        self.unresolved.insert(key);
+                    }
                 }
             }
         }
+        self.completed.insert(root.to_owned());
     }
 
     /// 名前 `names` と列挙できない持ち込み `gaps` を、まとめて設定ごとに解いて比べる。原子か量が上限を
@@ -1234,25 +1262,33 @@ impl ReexportNames {
             self.truncations.push(incomplete(root, UNLISTED));
         }
         for (name, tally) in tallies {
-            self.report(versions, &atoms, &configs, &name, tally);
+            // module の名前は型の名前空間なので、その束縛が取り込みのときだけ任せられる (同じ名前の値の
+            // 取り込みは module の配下の項目を残さない)。
+            let imported_type = tally.imported_type;
+            if self.report(versions, &atoms, &configs, &name, tally) && imported_type {
+                self.rebound.insert((root.to_owned(), name));
+            }
         }
         true
     }
 
-    /// 名前 `name` を比べられないとする。
-    fn unverified(&mut self, versions: &[&Index<'_>; 2], name: &Key) {
-        if let Some(candidate) =
+    /// 名前 `name` を比べられないとする。報告できたか (報告の置き場を決められなければ偽)。
+    fn unverified(&mut self, versions: &[&Index<'_>; 2], name: &Key) -> bool {
+        let Some(candidate) =
             fallback_candidate(versions[1], name).or_else(|| fallback_candidate(versions[0], name))
-        {
-            let old_signature = candidate.signature.clone();
-            self.outcomes.push(NameOutcome::Unverified {
-                candidate,
-                old_signature,
-            });
-        }
+        else {
+            return false;
+        };
+        let old_signature = candidate.signature.clone();
+        self.outcomes.push(NameOutcome::Unverified {
+            candidate,
+            old_signature,
+        });
+        true
     }
 
-    /// 名前 `name` の集計 `tally` を報告にする。
+    /// 名前 `name` の集計 `tally` を報告にする。取り込みの束縛として扱ったか (どこかの設定で取り込みの
+    /// 束縛があり、報告したか、公開の有無と先が旧新で同じ。Issue #314) を返す。
     fn report(
         &mut self,
         versions: &[&Index<'_>; 2],
@@ -1260,9 +1296,9 @@ impl ReexportNames {
         configs: &[u64],
         name: &Key,
         tally: Tally,
-    ) {
+    ) -> bool {
         if !tally.imported {
-            return;
+            return false;
         }
         let lost = tally.lost.iter().any(|lost| *lost);
         let gained = tally.gained.iter().any(|gained| *gained);
@@ -1279,18 +1315,19 @@ impl ReexportNames {
                 .or_else(|| old_candidate.clone())
                 .or_else(|| fallback_candidate(versions[1], name))
                 .or_else(|| fallback_candidate(versions[0], name));
-            if let Some(candidate) = candidate {
-                let old_signature =
-                    old_candidate.map_or_else(|| candidate.signature.clone(), |old| old.signature);
-                self.outcomes.push(NameOutcome::Unverified {
-                    candidate,
-                    old_signature,
-                });
-            }
-            return;
+            let Some(candidate) = candidate else {
+                return false;
+            };
+            let old_signature =
+                old_candidate.map_or_else(|| candidate.signature.clone(), |old| old.signature);
+            self.outcomes.push(NameOutcome::Unverified {
+                candidate,
+                old_signature,
+            });
+            return true;
         }
         if !lost && !gained {
-            return;
+            return true;
         }
         let never =
             |present: &[Vec<bool>; 3]| present.iter().all(|configs| configs.iter().all(|p| !p));
@@ -1324,23 +1361,25 @@ impl ReexportNames {
             items.chain(enum_declarations).collect()
         };
         if new_never {
-            if let Some(candidate) = old_candidate {
-                self.outcomes.push(NameOutcome::Removed(
-                    candidate,
-                    declarations(0, &tally.old_targets, &tally.old_enums),
-                ));
-            }
-            return;
+            let Some(candidate) = old_candidate else {
+                return false;
+            };
+            self.outcomes.push(NameOutcome::Removed(
+                candidate,
+                declarations(0, &tally.old_targets, &tally.old_enums),
+            ));
+            return true;
         }
         if old_never {
-            if let Some(candidate) = new_candidate {
-                self.names.push(name.1.clone());
-                self.outcomes.push(NameOutcome::Added(
-                    candidate,
-                    declarations(1, &tally.new_targets, &tally.new_enums),
-                ));
-            }
-            return;
+            let Some(candidate) = new_candidate else {
+                return false;
+            };
+            self.names.push(name.1.clone());
+            self.outcomes.push(NameOutcome::Added(
+                candidate,
+                declarations(1, &tally.new_targets, &tally.new_enums),
+            ));
+            return true;
         }
         // 表示は、消える設定のある名前空間を優先する。
         let namespace = (0..NAMESPACES.len())
@@ -1351,17 +1390,19 @@ impl ReexportNames {
             old: display::shown(atoms, configs, &tally.old_present[namespace]),
             new: display::shown(atoms, configs, &tally.new_present[namespace]),
         };
-        if let Some(candidate) = new_candidate.or(old_candidate) {
-            if gained {
-                self.names.push(name.1.clone());
-            }
-            self.outcomes.push(NameOutcome::Availability {
-                candidate,
-                lost,
-                gained,
-                availability,
-            });
+        let Some(candidate) = new_candidate.or(old_candidate) else {
+            return false;
+        };
+        if gained {
+            self.names.push(name.1.clone());
         }
+        self.outcomes.push(NameOutcome::Availability {
+            candidate,
+            lost,
+            gained,
+            availability,
+        });
+        true
     }
 }
 

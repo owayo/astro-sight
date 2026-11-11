@@ -113,6 +113,11 @@ pub(crate) fn detect_api_changes_with_renames(
         &rust_crates,
     );
     buckets.parse_truncations.extend(parse_truncations);
+    // 再公開に効く `use` が変わった lib crate で、再公開した名前の有る設定を比べ直す (Issue #306・
+    // #318)。module の比べ直しは、消した (足した) module の名前をこの比較が取り込みの束縛として比べたかを
+    // 使うので先に作る (Issue #314)。
+    let reexport_names =
+        rust_reexport_names::ReexportNames::new(dir, &rust_crates, diff_files, renames);
     // module の宣言の条件 (`#[cfg] mod m;` など) が変わった lib crate で、配下の公開の項目の有る設定を
     // 比べ直す (Issue #305)。追加の候補の名前は索引で引けるよう先に足す。
     let module_availability = rust_module_availability::ModuleAvailability::new(
@@ -122,16 +127,13 @@ pub(crate) fn detect_api_changes_with_renames(
         &strip_internal,
         diff_files,
         renames,
+        &reexport_names,
         &mut rust_public,
     );
     index_names.extend(module_availability.index_names().cloned());
     buckets
         .parse_truncations
         .extend(module_availability.truncations.iter().cloned());
-    // 再公開に効く `use` が変わった lib crate で、再公開した名前の有る設定を比べ直す (Issue #306・
-    // #318)。
-    let reexport_names =
-        rust_reexport_names::ReexportNames::new(dir, &rust_crates, diff_files, renames);
     index_names.extend(reexport_names.index_names().cloned());
     buckets
         .parse_truncations
@@ -371,17 +373,33 @@ pub(crate) fn detect_api_changes_with_renames(
     removed_kept.extend(unverified_removed);
     // 有る設定の一部から消えた Rust の項目 (Issue #291) は、項目そのものは残るので移動の相殺に
     // かけず、名前の参照が repo に残れば removed、無ければ removed_dead にする。
+    let cfg_removed = std::mem::take(&mut state.buckets.cfg_removed);
+    // 旧い版の全ての設定に有り、新しい版のどの設定にも無くなった項目 (module の宣言を消した。Issue #314) は、
+    // ふつうの削除と同じく再公開の名前の削除と重ねない (名前が同じなので、参照による区分も同じになる)。
+    // 一部の設定にしか無かった項目は、再公開の名前が残りの設定で消えたことを表さないので重ねる。
+    let lost_everywhere: Vec<ApiSymbolCandidate> = cfg_removed
+        .iter()
+        .filter(|(_, availability)| {
+            availability.new.is_empty() && availability.old.iter().any(Vec::is_empty)
+        })
+        .map(|(candidate, _)| candidate.clone())
+        .collect();
     let (cfg_removed_kept, cfg_removed_dead) = partition_cfg_removals(
         dir,
-        std::mem::take(&mut state.buckets.cfg_removed)
+        cfg_removed
             .into_iter()
             .map(|(candidate, availability)| (candidate, Some(availability)))
             .collect(),
     );
     // 再公開した名前の削除 (Issue #306・#318) も同じく分け、同じ名前の宣言自身の削除が同じか強い区分に
     // 残るものは重ねない。
+    let removed_kept_and_lost: Vec<ApiSymbolCandidate> = removed_kept
+        .iter()
+        .cloned()
+        .chain(lost_everywhere)
+        .collect();
     let (reexport_removed_kept, reexport_removed_dead) =
-        partition_reexport_removals(dir, reexport_removed, &removed_kept, &removed_dead);
+        partition_reexport_removals(dir, reexport_removed, &removed_kept_and_lost, &removed_dead);
     let cfg_added = std::mem::take(&mut state.buckets.cfg_added);
     let reexport_added = std::mem::take(&mut state.buckets.reexport_added);
 

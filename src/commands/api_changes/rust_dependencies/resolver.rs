@@ -80,6 +80,13 @@ pub(crate) struct Candidate {
     /// なので、宣言の有る設定を覆うかの証明に使える。`use`・glob・module の経路・ほかのファイルを
     /// 通った候補は、経路の条件や先の有無が欠け得るので使わない。
     pub(crate) direct: bool,
+    /// 定義に付いた、項目を置き換え得る属性 (属性マクロ・`derive` など) ごとの、適用される条件 (条件の
+    /// 属性のトークン。常に適用されるなら空。展開の後は別の項目かもしれない。Issue #314)。
+    pub(crate) replaceable: Vec<Vec<String>>,
+    /// module の経路をたどって入った別のファイルの先頭の内側の条件 (Issue #314)。名前を作り得るものの到達の
+    /// 判定 ([`Resolver::bindings_under`]・[`Resolver::opaque_along`]) と、たどる経路の条件にだけ使い、束縛の
+    /// 識別に入る `conditions` には入れない (`#![cfg(all())]` を足しただけで束縛が変わったことにしない)。
+    pub(crate) entered: Vec<String>,
 }
 
 impl Candidate {
@@ -88,16 +95,26 @@ impl Candidate {
             conditions: conditions.to_vec(),
             target,
             direct: false,
+            replaceable: Vec::new(),
+            entered: Vec::new(),
         }
     }
 
-    /// 名前を引いたスコープの定義の候補。`opaque` は覆いの証明に使えないか (項目を置き換え得る属性が
-    /// 付いている、値の名前で引いた名前付きのフィールドの構造体)。
-    fn definition(conditions: &[String], target: Target, opaque: bool) -> Self {
+    /// 名前を引いたスコープの定義の候補。`replaceable` は項目を置き換え得る属性ごとの適用の条件、`opaque` は
+    /// 覆いの証明に使えないか (項目を置き換え得る属性が付いている、値の名前で引いた名前付きのフィールドの
+    /// 構造体)。
+    fn definition(
+        conditions: &[String],
+        target: Target,
+        replaceable: Vec<Vec<String>>,
+        opaque: bool,
+    ) -> Self {
         Self {
             conditions: conditions.to_vec(),
             target,
             direct: !opaque,
+            replaceable,
+            entered: Vec::new(),
         }
     }
 }
@@ -122,6 +139,19 @@ impl Resolved {
                 candidate.conditions = all;
                 // 経路 (`use`・glob・module) を通った候補は、名前を引いたスコープの定義ではない。
                 candidate.direct = false;
+                candidate
+            })
+            .collect()
+    }
+
+    /// [`Self::under`] に加え、各候補の経路で入ったファイルの条件の前に `entered` を足した候補 (Issue #314)。
+    fn under_entered(self, conditions: &[String], entered: &[String]) -> Vec<Candidate> {
+        self.under(conditions)
+            .into_iter()
+            .map(|mut candidate| {
+                let mut all = entered.to_vec();
+                all.append(&mut candidate.entered);
+                candidate.entered = all;
                 candidate
             })
             .collect()
@@ -152,10 +182,30 @@ pub(crate) struct Resolver<'c> {
     condition_keys: std::cell::RefCell<HashMap<Vec<String>, Option<ConditionKeys>>>,
     /// 型別名・定数の右辺を描かずに候補を集める下見の最中か ([`Self::resolve_candidates`])。
     skip_renders: std::cell::Cell<bool>,
+    /// たどっている経路の条件 (Issue #314。[`Self::walk_modules`] の各段、glob・`use` の先、
+    /// [`Self::bindings_under`] の親の名前の解決の間)。[`Self::searching`] の間、この条件と合わせてどの設定でも
+    /// 成り立たない `mod` の宣言は、中身のファイルを開けなくても解けないことにしない。
+    reached: std::cell::RefCell<Vec<String>>,
+    /// 消した module の名前を作り得るものを探している最中か ([`Self::bindings_under`]・[`Self::opaque_along`]。
+    /// Issue #314)。契約が名指す束縛の比較 (#312) では、開けない宣言は今までどおり解けないことにする (属性
+    /// マクロが展開の前の `#[cfg]` を書き換え得るので、たどる経路の条件を確かとしない)。
+    searching: std::cell::Cell<bool>,
 }
 
 /// 有る条件の属性の鍵の並び (`cfg` と、`cfg` だけに絞った `cfg_attr`)。
 type ConditionKeys = Vec<Vec<String>>;
+
+/// [`Resolver::swap_reached`] で差し替えた経路の枝の条件を、落ちるときに戻す (`?` で抜けても戻す)。
+struct ReachedGuard<'a> {
+    cell: &'a std::cell::RefCell<Vec<String>>,
+    saved: Vec<String>,
+}
+
+impl Drop for ReachedGuard<'_> {
+    fn drop(&mut self) {
+        *self.cell.borrow_mut() = std::mem::take(&mut self.saved);
+    }
+}
 
 /// [`Resolver::swap_filter`] で差し替えた宣言の有る条件を、落ちるときに戻す (`?` で抜けても戻す)。
 struct FilterGuard<'a> {
@@ -245,6 +295,31 @@ impl AvailabilityFilter {
         };
         !configs.any(|config| declaration.holds(config) && !present.holds(config))
     }
+}
+
+/// 条件のトークン `conditions` (属性を並べたもの。置き場の節の生のトークンの `|` の区切りは読み飛ばし、`cfg`
+/// に絞った鍵の `#[` は `#` と `[` に分ける) が、どの設定でも成り立たないと確かめられるか (原子を独立に扱う。
+/// Issue #314)。読めなければ偽。
+pub(crate) fn conditions_never_hold(conditions: &[String]) -> bool {
+    let conditions: Vec<String> = conditions
+        .iter()
+        .flat_map(|token| match token.as_str() {
+            "|" => Vec::new(),
+            "#[" => vec!["#".to_owned(), "[".to_owned()],
+            _ => vec![token.clone()],
+        })
+        .collect();
+    !conditions.is_empty() && condition_keys(&conditions).is_some_and(|keys| keys_never_hold(&keys))
+}
+
+/// 鍵 `keys` の属性の積が、どの設定でも成り立たないか (原子を独立に扱う。設定を作れなければ偽)。
+fn keys_never_hold(keys: &ConditionKeys) -> bool {
+    let mut atoms = Atoms::independent();
+    let present = Predicate::All(keys.iter().map(|key| atoms.presence(key)).collect());
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    !configs.any(|config| present.holds(config))
 }
 
 /// 条件のトークン (`cfg`・`cfg_attr` の属性 (`#[..]`・`#![..]`) を [`push_tokens`] で並べたもの) の、
@@ -359,6 +434,8 @@ impl<'c> Resolver<'c> {
             availability: std::cell::RefCell::new(None),
             condition_keys: std::cell::RefCell::new(HashMap::new()),
             skip_renders: std::cell::Cell::new(false),
+            reached: std::cell::RefCell::new(Vec::new()),
+            searching: std::cell::Cell::new(false),
         }
     }
 }
@@ -432,6 +509,33 @@ impl Resolver<'_> {
         }
     }
 
+    /// たどっている経路の枝の条件を `reached` にし、落ちるときに戻す (Issue #314)。
+    fn swap_reached(&self, reached: Vec<String>) -> ReachedGuard<'_> {
+        let saved = std::mem::replace(&mut *self.reached.borrow_mut(), reached);
+        ReachedGuard {
+            cell: &self.reached,
+            saved,
+        }
+    }
+
+    /// ファイル `file` の `mod` の宣言の条件 `conditions` が、たどっている経路の条件と、ファイルの先頭の条件と
+    /// 合わせて、どの設定でも成り立たないか (Issue #314)。
+    fn never_reached(&self, file: &File, conditions: &[String]) -> bool {
+        let mut all = self.reached.borrow().clone();
+        all.extend(file.file_conditions.iter().cloned());
+        all.extend(conditions.iter().cloned());
+        self.never_holds(&all)
+    }
+
+    /// たどっている経路の条件に `more` を足した条件の下で `resolve` を解く (Issue #314)。解いた結果はその
+    /// 条件の下でしか使われないので、両立しない `mod` の宣言を除いても変わらない。
+    fn reaching<T>(&self, more: &[String], resolve: impl FnOnce() -> T) -> T {
+        let mut reached = self.reached.borrow().clone();
+        reached.extend(more.iter().cloned());
+        let _reached = self.swap_reached(reached);
+        resolve()
+    }
+
     /// 候補 `candidates` のうち宣言の有る条件 `filter` と両立するもの (添字) が、全て直接の定義で、宣言の
     /// 有る全ての設定を覆うなら、その添字。覆えば、その設定では明示の束縛が glob・prelude を隠すので、
     /// 両立しない候補は使われず、残す候補の右辺も同じ設定で絞れる。覆わない・決められないときは、その
@@ -464,6 +568,16 @@ impl Resolver<'_> {
         let saved = self.skip_renders.replace(true);
         SkipGuard {
             cell: &self.skip_renders,
+            saved,
+        }
+    }
+
+    /// 消した module の名前を作り得るものを探す間にする ([`Self::searching`]。Issue #314)。返すガードが落ちる
+    /// ときに元へ戻す。
+    fn searching_names(&self) -> SkipGuard<'_> {
+        let saved = self.searching.replace(true);
+        SkipGuard {
+            cell: &self.searching,
             saved,
         }
     }
@@ -738,6 +852,145 @@ impl Resolver<'_> {
         }
     }
 
+    /// 版の crate (`crate_files`) の crate root からの module の経路 `parent` の module (`#[cfg]` で分けた
+    /// 全ての分岐) で、名前 `name` を型の名前空間で解いた候補 (Issue #314)。経路を解けなければ None。
+    /// 束縛が無ければ prelude の候補だけになる。親のスコープの定義の候補は `direct` のまま残す (取り込みと
+    /// 区別する)。展開で名前が出入りし得るものの識別を、その条件の下で足す: 経路の祖先の module か、そこで
+    /// 次の名前を宣言する `mod` に項目を置き換え得る属性 (`opaque:`)、親の module の item 位置のマクロの
+    /// 呼び出し (`macros:`)、親の直下の項目を置き換え得る属性の付いた項目 (`attributes:`)。親のマクロと属性は、
+    /// 同じ名前の値の定義があっても (名前解決は見つけた定義で止まる) module の名前を作り得る。型別名・定数の
+    /// 右辺は使わないので描かない (どの設定にも無い右辺の経路を解こうとしない)。
+    pub(crate) fn bindings_under(&self, parent: &[String], name: &str) -> Option<Vec<Candidate>> {
+        let _skip = self.skipping_renders();
+        let _searching = self.searching_names();
+        let Opened::File(root) = self.crate_files?.root() else {
+            return None;
+        };
+        let mut found = Vec::new();
+        for conditions in self.opaque_along(parent, Some(name))? {
+            found.push(Candidate::new(
+                &conditions,
+                Target::Identity(format!("opaque:{}", parent.join("::"))),
+            ));
+        }
+        for branch in self.walk_absolute(&root, parent.to_vec(), 0)? {
+            match branch.target {
+                Target::Module(target) => {
+                    // 経路の条件と途中のファイルの先頭の内側の条件に、crate root と親の module のファイルの
+                    // 先頭の内側の条件を足す。
+                    let mut reached = root.file_conditions.clone();
+                    reached.extend(branch.conditions.iter().cloned());
+                    reached.extend(branch.entered.iter().cloned());
+                    reached.extend(target.file.file_conditions.iter().cloned());
+                    if let Some(bindings) = target.file.scopes.get(&target.scope) {
+                        let place = format!("{}#{}", target.file.path, target.scope.join("::"));
+                        for (prefix, items) in [
+                            ("macros", &bindings.macro_conditions),
+                            ("attributes", &bindings.attributed),
+                        ] {
+                            for conditions in items {
+                                let mut all = reached.clone();
+                                all.extend(conditions.iter().cloned());
+                                found.push(Candidate::new(
+                                    &all,
+                                    Target::Identity(format!("{prefix}:{place}")),
+                                ));
+                            }
+                        }
+                    }
+                    // 名前解決が足す親のマクロの候補は条件を持たないので、上の呼び出しごとの候補に任せる。
+                    let resolved = self.reaching(&reached, || {
+                        self.resolve_name(&target, name, Namespace::Type, 0)
+                    })?;
+                    for mut candidate in resolved.0 {
+                        if matches!(&candidate.target, Target::Identity(identity) if identity.starts_with("macros:"))
+                        {
+                            continue;
+                        }
+                        // 名前を作り得るかの判定にだけ使うので、経路で入ったファイルの条件も条件に入れる。
+                        let mut conditions = reached.clone();
+                        conditions.append(&mut candidate.conditions);
+                        conditions.append(&mut candidate.entered);
+                        candidate.conditions = conditions;
+                        found.push(candidate);
+                    }
+                }
+                Target::Identity(_) => {
+                    // module でない枝 (マクロ・外へ出る経路) も、crate root のファイルの先頭の条件と、経路で
+                    // 入ったファイルの条件の下でだけ名前を作り得る。
+                    let mut candidate = branch;
+                    let mut conditions = root.file_conditions.clone();
+                    conditions.append(&mut candidate.conditions);
+                    conditions.append(&mut candidate.entered);
+                    candidate.conditions = conditions;
+                    found.push(candidate);
+                }
+            }
+        }
+        Some(found)
+    }
+
+    /// 版の crate の crate root からの module の経路 `path` (`#[cfg]` で分けた全ての分岐) の各段のスコープ
+    /// (`path` の module 自身も) か、そこで次の名前 (`path` の次の段、最後の段の次は `last`) を宣言する
+    /// `mod` に、項目を置き換え得る属性が付いているところの条件 (ファイルをまたいでも。Issue #314)。展開で
+    /// 中身の名前が出入りし得る。module でない枝 (値の取り込み、その分岐に無い名前) は見ない。経路を
+    /// 解けなければ None。型別名・定数の右辺は使わないので描かない。
+    pub(crate) fn opaque_along(
+        &self,
+        path: &[String],
+        last: Option<&str>,
+    ) -> Option<Vec<Vec<String>>> {
+        let _skip = self.skipping_renders();
+        let _searching = self.searching_names();
+        let Opened::File(root) = self.crate_files?.root() else {
+            return None;
+        };
+        let mut found = Vec::new();
+        for depth in 0..=path.len() {
+            let next = path.get(depth).map(String::as_str).or(last);
+            for branch in self.walk_absolute(&root, path[..depth].to_vec(), 0)? {
+                let Target::Module(target) = &branch.target else {
+                    continue;
+                };
+                let Some(bindings) = target.file.scopes.get(&target.scope) else {
+                    continue;
+                };
+                let mut reached = root.file_conditions.clone();
+                reached.extend(branch.conditions.iter().cloned());
+                reached.extend(branch.entered.iter().cloned());
+                reached.extend(target.file.file_conditions.iter().cloned());
+                for conditions in &bindings.opaque {
+                    let mut all = reached.clone();
+                    all.extend(conditions.iter().cloned());
+                    found.push(all);
+                }
+                for declaration in next
+                    .and_then(|next| bindings.modules.get(next))
+                    .into_iter()
+                    .flatten()
+                {
+                    for applied in &declaration.opaque {
+                        let mut all = reached.clone();
+                        all.extend(declaration.conditions.iter().cloned());
+                        all.extend(applied.iter().cloned());
+                        found.push(all);
+                    }
+                }
+            }
+        }
+        Some(found)
+    }
+
+    /// 条件 (cfg のトークン) `conditions` が、どの設定でも成り立たないと確かめられるか (原子を独立に扱う。
+    /// Issue #314)。読めなければ偽。
+    pub(crate) fn never_holds(&self, conditions: &[String]) -> bool {
+        if conditions.is_empty() {
+            return false;
+        }
+        self.keys_of(conditions)
+            .is_some_and(|keys| keys_never_hold(&keys))
+    }
+
     /// ファイル `file` から、crate root からの module の経路 `absolute` をたどる。そのファイルの中なら
     /// その束縛でたどる。外なら、版の crate があれば crate root からたどり、無ければ `crate:` の識別に
     /// する。
@@ -787,13 +1040,16 @@ impl Resolver<'_> {
     }
 
     /// module `module` から、module の名前の並び `segments` をたどった枝。別名 (`use a as m`) も
-    /// 解き、条件付きの別名は条件ごとの枝に分ける。外へ出た枝は、残りの名前を足した識別にする。
+    /// 解き、条件付きの別名は条件ごとの枝に分ける。外へ出た枝は、残りの名前を足した識別にする。別の
+    /// ファイルの module に入る枝には、そのファイルの先頭の内側の条件も足す (Issue #314)。
     fn walk_modules(
         &self,
         module: ModuleRef,
         segments: &[String],
         depth: usize,
     ) -> Option<Vec<Candidate>> {
+        // 歩き始めるファイルの先頭の条件も、たどる経路の条件に入れる (Issue #314)。
+        let start = module.file.file_conditions.clone();
         let mut walking = vec![Candidate::new(&[], Target::Module(module))];
         let mut done = Vec::new();
         for (index, segment) in segments.iter().enumerate() {
@@ -802,10 +1058,23 @@ impl Resolver<'_> {
                 let Target::Module(module) = &branch.target else {
                     continue;
                 };
-                for candidate in self
-                    .resolve_module_segment(module, segment, depth + 1)?
-                    .under(&branch.conditions)
-                {
+                // 枝の条件と両立しない `mod` の宣言は、中身のファイルを開かない (Issue #314)。
+                let mut reached = start.clone();
+                reached.extend(branch.conditions.iter().cloned());
+                reached.extend(branch.entered.iter().cloned());
+                let resolved = self.reaching(&reached, || {
+                    self.resolve_module_segment(module, segment, depth + 1)
+                })?;
+                for mut candidate in resolved.under(&branch.conditions) {
+                    let mut entered = branch.entered.clone();
+                    entered.append(&mut candidate.entered);
+                    if let Target::Module(target) = &candidate.target
+                        && target.scope.is_empty()
+                        && !Rc::ptr_eq(&target.file, &module.file)
+                    {
+                        entered.extend(target.file.file_conditions.iter().cloned());
+                    }
+                    candidate.entered = entered;
                     match candidate.target {
                         Target::Module(_) => next.push(candidate),
                         Target::Identity(identity) => done.push(Candidate {
@@ -815,6 +1084,8 @@ impl Resolver<'_> {
                                 &segments[index + 1..],
                             )),
                             direct: false,
+                            replaceable: candidate.replaceable,
+                            entered: candidate.entered,
                         }),
                     }
                 }
@@ -864,30 +1135,36 @@ impl Resolver<'_> {
             for branch in self.glob_modules(module, index, glob, depth)? {
                 let mut conditions = glob.conditions.clone();
                 conditions.extend(branch.conditions);
+                let entered = branch.entered;
                 match branch.target {
                     Target::Module(target) => {
                         // glob は、取り込むスコープから見える宣言と `use` だけを持ち込む (`use super::*;` は
                         // 親の非公開の宣言も、`pub(crate) use child::*;` は child の非公開の
                         // `use super::X;` を持ち込まない)。
                         let importer = scope_module(module);
+                        // glob とその経路の条件の下で引く (Issue #314)。
+                        let mut reached = conditions.clone();
+                        reached.extend(entered.iter().cloned());
                         for &namespace in namespaces {
-                            if let Some(found) = self.lookup(
-                                &target,
-                                name,
-                                namespace,
-                                depth + 1,
-                                false,
-                                importer.as_deref(),
-                            )? {
-                                certain.extend(found.under(&conditions));
+                            if let Some(found) = self.reaching(&reached, || {
+                                self.lookup(
+                                    &target,
+                                    name,
+                                    namespace,
+                                    depth + 1,
+                                    false,
+                                    importer.as_deref(),
+                                )
+                            })? {
+                                certain.extend(found.under_entered(&conditions, &entered));
                                 break;
                             }
                         }
                     }
-                    Target::Identity(target) => uncertain.push(Candidate::new(
-                        &conditions,
-                        Target::Identity(format!("glob:{target}")),
-                    )),
+                    Target::Identity(target) => uncertain.push(Candidate {
+                        entered,
+                        ..Candidate::new(&conditions, Target::Identity(format!("glob:{target}")))
+                    }),
                 }
             }
         }
@@ -994,18 +1271,23 @@ impl Resolver<'_> {
                     let Target::Module(target) = branch.target else {
                         continue;
                     };
+                    let mut conditions = glob.conditions.clone();
+                    conditions.extend(branch.conditions);
                     let importer = scope_module(module);
-                    if let Some(resolved) = self.lookup(
-                        &target,
-                        name,
-                        Namespace::Type,
-                        depth + 1,
-                        true,
-                        importer.as_deref(),
-                    )? {
-                        let mut conditions = glob.conditions.clone();
-                        conditions.extend(branch.conditions);
-                        found.extend(resolved.under(&conditions));
+                    // glob とその経路の条件の下で引く (Issue #314)。
+                    let mut reached = conditions.clone();
+                    reached.extend(branch.entered.iter().cloned());
+                    if let Some(resolved) = self.reaching(&reached, || {
+                        self.lookup(
+                            &target,
+                            name,
+                            Namespace::Type,
+                            depth + 1,
+                            true,
+                            importer.as_deref(),
+                        )
+                    })? {
+                        found.extend(resolved.under_entered(&conditions, &branch.entered));
                     }
                 }
             }
@@ -1016,8 +1298,20 @@ impl Resolver<'_> {
         Some(Resolved::single(Target::Identity(format!("extern:{name}"))))
     }
 
-    /// スコープ `module` の `use` の先の module の部分を解いた枝。
+    /// スコープ `module` の `use` の先の module の部分を解いた枝。`use` 自身の条件の下で解く (Issue #314)。
     fn resolve_use_module(
+        &self,
+        module: &ModuleRef,
+        target: &UseTarget,
+        depth: usize,
+    ) -> Option<Vec<Candidate>> {
+        self.reaching(&target.conditions, || {
+            self.resolve_use_module_path(module, target, depth)
+        })
+    }
+
+    /// [`Self::resolve_use_module`] の本体。
+    fn resolve_use_module_path(
         &self,
         module: &ModuleRef,
         target: &UseTarget,
@@ -1148,6 +1442,17 @@ impl Resolver<'_> {
                                 Opened::Unparsed(path) => {
                                     Target::Identity(format!("unparsed:{path}:"))
                                 }
+                                // 消した module の名前を作り得るものを探す間は、どの設定にも無い宣言 (たどって
+                                // いる経路の条件と合わせて) の中身のファイルを開けなくても、解けないことにしない
+                                // (無くてもよい。rustc もその宣言を読まない。Issue #314)。開けたファイルは今までどおり
+                                // 候補にし (展開前の `#[cfg]` の判定で候補を変えない)、契約の比較 (#312) では
+                                // 今までどおり解けないことにする。
+                                Opened::Unknown
+                                    if self.searching.get()
+                                        && self.never_reached(file, &declaration.conditions) =>
+                                {
+                                    continue;
+                                }
                                 Opened::Unknown => return None,
                             };
                             found.push(Candidate::new(&declaration.conditions, target));
@@ -1168,6 +1473,7 @@ impl Resolver<'_> {
                 found.push(Candidate::definition(
                     &alias.conditions,
                     Target::Identity(format!("alias:{}#{name}:{rendered}", place(name))),
+                    alias.replaceable.clone(),
                     alias.opaque_attributes,
                 ));
             }
@@ -1185,6 +1491,7 @@ impl Resolver<'_> {
                 found.push(Candidate::definition(
                     &constant.conditions,
                     Target::Identity(format!("const:{}#{name}:{rendered}", place(name))),
+                    constant.replaceable.clone(),
                     constant.opaque_attributes,
                 ));
             }
@@ -1195,6 +1502,7 @@ impl Resolver<'_> {
                 found.push(Candidate::definition(
                     &item.conditions,
                     Target::Identity(format!("item:{}#{name}:{}", place(name), item.kind)),
+                    item.replaceable.clone(),
                     item.opaque_attributes || (namespace == Namespace::Value && item.named_fields),
                 ));
             }
@@ -1228,10 +1536,11 @@ impl Resolver<'_> {
                     || (item != name && bindings.uses.contains_key(item))
                 {
                     // 同じスコープの束縛の別名 (`mod types; use types as selected;`・
-                    // `use Raw as Out;`)。外の crate とみなす前に、同じスコープで引く。
-                    if let Some(resolved) =
-                        self.lookup(module, item, namespace, depth + 1, module_segment, None)?
-                    {
+                    // `use Raw as Out;`)。外の crate とみなす前に、同じスコープで引く (`use` の条件の下で。
+                    // Issue #314)。
+                    if let Some(resolved) = self.reaching(&target.conditions, || {
+                        self.lookup(module, item, namespace, depth + 1, module_segment, None)
+                    })? {
                         found.extend(resolved.under(&target.conditions));
                     }
                     continue;
@@ -1244,21 +1553,29 @@ impl Resolver<'_> {
             for branch in self.resolve_use_module(module, target, depth + 1)? {
                 let mut conditions = target.conditions.clone();
                 conditions.extend(branch.conditions);
+                let entered = branch.entered;
                 match branch.target {
                     Target::Module(target_module) => {
                         // 同じスコープの同じ名前を指す use (宣言の再公開) は、宣言で表す。
                         if target_module == *module && item == name {
                             continue;
                         }
+                        // `use` とその経路の条件の下で引く (Issue #314)。
+                        let mut reached = conditions.clone();
+                        reached.extend(entered.iter().cloned());
                         found.extend(
-                            self.resolve_name(&target_module, item, namespace, depth + 1)?
-                                .under(&conditions),
+                            self.reaching(&reached, || {
+                                self.resolve_name(&target_module, item, namespace, depth + 1)
+                            })?
+                            .under_entered(&conditions, &entered),
                         );
                     }
                     Target::Identity(prefix) => found.push(Candidate {
                         conditions,
                         target: Target::Identity(outside_path(&prefix, &[item.to_owned()])),
                         direct: false,
+                        replaceable: Vec::new(),
+                        entered,
                     }),
                 }
             }
