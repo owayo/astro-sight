@@ -123,10 +123,12 @@ pub(crate) fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -
     tokens
 }
 
-/// 項目を置き換えない (中身の分かる) 組み込みの属性の名前 (Issue #312)。組み込みの属性は、同じ名前の
-/// マクロを取り込むと曖昧さのエラーになるので、別のマクロを指さない。`derive`・`test` のような prelude
-/// のマクロと、ツールの属性 (`rustfmt::skip`) は、同じ名前の取り込みに隠れ得るので入れない。
-const INERT_ATTRIBUTES: [&str; 22] = [
+/// 項目を置き換えない (中身の分かる) 組み込みの属性の名前 (Issue #312・#314)。組み込みの属性は、同じ名前の
+/// マクロを取り込むと曖昧さのエラーになるので、別のマクロを指さない。`derive`・`test`・`global_allocator`
+/// のような prelude のマクロと、ツールの属性 (`rustfmt::skip`) は、同じ名前の取り込みに隠れ得るので入れない。
+/// 名前の解き方を変えるものは [`RESOLUTION_ATTRIBUTES`] に分ける。Rust 2024 の `unsafe(no_mangle)` は中の
+/// 属性で決める ([`inert_unsafe_arguments`])。
+const INERT_ATTRIBUTES: [&str; 39] = [
     "cfg",
     "doc",
     "allow",
@@ -149,7 +151,29 @@ const INERT_ATTRIBUTES: [&str; 22] = [
     "path",
     "macro_use",
     "macro_export",
+    "link",
+    "link_name",
+    "link_ordinal",
+    "no_link",
+    "target_feature",
+    "instruction_set",
+    "naked",
+    "ignore",
+    "should_panic",
+    "debugger_visualizer",
+    "collapse_debuginfo",
+    "panic_handler",
+    "proc_macro",
+    "proc_macro_derive",
+    "proc_macro_attribute",
+    "macro_escape",
+    "coverage",
 ];
+
+/// 項目を置き換えないが、中の名前の解き方を変える組み込みの属性 (Issue #314)。名前や中身を作り得る属性の
+/// 判定 ([`replaceable_attribute_conditions`]) では数えないが、名前解決 (#312) では中の名前を決め切れない
+/// ものとする ([`opaque_preceding_attributes`])。
+const RESOLUTION_ATTRIBUTES: [&str; 1] = ["no_implicit_prelude"];
 
 /// `item` の直前に並ぶ外側の属性に、項目を置き換え得るもの ([`INERT_ATTRIBUTES`] に無い属性。属性
 /// マクロなど。`cfg_attr` で付けるものも) があるか (Issue #312)。
@@ -157,6 +181,167 @@ pub(crate) fn opaque_preceding_attributes(item: tree_sitter::Node<'_>, source: &
     preceding_attribute_items(item)
         .into_iter()
         .any(|attribute_item| !inert_attribute_item(attribute_item, source))
+}
+
+/// `item` の直前に並ぶ外側の属性のうち、項目を置き換え得るもの ([`INERT_ATTRIBUTES`] にも
+/// [`RESOLUTION_ATTRIBUTES`] にも無い属性。属性マクロ・`derive` など) ごとの、適用される条件 (条件の属性のトークン。常に適用されるなら空。Issue #314)。`cfg_attr` の
+/// 中の属性は、そこへ至る全ての `cfg_attr` の述語が成り立つときに適用される (入れ子もたどる)。読めない
+/// `cfg_attr` は、読めたところまでの述語の下で常に適用されるとする。
+pub(crate) fn replaceable_attribute_conditions(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<Vec<String>> {
+    let mut found = Vec::new();
+    for attribute_item in preceding_attribute_items(item) {
+        let mut cursor = attribute_item.walk();
+        let Some(attribute) = attribute_item
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "attribute")
+        else {
+            continue;
+        };
+        let Some(path) = attribute.named_child(0) else {
+            found.push(Vec::new());
+            continue;
+        };
+        let arguments = attribute.child_by_field_name("arguments");
+        if plain_identifier(path, source) == Some("cfg_attr") {
+            match arguments {
+                Some(arguments) => cfg_attr_applications(arguments, source, &[], &mut found),
+                None => found.push(Vec::new()),
+            }
+        } else if !inert_plain(path, arguments.as_slice(), source, &RESOLUTION_ATTRIBUTES) {
+            found.push(Vec::new());
+        }
+    }
+    found
+}
+
+/// `cfg_attr` の引数 `arguments` (`token_tree`) の、置き換え得る属性ごとの適用の条件を `found` に足す。
+/// `outer` は外側の `cfg_attr` の述語の条件の属性のトークン (外側から)。
+fn cfg_attr_applications(
+    arguments: tree_sitter::Node<'_>,
+    source: &[u8],
+    outer: &[Vec<String>],
+    found: &mut Vec<Vec<String>>,
+) {
+    let flatten = |predicates: &[Vec<String>]| -> Vec<String> {
+        predicates.iter().flatten().cloned().collect()
+    };
+    let mut cursor = arguments.walk();
+    let children: Vec<tree_sitter::Node<'_>> = arguments
+        .children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+        found.push(flatten(outer));
+        return;
+    };
+    let mut groups: Vec<Vec<tree_sitter::Node<'_>>> = vec![Vec::new()];
+    for child in inner {
+        if child.kind() == "," {
+            groups.push(Vec::new());
+        } else if let Some(group) = groups.last_mut() {
+            group.push(*child);
+        }
+    }
+    let Some((predicate, attributes)) = groups.split_first() else {
+        found.push(flatten(outer));
+        return;
+    };
+    if predicate.is_empty() {
+        found.push(flatten(outer));
+        return;
+    }
+    let mut tokens = vec![
+        "#".to_owned(),
+        "[".to_owned(),
+        "identifier:cfg".to_owned(),
+        "(".to_owned(),
+    ];
+    for node in predicate {
+        push_tokens(*node, source, &mut tokens);
+    }
+    tokens.extend([")".to_owned(), "]".to_owned()]);
+    let mut path = outer.to_vec();
+    path.push(tokens);
+    for group in attributes {
+        let Some((first, rest)) = group.split_first() else {
+            continue;
+        };
+        if nested_cfg_attr(*first, rest, source) {
+            match rest {
+                [nested] if nested.kind() == "token_tree" => {
+                    cfg_attr_applications(*nested, source, &path, found);
+                }
+                _ => found.push(flatten(&path)),
+            }
+        } else if !inert_plain(*first, rest, source, &RESOLUTION_ATTRIBUTES) {
+            found.push(flatten(&path));
+        }
+    }
+}
+
+/// `cfg_attr` の引数の中の 1 つの属性 (経路の先頭のノード `first` と、続くノード `rest`) が、入れ子の
+/// `cfg_attr` か (経路の属性 `cfg_attr::x` は除く)。
+fn nested_cfg_attr(
+    first: tree_sitter::Node<'_>,
+    rest: &[tree_sitter::Node<'_>],
+    source: &[u8],
+) -> bool {
+    !rest.first().is_some_and(|next| next.kind() == "::")
+        && plain_identifier(first, source) == Some("cfg_attr")
+}
+
+/// `cfg_attr` 以外の属性 (経路の先頭のノード `first` と、続くノード `rest`) が、項目を置き換えない組み込みの
+/// 属性 ([`INERT_ATTRIBUTES`] と `extra`) か。経路の属性 (`a::b`) は組み込みでない。Rust 2024 の `unsafe(..)` は
+/// 中の属性で決める (Issue #314)。
+fn inert_plain(
+    first: tree_sitter::Node<'_>,
+    rest: &[tree_sitter::Node<'_>],
+    source: &[u8],
+    extra: &[&str],
+) -> bool {
+    if rest.first().is_some_and(|next| next.kind() == "::") {
+        return false;
+    }
+    if unsafe_keyword(first, source) {
+        return matches!(
+            rest,
+            [arguments] if arguments.kind() == "token_tree"
+                && inert_unsafe_arguments(*arguments, source)
+        );
+    }
+    plain_identifier(first, source)
+        .is_some_and(|name| INERT_ATTRIBUTES.contains(&name) || extra.contains(&name))
+}
+
+/// ノード `node` が、Rust 2024 の安全でない属性 (`unsafe(no_mangle)`) の `unsafe` か。属性の経路では識別子、
+/// `cfg_attr` の引数の中ではキーワードのトークンになる。`r#unsafe` (同じ名前のマクロ) は除く。
+fn unsafe_keyword(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "unsafe" => true,
+        "identifier" => node.utf8_text(source).ok() == Some("unsafe"),
+        _ => false,
+    }
+}
+
+/// `unsafe(..)` の引数 `arguments` (`token_tree`) の中の属性が、項目を置き換えない組み込みの属性か
+/// (`unsafe` は組み込みの属性にしか付けられない)。
+fn inert_unsafe_arguments(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = arguments.walk();
+    let children: Vec<tree_sitter::Node<'_>> = arguments
+        .children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    match children.get(1..children.len().saturating_sub(1)) {
+        Some([first, rest @ ..]) => {
+            !rest.first().is_some_and(|next| next.kind() == "::")
+                && plain_identifier(*first, source)
+                    .is_some_and(|name| INERT_ATTRIBUTES.contains(&name))
+        }
+        _ => false,
+    }
 }
 
 /// 外側の属性 (`attribute_item`) が、項目を置き換えない組み込みの属性か。
@@ -176,18 +361,16 @@ fn plain_identifier<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option
         .map(|text| text.strip_prefix("r#").unwrap_or(text))
 }
 
-/// 属性 (`attribute_item` の中の `attribute`) が項目を置き換えないか。
+/// 属性 (`attribute_item` の中の `attribute`) が項目を置き換えず、中の名前の解き方も変えないか (#312)。
 fn inert_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    match attribute
-        .named_child(0)
-        .and_then(|path| plain_identifier(path, source))
-    {
-        Some("cfg_attr") => attribute
-            .child_by_field_name("arguments")
-            .is_some_and(|arguments| inert_cfg_attr(arguments, source)),
-        Some(name) => INERT_ATTRIBUTES.contains(&name),
-        None => false,
+    let Some(path) = attribute.named_child(0) else {
+        return false;
+    };
+    let arguments = attribute.child_by_field_name("arguments");
+    if plain_identifier(path, source) == Some("cfg_attr") {
+        return arguments.is_some_and(|arguments| inert_cfg_attr(arguments, source));
     }
+    inert_plain(path, arguments.as_slice(), source, &[])
 }
 
 /// `cfg_attr(述語, 属性, ..)` の引数 (`token_tree`) の、付ける属性がどれも項目を置き換えないか。
@@ -208,18 +391,17 @@ fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
             group.push(*child);
         }
     }
-    groups.iter().skip(1).all(|group| match group.as_slice() {
-        [] => true,
-        // 経路の属性 (`a::b`) は組み込みでない
-        [_, separator, ..] if separator.kind() == "::" => false,
-        [first, rest @ ..] => match plain_identifier(*first, source) {
-            Some("cfg_attr") => {
-                matches!(rest, [nested] if nested.kind() == "token_tree")
-                    && rest.iter().all(|nested| inert_cfg_attr(*nested, source))
-            }
-            Some(name) => INERT_ATTRIBUTES.contains(&name),
-            None => false,
-        },
+    groups.iter().skip(1).all(|group| {
+        let Some((first, rest)) = group.split_first() else {
+            return true;
+        };
+        if nested_cfg_attr(*first, rest, source) {
+            return matches!(
+                rest,
+                [nested] if nested.kind() == "token_tree" && inert_cfg_attr(*nested, source)
+            );
+        }
+        inert_plain(*first, rest, source, &[])
     })
 }
 

@@ -636,6 +636,11 @@ impl<'a> RustCrates<'a> {
             .filter(|pair| pair.dependencies)
     }
 
+    /// 差分の中の package の旧新の lib crate の全て (どの入力が変わったかを問わない。Issue #314)。
+    pub(crate) fn library_pairs(&self) -> impl Iterator<Item = &CratePair<'a>> {
+        self.pairs.values()
+    }
+
     /// 束縛が変わった package の、crate root のパスと旧新の lib crate。
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (String, &CratePair<'a>)> {
         self.pairs

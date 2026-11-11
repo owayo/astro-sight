@@ -43,7 +43,9 @@ pub(crate) mod use_scan;
 
 pub(crate) use crates::RustCrates;
 pub(crate) use dependents::{ChangeSet, MoveMap};
-pub(crate) use resolver::{CrateFiles, File, Opened, Resolver};
+pub(crate) use resolver::{
+    Candidate, CrateFiles, File, Opened, Resolver, Target, conditions_never_hold,
+};
 
 /// 束縛を解く深さの上限 (別名の連鎖・module の経路・glob をたどる回数)。超えれば解けない。
 const MAX_DEPTH: usize = 32;
@@ -200,6 +202,9 @@ struct Definition {
     /// [`opaque_preceding_attributes`]) が付いているか (Issue #312)。同じ名前の inline module の束縛は
     /// 1 つのスコープにまとめるので、宣言を囲まない (属性マクロで消える) 本体の定義もあり得る。
     opaque_attributes: bool,
+    /// 自身に付いた、項目を置き換え得る属性 (属性マクロ・`derive` など) ごとの、適用される条件の属性の
+    /// トークン (常に適用されるなら空。Issue #314)。
+    replaceable: Vec<Vec<String>>,
     /// 宣言のノードのバイトの範囲。
     range: (usize, usize),
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
@@ -215,6 +220,9 @@ struct ItemDeclaration {
     /// [`opaque_preceding_attributes`]) が付いているか (Issue #312)。同じ名前の inline module の束縛は
     /// 1 つのスコープにまとめるので、宣言を囲まない (属性マクロで消える) 本体の定義もあり得る。
     opaque_attributes: bool,
+    /// 自身に付いた、項目を置き換え得る属性 (属性マクロ・`derive` など) ごとの、適用される条件の属性の
+    /// トークン (常に適用されるなら空。Issue #314)。
+    replaceable: Vec<Vec<String>>,
     /// 名前付きのフィールドの構造体か (値の名前空間に名前を作らない)。
     named_fields: bool,
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
@@ -245,6 +253,10 @@ pub(crate) struct ModuleDeclaration {
     enclosing_attributes: Vec<String>,
     /// 宣言を囲む inline module が全て `pub` (制限なし) か。
     enclosing_public: bool,
+    /// 宣言自身に付いた、項目を置き換え得る属性 (属性マクロなど) ごとの、適用される条件の属性のトークン
+    /// (常に適用されるなら空。展開で中身の名前が出入りし得る。囲む inline module のものはスコープの印で
+    /// 持つ。Issue #314)。
+    opaque: Vec<Vec<String>>,
 }
 
 impl ModuleDeclaration {
@@ -323,6 +335,21 @@ struct ScopeBindings {
     path_attribute: bool,
     /// item 位置でマクロを呼び出す (項目や module を生成し得る。Issue #305)。
     invokes_macros: bool,
+    /// スコープの inline module か、それを囲む inline module のうち、項目を置き換え得る属性 (属性マクロなど)
+    /// が付いているものの条件 (展開で名前が出入りし得る。同じ経路の cfg で分けた inline module ごと。
+    /// Issue #314)。
+    opaque: Vec<Vec<String>>,
+    /// スコープの直下の、項目を置き換え得る属性 (属性マクロ・`derive` など) の付いた項目ごとの条件 (展開は
+    /// 兄弟の名前も作り得る。Issue #314)。
+    attributed: Vec<Vec<String>>,
+    /// スコープの直下の item 位置のマクロの呼び出しごとの条件 (展開は兄弟の名前も作り得る。Issue #314)。
+    macro_conditions: Vec<Vec<String>>,
+    /// `impl`・trait・`extern` ブロックの中の、マクロの呼び出しごとの条件 (展開は関連項目を作り得るが、
+    /// スコープの名前は作らない。Issue #314)。
+    body_macro_conditions: Vec<Vec<String>>,
+    /// `impl`・trait・`extern` ブロックの中の、項目を置き換え得る属性の付いた関連項目ごとの条件 (適用の
+    /// 条件も。展開は関連項目を作り得る。Issue #314)。
+    body_attributed: Vec<Vec<String>>,
 }
 
 impl ScopeBindings {
@@ -347,6 +374,12 @@ impl ScopeBindings {
         self.macros.extend(other.macros);
         self.path_attribute |= other.path_attribute;
         self.invokes_macros |= other.invokes_macros;
+        self.opaque.extend(other.opaque);
+        self.attributed.extend(other.attributed);
+        self.macro_conditions.extend(other.macro_conditions);
+        self.body_macro_conditions
+            .extend(other.body_macro_conditions);
+        self.body_attributed.extend(other.body_attributed);
     }
 
     /// スコープが束縛する名前 (宣言・型別名・定数・module・`use`)。
@@ -389,6 +422,8 @@ pub(crate) struct DependencyIndex {
     macro_definitions: Vec<String>,
     /// ファイルの先頭の内側の `cfg` と `cfg` に絞った `cfg_attr` (読めなければ None。Issue #305)。
     file_availability: Option<Vec<AvailabilityAttr>>,
+    /// ファイルの先頭の内側の条件の属性のトークン (Issue #314)。
+    file_conditions: Vec<String>,
     tree: tree_sitter::Tree,
     source: Vec<u8>,
 }
@@ -517,11 +552,13 @@ impl DependencyIndex {
             mod_rs,
             macro_definitions: Vec::new(),
             file_availability: None,
+            file_conditions: Vec::new(),
             tree,
             source: source.to_vec(),
         };
         let root = index.tree.root_node();
         index.file_availability = file_availability(root, &index.source);
+        index.file_conditions = inner_conditions(root, &index.source);
         let mut scopes = Vec::new();
         let mut definitions = Vec::new();
         // 深い入れ子の inline module でもスタックを溢れさせないよう、明示のスタックで下りる。
@@ -530,7 +567,7 @@ impl DependencyIndex {
             path: Vec::new(),
             conditions: Vec::new(),
             path_attribute: false,
-            opaque: false,
+            opaque: Vec::new(),
         }];
         while let Some(scope) = pending.pop() {
             pending.extend(collect_scope(
@@ -790,12 +827,49 @@ impl DependencyIndex {
             _ => None,
         }
     }
-    /// スコープ `scope` (inline module の経路) が item 位置でマクロを呼び出すか (項目や module を
-    /// 生成し得る)。
-    pub(crate) fn scope_invokes_macros(&self, scope: &[String]) -> bool {
+
+    /// スコープ `scope` (inline module の経路) の直下の item 位置のマクロの呼び出しごとの条件 (Issue #314)。
+    pub(crate) fn scope_macro_conditions(&self, scope: &[String]) -> &[Vec<String>] {
         self.scopes
             .get(scope)
-            .is_some_and(|bindings| bindings.invokes_macros)
+            .map_or(&[], |bindings| bindings.macro_conditions.as_slice())
+    }
+
+    /// スコープ `scope` (inline module の経路) の `impl`・trait・`extern` ブロックの中の、マクロの呼び出し
+    /// ごとの条件 (Issue #314)。
+    pub(crate) fn scope_body_macro_conditions(&self, scope: &[String]) -> &[Vec<String>] {
+        self.scopes
+            .get(scope)
+            .map_or(&[], |bindings| bindings.body_macro_conditions.as_slice())
+    }
+
+    /// ファイルの先頭の内側の条件の属性のトークン (Issue #314)。
+    pub(crate) fn file_conditions(&self) -> &[String] {
+        &self.file_conditions
+    }
+
+    /// スコープ `scope` (inline module の経路) の inline module か、それを囲む inline module に付いた、項目を
+    /// 置き換え得る属性 (属性マクロなど) ごとの適用の条件 (Issue #314)。
+    pub(crate) fn scope_opaque(&self, scope: &[String]) -> &[Vec<String>] {
+        self.scopes
+            .get(scope)
+            .map_or(&[], |bindings| bindings.opaque.as_slice())
+    }
+
+    /// スコープ `scope` (inline module の経路) の `impl`・trait・`extern` ブロックの中の、項目を置き換え得る
+    /// 属性の付いた関連項目ごとの条件 (Issue #314)。
+    pub(crate) fn scope_body_attributed(&self, scope: &[String]) -> &[Vec<String>] {
+        self.scopes
+            .get(scope)
+            .map_or(&[], |bindings| bindings.body_attributed.as_slice())
+    }
+
+    /// スコープ `scope` (inline module の経路) の直下の、項目を置き換え得る属性 (属性マクロ・`derive`
+    /// など) の付いた項目ごとの条件 (Issue #314)。
+    pub(crate) fn scope_attributed(&self, scope: &[String]) -> &[Vec<String>] {
+        self.scopes
+            .get(scope)
+            .map_or(&[], |bindings| bindings.attributed.as_slice())
     }
 
     /// resolver が読む束縛の指紋 (Issue #300)。スコープ (inline module の経路) ごと。関数の本体・
@@ -906,9 +980,9 @@ struct ChildScope<'tree> {
     conditions: Vec<String>,
     /// スコープの inline module に `#[path]` が付いているか。
     path_attribute: bool,
-    /// スコープの inline module か、それを囲む inline module に、中身を置き換え得る属性 (属性マクロ
-    /// など。[`opaque_preceding_attributes`]) が付いているか (Issue #312)。
-    opaque: bool,
+    /// スコープの inline module か、それを囲む inline module のうち、中身を置き換え得る属性 (属性マクロ
+    /// など。[`opaque_preceding_attributes`]) が付いているものの条件 (Issue #312・#314)。
+    opaque: Vec<Vec<String>>,
 }
 
 /// 旧い版の宣言 (`old_declarations`、旧い版の文脈 `old`) と新しい版の宣言 (`new_declarations`、
@@ -1248,10 +1322,12 @@ fn collect_scope<'tree>(
     } = scope;
     let inherited = inherited.as_slice();
     // 定義に、項目を置き換え得る属性 (自身か囲む inline module のもの) が付いているか (Issue #312)。
-    let opaque_attributes =
-        |item: tree_sitter::Node<'_>| opaque || opaque_preceding_attributes(item, source);
+    let opaque_attributes = |item: tree_sitter::Node<'_>| {
+        !opaque.is_empty() || opaque_preceding_attributes(item, source)
+    };
     let mut bindings = ScopeBindings {
         path_attribute,
+        opaque: opaque.clone(),
         ..ScopeBindings::default()
     };
     let mut current_module: Vec<String> = file_module.map(<[String]>::to_vec).unwrap_or_default();
@@ -1270,6 +1346,54 @@ fn collect_scope<'tree>(
                 .and_then(|name| name.utf8_text(source).ok())
                 .map(|name| unraw(name).to_owned())
         };
+        // 項目自身に効く条件 (外側の属性と、inline module・関数・trait・impl・extern ブロックの中身の先頭の
+        // 内側の属性。Issue #312・#314)。
+        let own_conditions = || {
+            let mut own = conditions();
+            if matches!(
+                item.kind(),
+                "mod_item" | "function_item" | "trait_item" | "impl_item" | "foreign_mod_item"
+            ) && let Some(body) = item.child_by_field_name("body")
+            {
+                own.extend(inner_conditions(body, source));
+            }
+            own
+        };
+        // 項目を置き換え得る属性の付いた項目 (展開は兄弟の名前も作り得る)。属性ごとに、項目自身の条件と
+        // 適用の条件 (`cfg_attr` の述語) を合わせて数える (Issue #314)。
+        if !matches!(
+            item.kind(),
+            "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
+        ) {
+            for applied in replaceable_attribute_conditions(item, source) {
+                let mut all = own_conditions();
+                all.extend(applied);
+                bindings.attributed.push(all);
+            }
+        }
+        // `impl`・trait・`extern` ブロックの中のマクロの呼び出しと属性の付いた関連項目は、ブロックの条件と
+        // 項目ごとの条件を合わせて数える。ブロックに付いた属性マクロは中の `#[cfg]` を解かずに受け取るので、
+        // 中に呼び出しがあれば、属性の適用の条件でも数える (Issue #305・#314)。
+        if matches!(item.kind(), "impl_item" | "trait_item" | "foreign_mod_item")
+            && let Some(body) = item.child_by_field_name("body")
+        {
+            let block = own_conditions();
+            let (mut calls, attributed) = body_conditions(body, source);
+            bindings.invokes_macros |= !calls.is_empty();
+            if !calls.is_empty() {
+                calls.extend(replaceable_attribute_conditions(item, source));
+            }
+            for (out, found) in [
+                (&mut bindings.body_macro_conditions, calls),
+                (&mut bindings.body_attributed, attributed),
+            ] {
+                for own in found {
+                    let mut all = block.clone();
+                    all.extend(own);
+                    out.push(all);
+                }
+            }
+        }
         match item.kind() {
             "use_declaration" => {
                 let Some(argument) = item.child_by_field_name("argument") else {
@@ -1353,6 +1477,7 @@ fn collect_scope<'tree>(
                     bindings.aliases.entry(name).or_default().push(Definition {
                         conditions: conditions(),
                         opaque_attributes: opaque_attributes(item),
+                        replaceable: replaceable_attribute_conditions(item, source),
                         range: (item.start_byte(), item.end_byte()),
                         visibility: visibility(item, source, &current_module),
                     });
@@ -1367,6 +1492,7 @@ fn collect_scope<'tree>(
                         .push(Definition {
                             conditions: conditions(),
                             opaque_attributes: opaque_attributes(item),
+                            replaceable: replaceable_attribute_conditions(item, source),
                             range: (item.start_byte(), item.end_byte()),
                             visibility: visibility(item, source, &current_module),
                         });
@@ -1378,8 +1504,6 @@ fn collect_scope<'tree>(
             | "trait_item"
             | "function_item"
             | "function_signature_item" => {
-                // trait の中身の項目の位置のマクロは、関連項目を生成し得る (Issue #305)。
-                bindings.invokes_macros |= item.kind() == "trait_item" && body_invokes_macros(item);
                 if let Some(name) = name() {
                     let kind: &'static str = match item.kind() {
                         "struct_item" => "struct_item",
@@ -1403,6 +1527,7 @@ fn collect_scope<'tree>(
                             kind,
                             conditions: item_conditions,
                             opaque_attributes: opaque_attributes(item),
+                            replaceable: replaceable_attribute_conditions(item, source),
                             named_fields: item.kind() == "struct_item"
                                 && item
                                     .child_by_field_name("body")
@@ -1435,30 +1560,44 @@ fn collect_scope<'tree>(
                         location_attributes: location_attribute_tokens(item, source),
                         enclosing_attributes: enclosing_module_attributes(item, source),
                         enclosing_public: enclosing_modules_public(item, source),
+                        // inline module の中身の先頭の内側の属性も、宣言の属性の適用の条件に入れる。
+                        opaque: replaceable_attribute_conditions(item, source)
+                            .into_iter()
+                            .map(|applied| {
+                                let mut all = body
+                                    .map(|body| inner_conditions(body, source))
+                                    .unwrap_or_default();
+                                all.extend(applied);
+                                all
+                            })
+                            .collect(),
                     });
                 if let Some(body) = body {
                     let mut child = path.clone();
                     child.push(name);
                     let mut child_conditions = conditions();
                     child_conditions.extend(inner_conditions(body, source));
+                    let mut child_opaque = opaque.clone();
+                    for applied in replaceable_attribute_conditions(item, source) {
+                        let mut all = child_conditions.clone();
+                        all.extend(applied);
+                        child_opaque.push(all);
+                    }
                     children.push(ChildScope {
                         body,
                         path: child,
                         conditions: child_conditions,
                         path_attribute,
-                        opaque: opaque_attributes(item),
+                        opaque: child_opaque,
                     });
                 }
             }
             "macro_invocation" | "expression_statement" => {
                 bindings.macros.extend(tokens_of(item, source));
                 bindings.invokes_macros = true;
+                bindings.macro_conditions.push(conditions());
             }
             "macro_definition" => definitions.extend(tokens_of(item, source)),
-            // impl・extern ブロックの中身の項目の位置のマクロは、項目を生成し得る (Issue #305)。
-            "impl_item" | "foreign_mod_item" => {
-                bindings.invokes_macros |= body_invokes_macros(item);
-            }
             _ => {}
         }
     }
@@ -1496,14 +1635,38 @@ fn enclosing_module_attributes(item: tree_sitter::Node<'_>, source: &[u8]) -> Ve
     groups.into_iter().flatten().collect()
 }
 
-/// 項目 `item` (impl・trait・extern ブロック) の中身の直下で、マクロを呼び出すか。
-fn body_invokes_macros(item: tree_sitter::Node<'_>) -> bool {
-    let Some(body) = item.child_by_field_name("body") else {
-        return false;
-    };
+/// `impl`・trait・`extern` ブロックの中身 `body` の直下の、マクロの呼び出しごとの条件 (呼び出し自身の
+/// `cfg`) と、項目を置き換え得る属性の付いた関連項目の属性ごとの条件 (項目自身の `cfg` と属性の適用の
+/// 条件)。関連関数 (trait のデフォルトの実装も) 自身の条件には、本体の先頭の内側の `#![cfg]` も入れる。
+/// 展開は関連項目を作り得る (Issue #305・#314)。
+fn body_conditions(
+    body: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    let (mut calls, mut attributed) = (Vec::new(), Vec::new());
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .any(|child| matches!(child.kind(), "macro_invocation" | "expression_statement"))
+    for child in body.named_children(&mut cursor) {
+        match child.kind() {
+            "macro_invocation" | "expression_statement" => {
+                calls.push(preceding_conditions(child, source));
+            }
+            "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment" => {}
+            _ => {
+                let mut own = preceding_conditions(child, source);
+                if child.kind() == "function_item"
+                    && let Some(block) = child.child_by_field_name("body")
+                {
+                    own.extend(inner_conditions(block, source));
+                }
+                for applied in replaceable_attribute_conditions(child, source) {
+                    let mut all = own.clone();
+                    all.extend(applied);
+                    attributed.push(all);
+                }
+            }
+        }
+    }
+    (calls, attributed)
 }
 
 /// 属性 `attribute` の、module の中身の場所の決め方に効く部分のトークン (`path` と、`cfg_attr` の

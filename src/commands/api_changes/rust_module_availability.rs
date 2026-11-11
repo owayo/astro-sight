@@ -24,7 +24,11 @@
 //! - 比べ直した項目は、ファイルごとの有る設定の比較 (#291) から外す
 //! - 探し切れない (置き場の場所を決められない、置き場のファイルを読めない・構文エラー、項目の位置の
 //!   マクロ、上限、`[lib] path`) ときは、truncation の `rust_module_availability_incomplete` を出す
-//! - module の経路が片方の版に無い (宣言を消した・足した) 変化は扱わない (Issue #314)
+//! - module の経路が片方の版に無い (`mod` の宣言を消した・足した) ときも、配下の項目の置き場が消えた・
+//!   現れたものとして比べる (Issue #314)。その名前を再公開の名前の比較 (#306) が型の名前空間の取り込みの
+//!   束縛として比べたなら任せる。マクロや属性マクロがその名前や中身を作り得るなら、探し切れなかったことに
+//!   する。差分のファイルのファイルごとの比較 (宣言自身の条件の変化) は、置き場の消えた版を扱わないので
+//!   別に出す
 
 use super::rust_availability::AvailabilityChange;
 use super::rust_dependencies::placements::{Clause, Placement, Placements};
@@ -41,6 +45,16 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) enum Version {
     Old,
     New,
+}
+
+impl Version {
+    /// もう一方の版。
+    fn other(self) -> Self {
+        match self {
+            Self::Old => Self::New,
+            Self::New => Self::Old,
+        }
+    }
 }
 
 /// 項目の識別: crate root のパス、crate root からの module の経路 (ファイルの module と inline
@@ -121,6 +135,7 @@ fn inline_segments(context: &RustDeclarationContext) -> Vec<String> {
 }
 
 /// 比べ直す項目の宣言 1 つ。
+#[derive(Clone)]
 struct Entry {
     file: String,
     /// ファイルの索引 (契約が名指す名前の束縛を、その版の crate で解く)。
@@ -216,6 +231,8 @@ pub(crate) struct ModuleAvailability {
 
 impl ModuleAvailability {
     /// 差分の中の package の lib crate のうち、module の置き場の条件に効く入力が変わったものを比べ直す。
+    /// `reexports` は再公開した名前の比べ直しの結果 (消した・足した module の名前を任せるかに使う)。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         dir: &str,
         rust_crates: &RustCrates<'_>,
@@ -223,6 +240,7 @@ impl ModuleAvailability {
         strip_internal: &super::ts_strip_internal::StripInternal,
         diff_files: &[crate::models::impact::DiffFile],
         renames: &[crate::models::impact::DiffFile],
+        reexports: &super::rust_reexport_names::ReexportNames,
         rust_public: &mut RustPublicApiContext,
     ) -> Self {
         let mut this = Self::default();
@@ -244,6 +262,7 @@ impl ModuleAvailability {
                 dir,
                 root: &root,
                 pair,
+                crates: rust_crates,
                 base_blobs,
                 strip_internal,
                 pairs: &pairs,
@@ -252,6 +271,7 @@ impl ModuleAvailability {
                 compared: HashMap::new(),
                 coactive: HashMap::new(),
                 rust_public,
+                reexports,
                 facts: HashMap::new(),
                 bytes: 0,
             };
@@ -326,7 +346,9 @@ impl ModuleAvailability {
     }
 
     /// 変更ファイル `df` の、同じキーの旧新の宣言 (`old`・`new`、宣言の文脈と名前・種類) の有る設定の
-    /// 比較を、比べ直しが扱ったか (ファイルごとの比較を飛ばす)。
+    /// 比較を、比べ直しが扱ったか (ファイルごとの比較を飛ばす)。旧新の全ての置き場で、旧新の両方にある項目と
+    /// して比べたときだけ扱ったとする。片方の版にしか無い置き場 (module の宣言を消した・足した、など) が
+    /// あれば、その置き場の有無の変化とは別に、ファイルごとの比較 (宣言自身の条件の変化) も出す (Issue #314)。
     pub(crate) fn covers_availability(
         &self,
         df: &crate::models::impact::DiffFile,
@@ -336,10 +358,8 @@ impl ModuleAvailability {
         let covered =
             |version: Version, path: &str, side: &[(&RustDeclarationContext, &str, &str)]| {
                 side.iter().all(|(context, name, kind)| {
-                    matches!(
-                        self.status(version, path, context, name, kind),
-                        KeyStatus::Covered { .. }
-                    )
+                    self.status(version, path, context, name, kind)
+                        == KeyStatus::Covered { two_sided: true }
                 })
             };
         (!old.is_empty() || !new.is_empty())
@@ -395,6 +415,8 @@ struct CrateComparison<'c, 'a> {
     dir: &'c str,
     root: &'c str,
     pair: &'c super::rust_dependencies::crates::CratePair<'a>,
+    /// 差分の中の package の lib crate (移したファイルの行き先を引く。Issue #314)。
+    crates: &'c RustCrates<'a>,
     base_blobs: &'c crate::commands::git_input::GitBlobBatch,
     strip_internal: &'c super::ts_strip_internal::StripInternal,
     /// 差分のファイルの (旧いパス, 新しいパス)。
@@ -408,6 +430,8 @@ struct CrateComparison<'c, 'a> {
     /// 同じ設定で宣言になる旧新の組 (旧新の宣言のファイルと条件の並びごと)。
     coactive: HashMap<(Structure, Structure), Option<Coactive>>,
     rust_public: &'c mut RustPublicApiContext,
+    /// 再公開した名前の比べ直しの結果 (消した・足した module の名前を任せるか。Issue #314)。
+    reexports: &'c super::rust_reexport_names::ReexportNames,
     /// (版, ファイル) → 公開の項目 (読めない・構文エラーなら None)。
     facts: HashMap<(Version, String), Option<std::rc::Rc<SourceFacts>>>,
     /// 読んだ量。
@@ -432,18 +456,52 @@ impl CrateComparison<'_, '_> {
         }
         let pair = self.pair;
         let (old, new) = (pair.old.placements(), pair.new.placements());
-        // 置き場とその条件の対応が変わった module (旧新の両方にあるもの)。
+        // 置き場とその条件の対応が変わった module。片方の版にしか無い module (`mod` の宣言を消した・
+        // 足した) も、配下の項目の置き場が消えた・現れたものとして比べる (Issue #314)。
         let modules: BTreeSet<&Vec<String>> = old.files.keys().chain(new.files.keys()).collect();
         let mut changed: BTreeMap<Vec<String>, bool> = BTreeMap::new();
+        let mut gaps: Vec<String> = Vec::new();
         for module in modules {
             if mapping(old.files.get(module)) == mapping(new.files.get(module)) {
                 continue;
             }
-            if old.has_module(module) && new.has_module(module) {
-                changed.insert(module.clone(), true);
+            // 片方の版にしか無い module の名前を、もう一方の版の取り込みが作るなら、その名前は再公開の
+            // 名前の比較 (#306) に任せる (`pub use detail as api;` で旧い公開の経路を保つ、など)。
+            let missing = if !old.has_module(module) {
+                Some(Version::Old)
+            } else if !new.has_module(module) {
+                Some(Version::New)
+            } else {
+                None
+            };
+            // 片方の版にしか無い module の置き場のファイルを、どれも差分が消した (足した) か、別のパスの
+            // lib crate の module へ (から) 移したなら、ファイルの比較が中身の項目を削除・追加・移動として
+            // 扱う (`mod a;` を `mod b;` にして `a.rs` を `b.rs` へ移す。#314 の前と同じ)。
+            if let Some(version) = missing
+                && self.left_to_files(version.other(), module)
+            {
+                continue;
+            }
+            match missing.map(|version| self.rebinding(version, module)) {
+                Some(Rebinding::Imported) => continue,
+                Some(Rebinding::Unknown(reason)) => {
+                    changed.insert(module.clone(), false);
+                    gaps.push(format!("module `{}`: {reason}", module.join("::")));
+                }
+                Some(Rebinding::Absent) | None => {
+                    changed.insert(module.clone(), true);
+                    // 消した module の中の属性マクロ・`derive` が作る項目は、見える項目と一緒に消えるが
+                    // 数えられない。見える項目の削除は出したうえで、探し切れなかったことを申告する。
+                    if missing == Some(Version::New) && self.attributed_under(Version::Old, module)
+                    {
+                        gaps.push(format!(
+                            "module `{}`: items made by attribute macros or derives inside it were not listed",
+                            module.join("::")
+                        ));
+                    }
+                }
             }
         }
-        let mut gaps: Vec<String> = Vec::new();
         // 場所を決められない宣言の条件や場所の指定が変わった。
         let unknown: BTreeSet<&Vec<String>> =
             old.unknown.keys().chain(new.unknown.keys()).collect();
@@ -568,6 +626,83 @@ impl CrateComparison<'_, '_> {
             }
         }
         result.changed.insert(root, changed);
+    }
+
+    /// 版 `version` に無い module `module` の、いちばん外側の無い module の名前を、取り込みが作るか
+    /// (Issue #314)。再公開の名前の比較 (#306) がその名前を型の名前空間の取り込みの束縛として比べたなら
+    /// 任せる。そうでなければ、名前を宣言したもう一方の版で module か祖先に項目を置き換え得る属性が付いて
+    /// いない (配下の項目が展開で変わらない) ことを確かめ、その版の crate の親の module (`#[cfg]` で分けた
+    /// 全ての分岐) で名前を解き、名前を作るものを決め切れるかを確かめる ([`classify_rebinding`])。
+    fn rebinding(&self, version: Version, module: &[String]) -> Rebinding {
+        let placements = self.placements(version);
+        let Some(depth) =
+            (1..=module.len()).find(|&depth| !placements.has_module(&module[..depth]))
+        else {
+            return Rebinding::Absent;
+        };
+        let (parent, name) = (&module[..depth - 1], &module[depth - 1]);
+        let decided = self.reexports.rebinds(self.root, parent, name);
+        if decided == Some(true) {
+            return Rebinding::Imported;
+        }
+        let (crate_version, other) = match version {
+            Version::Old => (&self.pair.old, &self.pair.new),
+            Version::New => (&self.pair.new, &self.pair.old),
+        };
+        let (Opened::File(root), Opened::File(other_root)) = (crate_version.root(), other.root())
+        else {
+            return Rebinding::Unknown("the crate root could not be read");
+        };
+        let declaring = Resolver::new(Some(other), other_root, None, None);
+        if !declaring.opaque_along(module, None).is_some_and(|found| {
+            found
+                .iter()
+                .all(|conditions| declaring.never_holds(conditions))
+        }) {
+            return Rebinding::Unknown(
+                "an attribute macro on it or an enclosing module may change its items",
+            );
+        }
+        let resolver = Resolver::new(Some(crate_version), root, None, None);
+        match resolver.bindings_under(parent, name) {
+            Some(candidates) => {
+                classify_rebinding(&candidates, name, decided.is_some(), |candidate| {
+                    resolver.never_holds(candidate)
+                })
+            }
+            None => Rebinding::Unknown("the module that would hold its name could not be resolved"),
+        }
+    }
+
+    /// 版 `version` の module `module` の配下 (配下の module のファイルと、祖先のファイルの中の配下の inline
+    /// module も) に、どこかの設定で有る (置き場に着く条件・ファイルの先頭の条件・項目自身の条件が両立する)、
+    /// 項目を置き換え得る属性 (属性マクロ・`derive` など) の付いた項目があるか (Issue #314)。展開が作る項目は
+    /// 数えられない。
+    fn attributed_under(&self, version: Version, module: &[String]) -> bool {
+        self.placements(version)
+            .files
+            .iter()
+            .filter(|(placed, _)| module.starts_with(placed) || placed.starts_with(module))
+            .any(|(placed, files)| {
+                files.iter().any(|placement| {
+                    let Some(file) = &placement.index else {
+                        return false;
+                    };
+                    file.scope_paths().any(|scope| {
+                        let mut full = placed.clone();
+                        full.extend(scope.iter().cloned());
+                        full.starts_with(module)
+                            && !scope_unreachable(file, scope, &placement.clauses)
+                            && file
+                                .scope_attributed(scope)
+                                .iter()
+                                .chain(file.scope_body_attributed(scope))
+                                .any(|conditions| {
+                                    may_hold(&placement.clauses, file.file_conditions(), conditions)
+                                })
+                    })
+                })
+            })
     }
 
     /// 差分に構文エラーで読めない置き場のファイルがあるか (子の module を決められない)。
@@ -815,65 +950,150 @@ impl CrateComparison<'_, '_> {
         })
     }
 
-    /// 片方の版にしか無い項目の宣言 `entries` (版 `version`) を、差分の中のファイルの中身の変化
-    /// (ふつうの削除・追加) が説明するか。
-    fn explained_by_file(&mut self, version: Version, entries: &[Entry]) -> bool {
+    /// 版 `version` の差分のファイル `path` の、もう一方の版のパス (削除・追加なら `/dev/null`)。差分に
+    /// 無いファイルは None。
+    fn diff_counterpart(&self, version: Version, path: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find_map(|(old_path, new_path)| match version {
+                Version::Old if old_path == path => Some(new_path.as_str()),
+                Version::New if new_path == path => Some(old_path.as_str()),
+                _ => None,
+            })
+    }
+
+    /// 版 `version` にだけある module `module` の置き場のファイル (どこかの設定で着くもの) が、どれも
+    /// ファイルの比較に任せられるか ([`Self::carried_by_file`])。置き場が無ければ任せない (Issue #314)。
+    fn left_to_files(&mut self, version: Version, module: &[String]) -> bool {
+        let files: Vec<String> = self
+            .placements(version)
+            .files
+            .get(module)
+            .into_iter()
+            .flatten()
+            .filter(|placement| !placement.clauses.is_empty())
+            .map(|placement| placement.file.clone())
+            .collect();
+        !files.is_empty() && files.iter().all(|file| self.carried_by_file(version, file))
+    }
+
+    /// 版 `version` のファイル `path` を、差分が消した (新しい版なら足した) か、もう一方の版でどこかの
+    /// lib crate の module のファイルになる別のパスへ (から) 移したか。ファイルの比較が中身の項目を削除・
+    /// 追加・移動として扱い、移したファイルの項目は移した先の module に残るものとする (#314 の前と同じ。
+    /// 移した先の module の条件や公開範囲の違いは比べない)。消した (足した) ファイルは、ファイルごとの比較が
+    /// 公開の項目をどれも出すときだけ任せる ([`Self::file_items_reported`])。
+    fn carried_by_file(&mut self, version: Version, path: &str) -> bool {
+        match self.diff_counterpart(version, path).map(str::to_owned) {
+            Some(other) if other == "/dev/null" => self.file_items_reported(version, path),
+            Some(other) => other != path && self.placed_in_library(version.other(), &other),
+            None => false,
+        }
+    }
+
+    /// 版 `version` のファイル `path` の公開の項目を、ファイルごとの比較がどれも公開 API 面の中として出すか
+    /// ([`Self::reexported`]。bin だけの package のファイルや、別の lib の非公開の module のファイルの項目は
+    /// 出さない)。読めなければ出さないとする (Issue #314)。
+    fn file_items_reported(&mut self, version: Version, path: &str) -> bool {
+        let Some(facts) = self.facts(version, path) else {
+            return false;
+        };
+        let names: Vec<String> = facts
+            .symbols
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        names
+            .iter()
+            .all(|name| self.reexported(version, path, name))
+    }
+
+    /// ファイル `path` が、版 `version` で、差分の中の package のどれかの lib crate の module のファイルとして、
+    /// どこかの設定で着くか。ファイルの置かれたディレクトリの package に限らず、`#[path]` で別の場所のファイルを
+    /// 読む crate も見る (置き場を決められない crate では着かないとする)。
+    fn placed_in_library(&self, version: Version, path: &str) -> bool {
+        self.crates.library_pairs().any(|pair| {
+            let krate = match version {
+                Version::Old => &pair.old,
+                Version::New => &pair.new,
+            };
+            krate
+                .placements()
+                .files
+                .values()
+                .flatten()
+                .any(|placement| placement.file == path && !placement.clauses.is_empty())
+        })
+    }
+
+    /// 片方の版にしか無い項目の宣言 `entry` (版 `version`) を、差分の中のファイルの中身の変化
+    /// (ふつうの削除・追加) が説明し、ファイルごとの比較がそれを出すか。
+    fn explained_by_file(&mut self, version: Version, entry: &Entry) -> bool {
+        let Some(other) = self
+            .diff_counterpart(version, &entry.file)
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        let key = file_item_key(&entry.context, &entry.symbol.0, &entry.symbol.1);
+        // もう一方の版のファイルに無ければ、ファイルの比較がふつうの削除・追加として出す。読めなければ
+        // ファイルの比較も出せないので、説明しないとする。
+        let explained = other == "/dev/null"
+            || self
+                .facts(version.other(), &other)
+                .is_some_and(|facts| !facts.keys.contains(&key));
+        // ファイルごとの比較が公開 API 面の外として出さない削除・追加 (bin だけの package のファイルなど) は、
+        // ここで比べる (Issue #314)。
+        explained && self.reexported(version, &entry.file, &entry.symbol.0)
+    }
+
+    /// 片方の版にしか無い項目の宣言 `entries` (版 `version`) のうち、差分の中のファイルの中身の変化が説明
+    /// しないもの ([`Self::explained_by_file`])。説明する宣言はファイルごとの比較が削除・追加として出すが、
+    /// ほかの宣言の置き場が消えた・現れたことは出さないので、残りは比べる (Issue #314)。
+    fn unexplained_by_file(&mut self, version: Version, entries: &[Entry]) -> Vec<Entry> {
+        let mut unexplained = Vec::new();
         for entry in entries {
-            let other = self
-                .pairs
-                .iter()
-                .find_map(|(old_path, new_path)| match version {
-                    Version::Old if *old_path == entry.file => Some(new_path.clone()),
-                    Version::New if *new_path == entry.file => Some(old_path.clone()),
-                    _ => None,
-                });
-            let Some(other) = other else {
-                continue;
-            };
-            if other == "/dev/null" {
-                return true;
-            }
-            let other_version = match version {
-                Version::Old => Version::New,
-                Version::New => Version::Old,
-            };
-            let key = file_item_key(&entry.context, &entry.symbol.0, &entry.symbol.1);
-            // もう一方の版のファイルに無ければ、ファイルの比較がふつうの削除・追加として出す。読めなければ
-            // ファイルの比較も出せないので、説明しないとする。
-            if self
-                .facts(other_version, &other)
-                .is_some_and(|facts| !facts.keys.contains(&key))
-            {
-                return true;
+            if !self.explained_by_file(version, entry) {
+                unexplained.push(entry.clone());
             }
         }
-        false
+        unexplained
     }
 
     /// 項目の旧新の宣言を比べる。
     fn compare_key(&mut self, old: &[Entry], new: &[Entry]) -> Option<Outcome> {
+        let public = |entries: &[Entry]| {
+            entries
+                .iter()
+                .any(|entry| entry.expanded().next().is_some())
+        };
+        if !public(old) && !public(new) {
+            return None;
+        }
+        let unexplained: Vec<Entry>;
+        let (old, new) = match (old.is_empty(), new.is_empty()) {
+            (false, true) => {
+                unexplained = self.unexplained_by_file(Version::Old, old);
+                (unexplained.as_slice(), new)
+            }
+            (true, false) => {
+                unexplained = self.unexplained_by_file(Version::New, new);
+                (old, unexplained.as_slice())
+            }
+            _ => (old, new),
+        };
+        if !old.is_empty() && !new.is_empty() && self.contract_switches(old, new) {
+            let entry = &new[0];
+            return Some(Outcome::Ambiguous {
+                candidate: entry.candidate(),
+                old_signature: old[0].symbol.2.clone(),
+            });
+        }
         let old_expanded: Vec<RustDeclarationContext> =
             old.iter().flat_map(Entry::expanded).collect();
         let new_expanded: Vec<RustDeclarationContext> =
             new.iter().flat_map(Entry::expanded).collect();
         if old_expanded.is_empty() && new_expanded.is_empty() {
             return None;
-        }
-        if old.is_empty() || new.is_empty() {
-            let (version, side) = if new.is_empty() {
-                (Version::Old, old)
-            } else {
-                (Version::New, new)
-            };
-            if self.explained_by_file(version, side) {
-                return None;
-            }
-        } else if self.contract_switches(old, new) {
-            let entry = &new[0];
-            return Some(Outcome::Ambiguous {
-                candidate: entry.candidate(),
-                old_signature: old[0].symbol.2.clone(),
-            });
         }
         let old_refs: Vec<&RustDeclarationContext> = old_expanded.iter().collect();
         let new_refs: Vec<&RustDeclarationContext> = new_expanded.iter().collect();
@@ -1066,8 +1286,21 @@ fn macro_scopes(placements: &Placements) -> BTreeMap<Vec<String>, Vec<Vec<String
                 continue;
             }
             for scope in file.scope_paths() {
-                if file.scope_invokes_macros(scope)
-                    && !scope_unreachable(file, scope, &placement.clauses)
+                let holds = |conditions: &Vec<String>| {
+                    may_hold(&placement.clauses, file.file_conditions(), conditions)
+                };
+                let mut calls = file
+                    .scope_macro_conditions(scope)
+                    .iter()
+                    .chain(file.scope_body_macro_conditions(scope))
+                    .peekable();
+                // 直下と `impl`・trait・`extern` ブロックの中の呼び出しごとに、置き場に着く条件・ファイルの
+                // 先頭の条件と両立するものだけを数える。属性マクロは中の `#[cfg]` を解かずに受け取るので、
+                // 適用され得る属性マクロに囲まれた呼び出しは、呼び出しと間の inline module の条件で除かない
+                // (Issue #314)。
+                let wrapped = calls.peek().is_some() && file.scope_opaque(scope).iter().any(holds);
+                if wrapped
+                    || (calls.any(holds) && !scope_unreachable(file, scope, &placement.clauses))
                 {
                     let mut full = placed.clone();
                     full.extend(scope.iter().cloned());
@@ -1077,6 +1310,18 @@ fn macro_scopes(placements: &Placements) -> BTreeMap<Vec<String>, Vec<Vec<String
         }
     }
     found
+}
+
+/// 置き場に着く条件の節 `clauses` のどれかと、ファイルの先頭の条件 `file`、項目自身の条件 `own` (どれも条件の
+/// 属性のトークン) が、どこかの設定で同時に成り立ち得るか (成り立たないと確かめられなければ真。節が無ければ
+/// 偽。Issue #314)。
+fn may_hold(clauses: &[Clause], file: &[String], own: &[String]) -> bool {
+    clauses.iter().any(|clause| {
+        let mut all: Vec<String> = clause.raw.clone();
+        all.extend(file.iter().cloned());
+        all.extend(own.iter().cloned());
+        !super::rust_dependencies::conditions_never_hold(&all)
+    })
 }
 
 /// module `module` の置き場のファイルか、その祖先の置き場のファイルの `module` の配下のスコープが、
@@ -1090,6 +1335,98 @@ fn invokes_macros_under(
             .get(&module[..depth])
             .is_some_and(|found| found.iter().any(|full| full.starts_with(module)))
     })
+}
+
+/// 片方の版にしか無い module の名前を、その版の取り込みが作るか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rebinding {
+    /// 作らない (配下の項目の置き場が消えた・現れたものとして比べる)。
+    Absent,
+    /// 再公開の名前の比較 (#306) が、型の名前空間の取り込みの束縛として比べた (公開範囲と条件を問わない)。
+    Imported,
+    /// 決められない (理由)。
+    Unknown(&'static str),
+}
+
+/// 名前解決の候補 `candidates` (名前 `name` を解いたもの) から、名前を作るものを決め切れるかを確かめる。
+/// prelude の候補と、どの設定でも成り立たない条件の候補 (`never`) は数えない。glob の先・マクロ・属性
+/// マクロ・読めないファイル・解けない経路と、項目を置き換え得る属性の付いた同じ名前の定義は決め切れない。
+/// 再公開の名前の比較 (#306) が名前を比べ切った (`decided`) なら、ほかの束縛 (宣言、#306 が型の名前空間の
+/// 取り込みの束縛にならないとした取り込み) は module の名前を作らない。比べ切っていなければ、取り込み
+/// (親のスコープの定義でない候補) があれば決め切れない。
+fn classify_rebinding(
+    candidates: &[super::rust_dependencies::Candidate],
+    name: &str,
+    decided: bool,
+    never: impl Fn(&[String]) -> bool,
+) -> Rebinding {
+    use super::rust_dependencies::Target;
+    const UNCERTAIN: [(&str, &str); 8] = [
+        (
+            "glob:",
+            "a glob whose module could not be determined may bring its name",
+        ),
+        (
+            "macros:",
+            "a macro call at item level in its parent may make its name",
+        ),
+        (
+            "attributes:",
+            "an item with an attribute macro or derive in its parent may make its name",
+        ),
+        (
+            "opaque:",
+            "an attribute macro on its parent, an enclosing module, or a `mod` on the way may make its name",
+        ),
+        (
+            "unparsed:",
+            "a file that could not be parsed may make its name",
+        ),
+        (
+            "mod-file:",
+            "a path that could not be resolved may make its name",
+        ),
+        (
+            "outside:",
+            "a path that could not be resolved may make its name",
+        ),
+        (
+            "crate:",
+            "a path that could not be resolved may make its name",
+        ),
+    ];
+    let prelude = format!("prelude:{name}");
+    for candidate in candidates {
+        if matches!(&candidate.target, Target::Identity(identity) if *identity == prelude)
+            || never(&candidate.conditions)
+        {
+            continue;
+        }
+        if let Target::Identity(identity) = &candidate.target
+            && let Some((_, reason)) = UNCERTAIN
+                .iter()
+                .find(|(prefix, _)| identity.starts_with(prefix))
+        {
+            return Rebinding::Unknown(reason);
+        }
+        // 置き換え得る属性は、定義の条件と、属性が適用される条件 (`cfg_attr` の述語) がどこかの設定で両立する
+        // ものだけを数える。
+        if candidate.replaceable.iter().any(|applied| {
+            let mut all = candidate.conditions.clone();
+            all.extend(applied.iter().cloned());
+            !never(&all)
+        }) {
+            return Rebinding::Unknown(
+                "a definition of the same name has an attribute that may replace it",
+            );
+        }
+        if !decided && !candidate.direct {
+            return Rebinding::Unknown(
+                "an import whose comparison of re-exported names did not finish may make its name",
+            );
+        }
+    }
+    Rebinding::Absent
 }
 
 /// 置き場の条件 `clauses` で着くファイル `file` のスコープ `scope` (inline module の経路) が、どの設定
