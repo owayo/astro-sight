@@ -1,5 +1,34 @@
 # diff の解析
 
+`review.rename_candidates` は改名の対応候補を示す補助情報で、`review --hook` も同じキーに出力する。変更ファイルの旧新から、言語・kind が同じで名前が異なり、宣言名とコメント以外の AST 構造・トークンが等しい公開宣言を候補にする。staged は index のスナップショットを読む。各候補には `old`・`new` のファイル・名前・kind・0 始まりの行とバイト列、`status: "candidate"`、`evidence: ["name_independent_ast_equal"]` がある。競合する組もすべて候補に残し、`ambiguous`・`new_candidates_for_old`・`old_candidates_for_new` で多対一や候補競合を区別する。ファイル・kind・正規化した名前・名前の位置・名前以外の構造が同じ宣言だけを、多重集合として一対一に照合して候補から除く。別ファイルに同じ名前が残っても候補を消さない。本体が異なる削除と追加、別 kind、正規化した名前が同じ組（単純なファイル移動を含む）は改名の辺にしない。対応できない宣言の形は `rename_candidate_diagnostics` に申告する。
+
+旧名の公開経路は別の `old_api_presence` で示す。同じファイルの一意な新宣言を指す、無条件の root Rust `pub use new as old`・`pub use self::new as old` は `direct_reexport_present` と位置を出す。非公開・条件付き・別経路の再公開、その他の alias、証拠不足は `unverified` とし、旧名が無いと断定しない。直接の再公開があっても `compatibility` は `unverified` のまま。候補と診断は、既存の API 分類・impact の `change_type`・hook の `blocking_categories`・終了コードを変えない。
+
+候補の解析上限はソースの片側ごとに 2 MiB、旧新合計 64 MiB、片側ごとに AST 100,000 訪問（fingerprint の再訪を含む）、候補 1,000 組とする。読取・構文解析の失敗、未対応の宣言や上限は `rename_candidate_diagnostics` に出し、出力上限による省略には正確な `omitted` 件数を添える。候補数は解析できた在庫内の値で、ソースの診断があれば在庫は不完全である。順序と上限内に残す部分集合は決定的で、通常 JSON・TOON・hook JSON のすべてで補助情報を保持する。
+
+`review` の API 変更と `context` / `impact` の affected symbol に、旧新 AST の構文を比較した `change_evidence` を追加する。分類・blocking・終了コードは変えない。Python の `-> bool` だけの追加なら `{"analysis":"known","changed_parts":["return_annotation"],"annotation_only":true,"call_shape_unchanged":true}` となる。本体や decorator も変われば `annotation_only` は false になる。
+
+unknown または変更箇所が空の known な証拠は通常 JSON と既存の hook 通知に残し、単独では hook 通知を発生させない。
+
+`changed_parts` は次の固定語彙を列挙順で返し、複数を同時に持てる。
+
+| 項目 | 比較する構文 |
+| --- | --- |
+| `return_annotation` | 戻り値の明示的な型注釈と区切り |
+| `param_annotation` | 引数の型注釈と区切り |
+| `params` | 注釈・既定値を除く引数の名前、順序、パターン、省略/rest の印、区切り |
+| `default_value` | 引数の既定値の式と `=` |
+| `visibility` | 宣言の明示的な可視性と export |
+| `referenced_type` | 変数・定数の明示的な型注釈 |
+| `initializer` | 変数・定数の初期化式 |
+| `body` | 関数本体。内側のコードも含む |
+| `decorator` | Python の decorator と Rust の宣言属性 |
+| `other_declaration` | 修飾子・束縛種別など、それ以外の宣言トークンすべて |
+
+空白・コメントは比較せず、リテラルの内容は保つ。`annotation_only` が true になるのは、空でない変更が上記の型注釈 3 種類だけの場合。`call_shape_unchanged` は、型注釈・本体を除くソース上の引数構文（既定値の式も含む）の比較で、型検査・実行時の互換性の保証ではない。decorator・属性がある宣言、その他の宣言トークンも変わる場合、呼び出せない宣言では null とする。変更のない decorator も呼び出し形を変える可能性があるため断定しない。引数・既定値の構文が変われば false。`analysis: "unknown"` では両 boolean を明示的な null とし、`unknown_reason` は `source_unavailable`、`parse_error`、`unsupported_language`、`unsupported_syntax`、`declaration_pairing_ambiguous`、`resource_limit` のいずれか。unknown の空の `changed_parts` は「変更なし」の証拠ではない。
+
+初期の証明範囲は、既存のシンボル抽出器で取得できる Python・JavaScript・TypeScript/TSX・Rust の、一意なファイル直下の関数と単一束縛の変数・定数。入れ子の owner、未対応の構文・言語、同名の複数宣言、ソース取得失敗、parse error のあるファイルは unknown のまま残す。追加 AST 比較は旧新ソースそれぞれ 1 MiB を上限とし、超えた場合は `unknown_reason: "resource_limit"` と明示して既存の解析を保つ。宣言外のコードや import 先の型の意味は比較しない。本体だけ・初期化式だけの変更は API 変更がなくても証拠を持つ。通常 JSON と TOON に同じフィールドを残す。`review --hook` は情報提供を含む API 変更の各要素に同じ証拠を付け、impact の起点はトップレベルの `change_evidence: [{f,n,k,change_evidence}]` に残す。呼び出し側がゼロでも落とさず、この配列のために停止カテゴリを増やすことはない。
+
 unified diff (`--git` なら作業ツリーの `git diff`) を受け取り、変更の影響を調べるコマンドをまとめる。`context` が影響範囲を返し、`impact` は未解決の影響があれば exit 1 で止め、`review` は影響・共変更・公開 API の差分・死蔵シンボルを 1 回で返す。`dead-code` と `cochange` は diff が無くても使える。
 
 Rust で LF/CRLF の変換に巻き込まれただけの宣言は、旧新 AST で宣言全体・所属・属性が同じと確認できれば影響起点から外す。物理的な CRLF だけを LF と同一視し、文字列内の空白・空行・`\r` / `\n` のエスケープなどの実変更は残す。同名複数、別パス、復元・解析の失敗、大きい入力や深い所属は従来の保守的な判定を残す。通常・staged・外部 diff と、review の影響分析に適用する。
@@ -11,6 +40,10 @@ TS/TSX の拡張子の検証では、祖先の `tsconfig*.json`・`jsconfig*.jso
 ソース・設定の証拠を読み切れない場合や解析の予算を超えた場合は、`truncations` に `ts_extension_proof_unavailable`（hook では `trunc[].r`）を出し、証明できないファイル変更は従来の保守的な分類に残す。外部の設定の上限は、名前が一致するファイル10,000件、1ファイル2 MiB、合計64 MiB、祖先128段とする。
 
 ## context - スマートコンテキスト（diff → 影響分析）
+
+`review` の新規公開名の参照状況は、[追加 export の参照サマリ](added-reference-summary.md)
+を参照。同一 diff の他ファイルですでに使われる追加も表示する。既存の `api.add` の
+抽出範囲・分類と blocking の判定は維持する。
 
 unified diff を受け取り、変更の影響範囲を分析する。AI コードレビュー支援機能。関数シグネチャ変更は識別子境界で照合するため、`foo` と `foo_bar` のように名前の先頭だけが一致する別関数を混同しない。
 
@@ -599,6 +632,12 @@ Rust の項目を別のファイルへ移し、元のファイルで `pub use` �
 
 再公開の先は、同じ名前の宣言から推測せず、経路から解く。旧い宣言がファイルの module の直下にあり、そこでその名前の唯一の宣言であること (inline module の中の同じ名前の宣言は別の項目で、どの宣言を消したかは宣言の場所で分かる)。ファイルの module の経路が変わらず (別の module への rename では旧いパスが消える)、crate がその module として読むファイルのままで (module を inline にして残ったファイルではない)、その module が `#[cfg]` の無い `pub mod` の鎖で公開されたままであること。その名前を公開する named な `pub use` がその module に 1 つだけで、`#[cfg]` が無いこと。経路 (`detail::`・`self::`・`crate::`・`super::`、先頭の名前は crate の edition に沿って子 module に束縛されたもの) が、`#[path]` の無い条件なしの crate の module に届き、その module が名前を 1 つだけ宣言し (関数・定数・static・構造体・enum・union・trait・型別名)、その名前を束縛し得るほかのもの (`use`・`extern crate`・同じ名前の module・item のマクロ) が無いこと。先の宣言を同じ差分で足したかは base で決める。module のファイルを rename していれば旧いパスで読み、ファイルが無かったときは、ファイルのあった近い祖先の module から辿る (無い module は、そのスコープに生成し得る item 位置のマクロの呼び出しが無いときだけ新しいとみなす。属性マクロや derive が生成する module は検出しない)。再公開の先が既にあった宣言か、ほかの旧い型も (別の再公開か通常の移動で) 来る宣言か、その名前の型としての束縛が変わったファイルに足した宣言なら (base のファイルで、同じ名前の構造体・enum・union・trait・型別名か、その名前か glob を挙げる公開の `use` でその名前を束縛し得た module ごとに、同じものが属性も含めて同じトークンの並びで残り (トークンの間の空白とコメントは問わない)、足したものも無いこと。base のファイルの item 位置のマクロの呼び出しは、展開がマクロの定義次第なので変わったとみなす)、構造体・enum・union・trait は別の型でなくなり得るので blocking な `api.mod` にし、既にあった関数・定数・型別名はシグネチャが同じなら報告しない。こうして解けない再公開 (外部 crate・glob・`pub use` や module の `#[cfg]`・`as` の改名・多段の再公開) は、旧いパスの先の項目を比べられないので、`unverified.reason` が `reexport_target_unresolved` の blocking な `api.mod` にする。ほかの移動と同じく、シグネチャの中の識別子と型のパスが何を指すかは比べない。同じ表記が別の型・trait・定数を指すようになる変更も、変更なしや `moved` として報告し得るので、`moved` は型の互換を保証しない。先のファイルに同じ名前の構造体・enum・union が複数あると、再公開の先を解けても形を比べられず、blocking な `api.mod` に残る。
 
+### Python の import による再束縛
+
+Python の関数定義を、無条件の明示的なローカル `from ... import ...` の束縛へ置き換えた変更は、`api_changes.import_rebindings` (hook は `api.import_rebindings`) に公開名・解決先のファイル/名前/0 始まりの行・同値性・同じファイルの同名出現を残します。`binding_verified: false` の出現は束縛先が未証明です。出現数の上限は設けません。名前が残るという分類の訂正だけなら、削除から blocking の変更へ移すだけで、互換とはしません。
+
+`python_import_rebinding` の互換判定には別の狭い証明が必要です。通常の関数の AST が同じで、注釈・既定値が静的なプリミティブ型/値、戻り式が引数とリテラル・演算子だけ、module のグローバル値への依存がなく、ローカル import の経路に循環や初期化時の副作用がなく、リポジトリ全体で関数値の持ち出し・別名化・内省・動的な束縛がないと確かめられる場合に限ります。条件付き/関数内の import、デコレータ、未解決の import、名前空間の import、契約が未証明のものは blocking を保ちます。`refs` の出現は削りません。staged review は index のスナップショットを使い、作業ツリーで代用した証拠を index の事実として残しません。
+
 ### Python の受け手が未解決なメンバー削除
 
 `api_changes.removed_unresolved`（hook では `api.rm_unresolved`）は、削除が確定していても、残った属性参照の受け手を特定できず、使用位置の型要求だけが分かる候補を報告する。`confidence: "low"` の情報提供として扱い、hook を止めない。削除メンバーへの参照の有無は未確定で、`removed_dead` の証明条件は変えない。シェルの解析エラーで削除自体を確定できない `uncertain_removals` / `rm_unverified` も別区分のまま維持する。
@@ -642,7 +681,7 @@ Rust の項目を別のファイルへ移し、元のファイルで `pub use` �
 - 未参照の object member の削除
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
 - TypeScript の inline object 引数型への optional プロパティ追加。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
-- export した TS/TSX のトップレベル関数の、唯一の引数の inline object 型からの optional プロパティの削除。解析したリポジトリのどの JSX 要素・直接呼び出しも、削除したキーを渡さないことが条件（`optional_object_props_removed`）。リポジトリ内の証拠に基づく分類なので、リポジトリの外の利用者には破壊的な変更になり得る
+- export した TS/TSX のトップレベル関数の、唯一の引数の object 型からの optional プロパティの削除。型は inline またはこの props だけに使う同じファイルの非公開の別名とし、解析したリポジトリのどの JSX 要素・直接呼び出しも、削除したキーを渡さないことが条件（`optional_object_props_removed`）。リポジトリ内の証拠に基づく分類なので、リポジトリの外の利用者には破壊的な変更になり得る
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
 - Rust の関数・inherent impl のメソッドへの `const` の追加（`rust_const_fn_added`）。const の文脈の外からの呼び出しは変わらないので、呼び出し元は `impact_info` に残す。違ってよいのは `const` だけで、ほかの宣言・属性・外側のモジュールや `impl` のヘッダ・ファイルの import と、宣言に現れる名前の同じファイルの宣言（型別名・`use` の別名・配列長の定数など。それらが使う名前もたどる）は変わらないことが条件。戻り値が `impl Trait` の関数は、隠れた型と外に漏れる auto trait が本体で決まるので、本体と、その本体が参照する同じファイルの宣言も変わらないことが条件。マクロの token tree は原文を保ち、空の impl を含む impl ヘッダと、入れ子の `impl`・マクロ呼び出しは囲む宣言と属性も含めて比べ、そこに現れる名前も依存先として調べる。参照先が旧新とも一意な関数なら、既存のヘッダ正規化の下で const を足しただけで本体のトークンが不変な変更も許す。関数自身の `const` だけは除くので、関数内の未変更の `assert!` は証明を妨げない。位置依存または未証明のマクロ呼び出しは、行と Unicode 文字の列も不変であることを求める。別名と入れ子のマクロトークンも保留する。単純な assert と、入れ子のマクロ・属性・呼び出しを含まない一意な先行 root マクロ定義だけは位置を問わないが、同一ファイル内のマクロ束縛が不明ならこの例外は使わない。ヘッダのマクロは未対応のまま保守的に残す。`const` を外す変更や、引数・戻り値・ジェネリクス・`unsafe`・`async`・`extern`・公開範囲の同時の変更は blocking を維持する。同じファイルに同名の宣言（別の `impl` のメソッド、`cfg` で分けた関数）があると呼び出し元を区別できないので、`impacts` は残る
 
@@ -662,7 +701,9 @@ rest・computed key・入れ子・キーや束縛の重複・新しい別名は�
 
 React の `memo()` で包んだ関数部品は、変更の前後で包み方が同じなら、包んだ関数で証明する (`export const Tag = memo(function Tag(props) { … })` や arrow 関数)。宣言は、型注釈の無い一意なトップレベルの `const` で、初期化子 (括弧は透過する) が `memo` (`memo as m` も) に function 式か arrow 関数を 1 つだけ渡すこと。関数の種類と、その前後のトークン (`export const Tag = memo(` と `);`) は変えない。比較関数・型引数・`React.memo`・`memo` の中の `forwardRef`・ほかの wrapper は、包んだ関数の新しい型に合うことを証明できないので、従来の分類を維持する。その名前は `"react"` からの値の named import の `memo` だけで束縛し (`import type`・`{ type memo }` は不可)、ファイルのどこにも module のほかの束縛・`var` 宣言・書き込みが無いこと。`react` は、相対でない import の解決器が、ファイルの祖先の `package.json`（ルートかワークスペースのパッケージのもの）の registry の依存に解決すること (`paths`・`baseUrl`・`typeRoots`・classic の解決・ワークスペースのパッケージ・registry でない上書きがあれば証明しない)。解析するディレクトリの全体も、後述の JSX の証明と同じ監査を通ること。この証明では、ignore に関係なくすべての TS/JS のソースを流して読み、在庫のファイル数の上限は掛けない。diff はその環境を変えないこと。`tsconfig*.json` / `jsconfig*.json`、`extends`・`references` で読む設定、`package.json`、パッケージマネージャの設定、ロックファイル、Yarn の PnP のファイル、`lerna.json` を変えず、変えた TS/JS のソースの変更前の中身も同じ監査を通ること。改名したファイルは証明しない。包まない関数と同じく、部品の利用 (余分なプロパティを持つ値の spread や、props の `keyof`) は検査しない。
 
-`optional_object_props_removed` では、旧新の宣言を AST のトークンで比べる。inline object 型から消えてよいのは、通常の名前の optional な `property_signature` と、その分割代入の束縛だけである。残りのメンバー、残りの束縛（別名・既定値を含む）とその順序、引数の kind、ヘッダ、戻り値型は変えない。method・call・construct・index signature、union、引数全体の既定値、rest、2 個目の引数は blocking を維持する。
+`optional_object_props_removed` では、旧新の宣言を AST のトークンで比べる。object 型から消えてよいのは、通常の名前の optional な `property_signature` と、その分割代入の束縛だけである。残りのメンバー、残りの束縛（別名・既定値を含む）とその順序、引数の kind、ヘッダ、戻り値型は変えない。method・call・construct・index signature、union、引数全体の既定値、rest、2 個目の引数は blocking を維持する。
+
+inline object 型に加え、同じファイルの root 直下にある、一意で非公開の単純な型エイリアスも解決する。値は通常の object 型で、旧新の名前が同じであり、各版の識別子の出現が宣言名とこの関数の唯一の props 注釈だけであることを求める。公開・共有された別名、別名の連鎖、interface、交差型、ジェネリック型、import した別名は未証明のまま残す。`Args["hint"]` や `keyof Args` などの利用があれば、この局所的な証明は使わない。`ComponentProps<typeof Panel>`・`Parameters<typeof Panel>` は従来の利用の一覧で未証明となり、削除した属性の転送や JSX spread も証明しない。変更された呼び出しにも削除キーを渡さない証明を課すため、staged モードを含め、呼び出し行を変えただけでは解決済みにしない。
 
 残ったプロパティと戻り値型が参照する型は、同じファイルの型別名と interface をたどり、旧新で一致することを確かめる。ほかのファイルの型はたどらない。相対パスで import した型は証明しない。宣言のファイルにある別の export を経由して、変わった型が戻ってくることがあるためである。registry の依存から import した型と、リポジトリで宣言していない大域の型（lib や `@types` のもの）は、diff が宣言のファイル以外を 1 つも変えていないときだけ受け入れる。lock ファイルと `package.json` の変更も、ほかのファイルの変更に数える。import 文が変わらないことも条件。リポジトリのどこか（ignore したファイルを含む）で宣言した大域の型（`declare global` の中や、module でない TS ファイルのトップレベル）は証明しない。`typeof`・`infer`・mapped type と、class・enum・namespace への参照は証明しない。
 
@@ -913,3 +954,23 @@ Bash / zsh の関数が抽出結果から消えても、`ERROR` 内に同名の�
 解析エラーを含む変更後の Bash / zsh ファイルは、`truncations`（hook: `trunc`）にも `parse_error_region` として申告する。その範囲の宣言・参照・シグネチャ変更は未検証であり、exit 0 は互換性の保証ではない。推測したシンボルは追加せず、正常に解析できた領域の検証は続ける。
 
 明示 diff で対応言語のソースファイルを削除し、その旧内容が指定 base に無い、食い違う、または完全に照合できない場合、`review` は `truncations`（hook: `trunc`）へ `diff_base_mismatch` を出す。hook は `api.diff_base_mismatch` で停止する。抽出できた削除シンボルは blocking の `api.rm` に残し、旧ソース自体が無ければ打ち切りの申告だけを返す。文書や Git サブモジュールの削除は対象外。`--git` は `diff.submodule` の設定にかかわらず gitlink の短い差分を使う。可能なら削除前のリビジョンを `--base` に指定する。
+
+### TypeScript の末尾の既定値付き型引数
+
+`trailing_default_type_params` は、interface または object 型の別名で、既存の型引数とメンバーを保ち、制約や variance modifier のない静的な既定値付き型引数だけを末尾に足した変更を限定して証明する。追加した名前が旧宣言の中の外側の名前を隠す場合や、自己再帰する宣言は証明しない。本体が不変な場合も扱う。メンバーも足す場合は、追加した既定値を当てると型が `unknown` または `any` になる省略可能なプロパティだけに限り、既存の構造的な入力値に新たな型の制約を課さない。
+
+観測した利用は、従来の型引数の個数による、静的に解釈できる明示した戻り値型を持つ一意なトップレベル関数の必須引数の直接の型注釈だけに限る。本体では、その引数の既存プロパティを読むだけとする。consumer の観測した呼び出し・別名・転送 export は、ignore の外も含めて証明しない。構造的な実引数の private メンバーなどが、新しい名前と衝突する可能性があるため。既存の閉じたソースの在庫、ignore の外の監査、module 解決、宣言の依存先と consumer の再束縛の検査を共用する。`keyof`・`Required`・mapped type・augmentation・別名や再 export・implements/extends・値の持出し・未知の外部 import は blocking に残す。未解析、escape、曖昧な束縛、在庫の上限超過でも証明しない。通常の `refs` の出現一覧は保つ。
+
+## 参照と外部入口の証拠
+
+`dead_symbols` と `test_only_symbols` の各項目、および既存の `no_resolved_internal_callers: true` を持つ `api_changes.modified` に `reference_evidence` を添えます。hook でも `dead`・`test_only`・`api.mod` に同じ証拠を出します。集合と blocking の条件は変えません。
+
+`classification` は `no_references_in_scope` (走査範囲で参照ゼロ)、`test_references_only` (観測した参照がテストのみ)、`no_resolved_direct_callers` (直接呼び出しを解決できなかった)、`unverified` (既存の保留候補、または証拠の入力が不完全) を区別します。いずれも実行時に利用されないことの証明ではありません。`attribution` が示す名前照合の観測と、所有元・呼び出し元の解決は別です。
+
+`scope.root` は解析ルートからの相対パス `.`、`selection` は既存の参照走査方針です。候補の glob・テスト除外は dead-code の参照走査を狭めません。参照元の `file` はルート相対の `/` 区切り、`line` とバイト単位の `column` は 0 始まりです。テストの判定には既存のファイル名規約と `test_directory:<区分>` を使い、該当する規則をすべて `test_rules` に残します。
+
+参照と走査ファイルの代表パスは各 32 件まで表示します。`total`・`shown`・`omitted` と `total_files`・`omitted_files` に省略件数を残し、参照自体は全件を数えます。入力を読めなかった・解析できなかった場合は `scope.complete: false` と `diagnostics` を確認してください。件数ゼロだけで全体に参照が無いとは扱えません。
+
+`external_entry.status: proven` は、Python の解析対象ファイルと callable を `[project.scripts]` の `module:callable` が正確に指す登録を確認した場合だけです。同じ callable への複数の script 登録はすべて保持します。対象は pyproject のディレクトリを起点に解ける通常の `.py` / `__init__.py` 配置と ASCII のドット区切り名です。現在は module 直下の一意な関数を、module 文が関数定義とコメントだけの場合に証明します。入れ子、class、decorator、import、代入、削除、定義時に評価される default や複雑な型注釈は証明しません。任意の import 設定、src 配置の推測、外部 Protocol、gui-scripts も対象外です。メタデータは 1 MiB まで読み、欠落・不正・読取不可・上限超過・対応範囲外は `unproven_reasons` を付けて `unproven` に残します。未証明は「未登録」を意味しません。登録事実があっても dead/test_only/no_callers の既存判定は変わりません。
+
+`review --staged` の解析ルートは既存の index snapshot です。snapshot を使えなかった場合は `reference_evidence` を省きます。走査・降格の制約は、review の既存 `truncations` も確認してください。証拠の追加によって作業ツリーの参照を index の参照と同一視することはありません。
