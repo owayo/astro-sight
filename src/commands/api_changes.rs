@@ -163,6 +163,10 @@ pub(crate) fn detect_api_changes_with_renames(
             ),
         );
 
+    // 項目の有る設定の比較に、ファイルを置く module の置き場の条件を足す (Issue #316)。
+    let placement_availability =
+        rust_placement_availability::PlacementAvailability::new(&rust_crates);
+
     let inputs = DetectionInputs {
         dir,
         base,
@@ -177,6 +181,7 @@ pub(crate) fn detect_api_changes_with_renames(
         rust_crates: &rust_crates,
         module_availability: &module_availability,
         reexport_names: &reexport_names,
+        placement_availability: &placement_availability,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
@@ -335,6 +340,8 @@ pub(crate) fn detect_api_changes_with_renames(
     // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
     // ことの証明にはしない。
     compare_moved_availability(&inputs, &mut state, &moved);
+    // 内容の同じ rename をした Rust のファイルの項目も、旧い置き場と新しい置き場の条件で比べる (Issue #316)。
+    compare_renamed_availability(&inputs, &mut state, renames);
     // module の宣言の条件が変わった module の項目の比べ直しの結果を、ファイルごとの比較と同じ区分に
     // 振り分ける (Issue #305)。
     record_module_availability(&inputs, &mut state);
@@ -886,6 +893,7 @@ mod rust_declarations;
 mod rust_dependencies;
 mod rust_enum_api;
 mod rust_module_availability;
+mod rust_placement_availability;
 mod rust_public;
 mod rust_reexport_names;
 mod rust_ref_sites;

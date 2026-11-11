@@ -661,6 +661,24 @@ impl<'a> RustCrates<'a> {
         }
     }
 
+    /// 差分の中の package の、module の置き場をたどる版の lib crate の全て (`old` なら旧い版。crate root の
+    /// パスの順。Issue #316)。#305 の比べ直しの組があればそれを、無ければ入力の変化を問わない旧新の lib crate を使う。
+    pub(crate) fn placement_versions(&self, old: bool) -> Vec<&CrateVersion<'a>> {
+        let mut versions: Vec<&CrateVersion<'a>> = self
+            .pairs
+            .values()
+            .map(|pair| if old { &pair.old } else { &pair.new })
+            .chain(
+                self.libraries
+                    .iter()
+                    .filter(|(package, _)| !self.pairs.contains_key(*package))
+                    .map(|(_, libraries)| if old { &libraries.old } else { &libraries.new }),
+            )
+            .collect();
+        versions.sort_by(|left, right| left.root_path().cmp(right.root_path()));
+        versions
+    }
+
     /// パス `path` の package の旧新の lib crate (束縛や置き場の入力の変化を問わない。Issue #315)。lib の root
     /// が旧新で違う・差分にソースの無い package は None。
     pub(crate) fn library_versions(&self, path: &str) -> Option<&LibraryVersions<'a>> {
