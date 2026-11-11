@@ -138,6 +138,9 @@ pub(crate) struct DetectionInputs<'a> {
     pub(crate) module_availability: &'a super::rust_module_availability::ModuleAvailability,
     /// 変わった `use` が再公開する名前の比べ直し (Issue #306・#318)。
     pub(crate) reexport_names: &'a super::rust_reexport_names::ReexportNames,
+    /// 項目の有る設定の比較に、ファイルを置く module の置き場の条件を足す (Issue #316)。
+    pub(crate) placement_availability:
+        &'a super::rust_placement_availability::PlacementAvailability<'a, 'a>,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。

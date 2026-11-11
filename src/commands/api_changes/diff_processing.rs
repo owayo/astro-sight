@@ -1108,7 +1108,17 @@ fn collect_rust_availability_changes(
             olds.iter().map(|&i| &declarations.old[i]).collect();
         let new: Vec<&RustDeclarationContext> =
             news.iter().map(|&j| &declarations.new[j]).collect();
-        let change = compare(&old, &new);
+        let plain = compare(&old, &new);
+        // 宣言の条件が同じでも、別のファイルへの rename なら、移動元の旧い置き場と移動先の新しい置き場の条件を
+        // 足して比べ直す (Issue #316)。同じファイルの置き場の変化は、module の比べ直し (#305) が比べる。
+        if plain == AvailabilityChange::Same && df.old_path == df.new_path {
+            continue;
+        }
+        let decision =
+            inputs
+                .placement_availability
+                .decide(&df.old_path, &old, &df.new_path, &new, plain);
+        let change = decision.change;
         if change == AvailabilityChange::Same {
             continue;
         }
@@ -1135,10 +1145,12 @@ fn collect_rust_availability_changes(
             name,
             Some(&declarations.old[first_old]),
         );
+        let (availability, gained_availability) = decision.displays(|| describe(&old, &new));
         let item = AvailabilityItem {
             candidate,
             old_signature: old_sig.clone(),
-            availability: describe(&old, &new),
+            availability,
+            gained_availability,
             removable,
         };
         record_availability_change(inputs, state, change, item, |state| {
@@ -1165,6 +1177,9 @@ struct AvailabilityItem {
     old_signature: String,
     /// 旧新の有る条件の表示。
     availability: crate::models::review::CfgAvailability,
+    /// 増える設定の表示が `availability` と違えば、その表示 (置き場の条件を足して、消える設定と増える設定を
+    /// 別の比較で見つけたとき。Issue #316)。
+    gained_availability: Option<crate::models::review::CfgAvailability>,
     /// 旧い版で公開 API 面にあり、消える設定を削除と同じ区分の候補にしてよいか。
     removable: bool,
 }
@@ -1184,6 +1199,7 @@ fn record_availability_change(
         candidate,
         old_signature,
         availability,
+        gained_availability,
         removable,
     } = item;
     match change {
@@ -1221,7 +1237,10 @@ fn record_availability_change(
                     .push((candidate.clone(), availability.clone()));
             }
             if gained && addable(state) {
-                state.buckets.cfg_added.push((candidate, availability));
+                state
+                    .buckets
+                    .cfg_added
+                    .push((candidate, gained_availability.unwrap_or(availability)));
             }
         }
     }
@@ -1283,6 +1302,7 @@ pub(crate) fn record_module_availability(
                     candidate: candidate.clone(),
                     old_signature: old_signature.clone(),
                     availability: availability.clone(),
+                    gained_availability: None,
                     removable: *removable,
                 };
                 let name = candidate.name.clone();
@@ -1374,6 +1394,7 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                     candidate: candidate.clone(),
                     old_signature: candidate.signature.clone(),
                     availability: availability.clone(),
+                    gained_availability: None,
                     removable: true,
                 };
                 let change = AvailabilityChange::Changed {
@@ -1800,15 +1821,29 @@ pub(crate) fn compare_moved_availability(
                     record_signature_decision(inputs, state, change, decision);
                 }
             }
-            // 組を決められなかったとき (`news` が空) は、比べられなかったものとする。
-            let change = if new_declarations.is_empty() {
-                super::rust_availability::AvailabilityChange::Unverified
+            // 組を決められなかったとき (`news` が空) は、比べられなかったものとする。組を決めたら、移動元の旧い
+            // 置き場と移動先の新しい置き場の条件も足して比べる (Issue #316)。
+            let decision = if new_declarations.is_empty() {
+                super::rust_placement_availability::Decision::plain(
+                    super::rust_availability::AvailabilityChange::Unverified,
+                )
             } else {
-                super::rust_availability::compare(&old_declarations, &new_declarations)
+                let plain = super::rust_availability::compare(&old_declarations, &new_declarations);
+                inputs.placement_availability.decide(
+                    &symbol.from,
+                    &old_declarations,
+                    &symbol.to,
+                    &new_declarations,
+                    plain,
+                )
             };
+            let change = decision.change;
             if change == super::rust_availability::AvailabilityChange::Same {
                 continue;
             }
+            let (availability, gained_availability) = decision.displays(|| {
+                super::rust_availability::describe(&old_declarations, &new_declarations)
+            });
             let item = AvailabilityItem {
                 candidate: ApiSymbolCandidate {
                     inline_module: symbol.to_inline_module.clone(),
@@ -1821,10 +1856,8 @@ pub(crate) fn compare_moved_availability(
                     ),
                 },
                 old_signature: old_side[olds[0]].0.2.clone(),
-                availability: super::rust_availability::describe(
-                    &old_declarations,
-                    &new_declarations,
-                ),
+                availability,
+                gained_availability,
                 removable: true,
             };
             record_availability_change(inputs, state, change, item, |_| {
@@ -1833,6 +1866,129 @@ pub(crate) fn compare_moved_availability(
                     inputs.dir,
                     &symbol.name,
                     &symbol.to,
+                    inputs.diff_new_paths,
+                )
+            });
+        }
+    }
+}
+
+/// 内容の同じ rename (hunk の無い変更) をした Rust のファイルの公開の項目の有る設定を、旧い置き場と新しい
+/// 置き場の条件で比べる (Issue #316)。宣言自身の条件は旧新で同じなので、置き場の条件が違うときだけ変わる。
+/// module の比べ直し (#305・#314) が扱った項目は飛ばす。
+pub(crate) fn compare_renamed_availability(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    renames: &[crate::models::impact::DiffFile],
+) {
+    use super::rust_availability::{AvailabilityChange, describe};
+    let rust = |path: &str| {
+        crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok()
+            == Some(crate::language::LangId::Rust)
+    };
+    for df in renames {
+        if df.old_path == df.new_path
+            || !rust(&df.old_path)
+            || !rust(&df.new_path)
+            || is_binary_only_rust_crate(inputs.dir, &df.new_path)
+        {
+            continue;
+        }
+        let Some(source) = load_new_source(inputs.dir, &df.new_path).map(|source| source.to_vec())
+        else {
+            continue;
+        };
+        let Some((symbols, Some(declarations))) =
+            extract_deleted_exported_facts(&df.new_path, &source, inputs.strip_internal)
+        else {
+            continue;
+        };
+        // 同じ場所の `#[cfg]` の分岐 (同じ inline module・impl の対象・名前・種類) をまとめる。
+        type Key = (Option<String>, Vec<String>, String, String);
+        let mut groups: std::collections::BTreeMap<Key, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, ((name, kind, _), context)) in symbols.iter().zip(&declarations).enumerate() {
+            groups
+                .entry((
+                    inline_module_of(context),
+                    context.owner.clone(),
+                    name.clone(),
+                    kind.clone(),
+                ))
+                .or_default()
+                .push(index);
+        }
+        for ((inline_module, _, name, kind), indices) in groups {
+            let side: Vec<&RustDeclarationContext> =
+                indices.iter().map(|&index| &declarations[index]).collect();
+            let described: Vec<(&RustDeclarationContext, &str, &str)> = indices
+                .iter()
+                .map(|&index| {
+                    (
+                        &declarations[index],
+                        symbols[index].0.as_str(),
+                        symbols[index].1.as_str(),
+                    )
+                })
+                .collect();
+            if inputs
+                .module_availability
+                .covers_availability(df, &described, &described)
+            {
+                continue;
+            }
+            let decision = inputs.placement_availability.decide(
+                &df.old_path,
+                &side,
+                &df.new_path,
+                &side,
+                AvailabilityChange::Same,
+            );
+            let change = decision.change;
+            if change == AvailabilityChange::Same {
+                continue;
+            }
+            let (availability, gained_availability) = decision.displays(|| describe(&side, &side));
+            let first = indices[0];
+            let signature = symbols[first].2.clone();
+            let removable = !rust_declaration_outside_public_api_surface(
+                inputs.rust_crates,
+                state.rust_public,
+                inputs.dir,
+                inputs.base_blobs,
+                true,
+                &df.old_path,
+                &name,
+                Some(&declarations[first]),
+            );
+            let item = AvailabilityItem {
+                candidate: ApiSymbolCandidate {
+                    inline_module,
+                    name: name.clone(),
+                    kind,
+                    file: df.new_path.clone(),
+                    signature: signature.clone(),
+                },
+                old_signature: signature,
+                availability,
+                gained_availability,
+                removable,
+            };
+            record_availability_change(inputs, state, change, item, |state| {
+                !rust_declaration_outside_public_api_surface(
+                    inputs.rust_crates,
+                    state.rust_public,
+                    inputs.dir,
+                    inputs.base_blobs,
+                    false,
+                    &df.new_path,
+                    &name,
+                    Some(&declarations[first]),
+                ) && !is_used_in_diff_paths(
+                    inputs.ref_index,
+                    inputs.dir,
+                    &name,
+                    &df.new_path,
                     inputs.diff_new_paths,
                 )
             });
