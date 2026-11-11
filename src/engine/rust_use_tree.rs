@@ -251,7 +251,10 @@ fn expand_edges(
                     // pub fn の削除・変更が無音になっていた (モジュール到達性は
                     // compute_reexport_reachable_modules 側で固定点計算する)。
                     let exported_name = alias_override
-                        .map(str::to_string)
+                        .map(|name| {
+                            unicode_normalization::UnicodeNormalization::nfc(name)
+                                .collect::<String>()
+                        })
                         .unwrap_or_else(|| item.clone());
                     // group の中の `self` (`a::b::{self}`) と末尾の `::self` (`a::b::self`) は、経路の
                     // module 自身を取り込む。
@@ -396,7 +399,10 @@ fn flatten_use_path(
             }
             "identifier" => match node.utf8_text(source) {
                 Ok(text) => {
-                    out.push(UsePathSegment::Name(text.trim().to_string()));
+                    out.push(UsePathSegment::Name(
+                        unicode_normalization::UnicodeNormalization::nfc(text.trim())
+                            .collect::<String>(),
+                    ));
                     true
                 }
                 Err(_) => false,

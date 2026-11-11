@@ -460,6 +460,7 @@ pub(super) fn stream_caller_maps_and_defs(
                                 == crate::models::impact::DiffNewSide::WorkingTree,
                             jsx_shapes: Vec::new(),
                             jsx_parse_clean: std::cell::OnceCell::new(),
+                            import_spans: std::cell::OnceCell::new(),
                             python_imports: std::cell::OnceCell::new(),
                             rust_std_origin: std::cell::OnceCell::new(),
                             rust_local_macros: std::cell::OnceCell::new(),

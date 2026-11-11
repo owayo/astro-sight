@@ -103,7 +103,7 @@ pub(crate) fn collect_pub_use_edges(
                 let name = node
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(str::to_string);
+                    .map(|name| normalize_raw_identifier(name).into_owned());
                 let mut next_module = current_module.as_ref().clone();
                 if let Some(seg) = name {
                     next_module.push(seg);
@@ -185,8 +185,8 @@ pub(crate) fn bare_leading_name(edge: &RustPubUseEdge) -> Option<&str> {
 }
 
 /// raw identifier (`r#name`) を名前の比較用に外す。
-fn normalize_raw_identifier(name: &str) -> &str {
-    name.strip_prefix("r#").unwrap_or(name)
+fn normalize_raw_identifier(name: &str) -> std::borrow::Cow<'_, str> {
+    crate::language::normalize_identifier(crate::language::LangId::Rust, name)
 }
 
 /// スコープの直下の宣言が束縛する名前 (raw identifier は外して持つ)。
@@ -325,14 +325,16 @@ impl ScopeBindings {
 
     fn classify(&self, name: &str) -> BareLeadingBinding {
         let name = normalize_raw_identifier(name);
-        match self.child_mods.get(name).map(Vec::as_slice) {
+        match self.child_mods.get(name.as_ref()).map(Vec::as_slice) {
             // 子 mod と競合し得るものが同じスコープにあれば、コンパイルが通るのはどちらかが
             // cfg で消える場合で、どちらが残るかは決められない。
-            Some([true]) if !self.child_competitors.contains(name) => {
+            Some([true]) if !self.child_competitors.contains(name.as_ref()) => {
                 BareLeadingBinding::ChildModule
             }
             Some(_) => BareLeadingBinding::Unresolved,
-            None if self.open || self.other_names.contains(name) => BareLeadingBinding::Unresolved,
+            None if self.open || self.other_names.contains(name.as_ref()) => {
+                BareLeadingBinding::Unresolved
+            }
             None => BareLeadingBinding::Unbound,
         }
     }
@@ -414,30 +416,19 @@ pub(crate) fn module_inner_attributes_are_plain(
 pub(crate) fn rust_mod_item_has_path_attribute(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut prev = node.prev_named_sibling();
     while let Some(sib) = prev {
-        if sib.kind() != "attribute_item" {
-            break; // 連続する attribute_item は積み上がるが、他の宣言が出たら終了
-        }
-        if attribute_item_is_path(sib, source) {
-            return true;
+        match sib.kind() {
+            "line_comment" | "block_comment" => {}
+            "attribute_item" if attribute_item_is_path(sib, source) => return true,
+            "attribute_item" => {}
+            _ => break,
         }
         prev = sib.prev_named_sibling();
     }
     false
 }
 
-/// `attribute_item` の中身が `#[path = ...]` か判定する。
+/// `path` を指定する属性か。raw な名前と入れ子の `cfg_attr` も含め、読めない属性は保守側に残す。
 pub(crate) fn attribute_item_is_path(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    let mut cursor = attr_item.walk();
-    for child in attr_item.named_children(&mut cursor) {
-        if child.kind() == "attribute" {
-            // attribute の最初の identifier 子 (= attribute path) の text を見る。
-            let mut inner = child.walk();
-            for c in child.named_children(&mut inner) {
-                if c.kind() == "identifier" || c.kind() == "scoped_identifier" {
-                    return c.utf8_text(source).map(str::trim) == Ok("path");
-                }
-            }
-        }
-    }
-    false
+    super::super::rust_type_api::project_attribute(attr_item, source, &["path"])
+        .is_none_or(|projected| projected.is_some())
 }

@@ -61,12 +61,16 @@ fn declaration_kind(kind: &str) -> Option<&'static str> {
 }
 
 /// `r#` を外した識別子。
-fn unraw(text: &str) -> &str {
-    text.strip_prefix("r#").unwrap_or(text)
+fn unraw(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::language::normalize_identifier(crate::language::LangId::Rust, text)
 }
 
 /// 字面 `text` が名前 `name` を単語として (`r#` を外して) 含むか。
 fn mentions(text: &str, name: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized = (!text.is_ascii() && !unicode_normalization::is_nfc(text))
+        .then(|| text.nfc().collect::<String>());
+    let text = normalized.as_deref().unwrap_or(text);
     text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '#'))
         .any(|word| unraw(word) == name)
 }
@@ -103,7 +107,7 @@ fn scope_declaration<'tree>(
             // item 位置のマクロ (`make!();` は式の文に包まれる) は、どの名前の宣言も作り得る。
             "macro_invocation" | "expression_statement" => return None,
             "mod_item" => {
-                if declared_name() == Some(name) {
+                if declared_name().as_deref() == Some(name) {
                     return None;
                 }
             }
@@ -111,7 +115,7 @@ fn scope_declaration<'tree>(
                 let Some(declared) = declaration_kind(kind) else {
                     continue;
                 };
-                if declared_name() != Some(name) {
+                if declared_name().as_deref() != Some(name) {
                     continue;
                 }
                 if found.is_some() || !item_attributes_are_plain(item, source) {
@@ -152,6 +156,7 @@ fn inline_scope<'tree>(
                         .child_by_field_name("name")
                         .and_then(|n| n.utf8_text(source).ok())
                         .map(unraw)
+                        .as_deref()
                         == Some(name.as_str())
             })
             .collect();
@@ -219,6 +224,7 @@ pub(crate) fn module_scope_declarations(source: &[u8], name: &str) -> Option<usi
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(unraw)
+                    .as_deref()
                     == Some(name)
             {
                 count += 1;
@@ -269,7 +275,15 @@ pub(crate) fn push_tokens(node: tree_sitter::Node<'_>, source: &[u8], tokens: &m
         if node.child_count() == 0 || LITERAL_KINDS.contains(&kind) {
             if !text.is_empty() {
                 tokens.push(if node.is_named() {
-                    format!("{kind}:{text}")
+                    if kind.ends_with("identifier") {
+                        format!(
+                            "{kind}:{}",
+                            unicode_normalization::UnicodeNormalization::nfc(text)
+                                .collect::<String>()
+                        )
+                    } else {
+                        format!("{kind}:{text}")
+                    }
                 } else {
                     text.to_owned()
                 });
@@ -361,7 +375,7 @@ pub(crate) fn type_namespace_bindings(source: &[u8], name: &str) -> Option<TypeB
                     false
                 }
                 "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item" => {
-                    declared_name == Some(name)
+                    declared_name.as_deref() == Some(name)
                 }
                 "use_declaration" => {
                     has_visibility(item) && (mentions(text, name) || text.contains('*'))

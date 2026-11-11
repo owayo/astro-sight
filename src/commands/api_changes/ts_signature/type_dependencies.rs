@@ -243,6 +243,36 @@ impl<'tree> TopLevel<'tree> {
     }
 }
 
+/// 同一ファイルの衝突のない、型引数を持たない別名だけを局所的に解く。
+pub(super) fn local_type_aliases<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+) -> Option<HashMap<String, Node<'tree>>> {
+    if root.has_error() {
+        return None;
+    }
+    let top = TopLevel::collect(root, source)?;
+    Some(
+        top.bindings
+            .into_iter()
+            .filter_map(|(name, binding)| {
+                let Binding::Types(declarations) = binding else {
+                    return None;
+                };
+                let [(_, declaration)] = declarations.as_slice() else {
+                    return None;
+                };
+                if declaration.kind() != "type_alias_declaration"
+                    || declaration.child_by_field_name("type_parameters").is_some()
+                {
+                    return None;
+                }
+                Some((name, declaration.child_by_field_name("value")?))
+            })
+            .collect(),
+    )
+}
+
 fn plain(node: Node<'_>, source: &[u8]) -> Option<String> {
     let text = node.utf8_text(source).ok()?;
     (!text.is_empty() && !text.contains('\\')).then(|| text.to_owned())

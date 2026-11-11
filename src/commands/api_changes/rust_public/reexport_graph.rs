@@ -282,7 +282,10 @@ pub(crate) fn resolve_global_pub_use_edges(
             };
             if edition == RustEdition::E2018OrLater {
                 let first = target_module.first().or(target_item.as_deref())?;
-                if !aliases.contains(first.strip_prefix("r#").unwrap_or(first)) {
+                if !aliases.contains(
+                    crate::language::normalize_identifier(crate::language::LangId::Rust, first)
+                        .as_ref(),
+                ) {
                     // extern prelude の経路は、この crate 内の宣言や module を運ばない。
                     continue;
                 }
@@ -338,7 +341,10 @@ fn global_self_aliases(source: &[u8]) -> Option<std::collections::HashSet<String
                         return None;
                     }
                     let alias = item.child_by_field_name("alias")?.utf8_text(source).ok()?;
-                    if !aliases.insert(alias.strip_prefix("r#").unwrap_or(alias).to_owned()) {
+                    if !aliases.insert(
+                        crate::language::normalize_identifier(crate::language::LangId::Rust, alias)
+                            .into_owned(),
+                    ) {
                         return None;
                     }
                 }

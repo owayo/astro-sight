@@ -13,6 +13,7 @@ use super::{ApiClosureCaches, ApiRefIndex, has_blocking_value_usage};
 
 mod callable;
 mod callback_contract;
+mod constructor_params;
 mod dependency_changes;
 mod function_params;
 mod literal_union;

@@ -4,6 +4,69 @@ use crate::commands::tests::common::*;
 use crate::models::review::ApiChanges;
 use std::fs;
 
+fn rust_removed_member_api(client: &str) -> ApiChanges {
+    let removed = "impl Color {\n pub fn code(self) -> u8 { 0 }\n}\n";
+    let before = format!(
+        "#[derive(Clone, Copy)]\npub enum Color {{ Red }}\n{removed}\
+         #[derive(Clone, Copy)]\npub enum Size {{ Small }}\n\
+         impl Size {{ pub fn code(self) -> u8 {{ 1 }} }}\n\
+         pub struct Row {{ pub size: Size }}\n{client}\n"
+    );
+    let after = before.replace(removed, "");
+    api_after(&[("src/lib.rs", &before)], &[("src/lib.rs", &after)])
+}
+
+#[test]
+fn rust_removed_member_uses_proven_surviving_inherent_receiver() {
+    for client in [
+        "pub fn call(size: Size) -> u8 { size.code() }",
+        "pub fn call(size: &Size) -> u8 { size.code() }",
+        "pub fn call(row: Row) -> u8 { row.size.code() }",
+        "impl Size { pub fn call(self) -> u8 { self.code() } }",
+        "impl Row { pub fn call(&self) -> u8 { self.size.code() } }",
+        "pub fn call() -> u8 { let size: Size = Size::Small; size.code() }",
+    ] {
+        let api = rust_removed_member_api(client);
+        assert!(
+            api.removed.iter().all(|symbol| symbol.name != "Color.code"),
+            "{client}: {api:?}"
+        );
+        assert!(
+            api.removed_dead
+                .iter()
+                .any(|symbol| symbol.name == "Color.code"),
+            "{client}: {api:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_removed_member_preserves_unproven_and_deleted_receivers() {
+    for client in [
+        "pub fn call(size: Unknown) -> u8 { size.code() }",
+        "pub fn call(color: Color) -> u8 { color.code() }",
+        "trait Coding { fn code(&self) -> u8; } pub fn call(size: &dyn Coding) -> u8 { size.code() }",
+        "type Other = Size; pub fn call(size: Other) -> u8 { size.code() }",
+        "use crate::Size as Other; pub fn call(size: Other) -> u8 { size.code() }",
+        "pub fn call(size: Size) { let callback = |value| size.code(); }",
+        "pub fn call(size: Size) { let method = size.code; }",
+        "#[cfg(feature = \"selected\")] pub fn call(size: Size) -> u8 { size.code() }",
+        "mod other { pub struct Size; impl Size { pub fn code(self) -> u8 { 2 } } } pub fn call(size: other::Size) -> u8 { size.code() }",
+    ] {
+        let api = rust_removed_member_api(client);
+        assert!(
+            api.removed.iter().any(|symbol| symbol.name == "Color.code"),
+            "{client}: {api:?}"
+        );
+        assert!(
+            api.removed_dead
+                .iter()
+                .all(|symbol| symbol.name != "Color.code"),
+            "{client}: {api:?}"
+        );
+    }
+}
+
 fn api_after(files: &[(&str, &str)], changes: &[(&str, &str)]) -> ApiChanges {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();

@@ -1091,6 +1091,11 @@ fn filter_exported_with_metadata(
             continue;
         }
         let qualname = context.qualname(sym);
+        let qualname = if lang_id == crate::language::LangId::Rust {
+            unicode_normalization::UnicodeNormalization::nfc(qualname.as_str()).collect()
+        } else {
+            qualname
+        };
         if context.is_excluded_by_qualname(sym, &qualname) {
             continue;
         }
@@ -1119,6 +1124,11 @@ fn filter_exported_with_metadata(
             lang_id,
             published.is_some().then_some((root, source)),
         );
+        let sig = if lang_id == crate::language::LangId::Rust {
+            crate::engine::rust_signature::normalize_rust_identifier_spellings(&sig).unwrap_or(sig)
+        } else {
+            sig
+        };
         if result.rust_parameters.imports.is_some() {
             let function = rust_function_node_for_symbol(sym, root, source);
             let contract = function.and_then(|function| {

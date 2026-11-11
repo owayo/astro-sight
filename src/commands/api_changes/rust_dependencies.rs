@@ -66,13 +66,15 @@ fn owner_path_segments(owner: &[String]) -> Option<Vec<String>> {
         let (kind, text) = token.split_once(':')?;
         let name = match kind {
             "identifier" | "type_identifier" => unraw(text),
-            "crate" | "self" | "super" if index == 0 || kind == "super" => text,
+            "crate" | "self" | "super" if index == 0 || kind == "super" => {
+                std::borrow::Cow::Borrowed(text)
+            }
             _ => return None,
         };
         if name == "Self" {
             return None;
         }
-        segments.push(name.to_owned());
+        segments.push(name.into_owned());
     }
     (end % 2 == 1).then_some(segments)
 }
@@ -86,6 +88,7 @@ pub(crate) fn impl_owner_candidates(
     path: &str,
     scope: &[String],
     owner: &[String],
+    own: Option<&[AvailabilityAttr]>,
 ) -> Option<(Vec<Candidate>, Vec<Vec<String>>)> {
     let segments = owner_path_segments(owner)?;
     let Opened::File(file) = krate.open_file(path) else {
@@ -96,6 +99,41 @@ pub(crate) fn impl_owner_candidates(
     let placements = resolver
         .placement_branches(&file)
         .unwrap_or_else(|| vec![Vec::new()]);
+    let candidates = resolver::candidates_in_context(own, &placements, candidates);
+    let direct_root = match segments.as_slice() {
+        [anchor, name] if anchor == "crate" => {
+            let prelude = format!("prelude:{name}");
+            candidates.iter().all(|candidate| match &candidate.definition {
+                Some(definition) => {
+                    !definition.opaque
+                        && definition.path == krate.root_path()
+                        && definition.scope.is_empty()
+                        && definition.name == *name
+                        && matches!(definition.kind, "struct_item" | "enum_item" | "union_item")
+                }
+                None => matches!(&candidate.target, Target::Identity(identity) if *identity == prelude),
+            })
+        }
+        _ => false,
+    };
+    let known: Vec<Candidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.definition.as_ref().is_some_and(|definition| {
+                !definition.opaque
+                    && matches!(definition.kind, "struct_item" | "enum_item" | "union_item")
+            })
+        })
+        .cloned()
+        .collect();
+    // `crate::S` が root に直接宣言した型で、全設定を覆うと証明できたときだけ prelude を除く。
+    // glob・別名・マクロの不明な候補は、この証明に混ぜない。`derive` は既存の型を消さない。
+    let candidates =
+        if direct_root && !known.is_empty() && candidates_cover(own, &placements, &known) {
+            known
+        } else {
+            candidates
+        };
     Some((candidates, placements))
 }
 
@@ -238,7 +276,7 @@ fn modifier_visibility(
                         module.pop();
                     }
                     "self" => {}
-                    segment => module.push(unraw(segment).to_owned()),
+                    segment => module.push(unraw(segment).into_owned()),
                 }
             }
             Visibility::Within(module)
@@ -509,18 +547,20 @@ impl DependencyComparison {
 }
 
 /// 項目の種類が束縛する名前空間。
-fn item_namespaces(kind: &str) -> &'static [Namespace] {
-    match kind {
-        // 単位・タプルの構造体は値の名前空間にも入る。
-        "struct_item" => &[Namespace::Type, Namespace::Value],
-        "enum_item" | "union_item" | "trait_item" => &[Namespace::Type],
+fn item_namespaces(item: &ItemDeclaration) -> &'static [Namespace] {
+    match item.kind {
+        // 単位・タプルの構造体は値も束縛する。属性で書き換わり得る項目は形を確定しない。
+        "struct_item" if !item.named_fields || item.opaque_attributes => {
+            &[Namespace::Type, Namespace::Value]
+        }
+        "struct_item" | "enum_item" | "union_item" | "trait_item" => &[Namespace::Type],
         _ => &[Namespace::Value],
     }
 }
 
 /// 識別子の字面 (`r#` を外す)。
-fn unraw(text: &str) -> &str {
-    text.strip_prefix("r#").unwrap_or(text)
+fn unraw(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::language::normalize_identifier(crate::language::LangId::Rust, text)
 }
 
 /// `node` のトークンの並び ([`push_tokens`])。
@@ -952,9 +992,10 @@ impl DependencyIndex {
                     push(
                         name,
                         format!(
-                            "item {} {:?} {}",
+                            "item {} {:?} {:?} {}",
                             item.kind,
                             item.visibility,
+                            item_namespaces(item),
                             item.conditions.join(" ")
                         ),
                     );
@@ -1399,7 +1440,7 @@ fn collect_scope<'tree>(
         let name = || {
             item.child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source).ok())
-                .map(|name| unraw(name).to_owned())
+                .map(|name| unraw(name).into_owned())
         };
         // 項目自身に効く条件 (外側の属性と、inline module・関数・trait・impl・extern ブロックの中身の先頭の
         // 内側の属性。Issue #312・#314)。
@@ -1473,7 +1514,7 @@ fn collect_scope<'tree>(
                 let conditions = conditions();
                 let visibility = visibility(item, source, &current_module);
                 let unraw_all =
-                    |module: Vec<String>| module.iter().map(|s| unraw(s).to_owned()).collect();
+                    |module: Vec<String>| module.iter().map(|s| unraw(s).into_owned()).collect();
                 for edge in edges {
                     match edge {
                         RustPubUseEdge::Named {
@@ -1484,11 +1525,11 @@ fn collect_scope<'tree>(
                             ..
                         } => bindings
                             .uses
-                            .entry(unraw(&exported_name).to_owned())
+                            .entry(unraw(&exported_name).into_owned())
                             .or_default()
                             .push(UseTarget {
                                 module: unraw_all(target_module),
-                                item: Some(unraw(&target_item).to_owned()),
+                                item: Some(unraw(&target_item).into_owned()),
                                 origin,
                                 conditions: conditions.clone(),
                                 visibility: visibility.clone(),
@@ -1511,11 +1552,11 @@ fn collect_scope<'tree>(
                 let crate_name = item
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
-                    .map(|name| unraw(name).to_owned());
+                    .map(|name| unraw(name).into_owned());
                 let bound = item
                     .child_by_field_name("alias")
                     .and_then(|alias| alias.utf8_text(source).ok())
-                    .map(|alias| unraw(alias).to_owned())
+                    .map(|alias| unraw(alias).into_owned())
                     .or_else(|| crate_name.clone());
                 if let (Some(crate_name), Some(bound)) = (crate_name, bound) {
                     bindings.uses.entry(bound).or_default().push(UseTarget {
@@ -1813,8 +1854,7 @@ fn module_source(item: tree_sitter::Node<'_>, source: &[u8]) -> ModuleSource {
                     }
                     let name = attribute
                         .named_child(0)
-                        .and_then(|name| name.utf8_text(source).ok())
-                        .map(str::trim);
+                        .and_then(|name| super::rust_type_api::simple_name(name, source));
                     match name {
                         Some("path") => {
                             let value = attribute
@@ -1831,9 +1871,12 @@ fn module_source(item: tree_sitter::Node<'_>, source: &[u8]) -> ModuleSource {
                         }
                         // `cfg_attr(…, path = "…")` は条件で場所が変わる。
                         Some("cfg_attr")
-                            if tokens_of(attribute, source)
-                                .iter()
-                                .any(|token| token == "identifier:path") =>
+                            if super::rust_type_api::project_attribute(
+                                sibling,
+                                source,
+                                &["path"],
+                            )
+                            .is_none_or(|projected| projected.is_some()) =>
                         {
                             found = ModuleSource::Unknown;
                         }
@@ -2067,7 +2110,7 @@ fn generic_parameter_names(declaration: tree_sitter::Node<'_>, source: &[u8]) ->
                 .or_else(|| parameter.child_by_field_name("left")),
         };
         if let Some(text) = name.and_then(|name| name.utf8_text(source).ok()) {
-            names.push(unraw(text).to_owned());
+            names.push(unraw(text).into_owned());
         }
     }
     names
@@ -2091,7 +2134,7 @@ fn path_segments(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<Strin
     loop {
         match current.kind() {
             "identifier" | "type_identifier" | "crate" | "self" | "super" => {
-                segments.push(unraw(current.utf8_text(source).ok()?).to_owned());
+                segments.push(unraw(current.utf8_text(source).ok()?).into_owned());
                 break;
             }
             "scoped_identifier" | "scoped_type_identifier" => {
@@ -2099,7 +2142,7 @@ fn path_segments(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<Strin
                     .child_by_field_name("name")?
                     .utf8_text(source)
                     .ok()?;
-                segments.push(unraw(name).to_owned());
+                segments.push(unraw(name).into_owned());
                 match current.child_by_field_name("path") {
                     Some(path) => current = path,
                     // `::a` (先頭の `::`)。
@@ -2243,7 +2286,7 @@ mod tests {
                                 .unwrap()
                                 .utf8_text(source.as_bytes())
                                 .unwrap();
-                            module.push(unraw(text).to_owned());
+                            module.push(unraw(text).into_owned());
                         }
                         ancestor = parent.parent();
                     }
@@ -2281,6 +2324,84 @@ mod tests {
     use DependencyComparison::{Changed, Same};
 
     #[test]
+    fn raw_path_attributes_use_the_same_module_source() {
+        for (attributes, expected, has_path) in [
+            (
+                "#[path = \"actual.rs\"]",
+                ModuleSource::Path("actual.rs".into()),
+                true,
+            ),
+            (
+                "#[r#path = \"actual.rs\"]",
+                ModuleSource::Path("actual.rs".into()),
+                true,
+            ),
+            (
+                "#[r#path = r\"actual.rs\"]",
+                ModuleSource::Path("actual.rs".into()),
+                true,
+            ),
+            (
+                "#[cfg_attr(unix, path = \"actual.rs\")]",
+                ModuleSource::Unknown,
+                true,
+            ),
+            (
+                "#[cfg_attr(unix, r#path = \"actual.rs\")]",
+                ModuleSource::Unknown,
+                true,
+            ),
+            (
+                "#[r#cfg_attr(unix, r#cfg_attr(windows, r#path = \"actual.rs\"))]",
+                ModuleSource::Unknown,
+                true,
+            ),
+            (
+                "#[path = \"first.rs\"]\n#[r#path = \"actual.rs\"]",
+                ModuleSource::Unknown,
+                true,
+            ),
+            ("#[r#path = 1]", ModuleSource::Unknown, true),
+            (
+                "#[r#path = \"actual.rs\"]\n// comment",
+                ModuleSource::Path("actual.rs".into()),
+                true,
+            ),
+            ("#[doc = \"path\"]", ModuleSource::Default, false),
+            (
+                "#[cfg_attr(unix, doc = \"path\")]",
+                ModuleSource::Default,
+                false,
+            ),
+            (
+                "#[tool::path = \"actual.rs\"]",
+                ModuleSource::Default,
+                false,
+            ),
+        ] {
+            let source = format!("{attributes}\nmod selected;\n");
+            let tree = parser::parse_source(source.as_bytes(), crate::language::LangId::Rust)
+                .expect("parse");
+            assert!(!tree.root_node().has_error(), "{attributes}");
+            let module = tree
+                .root_node()
+                .named_children(&mut tree.root_node().walk())
+                .find(|node| node.kind() == "mod_item")
+                .expect("module");
+            assert_eq!(
+                module_source(module, source.as_bytes()),
+                expected,
+                "{attributes}"
+            );
+            assert_eq!(
+                rust_mod_item_has_path_attribute(module, source.as_bytes()),
+                has_path,
+                "{attributes}"
+            );
+        }
+    }
+
+    #[test]
     fn alias_targets_are_compared() {
         // `use … as` の別名と非公開の型別名の指す先の変化
         assert_eq!(
@@ -2316,6 +2437,64 @@ mod tests {
                 "label"
             ),
             Same
+        );
+    }
+
+    #[test]
+    fn value_name_resolution_follows_struct_shape() {
+        for (declaration, value_binding) in [
+            ("struct LEN;", true),
+            ("struct LEN();", true),
+            ("struct LEN(u8);", true),
+            ("struct LEN {}", false),
+            ("struct LEN { hidden: () }", false),
+            ("#[rewrite]\nstruct LEN { hidden: () }", true),
+            ("#[derive(Create)]\nstruct LEN { hidden: () }", true),
+            ("union LEN { hidden: u8 }", false),
+            ("enum LEN { Value }", false),
+            ("trait LEN {}", false),
+            ("fn LEN() {}", true),
+        ] {
+            let index = std::rc::Rc::new(
+                DependencyIndex::new(declaration.as_bytes(), "src/lib.rs").expect("index"),
+            );
+            let resolver = Resolver::textual(index.clone());
+            let module = resolver::ModuleRef {
+                file: index,
+                scope: Vec::new(),
+            };
+            let resolved = resolver
+                .resolve_name(&module, "LEN", Namespace::Value, 0)
+                .expect("resolve");
+            assert_eq!(
+                resolved
+                    .0
+                    .iter()
+                    .any(|candidate| candidate.definition.is_some()),
+                value_binding,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_shape_is_in_dependency_fingerprint() {
+        let fingerprint = |source: &str| {
+            DependencyIndex::new(source.as_bytes(), "src/lib.rs")
+                .expect("index")
+                .fingerprint()
+        };
+        assert_ne!(fingerprint("struct LEN;"), fingerprint("struct LEN {}"));
+        assert_ne!(fingerprint("struct LEN(u8);"), fingerprint("struct LEN {}"));
+        for attribute in ["#[rewrite]", "#[derive(Create)]"] {
+            assert_ne!(
+                fingerprint("struct LEN {}"),
+                fingerprint(&format!("{attribute}\nstruct LEN {{}}"))
+            );
+        }
+        assert_eq!(
+            fingerprint("struct LEN { hidden: u8 }"),
+            fingerprint("struct LEN { hidden: u16 }")
         );
     }
 

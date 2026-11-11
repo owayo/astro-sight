@@ -552,6 +552,7 @@ fn impact_rust_scope_excludes_local_patterns_parameters_and_captures() {
             "fn f() { let Some(comments) = value else { return; }; comments; }",
             "fn f() { let comments = 1; { comments; } let capture = || comments; }",
             "fn f() { let comments = 1; let capture = async move { comments }; }",
+            "fn f() { let comments = 1; for value in values { consume(comments); } }",
             "mod tests { use super::*; fn f() { let comments = 1; comments; } }",
         ] {
             let repo = rust_scope_repo(&format!("{import}{source}\n"));
@@ -637,10 +638,6 @@ fn impact_rust_scope_keeps_actual_calls_and_unproven_positions() {
             3,
         ),
         (
-            "fn f() {\n let comments = 1;\n for value in values { comments(); }\n}",
-            3,
-        ),
-        (
             "fn f() {\n let comments = 1;\n if let Some(x) = value { comments(); }\n}",
             3,
         ),
@@ -722,6 +719,77 @@ fn impact_rust_scope_original_local_declaration_is_not_a_caller() {
             .is_empty(),
         "{review}"
     );
+}
+
+#[test]
+fn impact_rust_scope_outer_string_in_for_with_child_test_glob_preserves_real_calls() {
+    for actual in [false, true] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "mod jobs;\nmod render;\n");
+        repo.write("src/jobs.rs", "pub fn run(n: u32) -> u32 { n + 1 }\n");
+        repo.write(
+            "src/render.rs",
+            format!(
+                r#"pub fn collect(values: &[char]) -> String {{
+    let mut run = String::new();
+    for (index, value) in values.iter().enumerate() {{
+        if index > 0 && !run.is_empty() {{
+            let previous = std::mem::take(&mut run);
+        }}
+        run.push(*value);
+    }}
+    run
+}}
+#[cfg(test)]
+mod tests {{ use super::*; }}
+{}"#,
+                if actual {
+                    "pub fn actual() -> u32 { crate::jobs::run(1) }\n"
+                } else {
+                    ""
+                }
+            ),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/jobs.rs", "pub fn run(n: u64) -> u64 { n + 1 }\n");
+        let context = repo.run_json("context", &["--git"]);
+        let change = &context["changes"][0];
+        for bucket in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            assert!(
+                change[bucket].as_array().is_none_or(|callers| {
+                    callers.iter().all(|caller| {
+                        caller["path"] != "src/render.rs" || caller["line"].as_u64().unwrap() > 9
+                    })
+                }),
+                "actual={actual}, {bucket}: {context}"
+            );
+        }
+        let callers = change["impacted_callers"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        assert_eq!(callers.len(), usize::from(actual), "{context}");
+        let refs = repo.run_json("refs", &["--name", "run"]);
+        assert_eq!(
+            refs["refs"].as_array().unwrap().len(),
+            6 + usize::from(actual)
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(i32::from(actual)), "{context}");
+    }
 }
 
 #[test]

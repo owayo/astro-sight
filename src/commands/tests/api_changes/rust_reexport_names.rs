@@ -92,6 +92,67 @@ fn cfg(old: &[&[&str]], new: &[&[&str]]) -> Option<CfgAvailability> {
 const X: &str = "cfg(feature = \"x\")";
 const DETAIL: (&str, &str) = ("src/detail.rs", "pub fn make() -> u32 {\n    1\n}\n");
 
+#[test]
+fn rust_nfc_declaration_spelling_is_not_an_api_change() {
+    for (old, new) in [
+        ("pub fn caf\u{e9}() {}\n", "pub fn cafe\u{301}() {}\n"),
+        (
+            "pub mod caf\u{e9} { pub fn make() {} }\n",
+            "pub mod cafe\u{301} { pub fn make() {} }\n",
+        ),
+        (
+            "pub struct Caf\u{e9} { pub caf\u{e9}: u8 }\n",
+            "pub struct Cafe\u{301} { pub cafe\u{301}: u8 }\n",
+        ),
+    ] {
+        let api = api_changes(&[("src/lib.rs", old)], &[("src/lib.rs", new)]);
+        assert!(api.added.is_empty(), "{api:?}");
+        assert!(api.removed.is_empty(), "{api:?}");
+        assert!(api.removed_dead.is_empty(), "{api:?}");
+        assert!(api.modified.is_empty(), "{api:?}");
+    }
+    let api = api_changes(
+        &[("src/lib.rs", "pub fn caf\u{e9}() {}\n")],
+        &[("src/lib.rs", "pub fn cafe() {}\n")],
+    );
+    assert_eq!(classify(&api, "cafe").0, "add", "{api:?}");
+    assert!(
+        matches!(classify(&api, "caf\u{e9}").0, "rm" | "rm_dead"),
+        "{api:?}"
+    );
+}
+
+#[test]
+fn rust_nfc_reexport_target_removal_is_reported() {
+    for (declaration, imported) in [("caf\u{e9}", "cafe\u{301}"), ("cafe\u{301}", "caf\u{e9}")] {
+        let definition = format!("mod detail {{ pub fn {declaration}() {{}} }}\n");
+        let old = format!("{definition}pub use detail::{imported} as api;\n");
+        let api = api_changes(&[("src/lib.rs", &old)], &[("src/lib.rs", &definition)]);
+        assert!(
+            matches!(classify(&api, "api").0, "rm" | "rm_dead"),
+            "{api:?}"
+        );
+        assert!(!incomplete(&api), "{api:?}");
+    }
+}
+
+#[test]
+fn rust_nfc_reexport_spelling_keeps_the_public_name() {
+    let old = "mod detail { pub fn caf\u{e9}() {} }\npub use detail::caf\u{e9} as api;\n";
+    let new = "mod detail { pub fn caf\u{e9}() {} }\npub use detail::cafe\u{301} as api;\n";
+    let api = api_changes(&[("src/lib.rs", old)], &[("src/lib.rs", new)]);
+    assert_eq!(classify(&api, "api").0, "none", "{api:?}");
+    assert!(!incomplete(&api), "{api:?}");
+}
+
+#[test]
+fn rust_nfc_type_dependency_changes_are_not_hidden_by_spelling() {
+    let old = "type Caf\u{e9} = u8;\npub fn run(_: Cafe\u{301}) {}\n";
+    let new = "type Caf\u{e9} = u16;\npub fn run(_: Cafe\u{301}) {}\n";
+    let api = api_changes(&[("src/lib.rs", old)], &[("src/lib.rs", new)]);
+    assert_eq!(classify(&api, "run").0, "mod", "{api:?}");
+}
+
 /// Issue #306 の再現: `pub use` に `#[cfg]` を足すと、再公開した名前が消える設定がある。
 #[test]
 fn reexport_cfg_added_is_a_removal() {

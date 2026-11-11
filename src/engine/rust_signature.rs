@@ -1025,6 +1025,52 @@ fn parseable_signature_source(signature: &str) -> (Vec<u8>, usize) {
     (parseable, original_len)
 }
 
+/// Rust のシグネチャの識別子だけを NFC にする。リテラルとコメントの中身は変えない。
+pub(crate) fn normalize_rust_identifier_spellings(signature: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    if signature.is_ascii() || unicode_normalization::is_nfc(signature) {
+        return Some(signature.to_owned());
+    }
+    let (source, original_len) = parseable_signature_source(signature);
+    let tree = parser::parse_source(&source, LangId::Rust).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut out = String::with_capacity(original_len);
+    let mut copied = 0;
+    let flow = walk_preorder(tree.root_node(), Children::All, |node, _| {
+        if node.start_byte() >= original_len {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if matches!(
+            node.kind(),
+            "string_literal"
+                | "raw_string_literal"
+                | "char_literal"
+                | "line_comment"
+                | "block_comment"
+        ) {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.child_count() == 0 && node.kind().ends_with("identifier") {
+            let Some(text) = signature.get(node.byte_range()) else {
+                return ControlFlow::Break(());
+            };
+            if !text.is_ascii() && !unicode_normalization::is_nfc(text) {
+                out.push_str(&signature[copied..node.start_byte()]);
+                out.extend(text.nfc());
+                copied = node.end_byte();
+            }
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    if flow.is_break() {
+        return None;
+    }
+    out.push_str(&signature[copied..]);
+    Some(out)
+}
+
 /// Rust の引数の束縛に付く `mut` か。
 ///
 /// `mut x: T`・`mut self`・パターンの中の `(mut a, b)`・`S { mut v }`・`ref mut z` の `mut` は
@@ -1267,6 +1313,20 @@ fn normalize_whitespace(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_nfc_signature_normalization_preserves_literal_contents() {
+        let signature = "pub fn cafe\u{301}(_: tagged!(\"cafe\u{301}\"))";
+        assert_eq!(
+            normalize_rust_identifier_spellings(signature).as_deref(),
+            Some("pub fn caf\u{e9}(_: tagged!(\"cafe\u{301}\"))")
+        );
+        assert_eq!(
+            normalize_rust_identifier_spellings("pub const VALUE: &str = \"cafe\u{301}\";")
+                .as_deref(),
+            Some("pub const VALUE: &str = \"cafe\u{301}\";")
+        );
+    }
 
     #[test]
     fn rust_signature_formatting_keys_keep_contract_tokens() {

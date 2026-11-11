@@ -3505,3 +3505,86 @@ def test_entry_returns_text():
         );
     }
 }
+#[test]
+fn python_mock_attribute_configuration_does_not_prevent_updated_method_closure() {
+    for mock in [
+        "from unittest.mock import MagicMock\n\ndef test_mock():\n    fake = MagicMock()\n    fake.greet.return_value = 'hi'\n    fake.greet.assert_not_called()\n",
+        "from unittest.mock import Mock as Stub\n\ndef test_mock():\n    fake = Stub()\n    fake.greet.return_value = 'hi'\n    fake.greet.assert_not_called()\n",
+    ] {
+        let changes = python_method_change_with_mock(mock, true, &[]);
+        assert!(closed_in_diff(&changes, "Greeter.greet"), "{changes:?}");
+        let changes = python_method_change_with_mock(mock, false, &[]);
+        assert!(!closed_in_diff(&changes, "Greeter.greet"), "{changes:?}");
+        assert!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "Greeter.greet")
+        );
+    }
+}
+
+#[test]
+fn python_mock_attribute_closure_keeps_unproven_receivers_blocking() {
+    for mock in [
+        "from unittest.mock import MagicMock\nfrom app.greeter import Greeter\n\ndef test_mock():\n    fake = MagicMock(spec=Greeter)\n    fake.greet.return_value = 'hi'\n",
+        "from unittest.mock import MagicMock\nfrom app.greeter import Greeter\n\ndef test_mock(MagicMock):\n    fake = MagicMock()\n    fake.greet.return_value = 'hi'\n",
+        "from unittest.mock import MagicMock\nfrom app.greeter import Greeter\n\ndef test_mock():\n    fake = MagicMock()\n    fake.greet = Greeter().greet\n    fake.greet.return_value = 'hi'\n",
+        "from unittest.mock import MagicMock\nfrom app.greeter import Greeter\n\ndef test_mock():\n    fake = MagicMock()\n    consume(fake)\n    fake.greet.return_value = 'hi'\n",
+        "from unittest.mock import MagicMock\nfrom app.greeter import Greeter\n\ndef test_mock():\n    fake = MagicMock()\n    fake = Greeter()\n    fake.greet.return_value = 'hi'\n",
+        "from app.greeter import Greeter\n\ndef test_mock():\n    fake = Greeter()\n    callback = fake.greet\n",
+        "def test_mock(fake):\n    fake.greet.return_value = 'hi'\n",
+    ] {
+        let changes = python_method_change_with_mock(mock, true, &[]);
+        assert!(
+            !closed_in_diff(&changes, "Greeter.greet"),
+            "{mock}: {changes:?}"
+        );
+        assert!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "Greeter.greet")
+        );
+    }
+    let mock = "from unittest.mock import MagicMock\n\ndef test_mock():\n    fake = MagicMock()\n    fake.greet.return_value = 'hi'\n";
+    let changes = python_method_change_with_mock(
+        mock,
+        true,
+        &[(
+            "unittest.py",
+            "from app.greeter import Greeter as MagicMock\n",
+        )],
+    );
+    assert!(!closed_in_diff(&changes, "Greeter.greet"), "{changes:?}");
+}
+
+fn python_method_change_with_mock(
+    mock: &str,
+    update_caller: bool,
+    additional: &[(&str, &str)],
+) -> crate::models::review::ApiChanges {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let before = "class Greeter:\n    def greet(self, name: str, title: str | None) -> str:\n        return name\n";
+    let after = "class Greeter:\n    def greet(self, name: str, lang: str) -> str:\n        return name + lang\n";
+    let caller = "from app.greeter import Greeter\n\ndef handle():\n    greeter = Greeter()\n    return greeter.greet(name='Name', title=None)\n";
+    let mut files = vec![
+        ("app/__init__.py", ""),
+        ("app/greeter.py", before),
+        ("app/handler.py", caller),
+        ("tests/test_handler.py", mock),
+    ];
+    files.extend_from_slice(additional);
+    git_commit_files(repo, &files, "initial");
+    fs::write(repo.join("app/greeter.py"), after).expect("write definition");
+    if update_caller {
+        fs::write(
+            repo.join("app/handler.py"),
+            caller.replace("title=None", "lang='en'"),
+        )
+        .expect("write caller");
+    }
+    detect_api_changes_from_worktree(repo)
+}

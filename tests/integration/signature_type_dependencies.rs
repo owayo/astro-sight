@@ -2,6 +2,62 @@
 
 use super::support::{TestRepo, cargo_bin};
 
+#[test]
+fn rust_opaque_return_contracts_block_worktree_and_index_reviews() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"opaque_demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write("src/lib.rs", "mod hidden;\npub fn produce() -> impl Copy { hidden::make() }\npub async fn future() { hidden::wait().await; }\npub fn ordinary() -> u8 { 0 }\n");
+        let before = "type Hidden = ();\npub fn make() -> Hidden { Hidden::default() }\npub async fn wait() { let held = (); std::future::ready(()).await; drop(held); }\n";
+        repo.write("src/hidden.rs", before);
+        repo.commit_all("base");
+        repo.write(
+            "src/hidden.rs",
+            before
+                .replace(
+                    "type Hidden = ();",
+                    "type Hidden = core::marker::PhantomData<std::rc::Rc<()>>;",
+                )
+                .replace("let held = ();", "let held = std::rc::Rc::new(());"),
+        );
+        if staged {
+            repo.stage_all();
+        }
+        let mut cmd = cargo_bin();
+        cmd.args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        if staged {
+            cmd.arg("--staged");
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "staged={staged}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
+        assert!(lists(&json["api"]["mod"], "produce"), "{json}");
+        assert!(lists(&json["api"]["mod"], "future"), "{json}");
+        assert!(!lists(&json["api"]["mod"], "ordinary"), "{json}");
+        assert!(!lists(&json["api"]["mod_closed"], "produce"), "{json}");
+        assert!(
+            json["blocking_categories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|category| category == "api.mod"),
+            "{json}"
+        );
+    }
+}
+
 fn lists(items: &serde_json::Value, name: &str) -> bool {
     items
         .as_array()

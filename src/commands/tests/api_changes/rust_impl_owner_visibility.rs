@@ -71,6 +71,20 @@ const REPORTED: [&str; 3] = ["rm_dead", "mod", "add"];
 /// 報告されない区分。
 const NONE: [&str; 3] = ["none", "none", "none"];
 
+#[test]
+fn internal_glob_and_unresolved_owner_bindings_stay_unknown() {
+    for lib in [
+        "mod hidden { pub struct S; }\nuse hidden::*;\nuse external::*;\nmod impls;\n",
+        "use external::Actual as S;\nmod impls;\n",
+    ] {
+        assert_eq!(
+            member_changes(&[("src/lib.rs", lib)], "impl crate::S"),
+            REPORTED,
+            "{lib}"
+        );
+    }
+}
+
 /// `files` に、見出し `head` (`impl crate::S` など。属性も含めてよい) の inherent impl (`MAKE` の見出しを `head` に
 /// 替えたもの) を `src/impls.rs` として足し、`make` を消す・`make` の戻り値の型を変える・`extra` を足したときの、
 /// それぞれの区分。

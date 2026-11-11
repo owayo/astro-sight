@@ -49,6 +49,7 @@ pub(crate) struct RustScopeIndex {
     blocks: HashMap<usize, BlockFacts>,
     parameters: HashMap<usize, HashSet<String>>,
     assignment_names: HashMap<usize, HashSet<String>>,
+    for_pattern_names: HashMap<usize, HashSet<String>>,
     pattern_positions: HashSet<usize>,
     unknown_positions: HashSet<usize>,
 }
@@ -66,6 +67,7 @@ impl RustScopeIndex {
             blocks: HashMap::new(),
             parameters: HashMap::new(),
             assignment_names: HashMap::new(),
+            for_pattern_names: HashMap::new(),
             pattern_positions: HashSet::new(),
             unknown_positions: HashSet::new(),
         };
@@ -110,6 +112,14 @@ impl RustScopeIndex {
                 "block" => {
                     let facts = index.block_facts(node, source);
                     index.blocks.insert(node.id(), facts);
+                }
+                "for_expression" => {
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        let (names, has_macro) = subtree_names(pattern, source);
+                        if !has_macro && names.iter().all(|name| name.is_ascii()) {
+                            index.for_pattern_names.insert(node.id(), names);
+                        }
+                    }
                 }
                 "function_item" => {
                     let mut names = HashSet::new();
@@ -251,8 +261,17 @@ impl RustScopeIndex {
         let mut proven = pattern_position;
         let mut child = node;
         while let Some(parent) = child.parent() {
+            // for の本体へ同名の束縛を持ち込まないと確かめた場合だけ、外側の let を探す。
+            let opaque_scope = OPAQUE_SCOPES.contains(&parent.kind())
+                && !(parent.kind() == "for_expression"
+                    && name.is_ascii()
+                    && field_contains(parent, "body", node)
+                    && self
+                        .for_pattern_names
+                        .get(&parent.id())
+                        .is_some_and(|names| !names.contains(name)));
             // 内側のブロックで確定した let は、外側のパターン束縛に影響されない。
-            if (!proven && OPAQUE_SCOPES.contains(&parent.kind()))
+            if (!proven && opaque_scope)
                 || ITEM_BOUNDARIES.contains(&parent.kind())
                 || matches!(
                     parent.kind(),
@@ -596,6 +615,36 @@ mod tests {
     }
 
     #[test]
+    fn rust_scope_proves_outer_binding_in_unrelated_for_pattern_body() {
+        for source in [
+            "fn f() { let comments = 1; for value in values { comments(); } }",
+            "fn f() { let comments = 1; for (index, value) in values { consume(comments); } }",
+            "fn f(comments: String) { for value in values { consume(&comments); } }",
+            "fn f() { let comments = 1; for value in values { for next in rest { consume(comments); } } }",
+            "fn f() { let comments = 1; for Some(value) in values { consume(comments); } }",
+        ] {
+            assert_eq!(
+                resolve_last(source),
+                LexicalBinding::RustValueBinding,
+                "{source}"
+            );
+        }
+        for source in [
+            "fn f() { let comments = 1; for comments in values { comments(); } }",
+            "fn f() { let comments = 1; for (value, comments) in values { comments(); } }",
+            "fn f() { let comments = 1; for (value, r#comments) in values { comments(); } }",
+            "fn f() { let comments = 1; for bind!() in values { comments(); } }",
+            "fn f() { let comments = 1; for K in values { comments(); } }",
+            "fn f() { let comments = 1; for value in comments() { consume(value); } }",
+            "fn f() { let comments = 1; for value in values { let capture = |arg| comments(); } }",
+            "fn f() { let comments = 1; for value in values { unknown!(); comments(); } }",
+            "fn f() { let comments = 1; for value in values { use crate::api::comments; comments(); } }",
+        ] {
+            assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
+        }
+    }
+
+    #[test]
     fn rust_scope_inner_let_keeps_opaque_bindings_and_barriers_unknown() {
         for source in [
             "fn f() { while let Some(comments) = next() { comments(); } }",
@@ -658,7 +707,6 @@ mod tests {
             "fn f() { let comments = 1; let value: comments = input; }",
             "fn f() { let comments = 1; let value: [u8; comments] = input; }",
             "fn f(comments: u8) -> [u8; comments] { value }",
-            "fn f() { let comments = 1; for value in values { comments(); } }",
             "fn f() { let comments = 1; match value { _ => comments() }; }",
             "fn f() { let comments = 1; if let Some(x) = value { comments(); } }",
             "fn f() { let comments = 1; while let Some(x) = value { comments(); } }",

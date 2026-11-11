@@ -159,6 +159,35 @@ fn present_indices_with_escapes<'a>(
     present_indices
 }
 
+/// NFC の字面が変わる Rust の入力は、バイト一致だけで参照候補を捨てない。
+fn extend_rust_nfc_candidates(
+    path: &camino::Utf8Path,
+    source: &[u8],
+    names: &[String],
+    present: &mut std::collections::HashSet<usize>,
+) {
+    if LangId::detect(path, source).ok() != Some(LangId::Rust) {
+        return;
+    }
+    if rust_nfc_source_can_change(source) {
+        present.extend(0..names.len());
+    } else {
+        present.extend(names.iter().enumerate().filter_map(|(index, name)| {
+            (!name.is_ascii() && !unicode_normalization::is_nfc(name)).then_some(index)
+        }));
+    }
+}
+
+fn rust_nfc_source_can_change(source: &[u8]) -> bool {
+    let changes = |bytes: &[u8]| {
+        !bytes.is_ascii()
+            && std::str::from_utf8(bytes).is_ok_and(|text| !unicode_normalization::is_nfc(text))
+    };
+    changes(source)
+        || definition::rust_format::escaped_capture_view(source)
+            .is_some_and(|decoded| changes(&decoded))
+}
+
 fn extend_present_indices<'a>(
     acs: impl Iterator<Item = (usize, &'a aho_corasick::AhoCorasick)>,
     source: &[u8],
@@ -376,7 +405,11 @@ fn find_refs_in_file(
     // 落ち、batch 経路 (AC は常に ASCII CI) が返す大小違いの呼び出しを single だけが落とす。
     let detected_lang = LangId::detect(path, source.as_bytes()).ok();
     let is_ci = detected_lang.is_some_and(|l| l.is_case_insensitive());
-    if !is_ci {
+    if !is_ci
+        && !(detected_lang == Some(LangId::Rust)
+            && ((!symbol_name.is_ascii() && !unicode_normalization::is_nfc(symbol_name))
+                || rust_nfc_source_can_change(source.as_bytes())))
+    {
         // PHP は関数/メソッド/クラス名が case-insensitive なため、大小無視で事前フィルタして
         // case 違いの参照を取りこぼさない。他の case-sensitive 言語は従来どおり memmem で弾く。
         let present = if detected_lang == Some(LangId::Php) {
@@ -461,7 +494,9 @@ impl SourceReferenceBatch {
                 symbols: Vec::new(),
             });
         }
-        let present_indices = ac_present_indices_multi(&self.acs, source, self.symbol_names.len());
+        let mut present_indices =
+            ac_present_indices_multi(&self.acs, source, self.symbol_names.len());
+        extend_rust_nfc_candidates(path, source, &self.symbol_names, &mut present_indices);
         if present_indices.is_empty() {
             return Ok(SourceReferenceScan {
                 references,
@@ -953,6 +988,12 @@ fn stream_present_indices_from(
     chunk_size: usize,
     limit: u64,
 ) -> Option<Vec<usize>> {
+    if symbol_names
+        .iter()
+        .any(|name| !name.is_ascii() && !unicode_normalization::is_nfc(name))
+    {
+        return Some((0..symbol_names.len()).collect());
+    }
     let overlap = symbol_names
         .iter()
         .map(|name| identifier_prefilter_pattern(name).len())
@@ -977,6 +1018,9 @@ fn stream_present_indices_from(
         total += read as u64;
         if total > limit {
             return None;
+        }
+        if !chunk[..read].is_ascii() {
+            return Some((0..num).collect());
         }
         buf.extend_from_slice(&chunk[..read]);
         format_seen |= definition::rust_format::has_format_marker(&buf);
@@ -1011,7 +1055,8 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
-    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
+    let mut present_indices = ac_present_indices(ac, source.as_bytes(), num);
+    extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
     if present_indices.is_empty() {
         return Ok(());
     }
@@ -1048,7 +1093,8 @@ pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
     let source = parser::read_file(path)?;
 
     // マルチパターン事前フィルタ (AC は ASCII CI で構築済、超集合フィルタ)
-    let present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
+    let mut present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
+    extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
     if present_indices.is_empty() {
         return Ok(vec![Vec::new(); num]);
     }
@@ -1141,7 +1187,8 @@ fn count_refs_in_source(
     source: &[u8],
 ) -> FileRefCount {
     let num = symbol_names.len();
-    let present_indices = ac_present_indices_multi(acs, source, num);
+    let mut present_indices = ac_present_indices_multi(acs, source, num);
+    extend_rust_nfc_candidates(path, source, symbol_names, &mut present_indices);
     if present_indices.is_empty() {
         return FileRefCount::Counted(vec![0; num]);
     }

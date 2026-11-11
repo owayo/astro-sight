@@ -558,6 +558,23 @@ pub(crate) fn item_availability(
     (availability, condition_tokens(&attributes, source))
 }
 
+/// 項目自身の有る条件だけを読む。祖先の条件を走査スタックで保持する経路で使う。
+pub(super) fn own_item_availability(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Vec<AvailabilityAttr>> {
+    let mut attributes = preceding_attribute_items(item);
+    attributes.reverse();
+    if item.kind() == "mod_item"
+        && let Some(body) = item.child_by_field_name("body")
+    {
+        attributes.extend(inner_attribute_items(body));
+    }
+    let mut availability = Some(Vec::new());
+    push_availability(&attributes, source, &mut availability);
+    availability
+}
+
 /// ファイル (`source_file` の `root`) の先頭の内側の属性のうち、`cfg` と `cfg` に絞った `cfg_attr` (外側
 /// から。読めない属性があれば None。Issue #305)。
 pub(crate) fn file_availability(
@@ -700,7 +717,10 @@ pub(crate) fn rust_declaration_context(
                 .and_then(|name| name.utf8_text(source).ok())
             {
                 // `r#api` と `api` は同じ module。
-                modules.push(name.strip_prefix("r#").unwrap_or(name).to_owned());
+                modules.push(
+                    crate::language::normalize_identifier(crate::language::LangId::Rust, name)
+                        .into_owned(),
+                );
             }
         }
         node = container;
@@ -1140,7 +1160,10 @@ pub(crate) fn callable_declarations(source: &[u8], name: &str) -> Option<usize> 
             && node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
-                .is_some_and(|declared| declared.strip_prefix("r#").unwrap_or(declared) == name)
+                .is_some_and(|declared| {
+                    crate::language::normalize_identifier(crate::language::LangId::Rust, declared)
+                        == name
+                })
         {
             count += 1;
         }
