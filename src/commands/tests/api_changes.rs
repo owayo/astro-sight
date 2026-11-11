@@ -18,6 +18,7 @@ mod rust_const_fn;
 mod rust_crate_kind;
 mod rust_enum_variants;
 mod rust_impl_headers;
+mod rust_impl_owner_visibility;
 mod rust_item_cfg;
 mod rust_module_cfg;
 mod rust_module_visibility;

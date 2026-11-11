@@ -87,6 +87,26 @@ pub(crate) struct Candidate {
     /// 判定 ([`Resolver::bindings_under`]・[`Resolver::opaque_along`]) と、たどる経路の条件にだけ使い、束縛の
     /// 識別に入る `conditions` には入れない (`#![cfg(all())]` を足しただけで束縛が変わったことにしない)。
     pub(crate) entered: Vec<String>,
+    /// 項目 (型・関数・trait など) の定義なら、その場所 (Issue #315。impl の対象の型の公開範囲を決める)。
+    pub(crate) definition: Option<Rc<ItemDefinition>>,
+}
+
+/// 名前を引いたスコープで見つけた項目の定義の場所 (Issue #315)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ItemDefinition {
+    /// 定義のあるファイルのパス。
+    pub(crate) path: String,
+    /// 定義のあるスコープ (ファイルの中の inline module の経路)。
+    pub(crate) scope: Vec<String>,
+    /// 定義の名前。
+    pub(crate) name: String,
+    /// 項目の種類 (`struct`・`enum`・`union`・`trait` など)。
+    pub(crate) kind: &'static str,
+    /// 制限の無い `pub` か。
+    pub(crate) public: bool,
+    /// 自身か囲む inline module に、項目そのもの (種類・名前・公開範囲) を置き換え得る属性 (属性マクロなど。
+    /// 項目を足すだけの `derive` は数えない) が付いているか。
+    pub(crate) opaque: bool,
 }
 
 impl Candidate {
@@ -97,6 +117,7 @@ impl Candidate {
             direct: false,
             replaceable: Vec::new(),
             entered: Vec::new(),
+            definition: None,
         }
     }
 
@@ -115,6 +136,7 @@ impl Candidate {
             direct: !opaque,
             replaceable,
             entered: Vec::new(),
+            definition: None,
         }
     }
 }
@@ -190,6 +212,9 @@ pub(crate) struct Resolver<'c> {
     /// Issue #314)。契約が名指す束縛の比較 (#312) では、開けない宣言は今までどおり解けないことにする (属性
     /// マクロが展開の前の `#[cfg]` を書き換え得るので、たどる経路の条件を確かとしない)。
     searching: std::cell::Cell<bool>,
+    /// module の経路を通った候補に、経路で入ったファイルの条件 (`entered`) を引き継ぐか (Issue #315。impl の
+    /// 対象の型を解く間だけ。候補の有る条件を、宣言の有る条件と比べる)。
+    keep_entered: std::cell::Cell<bool>,
 }
 
 /// 有る条件の属性の鍵の並び (`cfg` と、`cfg` だけに絞った `cfg_attr`)。
@@ -301,15 +326,78 @@ impl AvailabilityFilter {
 /// に絞った鍵の `#[` は `#` と `[` に分ける) が、どの設定でも成り立たないと確かめられるか (原子を独立に扱う。
 /// Issue #314)。読めなければ偽。
 pub(crate) fn conditions_never_hold(conditions: &[String]) -> bool {
-    let conditions: Vec<String> = conditions
+    let conditions = readable_condition_tokens(conditions);
+    !conditions.is_empty() && condition_keys(&conditions).is_some_and(|keys| keys_never_hold(&keys))
+}
+
+/// 宣言の有る条件 `own` (読めなければ None) と、宣言のファイルを置く条件の枝 `placements` (どれかが成り立つ) が
+/// 成り立つ全ての設定で、候補 `candidates` のどれかの条件 (`conditions` と、たどったファイルの条件 `entered`) が
+/// 成り立つか (Issue #315)。成り立てば、宣言の有る設定ではどこでも候補のどれかが名前を束縛し、glob・prelude などの
+/// 別の束縛は隠れる。決められなければ偽。
+pub(crate) fn candidates_cover(
+    own: Option<&[AvailabilityAttr]>,
+    placements: &[Vec<String>],
+    candidates: &[Candidate],
+) -> bool {
+    let keys = |conditions: &[String]| -> Option<ConditionKeys> {
+        let conditions = readable_condition_tokens(conditions);
+        if conditions.is_empty() {
+            Some(Vec::new())
+        } else {
+            condition_keys(&conditions)
+        }
+    };
+    let Some(branches) = candidates
+        .iter()
+        .map(|candidate| {
+            let mut conditions = candidate.conditions.clone();
+            conditions.extend(candidate.entered.iter().cloned());
+            keys(&conditions)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    // 条件の無い候補があれば、どの設定でも有る。
+    if branches.iter().any(Vec::is_empty) {
+        return true;
+    }
+    let Some(own) = own else {
+        return false;
+    };
+    let Some(placed) = placements
+        .iter()
+        .map(|placement| keys(placement))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let mut atoms = Atoms::independent();
+    let all = |keys: &ConditionKeys, atoms: &mut Atoms| {
+        Predicate::All(keys.iter().map(|key| atoms.presence(key)).collect())
+    };
+    let own_keys: ConditionKeys = own.iter().map(|attribute| attribute.key.clone()).collect();
+    let declaration = all(&own_keys, &mut atoms);
+    let placed = Predicate::Any(placed.iter().map(|keys| all(keys, &mut atoms)).collect());
+    let present = Predicate::Any(branches.iter().map(|keys| all(keys, &mut atoms)).collect());
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    !configs
+        .any(|config| declaration.holds(config) && placed.holds(config) && !present.holds(config))
+}
+
+/// 条件のトークンを、属性ごとに字面へ戻して読み直せる形にする (置き場の節の生のトークンの `|` の区切りは
+/// 読み飛ばし、`cfg` に絞った鍵の `#[` は `#` と `[` に分ける)。
+fn readable_condition_tokens(conditions: &[String]) -> Vec<String> {
+    conditions
         .iter()
         .flat_map(|token| match token.as_str() {
             "|" => Vec::new(),
             "#[" => vec!["#".to_owned(), "[".to_owned()],
             _ => vec![token.clone()],
         })
-        .collect();
-    !conditions.is_empty() && condition_keys(&conditions).is_some_and(|keys| keys_never_hold(&keys))
+        .collect()
 }
 
 /// 鍵 `keys` の属性の積が、どの設定でも成り立たないか (原子を独立に扱う。設定を作れなければ偽)。
@@ -436,6 +524,7 @@ impl<'c> Resolver<'c> {
             skip_renders: std::cell::Cell::new(false),
             reached: std::cell::RefCell::new(Vec::new()),
             searching: std::cell::Cell::new(false),
+            keep_entered: std::cell::Cell::new(false),
         }
     }
 }
@@ -680,6 +769,65 @@ impl Resolver<'_> {
         Some(self.joined_identity(&candidates))
     }
 
+    /// ファイル `file` のスコープ `scope` (inline module の経路) で、型の経路の区切り `segments` (`crate::S` の
+    /// `crate`・`S`) を型の名前空間で解いた候補 (Issue #315。inherent impl の対象の型を決める)。module の経路で
+    /// 入ったファイルの条件も候補の `entered` に引き継ぐ。解けなければ (候補が多すぎるときも) None。
+    pub(crate) fn resolve_type_path(
+        &self,
+        file: &File,
+        scope: &[String],
+        segments: &[String],
+    ) -> Option<Vec<Candidate>> {
+        let module = ModuleRef {
+            file: file.clone(),
+            scope: scope.to_vec(),
+        };
+        let reference = Reference {
+            segments: segments.to_vec(),
+            namespace: Namespace::Type,
+            local: false,
+        };
+        let saved = self.keep_entered.replace(true);
+        let candidates = self.resolve_candidates(&module, &reference, 0);
+        self.keep_entered.set(saved);
+        candidates
+    }
+
+    /// ファイル `file` を置く条件の枝 (crate root の先頭の条件と、crate root から `file` の module までの `mod` の
+    /// 宣言・別名の条件と、たどったファイルの先頭の条件。Issue #315)。crate root から `file` に着く枝だけ。
+    /// たどれない・着かなければ None。
+    pub(crate) fn placement_branches(&self, file: &File) -> Option<Vec<Vec<String>>> {
+        let module = file.file_module.clone()?;
+        let Opened::File(root) = self.crate_files?.root() else {
+            return None;
+        };
+        let root_conditions = root.file_conditions.clone();
+        let branches = self.walk_modules(
+            ModuleRef {
+                file: root,
+                scope: Vec::new(),
+            },
+            &module,
+            0,
+        )?;
+        let placed: Vec<Vec<String>> = branches
+            .into_iter()
+            .filter_map(|branch| match &branch.target {
+                Target::Module(target)
+                    if target.scope.is_empty() && target.file.path == file.path =>
+                {
+                    let mut conditions = root_conditions.clone();
+                    conditions.extend(branch.conditions);
+                    conditions.extend(branch.entered);
+                    Some(conditions)
+                }
+                // ほかのファイルに着く枝 (`cfg` で分けた別のファイル) は、このファイルを置かない。
+                _ => None,
+            })
+            .collect();
+        (!placed.is_empty()).then_some(placed)
+    }
+
     /// パス `reference` を解いた候補ごとの識別の字面 (並べ替えて重なりを除く)。解けなければ None。
     fn resolve_identities(&self, module: &ModuleRef, reference: &Reference) -> Option<Vec<String>> {
         let candidates = self.resolve_candidates(module, reference, 0)?;
@@ -785,10 +933,14 @@ impl Resolver<'_> {
                         };
                         candidates.extend(resolved.0);
                     } else {
-                        candidates.extend(
-                            self.resolve_name(&target, name, reference.namespace, depth)?
-                                .under(&branch.conditions),
-                        );
+                        let resolved =
+                            self.resolve_name(&target, name, reference.namespace, depth)?;
+                        // impl の対象の型を解く間は、経路で入ったファイルの条件も引き継ぐ (Issue #315)。
+                        candidates.extend(if self.keep_entered.get() {
+                            resolved.under_entered(&branch.conditions, &branch.entered)
+                        } else {
+                            resolved.under(&branch.conditions)
+                        });
                     }
                 }
                 Target::Identity(outside) => candidates.push(Candidate::new(
@@ -1086,6 +1238,7 @@ impl Resolver<'_> {
                             direct: false,
                             replaceable: candidate.replaceable,
                             entered: candidate.entered,
+                            definition: None,
                         }),
                     }
                 }
@@ -1499,12 +1652,23 @@ impl Resolver<'_> {
         for item in bindings.items.get(name).into_iter().flatten() {
             if visible(&item.visibility) && item_namespaces(item.kind).contains(&namespace) {
                 // 名前付きのフィールドの構造体は値を作らない (値の覆いの証明に使わない)。
-                found.push(Candidate::definition(
-                    &item.conditions,
-                    Target::Identity(format!("item:{}#{name}:{}", place(name), item.kind)),
-                    item.replaceable.clone(),
-                    item.opaque_attributes || (namespace == Namespace::Value && item.named_fields),
-                ));
+                found.push(Candidate {
+                    definition: Some(Rc::new(ItemDefinition {
+                        path: file.path.clone(),
+                        scope: scope.clone(),
+                        name: name.to_owned(),
+                        kind: item.kind,
+                        public: item.visibility == Visibility::Public,
+                        opaque: item.replacing_attributes,
+                    })),
+                    ..Candidate::definition(
+                        &item.conditions,
+                        Target::Identity(format!("item:{}#{name}:{}", place(name), item.kind)),
+                        item.replaceable.clone(),
+                        item.opaque_attributes
+                            || (namespace == Namespace::Value && item.named_fields),
+                    )
+                });
             }
         }
         for target in bindings.uses.get(name).into_iter().flatten() {
@@ -1576,6 +1740,7 @@ impl Resolver<'_> {
                         direct: false,
                         replaceable: Vec::new(),
                         entered,
+                        definition: None,
                     }),
                 }
             }

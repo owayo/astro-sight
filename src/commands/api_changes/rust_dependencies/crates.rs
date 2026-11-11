@@ -482,6 +482,16 @@ pub(crate) struct RustCrates<'a> {
     module_gaps: Vec<(String, String)>,
     /// 再公開に効く `use` が変わったが、lib crate を開けなかった package の crate root と理由 (Issue #306)。
     reexport_gaps: Vec<(String, String)>,
+    dir: &'a str,
+    /// package → 入力の変化を問わない旧新の lib crate (Issue #315。lib の root が旧新で同じ package。
+    /// ファイルは必要になったときに読む)。
+    libraries: HashMap<String, LibraryVersions<'a>>,
+}
+
+/// 旧新の lib crate (束縛や置き場の入力の変化を問わない。Issue #315)。
+pub(crate) struct LibraryVersions<'a> {
+    pub(crate) old: CrateVersion<'a>,
+    pub(crate) new: CrateVersion<'a>,
 }
 
 /// パスが package の lib crate のソースになり得るなら、その package (いちばん近い `Cargo.toml` の
@@ -598,11 +608,13 @@ impl<'a> RustCrates<'a> {
         }
         packages.sort();
         packages.dedup();
+        // 差分のパスの集合は package の間で共有する (package ごとに複製しない。Issue #315)。
+        let paths = DiffPaths::new(&all);
         let mut pairs = HashMap::new();
         let mut module_gaps = Vec::new();
         let mut reexport_gaps = member_gaps;
-        for package in packages {
-            match build_pair(dir, &all, &rename_pairs, base_blobs, &package) {
+        for package in packages.iter().cloned() {
+            match build_pair(dir, &all, &paths, &rename_pairs, base_blobs, &package) {
                 Built::Pair(pair) => {
                     pairs.insert(package, *pair);
                 }
@@ -621,11 +633,38 @@ impl<'a> RustCrates<'a> {
                 Built::Nothing => {}
             }
         }
+        // 入力の変化を問わない旧新の lib crate (Issue #315)。lib の root が旧新で同じ package だけ作る (ファイルは
+        // 必要になったときに読む)。
+        let mut libraries = HashMap::new();
+        for package in &packages {
+            let manifest = manifest_path(package);
+            let old_root = library_root_in(package, base_blobs.read(&manifest).as_deref());
+            let new_root = library_root_in(
+                package,
+                super::super::source_pair::load_new_source(dir, &manifest)
+                    .map(|text| text.to_vec())
+                    .as_deref(),
+            );
+            if let (Some(old_root), Some(new_root)) = (old_root, new_root)
+                && old_root == new_root
+            {
+                let (old, new) = library_pair(dir, &paths, base_blobs, old_root);
+                libraries.insert(package.clone(), LibraryVersions { old, new });
+            }
+        }
         Self {
             pairs,
             module_gaps,
             reexport_gaps,
+            dir,
+            libraries,
         }
+    }
+
+    /// パス `path` の package の旧新の lib crate (束縛や置き場の入力の変化を問わない。Issue #315)。lib の root
+    /// が旧新で違う・差分にソースの無い package は None。
+    pub(crate) fn library_versions(&self, path: &str) -> Option<&LibraryVersions<'a>> {
+        self.libraries.get(&crate_package(self.dir, path)?)
     }
 
     /// パス `path` の package の旧新の lib crate。束縛の入力が旧新で変わらない (ファイルの外へ出る
@@ -699,6 +738,86 @@ enum Built<'a> {
     Nothing,
 }
 
+/// 差分の旧新のパスの集合 (package の間で共有する。Issue #315)。
+struct DiffPaths {
+    /// 差分の旧い版のパス。
+    old: Rc<HashSet<String>>,
+    /// 差分の新しい版のパス。
+    new: Rc<HashSet<String>>,
+    /// 旧新のどちらかのパス。
+    changed: Rc<HashSet<String>>,
+}
+
+impl DiffPaths {
+    fn new(diff_files: &[crate::models::impact::DiffFile]) -> Self {
+        let old: HashSet<String> = diff_files
+            .iter()
+            .filter(|df| df.old_path != "/dev/null")
+            .map(|df| df.old_path.clone())
+            .collect();
+        let new: HashSet<String> = diff_files
+            .iter()
+            .filter(|df| df.new_path != "/dev/null")
+            .map(|df| df.new_path.clone())
+            .collect();
+        let changed = old.union(&new).cloned().collect();
+        Self {
+            old: Rc::new(old),
+            new: Rc::new(new),
+            changed: Rc::new(changed),
+        }
+    }
+}
+
+/// crate root `root` の旧新の lib crate の版。差分のファイル (`paths`) の旧い版は base の blob から、
+/// ほかのファイルは作業ツリーから読み、差分で足したファイルは旧い版に、消した・移したファイルは新しい版に
+/// 無いものとする。差分に無いファイルの索引は旧新で共有する。
+fn library_pair<'a>(
+    dir: &'a str,
+    paths: &DiffPaths,
+    base_blobs: &'a crate::commands::git_input::GitBlobBatch,
+    root: String,
+) -> (CrateVersion<'a>, CrateVersion<'a>) {
+    let worktree = move |path: &str| {
+        super::super::source_pair::load_new_source(dir, path).map(|source| source.to_vec())
+    };
+    let read_old: SourceReader<'a> = {
+        let old_paths = paths.old.clone();
+        let new_paths = paths.new.clone();
+        Box::new(move |path: &str| {
+            if old_paths.contains(path) {
+                base_blobs.read(path)
+            } else if new_paths.contains(path) {
+                // 差分で足したファイルは旧い版に無い。
+                None
+            } else {
+                worktree(path)
+            }
+        })
+    };
+    let read_new: SourceReader<'a> = {
+        let old_paths = paths.old.clone();
+        let new_paths = paths.new.clone();
+        Box::new(move |path: &str| {
+            if !new_paths.contains(path) && old_paths.contains(path) {
+                // 差分で消した・移したファイルは新しい版に無い。
+                None
+            } else {
+                worktree(path)
+            }
+        })
+    };
+    let shared = Rc::new(RefCell::new(HashMap::new()));
+    let old = CrateVersion::new(
+        root.clone(),
+        read_old,
+        paths.changed.clone(),
+        shared.clone(),
+    );
+    let new = CrateVersion::new(root, read_new, paths.changed.clone(), shared);
+    (old, new)
+}
+
 /// package `package` の旧新の lib crate を作る。束縛が変われば束縛の変化と比べ直すファイルを求め
 /// (Issue #300)、module の置き場の条件に効く入力が変われば印を付ける (Issue #305)。どちらも変わらない・
 /// lib が旧新のどちらかに無い package は作らない。`[lib] path` で crate root を変えた package は扱わず、
@@ -706,6 +825,7 @@ enum Built<'a> {
 fn build_pair<'a>(
     dir: &'a str,
     diff_files: &[crate::models::impact::DiffFile],
+    paths: &DiffPaths,
     rename_pairs: &[(String, String)],
     base_blobs: &'a crate::commands::git_input::GitBlobBatch,
     package: &str,
@@ -802,45 +922,7 @@ fn build_pair<'a>(
         }
         _ => return Built::Nothing,
     };
-    let old_paths: HashSet<String> = diff_files
-        .iter()
-        .filter(|df| df.old_path != "/dev/null")
-        .map(|df| df.old_path.clone())
-        .collect();
-    let new_paths: HashSet<String> = diff_files
-        .iter()
-        .filter(|df| df.new_path != "/dev/null")
-        .map(|df| df.new_path.clone())
-        .collect();
-    let changed: Rc<HashSet<String>> = Rc::new(old_paths.union(&new_paths).cloned().collect());
-    let worktree = move |path: &str| {
-        super::super::source_pair::load_new_source(dir, path).map(|source| source.to_vec())
-    };
-    let read_old: SourceReader<'a> = {
-        let old_paths = old_paths.clone();
-        let new_paths = new_paths.clone();
-        Box::new(move |path: &str| {
-            if old_paths.contains(path) {
-                base_blobs.read(path)
-            } else if new_paths.contains(path) {
-                // 差分で足したファイルは旧い版に無い。
-                None
-            } else {
-                worktree(path)
-            }
-        })
-    };
-    let read_new: SourceReader<'a> = Box::new(move |path: &str| {
-        if !new_paths.contains(path) && old_paths.contains(path) {
-            // 差分で消した・移したファイルは新しい版に無い。
-            None
-        } else {
-            worktree(path)
-        }
-    });
-    let shared = Rc::new(RefCell::new(HashMap::new()));
-    let old = CrateVersion::new(root.clone(), read_old, changed.clone(), shared.clone());
-    let new = CrateVersion::new(root, read_new, changed, shared);
+    let (old, new) = library_pair(dir, paths, base_blobs, root);
     // lib が旧新の両方に無ければ扱わない (公開面ごと現れる・消える)。読めない・構文エラーなら、
     // module の置き場の条件を比べられない。
     let (old_root, new_root) = (old.root(), new.root());

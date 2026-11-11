@@ -5,11 +5,13 @@ use crate::engine::symbols::rust_node_has_unrestricted_pub_visibility;
 use super::super::git_input::validate_git_revision;
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
 
+mod impl_owner;
 mod reexport_graph;
 mod reexport_target;
 mod signature_types;
 mod source_tree;
 mod use_tree;
+pub(crate) use impl_owner::*;
 pub(crate) use reexport_graph::*;
 pub(crate) use reexport_target::*;
 pub(crate) use source_tree::*;
@@ -406,6 +408,11 @@ pub(crate) struct RustPublicApiContext {
     /// `old_path` → base 側 `rust_private_module_info` の結果。`None` (public-reachable /
     /// 判定不能) もキャッシュして再 `git show` + 再 parse を防ぐ。
     private_module_memo: std::collections::HashMap<String, Option<RustPrivateModuleInfo>>,
+    /// (旧い版か, impl のあるファイル, inline module, impl の対象の型のトークン, 宣言の有る条件の字面) →
+    /// inherent impl の項目の公開 API 面 (Issue #315。同じ impl の項目で名前解決を繰り返さない)。
+    #[allow(clippy::type_complexity)]
+    owner_memo:
+        std::collections::HashMap<(bool, String, String, Vec<String>, Vec<String>), OwnerSurface>,
 }
 
 impl RustPublicApiContext {

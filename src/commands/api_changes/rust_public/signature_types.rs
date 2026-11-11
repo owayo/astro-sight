@@ -212,16 +212,25 @@ impl SignatureTypes {
                                 if self.observe_expansion(member, source) {
                                     continue;
                                 }
-                                if !matches!(member.kind(), "function_item" | "type_item")
-                                    || !(trait_impl
-                                        || rust_node_has_unrestricted_pub_visibility(
-                                            member, source,
-                                        ))
+                                if !matches!(
+                                    member.kind(),
+                                    "function_item" | "type_item" | "const_item"
+                                ) || !(trait_impl
+                                    || rust_node_has_unrestricted_pub_visibility(member, source))
                                 {
                                     continue;
                                 }
                                 let mut names = generics.clone();
                                 names.extend(generic_names(member, source));
+                                // 関連定数は型が外から見える (値の式は見えない。Issue #315)。
+                                let mut parts = if member.kind() == "const_item" {
+                                    member.child_by_field_name("type").into_iter().collect()
+                                } else {
+                                    header_parts(member)
+                                };
+                                // impl の対象の型の引数も、`Self` を通して届く (`impl Public<types::S>` の
+                                // `fn new() -> Self`。Issue #315)。
+                                parts.extend(item.child_by_field_name("type"));
                                 self.entries.push(Entry {
                                     owner: TypeKey {
                                         module: module.clone(),
@@ -229,7 +238,7 @@ impl SignatureTypes {
                                     },
                                     seed: false,
                                     nominal: true,
-                                    dependencies: type_paths(header_parts(member), source, &names),
+                                    dependencies: type_paths(parts, source, &names),
                                     receiver: receiver.clone(),
                                     fallback: trait_path.clone(),
                                 });
