@@ -3417,6 +3417,9 @@ fn decide_signature_change(
     if let Some(decision) = python_contract_decision(&site, sources, internally_closed) {
         return decision;
     }
+    if let Some(compatible) = super::rust_import_path::detect(inputs, &site, sources) {
+        return SignatureDecision::Compatible(compatible);
+    }
     if let Some(compat) = compatible_modification(
         ref_index,
         &site,
