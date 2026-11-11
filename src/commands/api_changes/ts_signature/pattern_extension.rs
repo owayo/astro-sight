@@ -227,26 +227,86 @@ fn default_matches_type(value: Node<'_>, ty: Node<'_>, source: &[u8]) -> bool {
         "null" => "null",
         _ => return false,
     };
-    let parts = if ty.kind() == "union_type" {
-        ts_union_type_parts(ty)
-    } else {
-        vec![ty]
-    };
+    let mut parts = vec![(ty, false)];
+    let mut aliases = HashSet::new();
+    let mut local_aliases = None;
+    let mut root = ty;
+    let mut unshadowed_aliases = true;
+    while let Some(parent) = root.parent() {
+        unshadowed_aliases &= parent.child_by_field_name("type_parameters").is_none();
+        root = parent;
+    }
     let mut found = false;
-    for part in parts {
+    while let Some((part, leave_alias)) = parts.pop() {
+        if leave_alias {
+            aliases.remove(&part.id());
+            continue;
+        }
         let actual = match part.kind() {
+            "union_type" | "parenthesized_type" => {
+                let mut cursor = part.walk();
+                parts.extend(
+                    part.named_children(&mut cursor)
+                        .filter(|child| child.kind() != "comment")
+                        .map(|child| (child, false)),
+                );
+                continue;
+            }
+            "type_identifier" => {
+                // 関数等の型引数が別名を隠し得る文脈では証明しない。
+                if !unshadowed_aliases {
+                    return false;
+                }
+                let Some(name) = plain_name(part, source) else {
+                    return false;
+                };
+                if local_aliases.is_none() {
+                    local_aliases = type_dependencies::local_type_aliases(root, source);
+                }
+                let Some(alias) = local_aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.get(&name))
+                    .copied()
+                else {
+                    return false;
+                };
+                if !aliases.insert(alias.id()) {
+                    return false;
+                }
+                parts.push((alias, true));
+                parts.push((alias, false));
+                continue;
+            }
             "predefined_type" => match part.utf8_text(source).ok() {
                 Some("string") => "string",
                 Some("number") => "number",
                 Some("boolean") => "boolean",
                 _ => return false,
             },
-            "literal_type"
-                if part
-                    .named_child(0)
-                    .is_some_and(|child| child.kind() == "null") =>
-            {
-                "null"
+            "literal_type" => {
+                let Some(literal) = part.named_child(0) else {
+                    return false;
+                };
+                if !inert_literal(literal, source) {
+                    return false;
+                }
+                let same_tokens = node_signature_tokens(value, source)
+                    .zip(node_signature_tokens(literal, source))
+                    .is_some_and(|(value, literal)| value == literal);
+                let same_plain_string = value.kind() == "string"
+                    && literal.kind() == "string"
+                    && value
+                        .utf8_text(source)
+                        .ok()
+                        .zip(literal.utf8_text(source).ok())
+                        .is_some_and(|(value, literal)| {
+                            !value.contains('\\')
+                                && !literal.contains('\\')
+                                && value.get(1..value.len().saturating_sub(1))
+                                    == literal.get(1..literal.len().saturating_sub(1))
+                        });
+                found |= same_tokens || same_plain_string;
+                continue;
             }
             _ => return false,
         };
@@ -598,6 +658,10 @@ mod tests {
         };
         let old = source(old_params);
         let new = source(new_params);
+        compatible_sources(&old, &new, lang)
+    }
+
+    fn compatible_sources(old: &str, new: &str, lang: LangId) -> bool {
         let old_tree = parser::parse_source(old.as_bytes(), lang).unwrap();
         let new_tree = parser::parse_source(new.as_bytes(), lang).unwrap();
         if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
@@ -614,6 +678,78 @@ mod tests {
             new.as_bytes(),
         )
         .is_some()
+    }
+
+    #[test]
+    fn destructured_optional_props_defaults_match_literal_unions() {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            for (value, ty, expected) in [
+                (r#""plain""#, r#""plain" | "muted""#, true),
+                ("'plain'", r#""plain" | "muted""#, true),
+                ("1", "1 | 2", true),
+                ("-1", "-1 | 2", true),
+                ("true", "false | true", true),
+                ("false", "false", true),
+                ("null", "null | 'plain'", true),
+                ("'plain'", "('plain' | 'muted')", true),
+                (r#""plain""#, r#""muted" | number"#, false),
+                (r#""loud""#, r#""plain" | "muted""#, false),
+                ("3", "1 | 2", false),
+                ("1n", "1 | 2", false),
+                ("01", "1 | 2", false),
+                ("true", "false", false),
+                ("'plain'", "string | Unknown", false),
+                ("'plain'", "string | { hidden: string }", false),
+            ] {
+                let params =
+                    format!("{{ label, hint = {value} }}: {{ label: string; hint?: {ty} }}");
+                assert_eq!(
+                    compatible("{ label }: { label: string }", &params, ": string", lang),
+                    expected,
+                    "{lang:?}/{value}/{ty}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn destructured_optional_props_defaults_resolve_unique_local_aliases() {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            for (prelude, parameters, expected) in [
+                ("type Tone = 'plain' | 'muted';", "", true),
+                ("export type Tone = 'plain' | 'muted';", "", true),
+                ("type Base = 'plain'; type Tone = Base | 'muted';", "", true),
+                ("type Base = 'plain'; type Tone = Base | Base;", "", true),
+                ("type Tone = string;", "", true),
+                ("type Tone = 'loud';", "", false),
+                ("type Tone = Other; type Other = Tone;", "", false),
+                ("type Tone = 'plain'; type Tone = 'muted';", "", false),
+                ("type Tone = 'plain'; interface Tone {}", "", false),
+                ("type Tone = 'plain'; class Tone {}", "", false),
+                ("type Tone = 'plain'; namespace Tone {}", "", false),
+                ("import type { Tone } from './tone';", "", false),
+                (
+                    "import type { Tone } from './tone'; type Tone = 'plain';",
+                    "",
+                    false,
+                ),
+                ("type Tone<T> = 'plain';", "", false),
+                ("type Tone = 'plain';", "<Tone>", false),
+            ] {
+                let source = |params: &str| {
+                    format!(
+                        "{prelude}\nexport function Field{parameters}({params}): string {{ return label; }}"
+                    )
+                };
+                let old = source("{ label }: { label: string }");
+                let new = source("{ label, tone = 'plain' }: { label: string; tone?: Tone }");
+                assert_eq!(
+                    compatible_sources(&old, &new, lang),
+                    expected,
+                    "{lang:?}/{prelude}/{parameters}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -884,12 +1020,30 @@ mod tests {
                     "default numeric literal type",
                     "{ label }: { label: string }",
                     "{ label, hint = 1 }: { label: string; hint?: 1 }",
-                    false,
+                    true,
                 ),
                 (
                     "default boolean literal type",
                     "{ label }: { label: string }",
                     "{ label, hint = true }: { label: string; hint?: true }",
+                    true,
+                ),
+                (
+                    "default mismatched numeric literal type",
+                    "{ label }: { label: string }",
+                    "{ label, hint = 2 }: { label: string; hint?: 1 }",
+                    false,
+                ),
+                (
+                    "default mismatched boolean literal type",
+                    "{ label }: { label: string }",
+                    "{ label, hint = true }: { label: string; hint?: false }",
+                    false,
+                ),
+                (
+                    "default outside numeric literal union",
+                    "{ label }: { label: string }",
+                    "{ label, hint = 3 }: { label: string; hint?: 1 | 2 }",
                     false,
                 ),
                 (

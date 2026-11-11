@@ -925,7 +925,7 @@ fn contracts_changed(
                             .and_then(|name| name.utf8_text(&new_file.source).ok()),
                     ) {
                         let mut inner = scope.clone();
-                        inner.push(unraw(name).to_owned());
+                        inner.push(unraw(name).into_owned());
                         pending.push((body, inner));
                     }
                 }
@@ -973,7 +973,7 @@ fn contracts_touch(file: &File, changes: &ChangeSet) -> bool {
                             .and_then(|name| name.utf8_text(&file.source).ok()),
                     ) {
                         let mut inner = scope.clone();
-                        inner.push(unraw(name).to_owned());
+                        inner.push(unraw(name).into_owned());
                         pending.push((body, inner));
                     }
                 }

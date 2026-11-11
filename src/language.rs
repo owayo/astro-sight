@@ -488,7 +488,7 @@ impl std::fmt::Display for DetectedLang {
 /// 識別子を照合用に正規化する。
 ///
 /// - case-insensitive な言語 (Xojo) は Unicode-aware に小文字化する。
-/// - Rust の raw identifier (`r#gen`) は `r#` を外す。`r#gen` と `gen` は同じ識別子で、
+/// - Rust は NFC に正規化し、raw identifier (`r#gen`) の `r#` を外す。`r#gen` と `gen` は同じ識別子で、
 ///   Rust 2024 で予約語になった `gen` を edition 2021 のクレートから呼ぶときは `a::r#gen()`
 ///   と書く。外さないと、この呼び出しを refs / impact / dead-code の件数がどれも数えない。
 /// - Swift / Kotlin の囲みの backtick (`` `default` ``) を外す。backtick は予約語などを名前に
@@ -503,6 +503,10 @@ pub fn normalize_identifier(lang: LangId, name: &str) -> std::borrow::Cow<'_, st
         LangId::Swift | LangId::Kotlin => strip_identifier_backticks(name),
         _ => name,
     };
+    if lang == LangId::Rust && !name.is_ascii() && !unicode_normalization::is_nfc(name) {
+        use unicode_normalization::UnicodeNormalization;
+        return Cow::Owned(name.nfc().collect());
+    }
     if !lang.is_case_insensitive() {
         return Cow::Borrowed(name);
     }
@@ -673,6 +677,26 @@ mod tests {
         let v = normalize_identifier(LangId::Rust, "MyVar");
         assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
         assert_eq!(&*v, "MyVar");
+    }
+
+    #[test]
+    fn normalize_rust_identifier_uses_nfc_only_for_rust() {
+        for name in ["cafe\u{301}", "r#cafe\u{301}"] {
+            assert_eq!(normalize_identifier(LangId::Rust, name), "caf\u{e9}");
+        }
+        assert_eq!(normalize_identifier(LangId::Rust, "\u{212a}"), "K");
+        assert!(matches!(
+            normalize_identifier(LangId::Rust, "caf\u{e9}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        for lang in [
+            LangId::Python,
+            LangId::Typescript,
+            LangId::Kotlin,
+            LangId::Swift,
+        ] {
+            assert_eq!(normalize_identifier(lang, "cafe\u{301}"), "cafe\u{301}");
+        }
     }
 
     /// Rust の raw identifier (`r#gen`) と Swift / Kotlin の囲みの backtick (`` `default` ``) は

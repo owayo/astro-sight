@@ -269,22 +269,22 @@ impl BindingProof {
                     let mut child = source_module.clone();
                     child.push(head.to_string());
                     if head == raw_head
-                        && !scope.child_competitors.contains(head)
-                        && scope.children.contains_key(head)
+                        && !scope.child_competitors.contains(head.as_ref())
+                        && scope.children.contains_key(head.as_ref())
                         && self
                             .activation(&child)
                             .is_some_and(|required| active.implies(&required))
                     {
                         collected.bare_leading = Some(BareLeadingBinding::GuardedChildModule);
                     } else if active.0.is_some()
-                        && !scope.children.contains_key(head)
-                        && !scope.names.contains(head)
+                        && !scope.children.contains_key(head.as_ref())
+                        && !scope.names.contains(head.as_ref())
                         && self
                             .scopes
                             .get(&[][..])
-                            .is_some_and(|root| !root.names.contains(head))
+                            .is_some_and(|root| !root.names.contains(head.as_ref()))
                         && !scope.globs.is_empty()
-                        && self.globs_lack_name(scope, head)
+                        && self.globs_lack_name(scope, head.as_ref())
                     {
                         // この edge は extern prelude へ解決した。ローカルの公開経路には混ぜない。
                         continue;

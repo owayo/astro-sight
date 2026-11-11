@@ -200,3 +200,61 @@ fn literal_const_values_templates_share_string_kind_and_regex_annotations_keep_p
         );
     }
 }
+
+#[test]
+fn numeric_arithmetic_const_values_follow_default_and_strict_policy() {
+    for extension in ["ts", "tsx"] {
+        for staged in [false, true] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            let file = format!("limits.{extension}");
+            let before = "export const RETRY_LIMIT = 3;\nexport const CACHE_TTL_MS = 60 * 1000;\n";
+            repo.write(&file, before);
+            repo.write(
+                format!("caller.{extension}"),
+                "import { RETRY_LIMIT, CACHE_TTL_MS } from './limits';\nexport function budget() { return RETRY_LIMIT * CACHE_TTL_MS; }\n",
+            );
+            repo.commit_all("initial");
+            repo.write(
+                &file,
+                before
+                    .replace("= 3", "= 5")
+                    .replace("60 * 1000", "5 * 60 * 1000"),
+            );
+            if staged {
+                repo.stage_all();
+            }
+            for strict in [false, true] {
+                let (output, json) = hook(&repo, staged, strict);
+                assert_eq!(
+                    output.status.success(),
+                    !strict,
+                    "{extension}, staged={staged}, strict={strict}: {json}"
+                );
+                let changes = json["api"]["const_value"].as_array().unwrap();
+                assert_eq!(changes.len(), 2, "{json}");
+                assert!(
+                    changes.iter().any(|change| change["n"] == "CACHE_TTL_MS"),
+                    "{json}"
+                );
+                assert!(json["api"]["mod"].is_null(), "{json}");
+                if strict {
+                    assert!(
+                        json["blocking_categories"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|category| category == "api.const_value"),
+                        "{json}"
+                    );
+                } else {
+                    assert!(json["impacts"].is_null(), "{json}");
+                    assert!(
+                        json["blocking_categories"].as_array().unwrap().is_empty(),
+                        "{json}"
+                    );
+                }
+            }
+        }
+    }
+}

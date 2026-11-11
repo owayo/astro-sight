@@ -114,12 +114,16 @@ pub(crate) fn inherent_member_surface(
                     .map(str::to_owned)
                     .collect()
             };
-            match rust_dependencies::impl_owner_candidates(krate, path, &scope, &context.owner) {
+            match rust_dependencies::impl_owner_candidates(
+                krate,
+                path,
+                &scope,
+                &context.owner,
+                context.availability.as_deref(),
+            ) {
                 Some((candidates, placements)) => {
-                    // 条件付きの候補 (`cfg` の付いた定義や取り込み、条件付きで入ったファイル) は、条件の成り立たない
-                    // 設定で、名前が glob などの別の束縛に替わり得るが、名前解決はそれを候補に入れない。impl の項目の
-                    // 有る全ての設定 (宣言の有る条件と、impl のファイルを置く条件) で候補のどれかが有ると確かめられ
-                    // なければ決めない。
+                    // 宣言と置き場の条件と両立する候補だけで比べる。その全設定を候補が覆うと証明できなければ、
+                    // glob など外側の束縛や未知の候補が残り得るので公開範囲を決めない。
                     if rust_dependencies::candidates_cover(
                         context.availability.as_deref(),
                         &placements,

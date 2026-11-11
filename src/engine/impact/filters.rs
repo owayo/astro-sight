@@ -373,6 +373,69 @@ pub(super) fn import_context_at(context: Option<&str>, column: usize) -> ImportC
     import_context_kind(statement_segment_at_column(ctx, column).trim())
 }
 
+/// Rust / JS / TS の import の宣言の範囲。参照ごとの祖先走査を避け、ファイルごとに一度作る。
+#[derive(Default)]
+pub(super) struct ImportSpans(Vec<std::ops::Range<usize>>);
+
+impl ImportSpans {
+    pub(super) fn build(mut node: tree_sitter::Node<'_>, lang: LangId) -> Self {
+        while let Some(parent) = node.parent() {
+            node = parent;
+        }
+        if node.has_error() {
+            return Self::default();
+        }
+        let mut spans = Vec::new();
+        let _ = crate::engine::tree_walk::walk_preorder(
+            node,
+            crate::engine::tree_walk::Children::Named,
+            |node, _| {
+                let is_import = match lang {
+                    LangId::Rust => node.kind() == "use_declaration",
+                    LangId::Javascript | LangId::Typescript | LangId::Tsx => {
+                        node.kind() == "import_statement"
+                            || (matches!(lang, LangId::Typescript | LangId::Tsx)
+                                && node.kind() == "import_alias")
+                            || (node.kind() == "export_statement"
+                                && (node.child_by_field_name("source").is_some() || {
+                                    let mut cursor = node.walk();
+                                    node.named_children(&mut cursor)
+                                        .any(|child| child.kind() == "export_clause")
+                                }))
+                    }
+                    LangId::C
+                    | LangId::Cpp
+                    | LangId::Python
+                    | LangId::Go
+                    | LangId::Php
+                    | LangId::Java
+                    | LangId::Kotlin
+                    | LangId::Swift
+                    | LangId::CSharp
+                    | LangId::Bash
+                    | LangId::Ruby
+                    | LangId::Zig
+                    | LangId::Xojo => false,
+                };
+                std::ops::ControlFlow::<(), _>::Continue(if is_import {
+                    spans.push(node.byte_range());
+                    crate::engine::tree_walk::Walk::Skip
+                } else {
+                    crate::engine::tree_walk::Walk::Descend
+                })
+            },
+        );
+        Self(spans)
+    }
+
+    pub(super) fn contains(&self, node: tree_sitter::Node<'_>) -> bool {
+        self.0
+            .partition_point(|span| span.start <= node.start_byte())
+            .checked_sub(1)
+            .is_some_and(|index| node.end_byte() <= self.0[index].end)
+    }
+}
+
 /// JS/TS の参照ノードが CommonJS の import の束縛位置にあるか。
 ///
 /// import とみなすのは次の 2 つだけ (どちらも括弧は透過する):
@@ -1007,6 +1070,104 @@ mod tests {
         assert!(is_import_context(Some("export { useCommitStore };")));
         assert!(is_import_context(Some("export{ useCommitStore };")));
         assert!(is_import_context(Some("export type { CommitStore };")));
+    }
+
+    #[test]
+    fn import_span_node_kinds_exist_in_supported_grammars() {
+        for lang in [
+            LangId::Rust,
+            LangId::Javascript,
+            LangId::Typescript,
+            LangId::Tsx,
+        ] {
+            let kinds = if lang == LangId::Rust {
+                &["use_declaration"][..]
+            } else if lang == LangId::Javascript {
+                &["import_statement", "export_statement", "export_clause"][..]
+            } else {
+                &[
+                    "import_statement",
+                    "import_alias",
+                    "export_statement",
+                    "export_clause",
+                ][..]
+            };
+            for kind in kinds {
+                tree_sitter::Query::new(&lang.ts_language(), &format!("({kind}) @node"))
+                    .unwrap_or_else(|error| panic!("{lang}: {kind}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn import_spans_use_ast_boundaries_for_rust_and_js_families() {
+        let cases = [
+            (
+                LangId::Rust,
+                "use crate::helper; fn run() { show(\"; use fake\", helper()); }",
+            ),
+            (
+                LangId::Rust,
+                "fn run() { use crate::{\nhelper,\n}; show(\"; use fake\", helper()); }",
+            ),
+            (
+                LangId::Javascript,
+                "import { helper } from './api'; show('; import fake', helper());",
+            ),
+            (
+                LangId::Typescript,
+                "export {\nhelper\n}; export const value = helper();",
+            ),
+            (
+                LangId::Tsx,
+                "import { helper } from './api'; const value = <span>{helper()}</span>;",
+            ),
+            (
+                LangId::Typescript,
+                "import alias = api.helper; show(\"; import fake\", helper());",
+            ),
+            (
+                LangId::Tsx,
+                "import alias = api.helper; const value = <span>{helper()}</span>;",
+            ),
+        ];
+        for (lang, source) in cases {
+            let tree = crate::engine::parser::parse_source(source.as_bytes(), lang).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let first = source.find("helper").unwrap();
+            let last = source.rfind("helper").unwrap();
+            let first = tree
+                .root_node()
+                .descendant_for_byte_range(first, first + 6)
+                .unwrap();
+            let last = tree
+                .root_node()
+                .descendant_for_byte_range(last, last + 6)
+                .unwrap();
+            let spans = ImportSpans::build(last, lang);
+            assert!(spans.contains(first), "{source}");
+            assert!(!spans.contains(last), "{source}");
+        }
+    }
+
+    #[test]
+    fn import_spans_do_not_prove_imports_in_parse_errors() {
+        for (lang, source) in [
+            (LangId::Rust, "use crate::helper; fn run( {"),
+            (
+                LangId::Typescript,
+                "import { helper } from './api'; function run( {",
+            ),
+        ] {
+            let tree = crate::engine::parser::parse_source(source.as_bytes(), lang).unwrap();
+            assert!(tree.root_node().has_error(), "{source}");
+            let start = source.find("helper").unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + 6)
+                .unwrap();
+            assert!(!ImportSpans::build(node, lang).contains(node), "{source}");
+        }
     }
 
     #[test]

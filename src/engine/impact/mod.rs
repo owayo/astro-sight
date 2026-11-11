@@ -1346,10 +1346,12 @@ fn find_parent_type_name(
             }
             // Ruby `class Foo` / `module Foo` は name フィールドではなく
             // 子ノードの constant / scope_resolution として配置される。
+            // Kotlin の型名も name フィールドを持たず、直下の type_identifier にある。
             let count = n.named_child_count() as u32;
             for i in 0..count {
                 if let Some(child) = n.named_child(i)
-                    && matches!(child.kind(), "constant" | "scope_resolution" | "identifier")
+                    && (matches!(child.kind(), "constant" | "scope_resolution" | "identifier")
+                        || (lang_id == LangId::Kotlin && child.kind() == "type_identifier"))
                     && let Ok(text) = child.utf8_text(source)
                 {
                     return Some(text.to_string());

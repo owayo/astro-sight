@@ -110,6 +110,22 @@ pub(crate) struct ItemDefinition {
 }
 
 impl Candidate {
+    /// 同じ到達先・条件の枝は、条件をたどった回数や属性の並びで増やさない。
+    fn push_distinct_branch(branches: &mut Vec<Self>, candidate: Self) {
+        let conditions = conditioned(&candidate.conditions, String::new());
+        let entered = conditioned(&candidate.entered, String::new());
+        if !branches.iter().any(|previous| {
+            previous.target == candidate.target
+                && previous.direct == candidate.direct
+                && previous.replaceable == candidate.replaceable
+                && previous.definition == candidate.definition
+                && conditioned(&previous.conditions, String::new()) == conditions
+                && conditioned(&previous.entered, String::new()) == entered
+        }) {
+            branches.push(candidate);
+        }
+    }
+
     fn new(conditions: &[String], target: Target) -> Self {
         Self {
             conditions: conditions.to_vec(),
@@ -122,8 +138,7 @@ impl Candidate {
     }
 
     /// 名前を引いたスコープの定義の候補。`replaceable` は項目を置き換え得る属性ごとの適用の条件、`opaque` は
-    /// 覆いの証明に使えないか (項目を置き換え得る属性が付いている、値の名前で引いた名前付きのフィールドの
-    /// 構造体)。
+    /// 覆いの証明に使えないか (項目を置き換え得る属性が付いている)。
     fn definition(
         conditions: &[String],
         target: Target,
@@ -200,6 +215,10 @@ pub(crate) struct Resolver<'c> {
     visiting_globs: std::cell::RefCell<Vec<GlobKey>>,
     /// 束縛を解いている宣言の有る条件 (Issue #312。[`Self::declaration_dependencies`] の間だけ)。
     availability: std::cell::RefCell<Option<Rc<AvailabilityFilter>>>,
+    /// 右辺の絞り込みとは別に保持する、契約自身の有る条件 (Issue #328)。
+    declaration_context: std::cell::RefCell<Option<Rc<AvailabilityFilter>>>,
+    /// 明示の束縛が無い設定で glob 等を探す間だけの条件。
+    fallback_context: std::cell::RefCell<Option<Rc<AvailabilityFilter>>>,
     /// 候補の条件のトークン → 有る条件の属性の鍵 ([`condition_keys`]。読めなければ None)。
     condition_keys: std::cell::RefCell<HashMap<Vec<String>, Option<ConditionKeys>>>,
     /// 型別名・定数の右辺を描かずに候補を集める下見の最中か ([`Self::resolve_candidates`])。
@@ -387,6 +406,56 @@ pub(crate) fn candidates_cover(
         .any(|config| declaration.holds(config) && placed.holds(config) && !present.holds(config))
 }
 
+/// 宣言と置き場のどの設定とも両立しない候補だけを除く。条件を読めない候補や置き場は残す。
+pub(super) fn candidates_in_context(
+    own: Option<&[AvailabilityAttr]>,
+    placements: &[Vec<String>],
+    candidates: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let Some(own) = own else {
+        return candidates;
+    };
+    let keys = |conditions: &[String]| {
+        let readable = readable_condition_tokens(conditions);
+        if readable.is_empty() {
+            Some(Vec::new())
+        } else {
+            condition_keys(&readable)
+        }
+    };
+    let Some(placed) = placements
+        .iter()
+        .map(|placement| keys(placement))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return candidates;
+    };
+    if placed.is_empty() {
+        return candidates;
+    }
+    let contexts: Vec<AvailabilityFilter> = placed
+        .into_iter()
+        .map(|placement| AvailabilityFilter {
+            own: own
+                .iter()
+                .map(|attribute| attribute.key.clone())
+                .chain(placement)
+                .collect(),
+        })
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            let mut conditions = candidate.conditions.clone();
+            conditions.extend(candidate.entered.iter().cloned());
+            let keys = keys(&conditions);
+            contexts
+                .iter()
+                .any(|context| context.compatible(keys.as_ref()))
+        })
+        .collect()
+}
+
 /// 条件のトークンを、属性ごとに字面へ戻して読み直せる形にする (置き場の節の生のトークンの `|` の区切りは
 /// 読み飛ばし、`cfg` に絞った鍵の `#[` は `#` と `[` に分ける)。
 fn readable_condition_tokens(conditions: &[String]) -> Vec<String> {
@@ -520,6 +589,8 @@ impl<'c> Resolver<'c> {
             active: std::cell::RefCell::new(Vec::new()),
             visiting_globs: std::cell::RefCell::new(Vec::new()),
             availability: std::cell::RefCell::new(None),
+            declaration_context: std::cell::RefCell::new(None),
+            fallback_context: std::cell::RefCell::new(None),
             condition_keys: std::cell::RefCell::new(HashMap::new()),
             skip_renders: std::cell::Cell::new(false),
             reached: std::cell::RefCell::new(Vec::new()),
@@ -720,7 +791,9 @@ impl Resolver<'_> {
             .collect();
         let textual = Resolver::textual(file.clone());
         *self.availability.borrow_mut() = availability.clone();
-        *textual.availability.borrow_mut() = availability;
+        *textual.availability.borrow_mut() = availability.clone();
+        *self.declaration_context.borrow_mut() = availability.clone();
+        *textual.declaration_context.borrow_mut() = availability;
         let mut found: HashMap<String, Vec<Option<String>>> = HashMap::new();
         for reference in contract_references(declaration, &file.source) {
             // 束縛の変わり得る名前や module に触れないパスは、旧新で同じ束縛なので字面で比べる
@@ -752,6 +825,7 @@ impl Resolver<'_> {
             }
         }
         *self.availability.borrow_mut() = None;
+        *self.declaration_context.borrow_mut() = None;
         for identities in found.values_mut() {
             identities.sort();
         }
@@ -933,8 +1007,11 @@ impl Resolver<'_> {
                         };
                         candidates.extend(resolved.0);
                     } else {
-                        let resolved =
-                            self.resolve_name(&target, name, reference.namespace, depth)?;
+                        let mut reached = branch.conditions.clone();
+                        reached.extend(branch.entered.iter().cloned());
+                        let resolved = self.reaching(&reached, || {
+                            self.resolve_name(&target, name, reference.namespace, depth)
+                        })?;
                         // impl の対象の型を解く間は、経路で入ったファイルの条件も引き継ぐ (Issue #315)。
                         candidates.extend(if self.keep_entered.get() {
                             resolved.under_entered(&branch.conditions, &branch.entered)
@@ -1228,33 +1305,168 @@ impl Resolver<'_> {
                     }
                     candidate.entered = entered;
                     match candidate.target {
-                        Target::Module(_) => next.push(candidate),
-                        Target::Identity(identity) => done.push(Candidate {
-                            conditions: candidate.conditions,
-                            target: Target::Identity(outside_path(
-                                &identity,
-                                &segments[index + 1..],
-                            )),
-                            direct: false,
-                            replaceable: candidate.replaceable,
-                            entered: candidate.entered,
-                            definition: None,
-                        }),
+                        Target::Module(_) => Candidate::push_distinct_branch(&mut next, candidate),
+                        Target::Identity(identity) => Candidate::push_distinct_branch(
+                            &mut done,
+                            Candidate {
+                                conditions: candidate.conditions,
+                                target: Target::Identity(outside_path(
+                                    &identity,
+                                    &segments[index + 1..],
+                                )),
+                                direct: false,
+                                replaceable: candidate.replaceable,
+                                entered: candidate.entered,
+                                definition: None,
+                            },
+                        ),
+                    }
+                    if next.len() + done.len() > MAX_CANDIDATES {
+                        return None;
                     }
                 }
             }
             walking = next;
-            if walking.len() + done.len() > MAX_CANDIDATES {
-                return None;
-            }
         }
         done.extend(walking);
         Some(done)
     }
 
-    /// スコープ `module` で名前 `name` を解く。明示の束縛が無ければ、glob、マクロ、外の glob、
-    /// prelude の候補をまとめる。型の名前空間で見つからなければ、値の名前空間も引く (const
-    /// ジェネリクスの引数)。
+    /// 明示の束縛が無い設定の条件。全設定で有ると証明したら None、読めなければ無条件。
+    fn fallback_conditions(
+        &self,
+        module: &ModuleRef,
+        explicit: &[Candidate],
+    ) -> Option<Vec<String>> {
+        if explicit.is_empty() {
+            return Some(Vec::new());
+        }
+        if module
+            .file
+            .scopes
+            .get(&module.scope)
+            .is_some_and(|bindings| !bindings.opaque.is_empty())
+            || explicit
+                .iter()
+                .any(|candidate| !candidate.replaceable.is_empty())
+        {
+            return Some(Vec::new());
+        }
+        let Some(mut branches) = explicit
+            .iter()
+            .map(|candidate| {
+                let mut conditions = candidate.conditions.clone();
+                conditions.extend(candidate.entered.iter().cloned());
+                self.keys_of(&conditions)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            // 条件を読めなければ、明示の束縛が glob を隠すと証明しない。
+            return Some(Vec::new());
+        };
+        for branch in &mut branches {
+            branch.sort();
+            branch.dedup();
+        }
+        branches.sort();
+        branches.dedup();
+        let mut atoms = Atoms::independent();
+        let present = Predicate::Any(
+            branches
+                .iter()
+                .map(|keys| Predicate::All(keys.iter().map(|key| atoms.presence(key)).collect()))
+                .collect(),
+        );
+        let absent = Predicate::Not(Box::new(present));
+        let reached = self.reached.borrow().clone();
+        let Some(reached) = self.keys_of(&reached) else {
+            return Some(Vec::new());
+        };
+        let mut context = reached;
+        if let Some(declaration) = self.declaration_context.borrow().as_ref() {
+            context.extend(declaration.own.iter().cloned());
+        }
+        let context = Predicate::All(context.iter().map(|key| atoms.presence(key)).collect());
+        let Some(mut configs) = atoms.configs() else {
+            return Some(Vec::new());
+        };
+        if !configs.any(|config| context.holds(config) && absent.holds(config)) {
+            return None;
+        }
+        // 既存の条件トークンに戻し、use の先や別名の右辺にも同じ否定条件を伝える。
+        enum Part<'a> {
+            Predicate(&'a Predicate),
+            Text(&'static str),
+        }
+        let mut text = String::from("#[cfg(");
+        let mut pending = vec![Part::Predicate(&absent)];
+        while let Some(part) = pending.pop() {
+            match part {
+                Part::Text(token) => text.push_str(token),
+                Part::Predicate(Predicate::Atom(index)) => text.push_str(&atoms.text(*index)),
+                Part::Predicate(Predicate::Not(inner)) => {
+                    text.push_str("not(");
+                    pending.push(Part::Text(")"));
+                    pending.push(Part::Predicate(inner));
+                }
+                Part::Predicate(Predicate::All(parts) | Predicate::Any(parts)) => {
+                    text.push_str(if matches!(part, Part::Predicate(Predicate::All(_))) {
+                        "all("
+                    } else {
+                        "any("
+                    });
+                    pending.push(Part::Text(")"));
+                    for child in parts.iter().rev() {
+                        pending.push(Part::Text(","));
+                        pending.push(Part::Predicate(child));
+                    }
+                }
+            }
+        }
+        text.push_str(")]\nstruct AstroSightFallback;\n");
+        let Some(tree) = parser::parse_source(text.as_bytes(), crate::language::LangId::Rust).ok()
+        else {
+            return Some(Vec::new());
+        };
+        if tree.root_node().has_error() {
+            return Some(Vec::new());
+        }
+        let Some(attribute) = tree.root_node().named_child(0) else {
+            return Some(Vec::new());
+        };
+        let mut tokens = Vec::new();
+        push_tokens(attribute, text.as_bytes(), &mut tokens);
+        Some(tokens)
+    }
+
+    fn in_fallback<T>(&self, conditions: &[String], resolve: impl FnOnce() -> T) -> T {
+        if conditions.is_empty() {
+            return resolve();
+        }
+        let mut all = self.reached.borrow().clone();
+        all.extend(conditions.iter().cloned());
+        let filter = self.keys_of(&all).map(|mut own| {
+            if let Some(declaration) = self.declaration_context.borrow().as_ref() {
+                own.extend(declaration.own.iter().cloned());
+            }
+            Rc::new(AvailabilityFilter { own })
+        });
+        let saved = std::mem::replace(&mut *self.fallback_context.borrow_mut(), filter);
+        let _filter = FilterGuard {
+            cell: &self.fallback_context,
+            saved,
+        };
+        self.reaching(conditions, resolve)
+    }
+
+    fn fallback_possible(&self, conditions: &[String]) -> bool {
+        self.fallback_context
+            .borrow()
+            .as_ref()
+            .is_none_or(|filter| filter.compatible(self.keys_of(conditions).as_ref()))
+    }
+
+    /// 明示の束縛が無い設定では、glob・マクロ・prelude の候補も引く。
     pub(super) fn resolve_name(
         &self,
         module: &ModuleRef,
@@ -1269,11 +1481,30 @@ impl Resolver<'_> {
             Namespace::Type => &[Namespace::Type, Namespace::Value],
             Namespace::Value => &[Namespace::Value],
         };
+        let mut explicit = Vec::new();
         for &namespace in namespaces {
             if let Some(found) = self.lookup(module, name, namespace, depth, false, None)? {
-                return Some(found);
+                explicit = found.0;
+                break;
             }
         }
+        let Some(conditions) = self.fallback_conditions(module, &explicit) else {
+            return Some(Resolved(explicit));
+        };
+        let fallback = self.in_fallback(&conditions, || {
+            self.resolve_fallback_name(module, name, namespaces, depth)
+        })?;
+        explicit.extend(fallback.under(&conditions));
+        (explicit.len() <= MAX_CANDIDATES).then_some(Resolved(explicit))
+    }
+
+    fn resolve_fallback_name(
+        &self,
+        module: &ModuleRef,
+        name: &str,
+        namespaces: &[Namespace],
+        depth: usize,
+    ) -> Option<Resolved> {
         // glob・マクロ・prelude の候補は直接の定義でないので、その先は絞らない。
         let _off = self.swap_filter(None);
         let Some(bindings) = module.file.scopes.get(&module.scope) else {
@@ -1285,6 +1516,9 @@ impl Resolver<'_> {
         let mut certain = Vec::new();
         let mut uncertain = Vec::new();
         for (index, glob) in bindings.globs.iter().enumerate() {
+            if !self.fallback_possible(&glob.conditions) {
+                continue;
+            }
             for branch in self.glob_modules(module, index, glob, depth)? {
                 let mut conditions = glob.conditions.clone();
                 conditions.extend(branch.conditions);
@@ -1396,14 +1630,35 @@ impl Resolver<'_> {
         if depth > MAX_DEPTH {
             return None;
         }
+        let mut explicit = Vec::new();
         for namespace in [Namespace::Type, Namespace::Value] {
             if let Some(found) = self.lookup(module, name, namespace, depth, true, None)? {
-                return Some(found);
+                explicit = found.0;
+                break;
             }
         }
+        let Some(conditions) = self.fallback_conditions(module, &explicit) else {
+            return Some(Resolved(explicit));
+        };
+        let fallback = self.in_fallback(&conditions, || {
+            self.resolve_fallback_module(module, name, depth)
+        })?;
+        explicit.extend(fallback.under(&conditions));
+        (explicit.len() <= MAX_CANDIDATES).then_some(Resolved(explicit))
+    }
+
+    fn resolve_fallback_module(
+        &self,
+        module: &ModuleRef,
+        name: &str,
+        depth: usize,
+    ) -> Option<Resolved> {
         if let Some(bindings) = module.file.scopes.get(&module.scope) {
             let mut found = Vec::new();
             for (index, glob) in bindings.globs.iter().enumerate() {
+                if !self.fallback_possible(&glob.conditions) {
+                    continue;
+                }
                 // 経路が crate の中へ向かうと字面で分かる glob (`crate::`・`self::`・`super::` か、同じ
                 // スコープの module・use の名前で始まる) だけを引く。外の crate への glob は中身が分から
                 // ないので引かず、その経路を解き直す手間 (glob の並びの順列) もかけない。経路が同じ
@@ -1554,37 +1809,46 @@ impl Resolver<'_> {
                 .get(name)
                 .into_iter()
                 .flatten()
-                .filter(|declaration| visible(&declaration.visibility))
+                .filter(|declaration| {
+                    visible(&declaration.visibility)
+                        && (!declaration.opaque.is_empty()
+                            || self.fallback_possible(&declaration.conditions))
+                })
                 .collect();
             if !declarations.is_empty() {
                 let mut path = scope.clone();
                 path.push(name.to_owned());
-                let inline = declarations.iter().any(|declaration| declaration.inline)
-                    && file.scopes.contains_key(&path);
-                let outlined = declarations.iter().any(|declaration| !declaration.inline);
-                // 中身がこのファイルの module。版の crate で解くときは、条件で分けた別のファイルの
-                // 宣言 (`#[cfg(windows)] #[path = "win.rs"] mod selected;`) も候補にする。
-                if inline && (self.crate_files.is_none() || !outlined) {
-                    return Some(Some(Resolved::single(Target::Module(ModuleRef {
-                        file: file.clone(),
-                        scope: path,
-                    }))));
-                }
-                if inline {
-                    found.push(Candidate::new(
-                        &[],
-                        Target::Module(ModuleRef {
-                            file: file.clone(),
-                            scope: path.clone(),
-                        }),
-                    ));
+                // 同じ名前の inline module も宣言ごとの条件を失わない。
+                for declaration in declarations.iter().filter(|declaration| declaration.inline) {
+                    if file.scopes.contains_key(&path) {
+                        found.push(Candidate {
+                            replaceable: declaration.opaque.clone(),
+                            ..Candidate::new(
+                                &declaration.conditions,
+                                Target::Module(ModuleRef {
+                                    file: file.clone(),
+                                    scope: path.clone(),
+                                }),
+                            )
+                        });
+                    }
                 }
                 match self.crate_files {
                     // 中身が別のファイルの module は、版の crate が無ければ字面で識別する。
-                    None => found.push(Candidate::new(
-                        &[],
-                        Target::Identity(format!("mod-file:{}", path.join("::"))),
-                    )),
+                    None => {
+                        for declaration in declarations
+                            .iter()
+                            .filter(|declaration| !declaration.inline)
+                        {
+                            found.push(Candidate {
+                                replaceable: declaration.opaque.clone(),
+                                ..Candidate::new(
+                                    &declaration.conditions,
+                                    Target::Identity(format!("mod-file:{}", path.join("::"))),
+                                )
+                            });
+                        }
+                    }
                     Some(crate_files) => {
                         for declaration in declarations.iter().filter(|d| !d.inline) {
                             let target = match crate_files.child(file, scope, name, declaration) {
@@ -1608,20 +1872,27 @@ impl Resolver<'_> {
                                 }
                                 Opened::Unknown => return None,
                             };
-                            found.push(Candidate::new(&declaration.conditions, target));
+                            found.push(Candidate {
+                                replaceable: declaration.opaque.clone(),
+                                ..Candidate::new(&declaration.conditions, target)
+                            });
                         }
                     }
                 }
             }
             for alias in bindings.aliases.get(name).into_iter().flatten() {
-                if !visible(&alias.visibility) {
+                if !visible(&alias.visibility)
+                    || (!alias.opaque_attributes && !self.fallback_possible(&alias.conditions))
+                {
                     continue;
                 }
                 let rendered = if self.skip_renders.get() {
                     String::new()
                 } else {
                     let _on = self.swap_filter(direct_filter(alias));
-                    self.render_definition(file, scope, alias, depth + 1)?
+                    self.reaching(&alias.conditions, || {
+                        self.render_definition(file, scope, alias, depth + 1)
+                    })?
                 };
                 found.push(Candidate::definition(
                     &alias.conditions,
@@ -1632,14 +1903,19 @@ impl Resolver<'_> {
             }
         } else {
             for constant in bindings.constants.get(name).into_iter().flatten() {
-                if !visible(&constant.visibility) {
+                if !visible(&constant.visibility)
+                    || (!constant.opaque_attributes
+                        && !self.fallback_possible(&constant.conditions))
+                {
                     continue;
                 }
                 let rendered = if self.skip_renders.get() {
                     String::new()
                 } else {
                     let _on = self.swap_filter(direct_filter(constant));
-                    self.render_definition(file, scope, constant, depth + 1)?
+                    self.reaching(&constant.conditions, || {
+                        self.render_definition(file, scope, constant, depth + 1)
+                    })?
                 };
                 found.push(Candidate::definition(
                     &constant.conditions,
@@ -1650,8 +1926,7 @@ impl Resolver<'_> {
             }
         }
         for item in bindings.items.get(name).into_iter().flatten() {
-            if visible(&item.visibility) && item_namespaces(item.kind).contains(&namespace) {
-                // 名前付きのフィールドの構造体は値を作らない (値の覆いの証明に使わない)。
+            if visible(&item.visibility) && item_namespaces(item).contains(&namespace) {
                 found.push(Candidate {
                     definition: Some(Rc::new(ItemDefinition {
                         path: file.path.clone(),
@@ -1665,14 +1940,13 @@ impl Resolver<'_> {
                         &item.conditions,
                         Target::Identity(format!("item:{}#{name}:{}", place(name), item.kind)),
                         item.replaceable.clone(),
-                        item.opaque_attributes
-                            || (namespace == Namespace::Value && item.named_fields),
+                        item.opaque_attributes,
                     )
                 });
             }
         }
         for target in bindings.uses.get(name).into_iter().flatten() {
-            if !visible(&target.visibility) {
+            if !visible(&target.visibility) || !self.fallback_possible(&target.conditions) {
                 continue;
             }
             let item = target.item.as_deref()?;
@@ -1686,32 +1960,33 @@ impl Resolver<'_> {
             }
             // `use name;` は同じスコープの子の module か外部 crate (自分の束縛を引き直さない)。
             if target.origin == UsePathOrigin::Bare && target.module.is_empty() {
-                let mut path = scope.clone();
-                path.push(item.to_owned());
-                let resolved = if file.scopes.contains_key(&path) {
-                    Target::Module(ModuleRef {
-                        file: file.clone(),
-                        scope: path,
-                    })
-                } else if bindings.modules.contains_key(item)
+                let local = bindings.modules.contains_key(item)
                     || bindings.items.contains_key(item)
                     || bindings.aliases.contains_key(item)
                     || bindings.constants.contains_key(item)
                     || (item != name && bindings.uses.contains_key(item))
-                {
+                    || !bindings.globs.is_empty();
+                if local && item != name {
                     // 同じスコープの束縛の別名 (`mod types; use types as selected;`・
                     // `use Raw as Out;`)。外の crate とみなす前に、同じスコープで引く (`use` の条件の下で。
                     // Issue #314)。
-                    if let Some(resolved) = self.reaching(&target.conditions, || {
-                        self.lookup(module, item, namespace, depth + 1, module_segment, None)
-                    })? {
-                        found.extend(resolved.under(&target.conditions));
-                    }
+                    let resolved = self.reaching(&target.conditions, || {
+                        if module_segment {
+                            self.resolve_module_segment(module, item, depth + 1)
+                        } else {
+                            self.resolve_name(module, item, namespace, depth + 1)
+                        }
+                    })?;
+                    found.extend(resolved.under(&target.conditions));
                     continue;
-                } else {
-                    Target::Identity(format!("extern:{item}"))
-                };
-                found.push(Candidate::new(&target.conditions, resolved));
+                }
+                if local && item == name {
+                    continue;
+                }
+                found.push(Candidate::new(
+                    &target.conditions,
+                    Target::Identity(format!("extern:{item}")),
+                ));
                 continue;
             }
             for branch in self.resolve_use_module(module, target, depth + 1)? {
@@ -2022,5 +2297,47 @@ mod tests {
         // 条件の無い宣言と、読めない条件の宣言は絞らない
         assert!(AvailabilityFilter::new(Some(&[])).is_none());
         assert!(AvailabilityFilter::new(None).is_none());
+    }
+
+    #[test]
+    fn owner_context_keeps_unreadable_conditions_and_placements() {
+        let own = [AvailabilityAttr {
+            key: "cfg ( feature = \"x\" )"
+                .split(' ')
+                .map(str::to_owned)
+                .collect(),
+            shown: "cfg(feature = \"x\")".to_owned(),
+        }];
+        let candidates = vec![
+            Candidate::new(
+                &conditions("#[cfg(feature = \"x\")]"),
+                Target::Identity("present".into()),
+            ),
+            Candidate::new(
+                &conditions("#[cfg(not(feature = \"x\"))]"),
+                Target::Identity("absent".into()),
+            ),
+            Candidate::new(&["cfg".into()], Target::Identity("unknown".into())),
+        ];
+        let filtered = candidates_in_context(Some(&own), &[Vec::new()], candidates.clone());
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].target, candidates[0].target);
+        assert_eq!(filtered[1].target, candidates[2].target);
+        assert_eq!(
+            candidates_in_context(
+                Some(&[]),
+                &[conditions("#[cfg(feature = \"x\")]")],
+                candidates.clone()
+            ),
+            filtered
+        );
+        assert_eq!(
+            candidates_in_context(None, &[Vec::new()], candidates.clone()),
+            candidates
+        );
+        assert_eq!(
+            candidates_in_context(Some(&own), &[vec!["cfg".into()]], candidates.clone()),
+            candidates
+        );
     }
 }

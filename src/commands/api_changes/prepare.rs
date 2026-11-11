@@ -1267,7 +1267,7 @@ pub(crate) fn extract_new_file_facts(
 }
 
 /// `dir` で追跡しているファイル (`dir` 相対)。列挙できなければ None。
-fn tracked_files(dir: &str) -> Option<Vec<String>> {
+pub(super) fn tracked_files(dir: &str) -> Option<Vec<String>> {
     let output = crate::git_support::git_command_for_dir(dir)
         .args(["ls-files", "-z"])
         .current_dir(dir)

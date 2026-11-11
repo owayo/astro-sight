@@ -325,7 +325,9 @@ fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str)
 fn has_token(node: tree_sitter::Node<'_>, source: &[u8], name: &str) -> bool {
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if current.child_count() == 0 && current.utf8_text(source).ok().map(unraw) == Some(name) {
+        if current.child_count() == 0
+            && current.utf8_text(source).ok().map(unraw).as_deref() == Some(name)
+        {
             return true;
         }
         let mut cursor = current.walk();
@@ -390,7 +392,7 @@ fn keyword_aliases(
     let text = |node: tree_sitter::Node<'_>| {
         node.utf8_text(source)
             .ok()
-            .map(|text| unraw(text.trim()).to_owned())
+            .map(|text| unraw(text.trim()).into_owned())
     };
     // 経路の字面が `crate`・`self`・`super` だけでできていれば、その先の module。
     let target = |path: tree_sitter::Node<'_>| -> Option<Vec<String>> {
@@ -545,7 +547,7 @@ fn forwarded_calls(tokens: &[String]) -> Vec<String> {
         if let Some(name) = tokens[open - 2]
             .split_once(':')
             .filter(|(kind, _)| kind.ends_with("identifier"))
-            .map(|(_, text)| unraw(text).to_owned())
+            .map(|(_, text)| unraw(text).into_owned())
         {
             found.push(name);
         }
@@ -561,7 +563,7 @@ fn calls_in(tokens: &[String]) -> Vec<String> {
         .windows(2)
         .filter_map(|pair| {
             let (kind, text) = pair[0].split_once(':')?;
-            (kind.ends_with("identifier") && pair[1] == "!").then(|| unraw(text).to_owned())
+            (kind.ends_with("identifier") && pair[1] == "!").then(|| unraw(text).into_owned())
         })
         .collect();
     calls.sort();
@@ -575,7 +577,7 @@ fn call_paths_in(tokens: &[String]) -> Vec<String> {
         token
             .split_once(':')
             .filter(|(kind, _)| !kind.is_empty())
-            .map(|(_, text)| unraw(text).to_owned())
+            .map(|(_, text)| unraw(text).into_owned())
     };
     let mut paths: Vec<String> = Vec::new();
     for (index, pair) in tokens.windows(2).enumerate() {
@@ -602,7 +604,8 @@ fn names_in(tokens: &[String]) -> Vec<String> {
         .iter()
         .filter_map(|token| {
             let (kind, text) = token.split_once(':')?;
-            kind.ends_with("identifier").then(|| unraw(text).to_owned())
+            kind.ends_with("identifier")
+                .then(|| unraw(text).into_owned())
         })
         .collect();
     names.sort();
@@ -643,7 +646,7 @@ pub(crate) fn exports(
                     child
                         .child_by_field_name("name")
                         .and_then(|name| name.utf8_text(source).ok())
-                        .map(|name| unraw(name).to_owned())
+                        .map(|name| unraw(name).into_owned())
                 })
                 .collect()
         };
@@ -656,7 +659,7 @@ pub(crate) fn exports(
             let named = |field: &str| {
                 item.child_by_field_name(field)
                     .and_then(|name| name.utf8_text(source).ok())
-                    .map(|name| unraw(name).to_owned())
+                    .map(|name| unraw(name).into_owned())
             };
             let declared = |kind: &'static str, namespaces: u8, scope: Option<Vec<String>>| {
                 let (availability, availability_raw) = item_availability(item, source);
@@ -722,7 +725,7 @@ pub(crate) fn exports(
                             let Some(variant_name) = variant
                                 .child_by_field_name("name")
                                 .and_then(|name| name.utf8_text(source).ok())
-                                .map(|name| unraw(name).to_owned())
+                                .map(|name| unraw(name).into_owned())
                             else {
                                 continue;
                             };
@@ -937,7 +940,7 @@ pub(crate) fn exports(
                         continue;
                     }
                     let unraw_all = |module: Vec<String>| -> Vec<String> {
-                        module.iter().map(|s| unraw(s).to_owned()).collect()
+                        module.iter().map(|s| unraw(s).into_owned()).collect()
                     };
                     // `crate`・`self`・`super` だけの経路の別名は、先の module の取り込みにする (crate
                     // root は先の名前の無い取り込み)。
@@ -969,12 +972,12 @@ pub(crate) fn exports(
                                 origin,
                                 ..
                             } => {
-                                let name = unraw(&exported_name).to_owned();
+                                let name = unraw(&exported_name).into_owned();
                                 if name == "_" {
                                     continue;
                                 }
                                 let module = unraw_all(target_module);
-                                let item = unraw(&target_item).to_owned();
+                                let item = unraw(&target_item).into_owned();
                                 let namespaces = if self_edges.contains(&position) {
                                     TYPE
                                 } else {
@@ -1050,7 +1053,7 @@ pub(crate) fn exports(
                             let Some(name) = inner
                                 .child_by_field_name("name")
                                 .and_then(|name| name.utf8_text(source).ok())
-                                .map(|name| unraw(name).to_owned())
+                                .map(|name| unraw(name).into_owned())
                             else {
                                 continue;
                             };
@@ -1088,7 +1091,7 @@ pub(crate) fn exports(
                                     token
                                         .split_once(':')
                                         .filter(|(kind, _)| !kind.is_empty())
-                                        .map(|(_, text)| unraw(text).to_owned())
+                                        .map(|(_, text)| unraw(text).into_owned())
                                 })
                                 .collect()
                         })

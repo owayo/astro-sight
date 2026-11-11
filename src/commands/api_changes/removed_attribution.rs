@@ -38,6 +38,8 @@ pub(crate) enum RefOrigin {
     LocalValue,
     /// Rust の関連メンバー定義、直接のメソッド呼び出し、または型を修飾部に持つ関連項目のパス。
     RustAssociatedMember,
+    /// 同じファイル直下の一意な型の、残存する inherent メソッドの定義か呼び出し。
+    RustInherentMember { owner: String },
     /// 参照ファイル自身に同名定義が残存している (bash)。静的な依存先に削除ファイルが
     /// 含まれる場合は証明しない。
     SelfDefined {
@@ -87,6 +89,7 @@ pub(crate) struct RemovedCandidateRef<'a> {
     /// 削除シンボルの kind (`function` / `method` / `class` ...)。
     pub(crate) kind: &'a str,
     pub(super) rust_module_function: Option<super::rust_ref_sites::ModuleFunctionProof>,
+    pub(super) rust_member_owner: Option<super::removed_rust_members::RemovedOwnerProof>,
 }
 
 /// `attr` が「削除ファイル `candidate.old_path` のシンボルではなく残存シンボル由来」と
@@ -142,6 +145,16 @@ pub(crate) fn proves_survivor_origin_with_ffi(
         RefOrigin::LocalValue => candidate.kind == "function" && !candidate.name.contains('.'),
         RefOrigin::RustAssociatedMember => {
             attr.ref_lang == Some(LangId::Rust) && candidate.rust_module_function.is_some()
+        }
+        RefOrigin::RustInherentMember { owner } => {
+            attr.ref_lang == Some(LangId::Rust)
+                && (candidate.rust_module_function.is_some()
+                    || (path_lang(candidate.old_path) == Some(LangId::Rust)
+                        && attr.ref_path == candidate.old_path
+                        && candidate
+                            .rust_member_owner
+                            .as_ref()
+                            .is_some_and(|proof| proof.owner != *owner)))
         }
         RefOrigin::SelfDefined { sourced_candidates } => {
             sourced_candidates
@@ -219,6 +232,7 @@ pub(crate) fn proves_independent_definition_with_ffi(
             RefOrigin::IndependentDefinition { .. }
                 | RefOrigin::LocalValue
                 | RefOrigin::RustAssociatedMember
+                | RefOrigin::RustInherentMember { .. }
         ))
         && proves_survivor_origin_with_ffi(attr, candidate, foreign_bindable)
 }
@@ -256,6 +270,7 @@ pub(crate) struct RefAttributionFacts {
     rust_file_scope_positions: super::removed_scope::Positions,
     rust_sites: HashMap<(usize, usize), super::rust_ref_sites::MemberSite>,
     rust_paths: HashMap<(usize, usize), super::removed_rust_paths::PathSite>,
+    rust_members: HashMap<(usize, usize), String>,
     /// JS/TS: 出現の位置 (0 始まりの行・byte 列) ごとの分類。外部パッケージの束縛
     /// (`JsRefSite::External`) の出現は参照に数えない。
     js_sites: HashMap<(usize, usize), super::js_ref_sites::JsRefSite>,
@@ -285,6 +300,7 @@ impl RefAttributionFacts {
             rust_file_scope_positions: HashSet::new(),
             rust_sites: HashMap::new(),
             rust_paths: HashMap::new(),
+            rust_members: HashMap::new(),
             js_sites: HashMap::new(),
             js_member_evidence: HashMap::new(),
             bash_sourced_candidates: None,
@@ -329,6 +345,11 @@ fn ref_origin_for(
     residual_def_paths: &HashSet<String>,
     position: (usize, usize),
 ) -> RefOrigin {
+    if let Some(owner) = facts.rust_members.get(&position) {
+        return RefOrigin::RustInherentMember {
+            owner: owner.clone(),
+        };
+    }
     match facts.rust_sites.get(&position) {
         Some(super::rust_ref_sites::MemberSite::UnprovenFieldValue) => return RefOrigin::Unproven,
         Some(
@@ -430,7 +451,7 @@ pub(crate) fn analyze_ref_attribution_facts(
         ),
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
         LangId::Python => analyze_python_facts(utf8, symbol),
-        LangId::Rust => analyze_rust_facts(utf8, ref_path, symbol, rust_paths),
+        LangId::Rust => analyze_rust_facts(utf8, ref_path, symbol, member_proof, rust_paths),
         _ => RefAttributionFacts::opaque(),
     };
     facts.ref_lang = Some(lang);
@@ -513,6 +534,7 @@ fn analyze_rust_facts(
     utf8: &camino::Utf8Path,
     ref_path: &str,
     symbol: &str,
+    member_proof: bool,
     rust_paths: &mut super::removed_rust_paths::RustPathResolver,
 ) -> RefAttributionFacts {
     let Ok(source) = parser::read_file(utf8) else {
@@ -535,6 +557,11 @@ fn analyze_rust_facts(
         rust_file_scope_positions,
         rust_sites: super::rust_ref_sites::member_positions(tree.root_node(), &source, symbol),
         rust_paths: rust_paths.positions(tree.root_node(), &source, symbol, ref_path),
+        rust_members: if member_proof {
+            super::removed_rust_members::positions(tree.root_node(), &source, symbol)
+        } else {
+            HashMap::new()
+        },
         ..RefAttributionFacts::opaque()
     }
 }
@@ -1049,6 +1076,7 @@ mod tests {
                     name: "Formatter.formatItem",
                     kind: "method",
                     rust_module_function: None,
+                    rust_member_owner: None,
                 },
             ));
         }
@@ -1059,6 +1087,7 @@ mod tests {
                 name: "Formatter.formatItem",
                 kind: "method",
                 rust_module_function: None,
+                rust_member_owner: None,
             },
         ));
     }
@@ -1153,6 +1182,7 @@ mod tests {
             name,
             kind,
             rust_module_function: None,
+            rust_member_owner: None,
         }
     }
 

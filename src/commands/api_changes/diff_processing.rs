@@ -2995,9 +2995,37 @@ impl<'a> ChangedSignatureFiles<'a> {
                             site.compatible("ts_class_optional_members_added"),
                         ))
                     }
-                    Some(super::ts_class_api::ClassChange::Breaking) | None => {
-                        Some(SignatureDecision::Blocking(None))
+                    Some(super::ts_class_api::ClassChange::Breaking) => {
+                        // コンストラクタの省略可能な引数追加も形の差になる。ほかの構造と依存が
+                        // 変わらない証明を通したものだけ、クラスの早期 blocking から分ける。
+                        detect_trailing_optional_params_compatible_mod(&site, &mut sources).map_or(
+                            Some(SignatureDecision::Blocking(None)),
+                            |compat| {
+                                let status = self
+                                    .type_dependencies
+                                    .and_then(|types| types.get(name))
+                                    .copied()
+                                    .unwrap_or_default();
+                                let dependencies_unchanged = status
+                                    != super::ts_signature::DependencyStatus::Changed
+                                    && (status != super::ts_signature::DependencyStatus::Unknown
+                                        || super::ts_signature::compatible_dependencies_unchanged(
+                                            &site,
+                                            &mut sources,
+                                            &mut state.closure_caches.optional_removal,
+                                            inputs.diff_files,
+                                            &compat.reason,
+                                            self.type_dependencies,
+                                        ));
+                                Some(if dependencies_unchanged {
+                                    SignatureDecision::Compatible(compat)
+                                } else {
+                                    SignatureDecision::Blocking(None)
+                                })
+                            },
+                        )
                     }
+                    None => Some(SignatureDecision::Blocking(None)),
                 }
             };
             if let Some(decision) = decision {

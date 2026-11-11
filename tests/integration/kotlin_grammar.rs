@@ -97,3 +97,60 @@ fn kotlin_when_return_cli_matches_braced_symbols_refs_calls_and_imports() {
         "{malformed}"
     );
 }
+
+#[test]
+fn kotlin_member_impact_requires_the_declaring_type_in_the_reference_file() {
+    for (consumer, actual) in [
+        (
+            "import java.util.Properties\n\nval settings = Properties()\nval value = settings.run { getProperty(\"mode\") }\n",
+            false,
+        ),
+        (
+            "import example.SettingShelf\n\nval settings = SettingShelf()\nval value = settings.run { getProperty(\"mode\") }\n",
+            true,
+        ),
+        (
+            "import example.SettingShelf\n\nval settings = SettingShelf()\nval value = settings.getProperty(\"mode\")\n",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "reader.kt",
+            "package example\nclass SettingShelf {\n    fun getProperty(key: String): String = key\n}\n",
+        );
+        repo.write("setup.gradle.kts", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "reader.kt",
+            "package example\nclass SettingShelf {\n    fun getProperty(key: String): String = key.uppercase()\n}\n",
+        );
+        let review = repo.run_json("review", &["--git"]);
+        let has_member_caller = review["impact"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|change| change["impacted_callers"].as_array())
+            .flatten()
+            .any(|caller| {
+                caller["path"] == "setup.gradle.kts"
+                    && caller["symbols"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|symbol| symbol == "getProperty")
+            });
+        assert_eq!(has_member_caller, actual, "{consumer}: {review}");
+
+        let refs = repo.run_json("refs", &["--name", "getProperty"]);
+        assert!(
+            refs["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reference| reference["path"] == "setup.gradle.kts"),
+            "{consumer}: {refs}"
+        );
+    }
+}

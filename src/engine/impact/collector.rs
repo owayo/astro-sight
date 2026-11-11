@@ -344,6 +344,7 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) new_side_is_worktree: bool,
     pub(super) jsx_shapes: Vec<super::jsx_props::JsxShape>,
     pub(super) jsx_parse_clean: std::cell::OnceCell<bool>,
+    pub(super) import_spans: std::cell::OnceCell<filters::ImportSpans>,
     pub(super) python_imports:
         std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
     pub(super) rust_std_origin:
@@ -474,26 +475,24 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             None => (node, source, rust_owner_index),
         };
 
-        // Stage 6 (import 行) の判定は文字列のままでないと行えないため、ここで即決する。
-        // caller_name も context から抽出し、pool へ intern して ID にしてから push する。
-        // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
-        // context は trim 済み文字列のため、列は context_column (trim 相対) を渡す
-        // (絶対列 `column` は AST point 照合用で座標系が異なる)。
-        // 写しに対応した参照は、行の字面 (書式の文字列の `; use` などにも一致する) ではなく、写しの
-        // 構文木で `use` の宣言の中かを見る。
+        // import の範囲は AST で確かめる。文字列・コメントの `; use` / `; import` では降格しない。
+        // 標準マクロの写しに対応した参照は、写しで確かめた `use` の結果を使う。
         let is_import = match rust_macro_site {
             Some((_, _, in_use)) => in_use,
+            None if self.ref_lang == Some(LangId::Rust)
+                || self.ref_lang.is_some_and(lang_is_ts_family) =>
+            {
+                node.is_some_and(|node| {
+                    self.import_spans
+                        .get_or_init(|| filters::ImportSpans::build(node, self.ref_lang.unwrap()))
+                        .contains(node)
+                        || (self.ref_lang.is_some_and(lang_is_ts_family)
+                            && filters::is_commonjs_require_binding(node, source))
+                })
+            }
             None => match filters::import_context_at(Some(context), context_column) {
                 filters::ImportContext::NotImport => false,
-                filters::ImportContext::Import => true,
-                // `= require(` を含む文を丸ごと import とみなすと、同じ文の実際の呼び出し
-                // (`require('./a').foo(1)`) まで import (情報提供) に落ちる。JS/TS は AST で
-                // CommonJS の束縛位置かを確かめ、確かめられなければ import としない。
-                filters::ImportContext::RequireOnly => {
-                    !self.ref_lang.is_some_and(lang_is_ts_family)
-                        || node
-                            .is_some_and(|node| filters::is_commonjs_require_binding(node, source))
-                }
+                filters::ImportContext::Import | filters::ImportContext::RequireOnly => true,
             },
         };
         let unproven_module_ref = is_import

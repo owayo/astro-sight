@@ -90,6 +90,74 @@ fn is_const_value_only_change_ts_untyped_scalar_is_true() {
     ));
 }
 
+#[test]
+fn is_const_value_only_change_numeric_arithmetic_is_value_only() {
+    for lang in [
+        crate::language::LangId::Javascript,
+        crate::language::LangId::Typescript,
+        crate::language::LangId::Tsx,
+    ] {
+        for (old, new) in [
+            ("60 * 1000", "5 * 60 * 1000"),
+            ("1 + 2", "3 - 4"),
+            ("1 / 2", "3 % 4"),
+            ("2 ** 3", "4 ** 5"),
+            ("-(60 * 1000)", "(5 * -60) * 1000"),
+            ("0x10 * 2", "0b10 * 0o10 + 1_000"),
+            ("1.5e2 * 2", "(.5 + 1) / 2"),
+            ("(1 /* old */ + 2)", "(3 + /* new */ 4)"),
+        ] {
+            assert!(
+                is_const_value_only_change(
+                    &format!("export const VALUE = {old};"),
+                    &format!("export const VALUE = {new};"),
+                    "variable",
+                    lang,
+                ),
+                "{lang:?}: {old} -> {new}"
+            );
+        }
+    }
+}
+
+#[test]
+fn is_const_value_only_change_numeric_arithmetic_keeps_uncertain_types_blocking() {
+    for lang in [
+        crate::language::LangId::Javascript,
+        crate::language::LangId::Typescript,
+        crate::language::LangId::Tsx,
+    ] {
+        for (old, new) in [
+            ("60 * 1000", "BASE_MS * 2"),
+            ("60 * 1000", "Number('30') * 1000"),
+            ("60 * 1000", "'5m'"),
+            ("60 * 1000", "1n * 2n"),
+            ("60 * 1000", "1n * 2"),
+            ("60 * 1000", "1 + '2'"),
+            ("60 * 1000", "1 < 2"),
+            ("60 * 1000", "1 && 2"),
+            ("60 * 1000", "~1 * 2"),
+            ("60 * 1000", "[1, 2]"),
+            ("60 * 1000", "1 +"),
+            // literal 型と number 型の間の変化は既存の blocking 判定に残す。
+            ("1000", "30 * 1000"),
+            ("30 * 1000", "1000"),
+            ("(1000)", "30 * 1000"),
+            ("-1000", "30 * 1000"),
+        ] {
+            assert!(
+                !is_const_value_only_change(
+                    &format!("export const VALUE = {old};"),
+                    &format!("export const VALUE = {new};"),
+                    "variable",
+                    lang,
+                ),
+                "{lang:?}: {old} -> {new}"
+            );
+        }
+    }
+}
+
 /// 型注釈のない scalar は値から公開型が推論されるため、種類が変わる変更 (number → string 等) は
 /// 値だけの変更ではない。静的 container の葉 (`{ timeout: 30 }` → `{ timeout: "30s" }`) が
 /// blocking なのと揃え、トップレベルでも種類が同じときだけ const_value に降格する。

@@ -49,7 +49,7 @@ impl SignatureTypes {
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
                 {
-                    self.macro_bindings.insert(clean(name).to_owned());
+                    self.macro_bindings.insert(clean(name).into_owned());
                 } else {
                     self.opaque = true;
                 }
@@ -89,7 +89,7 @@ impl SignatureTypes {
                     "mod_item" => {
                         if let Some(body) = item.child_by_field_name("body") {
                             let mut child = module.clone();
-                            child.push(clean(name?).to_owned());
+                            child.push(clean(name?).into_owned());
                             pending.push((body, child));
                         }
                     }
@@ -116,7 +116,7 @@ impl SignatureTypes {
                     "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item" => {
                         let owner = TypeKey {
                             module: module.clone(),
-                            name: clean(name?).to_owned(),
+                            name: clean(name?).into_owned(),
                         };
                         self.declarations.insert(owner.clone());
                         if mod_declaration_is_unconditional(item, source) {
@@ -157,7 +157,7 @@ impl SignatureTypes {
                         self.entries.push(Entry {
                             owner: TypeKey {
                                 module: module.clone(),
-                                name: clean(name?).to_owned(),
+                                name: clean(name?).into_owned(),
                             },
                             seed: true,
                             nominal: false,
@@ -170,7 +170,7 @@ impl SignatureTypes {
                         self.entries.push(Entry {
                             owner: TypeKey {
                                 module: module.clone(),
-                                name: clean(name?).to_owned(),
+                                name: clean(name?).into_owned(),
                             },
                             seed: true,
                             nominal: false,
@@ -281,7 +281,9 @@ impl SignatureTypes {
             for import in &self.imports {
                 match import {
                     RustPubUseEdge::Named { exported_name, .. } => {
-                        unknown |= self.shadowable_attributes.contains(clean(exported_name));
+                        unknown |= self
+                            .shadowable_attributes
+                            .contains(clean(exported_name).as_ref());
                     }
                     RustPubUseEdge::Wildcard {
                         source_module,
@@ -290,7 +292,7 @@ impl SignatureTypes {
                     } => {
                         let mut target: Vec<_> = target_module
                             .iter()
-                            .map(|part| clean(part).to_owned())
+                            .map(|part| clean(part).into_owned())
                             .collect();
                         let local = match origin {
                             UsePathOrigin::Anchored => true,
@@ -448,7 +450,7 @@ impl Resolver<'_> {
                 bound = true;
             }
             definite |= self.imports.iter().enumerate().any(|(index, import)| {
-                self.definite_imports.contains(&index) && matches!(import, RustPubUseEdge::Named { source_module, exported_name, .. } if source_module == &scope && clean(exported_name) == first)
+                self.definite_imports.contains(&index) && matches!(import, RustPubUseEdge::Named { source_module, exported_name, .. } if source_module == &scope && clean(exported_name).as_ref() == first)
             });
             for (index, import) in self.imports.iter().enumerate() {
                 if definite && matches!(import, RustPubUseEdge::Wildcard { .. }) {
@@ -461,7 +463,7 @@ impl Resolver<'_> {
                         target_module,
                         target_item,
                         ..
-                    } if clean(exported_name) == first => {
+                    } if clean(exported_name).as_ref() == first => {
                         (source_module, target_module, Some(target_item))
                     }
                     RustPubUseEdge::Wildcard {
@@ -477,9 +479,10 @@ impl Resolver<'_> {
                 if !imports_used.insert(index) {
                     return Err(());
                 }
-                let mut target: Vec<_> = target.iter().map(|part| clean(part).to_owned()).collect();
+                let mut target: Vec<_> =
+                    target.iter().map(|part| clean(part).into_owned()).collect();
                 if let Some(item) = item {
-                    target.push(clean(item).to_owned());
+                    target.push(clean(item).into_owned());
                     target.extend_from_slice(tail);
                 } else {
                     target.extend_from_slice(&path);
@@ -563,8 +566,8 @@ impl Resolver<'_> {
     }
 }
 
-fn clean(name: &str) -> &str {
-    name.strip_prefix("r#").unwrap_or(name)
+fn clean(name: &str) -> std::borrow::Cow<'_, str> {
+    crate::language::normalize_identifier(crate::language::LangId::Rust, name)
 }
 
 fn generic_names(item: Node<'_>, source: &[u8]) -> HashSet<String> {
@@ -576,7 +579,7 @@ fn generic_names(item: Node<'_>, source: &[u8]) -> HashSet<String> {
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source).ok())
             {
-                names.insert(clean(name).to_owned());
+                names.insert(clean(name).into_owned());
             }
         }
     }
@@ -669,7 +672,7 @@ fn type_path(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
                 }
             }
             "type_identifier" | "identifier" | "primitive_type" | "crate" | "self" | "super" => {
-                path.push(clean(node.utf8_text(source).ok()?).to_owned())
+                path.push(clean(node.utf8_text(source).ok()?).into_owned())
             }
             _ => return None,
         }

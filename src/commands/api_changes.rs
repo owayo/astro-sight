@@ -339,6 +339,7 @@ pub(crate) fn detect_api_changes_with_renames(
     // 別のファイルへ移した Rust の項目も、移動元と移動先の宣言 (同じ場所の `#[cfg]` の分岐を
     // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
     // ことの証明にはしない。
+    let moved = rust_impl_moves::verify(&inputs, moved, &mut state.buckets.modified);
     compare_moved_availability(&inputs, &mut state, &moved);
     // 内容の同じ rename をした Rust のファイルの項目も、旧い置き場と新しい置き場の条件で比べる (Issue #316)。
     compare_renamed_availability(&inputs, &mut state, renames);
@@ -347,6 +348,7 @@ pub(crate) fn detect_api_changes_with_renames(
     record_module_availability(&inputs, &mut state);
     // 再公開した名前の比べ直しの結果も、同じ区分に振り分ける (Issue #306・#318)。
     record_reexport_names(&inputs, &mut state);
+    rust_opaque_return::record(&inputs, &mut state, &moved);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -884,6 +886,7 @@ mod ref_index;
 mod removed_attribution;
 mod removed_cargo;
 mod removed_ffi;
+mod removed_rust_members;
 mod removed_rust_paths;
 mod removed_scope;
 
@@ -892,7 +895,9 @@ mod rust_cfg_predicate;
 mod rust_declarations;
 mod rust_dependencies;
 mod rust_enum_api;
+mod rust_impl_moves;
 mod rust_module_availability;
+mod rust_opaque_return;
 mod rust_placement_availability;
 mod rust_public;
 mod rust_reexport_names;

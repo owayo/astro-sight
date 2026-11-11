@@ -837,3 +837,61 @@ fn python_member_removal_accepts_local_static_bases_but_keeps_imported_bases_unp
         assert_eq!(stderr.contains("\"rm_dead\""), informational, "{stderr}");
     }
 }
+#[test]
+fn python_mock_attribute_configuration_keeps_review_hook_and_refs_distinct() {
+    let before = "class Greeter:\n    def greet(self, name: str, title: str | None) -> str:\n        return name\n";
+    let caller = "from app.greeter import Greeter\n\ndef handle():\n    greeter = Greeter()\n    return greeter.greet(name='Name', title=None)\n";
+    let mock = "from unittest.mock import MagicMock\n\ndef test_mock():\n    fake = MagicMock()\n    fake.greet.return_value = 'hi'\n    fake.greet.assert_not_called()\n";
+    for update_caller in [false, true] {
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(
+                    root.join("app/greeter.py"),
+                    before.replace("title: str | None", "lang: str"),
+                )
+                .unwrap();
+                if update_caller {
+                    std::fs::write(
+                        root.join("app/handler.py"),
+                        caller.replace("title=None", "lang='en'"),
+                    )
+                    .unwrap();
+                }
+                let refs = cargo_bin_with_explicit_config()
+                    .args(["refs", "--name", "greet", "--dir", root.to_str().unwrap()])
+                    .output()
+                    .unwrap();
+                assert!(refs.status.success());
+                let refs: serde_json::Value = serde_json::from_slice(&refs.stdout).unwrap();
+                assert_eq!(
+                    refs["refs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|reference| { reference["path"] == "tests/test_handler.py" })
+                        .count(),
+                    2,
+                    "{refs}"
+                );
+            },
+            &[
+                ("app/__init__.py", ""),
+                ("app/greeter.py", before),
+                ("app/handler.py", caller),
+                ("tests/test_handler.py", mock),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), update_caller, "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        if update_caller {
+            assert_eq!(json["api"]["mod_closed"][0]["n"], "Greeter.greet", "{json}");
+            assert!(
+                json["blocking_categories"].as_array().unwrap().is_empty(),
+                "{json}"
+            );
+        } else {
+            assert_eq!(json["api"]["mod"][0]["n"], "Greeter.greet", "{json}");
+        }
+    }
+}

@@ -12,6 +12,7 @@ mod integration {
     mod bash_grammar;
     mod cli_basics;
     mod cochange;
+    mod constructor_optional_params;
     mod context;
     mod dead_code;
     mod dead_code_conventions;
@@ -20,6 +21,7 @@ mod integration {
     mod dead_code_parse_budget;
     mod dead_code_uncounted;
     mod deep_nesting;
+    mod destructured_optional_defaults;
     mod fixed_callback_contract;
     mod function_value_handoff;
     mod git_invocations;
@@ -28,6 +30,7 @@ mod integration {
     mod identifier_spellings;
     mod impact;
     mod impact_diff_input;
+    mod impact_import_context;
     mod impact_jsx_props;
     mod impact_object_members;
     mod impact_output;

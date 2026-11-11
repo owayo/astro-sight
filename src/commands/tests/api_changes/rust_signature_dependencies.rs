@@ -86,6 +86,39 @@ fn unchanged_dependencies_are_not_reported() {
     assert!(api.modified.is_empty(), "{api:?}");
 }
 
+/// 型だけを束縛する宣言は、glob で取り込んだ同名の定数を隠さない。
+#[test]
+fn type_only_items_do_not_hide_glob_value_dependencies() {
+    for declaration in [
+        "struct LEN { hidden: () }",
+        "struct LEN {}",
+        "union LEN { hidden: u8 }",
+        "enum LEN { Value }",
+        "trait LEN {}",
+    ] {
+        let source = |base: &str| {
+            format!(
+                "const BASE: usize = {base};\nmod fallback {{ pub const LEN: usize = crate::BASE; }}\nuse fallback::*;\n#[allow(non_camel_case_types, dead_code)]\n{declaration}\npub fn run(_: [u8; LEN]) {{}}\n"
+            )
+        };
+        let api = api_changes(&source("1"), &source("2"));
+        assert_eq!(
+            dependency_reason(&api, "run"),
+            Some(Reason::RustSignatureDependencyChanged),
+            "{declaration}: {api:?}"
+        );
+    }
+
+    // 型の名前空間では、引き続き同じスコープの構造体が glob の型別名より優先される。
+    let source = |base: &str| {
+        format!(
+            "type Base = {base};\nmod fallback {{ pub type LEN = crate::Base; }}\nuse fallback::*;\nstruct LEN {{ hidden: () }}\npub fn run(_: LEN) {{}}\n"
+        )
+    };
+    let api = api_changes(&source("u8"), &source("u16"));
+    assert_eq!(dependency_reason(&api, "run"), None, "{api:?}");
+}
+
 /// 引数名・const の追加・互換なフィールドの追加と同時に別名の指す先を変えても、互換や変更なしに
 /// せず blocking。
 #[test]
@@ -469,6 +502,45 @@ fn files_opened_through_path_attributes_are_followed() {
         Some(Reason::RustSignatureDependencyChanged),
         "{api:?}"
     );
+}
+
+/// raw な属性名も同じファイルを開き、既定の場所に残る未使用ファイルとは区別する。
+#[test]
+fn raw_path_attributes_follow_actual_file_dependencies() {
+    for attribute in ["path", "r#path"] {
+        let lib = |base: &str| {
+            format!(
+                "type Base = {base};\n#[{attribute} = \"actual.rs\"]\nmod selected;\npub fn run(_: selected::Text) {{}}\n"
+            )
+        };
+        let old_lib = lib("u8");
+        let new_lib = lib("u16");
+        let files = [
+            ("src/lib.rs", old_lib.as_str()),
+            ("src/actual.rs", "pub type Text = crate::Base;\n"),
+            ("src/selected.rs", "pub type Text = u32;\n"),
+        ];
+        let api = api_changes_of_files(&files, &[("src/lib.rs", &new_lib)]);
+        assert_eq!(
+            dependency_reason(&api, "run"),
+            Some(Reason::RustSignatureDependencyChanged),
+            "{attribute}: {api:?}"
+        );
+        assert!(
+            api.modified
+                .iter()
+                .any(|change| change.name == "Text" && change.file == "src/actual.rs"),
+            "{attribute}: {api:?}"
+        );
+
+        let unrelated =
+            api_changes_of_files(&files, &[("src/selected.rs", "pub type Text = u64;\n")]);
+        assert_eq!(
+            dependency_reason(&unrelated, "run"),
+            None,
+            "{attribute}: {unrelated:?}"
+        );
+    }
 }
 
 /// 型を別のファイルへ移して再公開を付け替えただけなら、変えていない型別名の右辺の中で名指していても

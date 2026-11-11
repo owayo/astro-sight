@@ -98,8 +98,10 @@ pub(crate) fn partition_removed_dead_candidates(
         .iter()
         .filter(|c| {
             matches!(c.kind.as_str(), "method" | "function")
-                && super::removed_attribution::path_lang(&c.file)
-                    .is_some_and(super::removed_attribution::is_js_ts_family)
+                && super::removed_attribution::path_lang(&c.file).is_some_and(|lang| {
+                    super::removed_attribution::is_js_ts_family(lang)
+                        || (lang == crate::language::LangId::Rust && c.name.contains('.'))
+                })
         })
         .map(|c| bare_name(&c.name).to_string())
         .collect();
@@ -119,6 +121,8 @@ pub(crate) fn partition_removed_dead_candidates(
     let mut python_members = super::python_member_origin::PythonMemberOrigins::default();
     let mut private_owners = super::python_private_owner::PrivateOwnerRemovals::default();
     let mut old_rust_functions: HashMap<String, Option<super::rust_ref_sites::ModuleFunctions>> =
+        HashMap::new();
+    let mut old_rust_members: HashMap<String, Option<super::removed_rust_members::RemovedOwners>> =
         HashMap::new();
     let mut rust_paths = super::removed_rust_paths::RustPathResolver::new(dir);
     let python_old_paths: HashSet<String> = candidates
@@ -240,6 +244,22 @@ pub(crate) fn partition_removed_dead_candidates(
             kind: &c.kind,
             rust_module_function: rust_functions
                 .and_then(|functions| functions.prove(&c.name, &c.signature)),
+            rust_member_owner: (matches!(c.kind.as_str(), "function" | "method")
+                && c.name.contains('.')
+                && super::removed_attribution::path_lang(&c.file)
+                    == Some(crate::language::LangId::Rust))
+            .then(|| {
+                old_rust_members
+                    .entry(c.file.clone())
+                    .or_insert_with(|| {
+                        super::removed_rust_members::RemovedOwners::parse(
+                            &base_blobs.read(&c.file)?,
+                        )
+                    })
+                    .as_ref()
+                    .and_then(|owners| owners.prove(&c.name))
+            })
+            .flatten(),
         };
         if python_input_complete
             && private_owners.proves_closed_removal(
@@ -447,6 +467,7 @@ fn has_no_live_reference(
             RefOrigin::IndependentDefinition { .. }
                 | RefOrigin::LocalValue
                 | RefOrigin::RustAssociatedMember
+                | RefOrigin::RustInherentMember { .. }
         )
     });
     if !references.is_empty()

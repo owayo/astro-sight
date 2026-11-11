@@ -8,6 +8,8 @@ use tree_sitter::Node;
 use super::ref_index::{ApiClosureCaches, parsed_ref_file, parsed_ref_file_shared};
 use crate::models::reference::SymbolReference;
 
+mod mock_attributes;
+
 /// 1 回の検出の中で答えが変わらない、Python のクラス・束縛の解決結果のキャッシュ。
 ///
 /// メソッドの閉包判定は参照 1 件ごとに受け手のクラスを解決する。キャッシュが無いと、
@@ -31,6 +33,8 @@ pub(crate) struct PythonClassCache {
     dynamic_lookups: HashMap<String, bool>,
     /// (ファイル, クラス名) → `class_import_module`
     import_modules: HashMap<(String, String), Option<String>>,
+    /// (ファイル, 関数, 変数) → 無引数 Mock の設定にしか使われない束縛。
+    mock_receivers: HashMap<(String, usize, String), bool>,
     /// キャッシュが効いていることを確かめるための計算回数 (テスト用)。
     #[cfg(test)]
     pub(super) stats: PythonClassCacheStats,
@@ -1111,6 +1115,9 @@ pub(super) fn method_reference_owner(
     }) else {
         return MethodCallMatch::Unknown;
     };
+    if mock_attributes::proves_configuration(attribute, caller_file, dir, caches) {
+        return MethodCallMatch::Other;
+    }
     if attribute.parent().is_none_or(|n| {
         n.kind() != "call"
             || n.child_by_field_name("function")
@@ -1251,6 +1258,9 @@ pub(super) fn changed_method_call_matches_signature(
         != Some(member.id())
     {
         return MethodCallMatch::Unknown;
+    }
+    if mock_attributes::proves_configuration(attribute, caller_file, dir, caches) {
+        return MethodCallMatch::Other;
     }
     let Some(call) = attribute.parent().filter(|parent| parent.kind() == "call") else {
         return MethodCallMatch::Unknown;

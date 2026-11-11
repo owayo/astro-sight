@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn rust_nfc_references_keep_spelling_and_byte_columns_in_every_scan() {
+    let source = "pub fn caf\u{e9}() {}\nfn call() { cafe\u{301}(); }\n";
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("lib.rs");
+    std::fs::write(&file, source).unwrap();
+    let path = camino::Utf8Path::from_path(&file).unwrap();
+    let names = vec![
+        "caf\u{e9}".to_owned(),
+        "cafe\u{301}".to_owned(),
+        "cafe".to_owned(),
+    ];
+    let acs = build_batch_acs(&names).unwrap();
+    let batch = find_refs_batch_in_file_indexed::<true>(&names, &acs, path).unwrap();
+    let counts = count_refs_in_file(&names, &acs, path).unwrap();
+    let old = SourceReferenceBatch::new(&names)
+        .unwrap()
+        .scan(path, source.as_bytes())
+        .unwrap();
+    for (index, name) in names.iter().enumerate() {
+        let prefilter = SingleNamePrefilter::new(name).unwrap();
+        let single = find_refs_in_file(name, path, &prefilter).unwrap();
+        let expected = if index < 2 { 2 } else { 0 };
+        assert_eq!(single.len(), expected, "{name}: {single:?}");
+        assert_eq!(batch[index].len(), expected, "{name}: {:?}", batch[index]);
+        assert_eq!(old.references[index].len(), expected, "{name}");
+        assert_eq!(counts[index], usize::from(index < 2), "{name}");
+        if index < 2 {
+            let call = single.iter().find(|reference| reference.line == 1).unwrap();
+            assert_eq!(call.column, 12);
+            assert_eq!(
+                call.context.as_deref(),
+                Some("fn call() { cafe\u{301}(); }")
+            );
+        }
+    }
+    std::fs::write(&file, "fn K() {}\nfn call() { K(); }\n").unwrap();
+    let prefilter = SingleNamePrefilter::new("\u{212a}").unwrap();
+    assert_eq!(
+        find_refs_in_file("\u{212a}", path, &prefilter)
+            .unwrap()
+            .len(),
+        2
+    );
+    std::fs::write(&file, "fn call() { println!(\"{cafe\\u{301}}\"); }\n").unwrap();
+    let names = vec!["caf\u{e9}".to_owned()];
+    let acs = build_batch_acs(&names).unwrap();
+    let prefilter = SingleNamePrefilter::new(&names[0]).unwrap();
+    assert_eq!(
+        find_refs_in_file(&names[0], path, &prefilter)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        find_refs_batch_in_file_indexed::<true>(&names, &acs, path).unwrap()[0].len(),
+        1
+    );
+    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), [1]);
+}
+
 /// cfg 条件のキーは同名の Rust シンボルを参照しない。
 /// cfg_attr の条件以外や通常のマクロ引数、関数呼び出しは残す。
 #[test]
