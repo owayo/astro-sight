@@ -1,370 +1,279 @@
 ---
 name: astro-sight
 description: >-
-  tree-sitter AST でコード構造を解析する CLI。コード識別子 (関数/クラス/変数/型/メソッド名)
-  を探すときは Grep でなく必ずこれ — refs --name/--names (関数の呼び出し元の特定も refs)。
-  diff/PR レビューは review --git、編集中・編集後の diff 影響分析は context/impact、
-  構文ノードの特定・parse エラー調査は ast。
-  dead-code/symbols/calls/imports/sequence/lint/session も提供。
-  識別子検索・シンボル参照・呼び出し関係・構造把握・構文確認・コードレビューの場面で発動。
+  Analyze source code with the astro-sight AST CLI. Use refs instead of grep/rg
+  for code identifiers, including definitions and callers; review for diffs and
+  PRs; context/impact during and after edits; and ast for syntax boundaries or
+  parse errors. Use symbols, calls, imports, sequence, cochange, dead-code, lint,
+  and session for related structural analysis.
 allowed-tools: Bash(astro-sight:*)
 ---
 
 # astro-sight
 
-tree-sitter AST-based code structure CLI. The primary **Grep replacement for code identifiers** (`refs`), plus diff review (`review`), impact analysis (`context` / `impact`), dead-code detection, and structural queries. Output defaults to compact JSON, with TOON and automatic token-size selection available on data commands.
+Use AST evidence to locate code, inspect dependencies, and assess changes. Results
+are static analysis within the selected scope, not a compiler check or proof of
+runtime behavior. Check the installed CLI with `astro-sight <command> --help`
+when an option or output field differs from this guide.
 
-## 更新後の版確認
+## Choose the query
 
-更新後も以前の検出が残るときは、`command -v astro-sight` と `astro-sight --version` で実行先と版を確認する。mise の shim が選ばれる場合は `mise which astro-sight` で実体を調べる。`make install` の既定の配置先と実行先が違うときは、実体のあるディレクトリを `INSTALL_PATH` に指定してインストールする。
-
-## When to Use (Decision Checklist)
-
-**Immediately before every Grep call, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep. Classify the search pattern itself; do not infer from the file type or the surrounding task.
-The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception. Searching inside a **single file** is still identifier search — use `refs --name <sym> --dir . --glob <file>` instead of grepping that file. Wanting the surrounding lines (`grep -A 20 <sym>`) is not an exception either — run `refs` for the exact hit lines, then Read those offsets. A keyword prefix does not make it a text search: grepping `fn foo` / `struct Foo` / `impl Foo` / `class Foo` to find a definition is identifier search — `refs --name foo` marks the definition with `"kind":"def"`.
+Before using grep/rg, inspect the search pattern itself. If it contains a code
+identifier, use `refs`, even for one file, a definition such as `fn parse`, or a
+search that needs surrounding lines. Use returned locations to read more context.
+Text search remains appropriate for error messages, configuration values, prose,
+TODO comments, and filename discovery.
 
 | Need | Command |
 |---|---|
-| Find a function / class / variable / type / constant / method name | `refs --name <sym>` (pipe-separated `FOO`/`Bar` → `refs --names FOO,Bar`; single file → add `--glob <file>`) |
-| Review a diff / PR / bug-fix end-to-end | `review --dir . --git` (external patch: `--diff-file <patch>`) |
-| Who calls a function — check this before changing its signature | `refs --name <fn>` (`ctx` shows each call site, across files) |
-| What the current diff breaks (needs uncommitted changes; a clean tree returns nothing) | `context --dir . --git` |
-| Unresolved impacts (after editing) | `impact --dir . --git` |
-| Dead (unreferenced) exported symbols | `dead-code --dir .` (diff-scoped: `--git`) — results carry `line` |
-| File / directory structure | `symbols --path <file>` / `symbols --dir <dir>` |
-| Exact syntax node at a cursor, or parse-error debug | `ast --path <file> --line <n> --col <n>` |
-| What a function calls (its callees — not its callers) | `calls --path <file> --function <name>` |
-| What a file imports | `imports --path <file>` |
-| Understand ordered call flow, especially 3+ interactions | `sequence --path <file> --function <name>` |
-| Files that usually change together | `cochange --dir . --paths <file>` |
-| Repeated AST/text policy | `lint --path <file> --rules rules.yaml` |
-| 2+ mixed queries in one process | `session` (NDJSON) |
+| Definitions and uses of one identifier, including callers | `astro-sight refs --name <name> --dir .` |
+| Several identifiers | `astro-sight refs --names Foo,bar --dir .` |
+| One file's occurrences | `astro-sight refs --name <name> --dir . --glob 'src/file.rs'` |
+| Diff or PR review | `astro-sight review --dir . --git` |
+| Affected symbols, signatures, and callers | `astro-sight context --dir . --git` |
+| Unresolved caller impacts after editing | `astro-sight impact --dir . --git` |
+| Exported symbols with no observed uses | `astro-sight dead-code --dir . --git` |
+| Definitions and complexity | `astro-sight symbols --path <file>` |
+| Directory inventory | `astro-sight symbols --dir <dir>` |
+| Calls made by a function | `astro-sight calls --path <file> --function <name>` |
+| Imports and exports | `astro-sight imports --path <file>` |
+| Ordered call flow | `astro-sight sequence --path <file> --function <name>` |
+| Historical co-change candidates | `astro-sight cochange --dir . --paths <file>` |
+| Exact syntax node | `astro-sight ast --path <file> --line <n> --col <n>` |
+| Repeated AST/text rules | `astro-sight lint --path <file> --rules rules.yaml` |
 
-**Grep is fine for**: error messages, config values, TODO comments, file-path patterns — anything that is NOT a code identifier.
+`calls --function X` lists X's **callees**, not its callers. Use `refs --name X
+--dir .` for callers, then inspect the occurrence: definitions, imports, and other
+uses also appear in `refs`. Same-name matches do not establish binding identity.
+Use `sequence` when order or a chain of three or more interactions matters.
 
-**Languages parsed** (16): Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Identifiers that live *only* in a file type outside this list — SQL column names, HCL/Terraform blocks, `.vue` / `.svelte` templates — cannot be resolved, so Grep stays correct there. Do not guess, though: run `refs` first. A zero-result AST query is itself an analysis result. `refs` and `dead-code` name the unparseable source types in scope (`truncations` → `unanalyzable_source`), and `refs` fails with `UNSUPPORTED_LANGUAGE` when no file in scope can be parsed, so a zero result is never a silent "not searched".
+For two or more structural queries, use `session` from the start; use `refs
+--names` when only searching several names. See the examples below.
 
-## Quick Reference
+## Reference searches and coverage
 
-```bash
-astro-sight refs --name <symbol> --dir .           # 1. references (REPLACES Grep for identifiers)
-astro-sight refs --names sym1,sym2 --dir .         # 2. batch symbol search (REPLACES Grep "FOO|Bar")
-astro-sight review --dir . --git                   # 3. one-shot diff/PR review
-astro-sight context --dir . --git                  # 4. what the current diff breaks (needs a diff)
-astro-sight impact --dir . --git                   # 5. unresolved impacts (after editing)
-astro-sight dead-code --dir . --git                # 6. dead exported symbols
-astro-sight symbols --path <file>                  # 7. file structure
-astro-sight calls --path <file> --function <name>  # 8. callees of a function (callers → refs)
-astro-sight imports --path <file>                  # 9. imports/exports
-astro-sight sequence --path <file> --function <name> # 10. ordered call flow (3+ interactions)
-astro-sight cochange --dir . --paths <file>        # 11. files that usually change together
-astro-sight lint --path <file> --rules rules.yaml  # 12. repeated structural policy
-printf '%s\n' \
-  '{"command":"refs","name":"S","dir":"."}' \
-  '{"command":"symbols","path":"src/main.rs"}' \
-  | astro-sight session                                  # 13. batch mixed queries
-astro-sight <command> --format auto                # 14. json/toon whichever costs fewer tokens
-```
+`refs` matches identifier occurrences rather than arbitrary text substrings.
+Results contain `refs` with `path`, `ln`, `col`, `ctx`, and `kind`
+(`def`, `ref`, or `unknown`). `ctx` supplies the source line; read the file when
+surrounding logic is needed. `unknown` can retain a Bash/zsh declaration header
+inside a parse-error region and does not verify a definition or use.
 
-## Commands
+Directory scans respect ignore rules and scope filters. Generated files are
+skipped by default and reported in `skipped`; use `--include-generated` when
+those files matter. Generated detection honors `.gitattributes`
+`linguist-generated` overrides before filename/header heuristics.
 
-### `refs` — Cross-File Symbol Search (Use Instead of Grep)
+Read coverage notices before interpreting an empty result. Public `refs` reports
+unsupported source types in `truncations` (`reason: unanalyzable_source`) when their
+contents may match a requested name. This filter is independent of AST hit counts:
+a zero-reference query still reports a matching unsupported source, while files
+without the requested name do not generate notices. Unreadable, oversized, or
+undecodable sources remain reported conservatively. These files were not parsed;
+inventory file types when scope-wide completeness matters. A nonempty scope with
+no searchable file returns
+`UNSUPPORTED_LANGUAGE`; a scope matching no files can return an empty result.
+An absent notice does not prove coverage of unknown extensions, ignored files,
+external consumers, or dynamic uses. Do not repeat a successful supported-source
+identifier search with grep/rg merely because it returned zero. For an unsupported
+or failed source, inspect the diagnostic and use text search where AST analysis
+cannot cover it, stating that limitation.
 
-The primary Grep replacement. Matches only tree-sitter identifier nodes — no false positives from comments, strings, or partial matches.
+### Output limits
 
-```bash
-astro-sight refs --name <symbol> --dir <directory>
-astro-sight refs --name <symbol> --dir <directory> --glob "**/*.rs"   # narrow by glob
-astro-sight refs --names sym1,sym2,sym3 --dir <directory>             # multiple symbols (NDJSON, one line each)
-astro-sight refs --name <symbol> --dir . --max-results unlimited      # opt out of the default cap
-```
+`refs` defaults to at most 100 displayed occurrences and an estimated 3,000-token
+budget. These limit output, not the search. When occurrences are omitted,
+`result_summary` gives `shown`, `total`, `omitted`, and `limited_by`. Its `by_lang`,
+`by_kind`, and `files` describe **omitted occurrences only**; use them to narrow
+`--glob` before requesting a much larger output. `total` counts the analyzed
+input, not necessarily the whole repository. When present, `complete_input:
+false` explicitly warns that input coverage is incomplete.
 
-Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def`/`ref`/`unknown`). `ctx` shows the source line — no need to Read files afterward.
-
-`unknown` marks a recognizable Bash/zsh declaration header inside a parse error region. Its occurrence is retained, but neither a definition nor a use is verified. Check the `symbols` / `ast` diagnostics; zsh uses the Bash grammar as a fallback.
-
-**Files astro-sight cannot parse are reported, not silently skipped.** Source files in scope with no parser (`.vue`, `.svelte`, `.scala`, `.applescript`, ...) appear in `truncations` as `unanalyzable_source` (one entry per extension, with a count and up to three paths); references inside them were not searched, so read it before trusting a zero result. With `--names` the list is attached once, to the first record. When the scope (`--dir` / `--glob`) has files but **none** can be searched (only `.applescript`, only Markdown, ...), `refs` fails with `UNSUPPORTED_LANGUAGE` instead of returning an empty list, like `symbols --path` does. A scope that matches no file at all still returns an empty list.
-
-**Output is capped by default** (100 refs / ~3,000 tokens) so one hot identifier cannot burn tens of thousands of tokens. Analysis is never truncated — only the output is. When results are omitted you get a `result_summary`:
-
-```json
-"result_summary": {
-  "shown": 64, "total": 1846, "omitted": 1782,
-  "limited_by": ["max_results", "token_budget"],
-  "by_lang": { "rust": 1776, "php": 5 },
-  "files": [ { "path": "src/foo.rs", "count": 326 } ],
-  "other_files": { "files": 128, "count": 1231 }
-}
-```
-
-`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent; output is byte-identical to an unlimited run unless sample paths were shortened (below). A `budget_exceeded: true` field means the output could not be squeezed into `--token-budget` even at zero shown refs (the summary itself has a fixed cost) — raise the budget, pass fewer names, or narrow with `--glob`.
-
-Sample paths in `skipped.paths` and `truncations[].detail.examples` give way to refs: they are shortened before any ref is cut, the counts (`skipped.generated`, `detail.count`) stay, and a shortened list carries `paths_limited_by` / `examples_limited_by: "token_budget"`. Those fields mean only the sample was cut, not the refs; pass `--token-budget unlimited` to see every sample path.
-
-### `calls` — Call Graph Extraction
+To remove both output limits:
 
 ```bash
-astro-sight calls --path <file>                    # all call edges in a file
-astro-sight calls --path <file> --function <name>  # only calls made by one function
+astro-sight refs --name <name> --dir . --max-results unlimited --token-budget unlimited
 ```
 
-Output (compact): `calls` array grouped by `caller`, each with `range` and `callees` (`name`, `ln`, `col`). `--pretty` for full format.
+Setting only one limit to `unlimited` leaves the other in effect. A
+`budget_exceeded` summary means even the minimized output exceeded the estimate;
+raise the budget, reduce names, or narrow the scope. Sample paths may be shortened
+before occurrences are cut: `paths_limited_by` / `examples_limited_by` describe
+those samples, while their counts remain. No `result_summary` means no reference
+occurrences were omitted, not that every possible input was analyzed. With CLI
+`--names`, shared coverage notices appear only on the first result.
 
-`--function <name>` keeps only the calls made **from inside** `<name>`, so it answers "what does `<name>` call?". It never lists who calls `<name>` — for callers (including other files) use `refs --name <name>`, whose `ctx` shows each call site.
+## Editing and reviewing code
 
-### `context` — Diff Impact Analysis
-
-Reads a unified diff and finds affected symbols, signature changes, and impacted callers. Answers "what does this change break?". It needs a diff to exist: on a clean working tree `--git` yields `{"changes":[]}`, so before your first edit list the call sites with `refs --name <symbol>` instead, and run `context` once edits are in place.
-
-```bash
-astro-sight context --dir . --git                      # auto git diff (recommended)
-astro-sight context --dir . --git --staged             # staged changes
-astro-sight context --dir . --git --base HEAD~3        # custom base ref
-astro-sight context --dir . --diff-file changes.patch  # diff file (also: --diff "<str>", or pipe `git diff`)
-```
-
-Output: `changes` per file with `affected_symbols`, `signature_changes`, `impacted_callers` (real call sites — act on these). Low-signal references are split out: `low_confidence_callers` (bare-name / generic-method matches) and `informational_callers` (import / barrel re-export lines — no edit needed while the symbol keeps its name and signature). Vendor/build-artifact exclusion applies — see Notes.
-
-Function-local symbols are excluded as cross-file impact origins in TypeScript/JavaScript, Rust, Python, Go, Java, and Kotlin. This includes Kotlin nested functions; a same-named call in another file is not treated as their caller.
-
-### `impact` — Unresolved Impact Detection (Stop Hook)
-
-Uses `context` internally, then flags impacts whose callers live in files NOT included in the diff. Designed for AI agent stop hooks.
+Before changing a function or type, enumerate its uses with `refs`. A clean
+working tree gives `context --git` no changes to analyze. Once edits exist, run
+`context` before moving to another file and `impact` after the changes. Begin a
+diff/PR review with `review`, which combines impact, API differences, dead-symbol
+candidates, and historical co-change evidence.
 
 ```bash
-astro-sight impact --dir . --git            # auto git diff (recommended)
-astro-sight impact --dir . --git --staged   # staged changes
-astro-sight impact --dir . --git --hook     # appends triage hint on detection
-```
-
-Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr). Only real call-site references count as unresolved — import-only / re-export references never trigger exit 1. `--hook` appends a triage hint for AI agents.
-
-With `--git`, API changes classified compatible by `review` do not block unchanged callers when every same-named declaration in both source versions has compatible evidence. Qualified method names are matched to bare caller names only under this proof; incompatible, private, deleted, ambiguous, or unparsed declarations keep callers blocking. Unproven changes to same-named declarations elsewhere in the diff also keep callers blocking. This covers compatible type-member additions without function signature changes. In staged mode, the proof is used only when the working tree matches the index.
-
-For unique root TS/TSX functions with one inline object parameter, direct identifier JSX tags omitting all changed, still-optional props can be informational per source/name. Headers, patterns and explicit return types must stay unchanged; whole-parameter and pattern defaults are excluded. Prop/return types must be primitive, literal or static inline objects. Inferred returns must all be direct JSX or string/number/boolean/null literals after removing parentheses, with a final top-level return and identical old/new category sets. Nested functions/classes are skipped; JSX pragma comments prevent the inferred-return proof. Supplied props (including `undefined`), spread, type arguments, mismatched tags, changed implicit children, overloads, required changes and top-level prop additions/removals stay unproven. Any bytes between paired tags, including whitespace, count as children. Existing Low routes and global `api.mod` classification retain priority; other body behavior, `refs` and dead-code occurrences are unchanged.
-
-### `review` — Structured Diff Review (One-Shot)
-
-Integrates `context` (impact) + `cochange` (missing co-change) + API surface diff (added/removed/modified public symbols) + dead symbol detection. Ideal for PR review or pre-merge checks.
-
-```bash
+astro-sight refs --name <name> --dir .
+# Make the intended change.
+astro-sight context --dir . --git
+# Update affected code and validate behavior.
+astro-sight impact --dir . --git
 astro-sight review --dir . --git
-astro-sight review --dir . --git --base HEAD~3
-astro-sight review --dir . --diff-file changes.patch                       # external rename-aware patch
-astro-sight review --dir . --git --framework laravel                       # exclude framework conventions from dead_symbols
-astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Legacy/**'
-astro-sight review --dir . --git --dead-scope touched-symbols              # only dead symbols whose declaration overlaps the diff
 ```
 
-Output: `impact` (ContextResult), `missing_cochanges`, `cochange_diagnostics` (why `missing_cochanges` is empty — see `cochange`), `api_changes`, `dead_symbols`, `test_only_symbols` (public symbols referenced only from tests — review, don't auto-delete).
+Review contracts/types, implementation, callers, and tests in dependency order.
+Verify findings against source and a concrete failing scenario before changing
+code. An informational classification or a caller on an edited line is not a
+substitute for a type check or relevant behavioral validation.
+
+### Select the actual diff
+
+- `--git` compares `HEAD` with the working tree, including staged changes. A clean
+  tree has no diff; untracked files are not part of Git's ordinary diff.
+- `--git --base <rev>` compares that revision with the working tree. For example,
+  `HEAD~3` includes the last three commits **plus uncommitted changes**. Select the
+  intended PR base explicitly rather than assuming `--git` reviews committed work.
+- `--git --staged` selects the index. `review` analyzes an index snapshot; read
+  `staged_snapshot_unavailable` if it falls back. Do not interpret a fallback with
+  divergent working-tree files as a complete staged-only proof.
+- `context` and `review` also accept `--diff-file changes.patch`, `--diff`, or stdin.
+  Keep `--dir`, source checkout, and `--base` consistent with the patch, especially
+  for deletions. `impact` accepts `--git` or stdin, not `--diff-file` / `--diff`.
+
+### Interpret review and hook results
+
+Normal `review` returns `impact`, `api_changes`, `dead_symbols`, and
+`missing_cochanges`, with diagnostics and additional informational fields when
+applicable. Inspect `impacted_callers`, `low_confidence_callers`, and
+`informational_callers` separately: import/re-export occurrences and bare-name
+matches are not equivalent to verified affected calls.
+
+API changes may be blocking removals/modifications or informational categories
+such as compatible changes, moves, dead cleanup, and changes closed within the
+diff. Read each entry's `reason`, `unverified`, `contract_change`, or
+`compatibility` when present. Compatibility proofs have bounded language and
+repository scopes; aliases, ambiguous ownership, incomplete parsing, and external
+consumers can remain unproven. In particular, an optional-prop removal classified
+compatible within the repository does not prove compatibility for external JSX
+consumers. Do not reproduce classifier rules manually or demote an unverified
+finding because all matching lines changed.
+
+- Normal `review` can exit 0 while reporting findings. Use `review --hook` when
+  the command must signal blocking findings through its exit status.
+- `review --hook` emits compact JSON to stderr when it has findings or coverage
+  notices.
+  `blocking_categories` identifies the buckets responsible for exit 1; an empty
+  array means informational output. No findings or notices can mean no output.
+- `--strict-public-const-values` promotes value-only const/static and callback-body
+  categories to blocking; `--strict-public-type-annotations` independently blocks
+  unverified annotation-only changes. A callback-body category does not prove the
+  returned public shape stayed compatible.
+- Hook dead scope defaults to `touched-symbols` and omits newly added exports;
+  `--include-wip-dead` restores those warnings. Normal review defaults to `all`
+  within the diff-selected files. Use `dead-code --dir .` for a project-wide scan.
+- `impact` normally stays silent and exits 0 when no unresolved callers remain.
+  Findings go to stderr with exit 1; `--hook` adds a triage hint. Errors can also
+  exit 1, so inspect both streams. It is not a structured review JSON command.
+- Persistent Git input changes make `review --git` return `REVIEW_INPUT_CHANGED`
+  on stdout and exit 2 after bounded retries. Stabilize the index/worktree and
+  rerun. Neither exit 0 nor an empty blocking list establishes complete coverage;
+  read `truncations`, errors, and skip notices as well.
+
+### Dead code and co-change evidence
+
+Dead-code results are candidates based on observed references. Read
+`unverified_symbols`, `truncations`, `generated_candidates_skipped`, and
+`test_only_symbols` when present. Missing parsers, read/parse failures, framework
+entrypoints, and consumers outside the repository limit deletion decisions.
+Generated files are excluded as dead candidates by default, but their references
+within the scan are counted because generated code can call handwritten code.
+`--include-generated` also makes their symbols candidates. `--framework` adjusts
+dead-symbol conventions; it does not establish API compatibility.
+
+`missing_cochanges` and `expected_with` are legacy names for historical
+associations. Their `interpretation`, frequency ratios, and ranking scores do not
+prove that a change is required or complete. Even `verification_target` or a
+recent-change resolution is a prompt to compare current dependencies with prior
+work, not a requirement to edit or proof of correctness. Unknown interpretation
+values remain unassessed. Check source/import evidence before acting.
+
+Read `cochange_diagnostics` (review) or `diagnostics` (cochange), especially for
+empty results: no history, new files, filtering, and failed commit scans differ
+from evidence of no association. Standalone `cochange` can fall back from
+changed-line blame to file history (`evidence: history`). Its default
+`--min-samples` is 2; review's `--cochange-min-samples` is 3. Lower thresholds only
+when the evidence warrants it. `confidence` filters the raw frequency ratio;
+smoothed scores rank candidates and are not probabilities of a missing edit.
+
+## Structural queries and sessions
+
+For multiple queries, send one JSON request per line to `session`. Each response
+is a JSON line, possibly containing an error; inspect every response, not just
+the process exit code. The examples use an existing source path; substitute paths
+for the current project.
+
+Bash:
 
-Review in dependency order: contracts/types → implementation → callers → tests. Treat a finding as actionable only after AST evidence and a concrete failing scenario verify it; keep unverified concerns informational.
-
-**Blocking vs informational** (what `--hook` blocks on): unresolved `impact` from real call sites, `api_changes.removed` / `.modified`, and `dead_symbols`. Everything else is informational — `api_changes.added` / `.moved` (add/rm pair matched across files) / `.property_to_field` / `.removed_dead` (dead-code cleanup, not breakage) / `.modified_closed_in_diff` (all cross-file refs already updated in the same diff) / `.const_value_changes` (value-only const/static edits; blocking only with `--strict-public-const-values`) / `.callback_body_changes` (JS/TS/TSX unique module-level const: only direct callback bodies inside arbitrary calls changed; runtime return shape is unverified, `reason: callback_body_change`; hook key `callback_body`, blocking only with `--strict-public-const-values`) / `.compatible_modified` (signature string changed but call sites stay compatible: React HOC wrap, unreferenced object-member removal, trailing optional/default params in TS/Python, TS optional props removal proven by repository uses; `reason` explains why), plus `missing_cochanges` and import-only impact (hook key `impact_info`). Entries in `api_changes.modified` may carry `contract_change` (hook key `contract`) — `{kind, breaks}` naming the language-specific contract change and which side breaks (`producer` = code building the value, `consumer` = code reading it). It classifies Python `TypedDict` contract changes: class-level `total=` flips (`typed_dict_total_false_removed` / `_added`) and per-field requiredness flips (`typed_dict_field_became_required` / `_not_required`, e.g. `y: NotRequired[str]` → `y: str`). Field-level entries appear as pseudo-symbols (`name` = `Class.field`, `kind` = `field`, signatures like `optional str` → `required str`) inside the same `api.mod` list. It also classifies public, module-level, direct Python `Literal` aliases: a value-set shrink is `literal_values_narrowed` / `producer`, and a value-set expansion is `literal_values_widened` / `consumer`; these entries use `kind` = `type`. Literal aliases must resolve to `typing` / `typing_extensions`, and only strings without escapes or prefixes, decimal integers, booleans, and `None` are compared. Mixed replacements, dynamic `__all__`, shadowing, star imports, and non-static values stay unclassified and blocking rather than guessing a direction. Test files are excluded under the same public API surface policy as other symbols. Both field- and type-level entries are output-only pseudo-symbols and never enter `symbols` / `refs` / `dead-code`. Classification never changes severity: classified entries stay blocking and are never demoted to `modified_closed_in_diff` / `compatible_modified`, because external repos and dynamically constructed values cannot be tracked statically. Unclassified changes simply omit the key.
-
-Callback-body classification also follows nested call arguments and curried calls. It rejects same-name module bindings (including types/imports/namespaces), parse errors, multiple declarators, and callbacks inside object/array arguments. String, regex, template and JSX arguments outside callback bodies retain their raw text. Existing const-value, compatible and closed-in-diff classifications take priority; strict mode only promotes entries that remain in the callback-body bucket. The callback bucket does not prove return-shape compatibility.
-
-TS/TSX `api_changes.type_annotation_changes` reports a unique module-level `const` whose declarator annotation changed while its initializer and other declaration structure stayed equal. `reason: type_annotation_only` and `compatibility: unverified` require a TypeScript check. Hook key `type_annotation` retains causal references in `impact_info`; the independent `--strict-public-type-annotations` flag blocks through `policy.type_annotation`. Annotation formatting alone is omitted in both modes. Combined initializer changes and uncertain parsing retain existing classifications.
-
-TypeScript trailing optional/default parameters and optional inline object properties also cover a unique module-level `const` initialized directly by an arrow or function expression (TS/TSX). Parentheses are allowed; mutable bindings, ambiguous declarations, parse errors, assertions and arbitrary call wrappers do not qualify for this compatibility classification. Declaration headers, existing parameters and return types must stay equal as AST tokens, preserving literal contents and comments. Bare arrows count as one required parameter. Rest parameters must remain last and cannot be optional or defaulted. An unchanged explicit const annotation retains existing const-value classification priority; direct callable annotations are checked against the original source before using that bucket.
-
-For `optional_object_props`, a destructured object parameter may append shorthand bindings for optional keys added to its inline type (or unique object union branch) in the same change. Literal defaults are allowed; old elements, aliases, defaults, and their order must stay equal. Rest/computed/nested patterns, duplicates, new aliases, nonliteral defaults, and new names mentioned elsewhere in the signature stay blocking. Type-only proofs keep their existing behavior.
-
-For added bindings, other union branches must be `undefined`. Defaults must match only `string`, `number`, `boolean`, `null`, or their unions; aliases, other literal types, unknown types, BigInt defaults, legacy octal numbers, and numeric string/template escapes remain unproven.
-
-New bindings must not collide with direct-body lexical or function declarations, or any `var` binding in the same function scope. Unknown declarations stay blocking. Ordinary body references are outside this compatibility proof.
-
-For a required property added to an exported TS/TSX interface or object type alias, `modified_closed_in_diff` (hook: `api.mod_closed`) needs a proof for each reference; a reference on a changed line is not enough. Every function returning the type and every `const x: T` / `satisfies T` value must build the new property with a fitting value on a changed line, and every caller of a top-level function taking the type must pass such a value. Generic or `extends` declarations, index signatures, required methods, references in other positions (`T[]`, `as T`, callbacks), `typeof` copies of a producer, and JSDoc mentions in JS files keep `api.mod` blocking even when every reference line changed. Types carried only by inference (call results, arguments) are outside this proof.
-
-For JS/TS value bindings, replacing a local public variable/constant with a named re-export (including an imported name exported by a clause) remains a blocking `api.mod`. The forwarded definition, value, type, and module evaluation are unverified; the same export name alone does not prove compatibility. Signatures show the old declaration and the new export specifier. This does not resolve downstream consumers through barrel files. Existing function/class/type re-export handling is unchanged.
-
-For Bash/zsh parse errors, `api_changes.uncertain_removals` (hook: `api.rm_unverified`) reports declaration headers that remain in the source but could not be parsed. These entries are informational; confirmed deletions in the same file still block. `truncations` (hook: `trunc`) includes `parse_error_region`: declarations, references, and signature changes in that region are unverified, so exit 0 does not establish compatibility.
-
-For a deleted source file in an explicit diff, `truncations` reports `diff_base_mismatch` when the deleted content cannot be checked against the requested base. The hook blocks with `api.diff_base_mismatch`; extracted deletions remain in `api.rm` because the old public surface cannot be proven from that base. Non-source files, including Git submodules, do not trigger this check. Supply the revision before deletion as `--base` when available.
-
-For Rust, when a diff changes a binding that a public signature names through another file of the library crate (a private `type Result<T> = …;` in `error.rs` imported by `api.rs`), the declaration is a blocking `api.mod` with `unverified.reason` `rust_signature_dependency_changed`, also when the naming file is not in the diff. When the files that may name the changed bindings cannot all be searched, `truncations` reports `rust_dependents_incomplete` and the hook blocks with `api.rust_dependents_incomplete`. When a diff changes the conditions or `path` of a `mod` declaration (`#[cfg(feature = "x")] pub mod api;`), the public items of that module are compared for where they exist like items whose own `#[cfg]` changed, also in files that the diff does not change; when they cannot all be compared, `truncations` reports `rust_module_availability_incomplete` and the hook blocks with `api.rust_module_availability_incomplete`. Names made by `pub use` and globs are compared the same way, resolved for each combination of the cfg atoms (adding `#[cfg]` to a re-export is reported like a removal; removing it, narrowing it to `pub(crate) use`, or hiding a glob's name behind a private item is an ordinary removal); when they cannot all be listed, `truncations` reports `rust_reexports_incomplete` and the hook blocks with `api.rust_reexports_incomplete`.
-
-With `--git --staged`, review analyzes a snapshot of the index, so unstaged edits do not enter the result. A repository with more than 50,000 files or 512 MiB falls back to reading the working tree and reports `staged_snapshot_unavailable` in `truncations` (hook: `trunc`); when the working tree then differs from the index, reference-based downgrades (`mod_closed` / `mod_compat` / `rm_dead`) stay blocking. If the cross-file reference scan cannot be prepared (for example, an unreadable directory in the workspace), `context` / `impact` / `review` fail with `IO_ERROR` (exit 1) instead of reporting no callers; fix the permission or exclude the directory.
-
-`review --git` retries index/worktree changes and Git indexing short reads with at most three fresh attempts. If they persist, normal review and `--hook` return one `REVIEW_INPUT_CHANGED` JSON error on stdout and exit 2; the hook also prints a rerun instruction to stderr. Other errors and blocking findings keep exit 1. Explicit `--diff`, `--diff-file`, and stdin inputs are not retried.
-
-- Rust functions and methods can opt out of dead/test-only candidates with the exact standalone line `// astro-sight:allow-dead` immediately before the declaration. Outer attributes and outer doc comments may intervene, with no blank line or ordinary comment. The marker applies to that declaration only; it is not inherited from an impl/module or shared across cfg variants, and does not apply to types or constants. It does not change refs, impact, or API changes.
-- `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
-- `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.
-- Hook JSON includes `blocking_categories`, listing the emitted buckets responsible for exit 1: `api.diff_base_mismatch`, `api.rust_dependents_incomplete`, `api.rust_module_availability_incomplete`, `api.rust_reexports_incomplete`, `impacts`, `api.rm`, `api.mod`, `api.const_value` and `api.callback_body` (const-value strict only), `policy.type_annotation` (type-annotation strict only), and `dead`, in that order. An empty array means the output is informational and does not block. No JSON is emitted when there are no findings or coverage notices. Informational buckets may coexist with blocking ones; their presence does not make them a stopping reason.
-- `trunc` entries with `r: "unanalyzable_source"` include `d: {x, n, e?}`: lowercase extension without a leading dot, total file count, and up to three sorted representative paths. Other reasons and legacy entries omit `d`. These coverage facts remain informational.
-- `missing_cochanges` and `expected_with` are legacy names for historical associations, not change obligations. Each candidate includes `interpretation` with `relation: historical_cochange`, `actionability: history_only`, and `resolution: not_assessed` (hook: `i`). Neither changed-line blame nor file history proves necessity or completion. Unknown values must not be treated as required or resolved. `confidence` is a frequency ratio; `ranking_score` (hook: `s`) explains the selected ranking and is omitted when unavailable or non-finite. Neither is a probability of an omitted change.
-- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume. `--cochange-min-samples` (default 3, stricter than the standalone `cochange` default of 2) requires a pair to have changed together at least that many times: with changed-line blame a source often has only 2 evidence commits, so a pair that co-changed once reaches confidence 1.0 and dominates the report. Pass 2 to see small-sample candidates. Deduplication and the final top-10 selection preserve the standalone command's smoothed `score`; raw confidence remains the filter and displayed evidence. Dependency manifests (`Cargo.toml` / `package.json` / `pyproject.toml`, ...) and lockfiles are never reported as missing co-changes: dependency-adding commits always touch them together with sources, so the historical correlation hits 100% even though a body-only edit that adds no imports has no causal link to them (the standalone `cochange` command still reports manifests as historical fact; lockfiles are excluded there too as generated files). External snapshots are handled directionally: updating only a `__snapshots__/*.snap` file never asks for its source test, while changing the test still reports the missing snapshot update. Suppression requires all of — the snapshot's immediate parent directory is exactly `__snapshots__`, stripping one trailing `.snap` yields the missing candidate's exact path (the Jest / Vitest / Bun convention), the source test exists as a regular file, and the snapshot's first line matches a known runner header exactly. Unknown headers, custom snapshot resolvers, inline snapshots, and other formats keep the usual historical-correlation report; `--include-generated` disables the direction rule. Each entry carries `n` (co-change count) / `d` (denominator) and `e: "history"` when the evidence came from file-history fallback rather than changed-line blame.
-- CLI-only (not available in `session`).
-
-TS/TSX trailing optional/default parameter removal uses `compatible_modified` (`reason: trailing_optional_params_removed`; hook: `mod_compat`) only for a unique named top-level function with unchanged remaining parameters and an unchanged explicit return annotation. All observed references must be direct calls within the new argument count, or verified declaration/import names; at least one call is required. Causal calls remain in `impact_info`. Module dependencies are checked independently of the function name: aliases, re-exports, dynamic transport, ambiguous resolution, shadowing, unsupported source formats and incomplete parsing prevent the proof. This establishes call compatibility within the analyzed static repository scope, without guaranteeing external consumers or equivalent runtime behavior. Existing trailing-parameter additions keep their classification.
-
-The removal proof rejects other same-name bindings or unverified occurrences, including references that may belong to another origin. It does not attempt general alias or scope resolution. Known dynamic execution entries such as `eval` and `Function`, escaped identifiers, or source languages outside the proof's supported inventory also prevent the classification. Inventory limits of 512 files, 8 MiB of source, and 100,000 AST nodes also retain the existing conservative classification when exceeded.
-
-TS/TSX optional inline props removal uses `compatible_modified` (`reason: optional_object_props_removed`; hook: `mod_compat`) only for a unique exported top-level function whose only parameter loses optional properties from its inline object type, together with the matching destructured bindings, while the rest of the declaration stays equal as AST tokens. Types referenced by the remaining properties and the return type must stay unchanged: same-file aliases and interfaces are followed; types imported through a relative path and global types declared anywhere in the repository are never proven; types imported from a registry dependency and lib/`@types` globals need an unchanged import and a diff that changes no file other than the declaring file (lockfiles and `package.json` included). Every occurrence must be a verified declaration/import name, a JSX element that names the function directly with ordinary attributes and none of the removed keys (no spreads), or, only with an unchanged explicit return type, a direct call with one object literal of plain keys. Without a return annotation, the directly returned value categories must match. A replaced JSX environment prevents the proof: in any repository `tsconfig*.json` / `jsconfig*.json`, `jsxFactory`, `jsxFragmentFactory`, a non-`react` `jsxImportSource`, `paths` keys that can match `react` or its subpaths, a `baseUrl` with a local `react`, or an `extends`/`references` entry outside the analyzed directory; in any repository TS / JS / `.d.ts` file, a declaration or export that creates the name `JSX` (including `export { X as JSX }`), a `@jsx` pragma in any letter case, a `declare module "react"` (or `react/jsx-runtime` / `react/jsx-dev-runtime`) augmentation, or a `/// <reference>` with `no-default-lib`, a missing `path` target, or a non-registry `types` (directives are read like TypeScript: any letter case, spaces or tabs around `=`, either quote). Because the automatic runtime imports nothing visible, `react` and `@types/react` must be registry dependencies without an `npm:` alias, and a non-registry `@types/*`, a dependency with contents from outside the repository (git, URL, outside path), or a non-registry `compilerOptions.types` entry also prevents the proof. JSX call sites remain in `impact_info`. This is repository-local evidence; consumers outside the repository may still pass a removed key.
-
-Both removal proofs share a trust boundary. The usage inventory parses every source of the ignore-respecting scan (another language or an unanalyzable source there prevents both proofs); outside it (ignored and hidden files except `node_modules` and `.git`), only TS/JS files and embedded sources (`.vue` `.svelte` `.astro` `.mdx`) are streamed, once per detection for all changed functions; files that mention the changed function's name as an identifier word (or through a Unicode escape; unreadable files count) join the inventory under the same proof, while an embedded source that mentions it prevents the proof. TS files, including `.d.ts`, also join when an `import` / `export … from` / `import()` (also in types) / `require()` / `import x = require()` / `declare module` / `/// <reference>` resolves to the declaring file through relative paths, directory indexes, `paths` / `baseUrl`, or repository packages, or cannot be resolved and is not a registry dependency (a relative entry reaching a directory with `package.json`, or nothing, is unresolved); in non-declaration TS files the declaring file's name (`panel` for `panel.tsx`, the directory for `index.tsx`) also counts (ignored checkJs JS using a namespace import with a computed key and no function name is not caught). Other languages are not read; one detection reads at most 1 GiB and parses at most 64 MiB of outside files with no file-count limit, and the inventory limits (512 files, 8 MiB, 100,000 nodes) apply only to files in the inventory. The audit covers every file except `node_modules` and `.git` regardless of ignore rules (sources, `.d.ts`, all `tsconfig*.json` / `jsconfig*.json` and `package.json`); outside the scan it parses only TS/JS files containing `JSX`, `declare`, `@jsx`, `<reference`, or a Unicode escape of an ASCII identifier character (8 MiB per file, 64 MiB per pass). Registry packages in `node_modules` are trusted not to depend on repository sources or change React's standard JSX contract; anything undecided keeps the existing classification. A directory symlink or a symlinked source/config, a tsconfig `files` / `include` / `typeRoots` entry or a `/// <reference path>` reaching outside the directory or into `node_modules`, unreadable configs, package-manager YAML, or `.npmrc`, a pnpmfile (including a `pnpmfile` / `global-pnpmfile` entry in `.npmrc`), a `moduleSuffixes` other than `[""]` or a multi-entry `rootDirs`, an override key that cannot be parsed (every package name in a key counts; a `>` inside a version range is not a selector), and an audit that cannot read or parse a selected file within its limits leave no audit: the props proof does not hold and the trailing-parameter proof accepts no unresolved import. Directories that cannot be opened for lack of permission are skipped; any directory symlink (such as a Linux `.venv`'s `lib64 -> lib`) leaves no audit. An import whose specifier the inventory cannot resolve is accepted only when it is a plain named import whose imported and local names all differ from the target (`import { useState } from "react"`) and its package is a registry dependency: no repository `package.json` has that name, no `paths` key or `baseUrl` entry can redirect it, and no `package.json`, `pnpm-workspace.yaml` (overrides, packageExtensions, patchedDependencies, catalogs; `catalog:` references are resolved there), or `.yarnrc.yml` (packageExtensions) in the directory or its ancestors declares, overrides (an npm `$name` override is judged by the referenced dependency's specifier), or patches it with `file:`, `link:`, `workspace:`, `portal:`, `patch:`, `catalog:`, a path, or a git/URL specifier (hoisting makes every manifest relevant; a workspace definition outside the analyzed directory leaves it undecided). Default, namespace, `default as`, string-named, and same-name imports, re-exports, `import()`, `require()`, and side-effect imports still need a resolved specifier.
-
-Scalar-only TS/TSX property removals also cover unique root array producers whose return directly maps an array with an expression-bodied object arrow. `Row[]`, `Array<Row>`, `readonly Row[]`, and async `Promise<Row[]>` are supported. Registered producers may feed only a direct `.map(consumer)` (with direct await for Promise), checked by one verifier from both producer and consumer references. Consumers have one required Row parameter and an explicit primitive/void result. Aliases, typeof, array escapes, forwarding arrows, block callbacks, optional/type-argument/spread/thisArg forms, and non-scalar invariant combinations remain unproven. Addition/narrowing and refs/dead-code occurrences retain their existing contracts.
-
-Pure TS/TSX property removals with retained scalar arrays or `Record<string, scalar>` can use an unchanged-value proof. It pairs unique root function-return and root typed-const object literals across the base and current source. The target declaration and removed-key entries are excluded from a complete file-token comparison; all remaining expressions, optional values, bindings, and parameters must match. Only built-in names in retained generic annotations are audited for declarations/imports, aliases, and writes; ordinary value reads such as `Array.isArray` are allowed. Removed members themselves remain limited to scalar types. Named element types, outside variables, calls/assertions, local producers, and inline argument literals remain unproven. Parameter values require scalar, `T[]`, or `readonly T[]` annotations; generic parameter types remain unproven. Limits are 2 MiB per file, 100,000 nodes, and eight value-nesting levels. Scalar-only removal retains its existing type checks; refs/dead-code occurrence output is unchanged.
-
-Pure removals from a directly exported root string-literal union alias can use a separate `mod_closed` proof. Retained order/spelling and declaration headers stay unchanged. Root Record/array constants and required ordinary-function parameters are registered by binding, then audited through retained literals, verified Mode parameters/callbacks, known consumer calls and Record reads. Inline filter chains must end in a primitive map. Aliases, typeof/keyof, re-exports, writes, unknown arguments and unsupported flows remain blocking even on edited lines. A bounded cooked-string/key residue scan also covers relevant JSON, JSDoc and embedded sources; unrelated exact removed values block, while substrings and unrelated interpolated templates do not. The inventory preserves refs selection and rejects incomplete reads/parses, hidden transport, ambiguous resolution, builtin changes and limits (10,000 files, 64 MiB, 512 parses, 100,000 AST nodes). Relative ownership audits logical/physical ancestor configs regardless of ignore. Project references, directory package entries, and earlier resolution alternatives remain unproven; these include implementations before explicit declaration imports and legacy JS suffix alternatives. Command-line-selected non-ancestor configs and external bundler resolution are outside this proof. Constant-value policy and standalone impact/refs/dead-code occurrences are unchanged.
-
-### `imports` — Import/Export Extraction
-
-Language-specific tree-sitter queries for all 16 languages. JavaScript, TypeScript, and TSX include static imports, `require()`, and dynamic `import()` whose first argument is a plain string or an interpolation-free template literal. Only the first argument is used as the dependency target. Interpolated template literals are omitted because their dependency cannot be determined statically.
-
-```bash
-astro-sight imports --path <file>
-astro-sight imports --paths src/main.rs,src/lib.rs   # batch
-```
-
-Output: `imports` array with `src`, `ln`, `kind` (Import/Use/Include/Require), `ctx`.
-
-### `symbols` — Symbol Extraction
-
-Lists function/class/struct/enum definitions. Compact by default for token efficiency: `name`, `kind` (short form), `ln` (0-indexed), plus `cx` (cyclomatic complexity, functions/methods only) and `cn` (enclosing container name) when applicable.
-
-`cx` follows McCabe and is **comparable across languages**: base 1 plus one per decision point. switch/match counts each arm but not the construct itself (a 3-way switch is 4); a plain `else` is not a decision point (`if/else` is 2, `if/else if/else` is 3); ternaries count. Whether a catch-all arm (`default:` / `_ =>`) counts is grammar-dependent, so expect ±1 there. Nested functions and closures keep their own `cx` and do not inflate the enclosing function's.
-
-`cn` is the enclosing container; for Go methods it is the receiver type (`func (b *Box) Area()` → `cn: "Box"`).
-
-Besides functions/classes/types, it also extracts JS/TS destructured bindings (`export const { auth, signOut } = NextAuth()` → one symbol per bound name, `ln` = that name's line; property keys are not bindings), `var`, generator functions, `abstract class`, Java/C# `record`, Go type aliases, and Rust trait methods (including bodiless required ones, which inherit the trait's visibility). TS interface / abstract methods and Go interface methods are not extracted yet.
-
-```bash
-astro-sight symbols --path <file>            # single file
-astro-sight symbols --path <file> --doc      # include docstrings
-astro-sight symbols --path <file> --full     # full legacy output (hash, range, doc)
-astro-sight symbols --dir <directory>        # directory scan (NDJSON)
-astro-sight symbols --dir <directory> --glob "**/*.rs"
-```
-
-### `sequence` — Mermaid Sequence Diagram
-
-Use this after `calls` when execution order matters or the flow spans three or more caller/callee interactions; the diagram makes branches and hand-offs easier to verify.
-
-```bash
-astro-sight sequence --path <file>
-astro-sight sequence --path <file> --function main
-```
-
-Output: `diagram` (Mermaid text), `participants` (ordered list).
-
-### `cochange` — Co-change Analysis
-
-Blame-based: starts from source files (auto-derived from `git diff` or explicit), runs `git blame` on changed lines to get the latest-modifying commits, then aggregates co-occurring files from each commit's diff-tree. When changed-line blame cannot produce enough evidence, the source falls back to its own file history.
-
-```bash
-astro-sight cochange --dir . --git                                 # uncommitted changes (same default as review)
-astro-sight cochange --dir . --git --base HEAD~5                   # last 5 commits plus uncommitted
-astro-sight cochange --dir . --paths src/service.rs               # explicit sources (history fallback)
-astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renames/copies
-astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # rank by raw confidence
-```
-
-Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed, ranking-only), and `evidence: "history"` when the pair came from the history fallback (absent = changed-line blame); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file`. `--base` defaults to `HEAD` and is evaluated as `git diff <base>` — same as `context` / `impact` / `review` / `dead-code`, so plain `--git` means "my uncommitted changes" and `--base HEAD~5` means "last 5 commits plus uncommitted". `--min-confidence` / `--min-score` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is (a `--git` diff that is entirely excluded returns an empty result, not an error). Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
-
-**Thresholds vs ranking**: `--min-confidence` (default 0.3) gates on the raw `co_changes / denominator` ratio. The smoothed `score` is used only for ordering — gating on it would make small-evidence sources structurally unreportable, since its ceiling is `(denom + alpha) / (denom + alpha + beta)` (with the default beta=8, a source with 2 evidence commits caps at 0.27). Use `--min-score` if you explicitly want a shrinkage gate on top.
-
-**History fallback**: a source whose changed-line blame yields fewer than `--min-denominator` commits (no diff against base, pure-addition hunks only, or a single blame commit) falls back to `git log <base> -n 20 -- <file>`. This is what makes `--paths <file>` on an unmodified file work at all, and it covers the very common "add a new field/method" shape. Tune with `--history-limit` (`0` disables it; note the window is also the confidence denominator for fallback sources, so widening it dilutes coupling). Files newly added against `--base` have no prior history and cannot be sources — `diagnostics.new_files_without_history` records them.
-
-**Diagnostics**: `diagnostics` explains an empty or short result — how many sources were requested, how many got blame vs history evidence, how many had none, and how many candidate pairs each filter dropped (`filtered_min_samples` / `filtered_min_confidence` / `filtered_min_score` / `skipped_min_denominator`), plus a sorted `reasons` enum. Check it before concluding "no co-change". A nonzero `commit_scan_failures` (reason `CommitScanFailed`, omitted from JSON when zero) means some evidence commits could not be read with `git diff-tree` — those count toward the confidence denominator but can never contribute a co-change, so the result is *partially unanalyzed* rather than "these files don't change together".
-
-Noise-suppression defaults (each has a flag to loosen): top 10 candidates per source file (`--per-source-limit`), pairs need ≥2 shared commits (`--min-samples`), merge commits excluded (`--include-merges` restores), same-author commits within 7 days collapse into one unit (`--author-unit-window-days`), commits touching >100 files skipped (`--max-files-per-commit`, and those commits are excluded from the confidence denominator too). If expected pairs are missing, read `diagnostics` first, then loosen these.
-
-### `ast` — AST Fragment Extraction
-
-```bash
-astro-sight ast --path <file> --line <n> --col <n>   # node at position/range
-astro-sight ast --path <file>                        # full file, top-level nodes
-```
-
-### `lint` — AST Pattern Matching
-
-Lint with custom YAML rules (tree-sitter query or text pattern).
-
-```bash
-astro-sight lint --path <file> --rules rules.yaml
-```
-
-### `dead-code` — Dead Code Detection
-
-Exported symbols with zero non-definition references. Diff flags limit the scan to diff-related files; without a diff, scans the whole project. Package-manager trees, test dirs, and build artifacts are excluded by default (`--include-vendor` / `--include-tests` / `--include-build` to opt back in).
-
-When the directory contains source files astro-sight has no parser for (`.vue`, `.svelte`, `.astro`, `.erb`, `.razor`, `.scala`, ...), references inside them cannot be counted, so a live symbol used only from such a file would be reported as dead. Those files are declared in `truncations` with `reason: "unanalyzable_source"` (folded to one entry per extension). The declaration covers the whole directory the references were counted in, so `--glob` / `--git` do not narrow it. **Read it before acting on a dead symbol** — the field is absent when every source file was analyzed.
-
-Files detected as generated (`.gitattributes` `linguist-generated` first, as GitHub Linguist reads it, so `-linguist-generated` / `=false` keeps a header-marked file; then minified / IDE helper names, then a generated-file header comment; the same decision as `refs`) are excluded from the dead **candidates** only; references inside them are always counted, because generated code (e.g. a gRPC `*_grpc.pb.go` handler) calls hand-written code at runtime. The excluded files are listed in `generated_candidates_skipped` (same `{generated, paths, truncated}` shape as `refs`' `skipped`); the global `--include-generated` makes their symbols candidates too.
-
-```bash
-astro-sight dead-code --dir .                       # auto-detects each monorepo workspace with a `next` dependency
-astro-sight dead-code --dir . --glob "**/*.rs"
-astro-sight dead-code --dir . --git                # diff-related files only
-astro-sight dead-code --dir . --git --staged
-astro-sight dead-code --dir . --framework laravel  # Laravel conventions (migrations, Controllers, Middleware, ...)
-astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
-astro-sight dead-code --dir . --git --dead-scope touched-symbols   # only dead symbols declared inside diff hunks
-```
-
-Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). When a file whose references are counted cannot be read (over 100MB, no permission) or parsed, candidates whose names appear in it go to `unverified_symbols` instead of `dead_symbols`, and the file is reported as `source_analysis_failed` in `truncations`. Duplicate-named symbols across files are conservatively skipped. Runtime conventions (PHPUnit `*Test`/`*TestCase` + `testXxx`/`setUp`; Python unittest/pytest; Python `urllib.request.BaseHandler` protocol methods; watchdog `FileSystemEventHandler` callbacks; Angular lifecycle hooks like `ngOnInit`, `@Pipe` `transform`, and `ngOnDestroy` on `@Injectable` / `@Pipe` classes; PHP uppercase docblock annotations and PHP 8 attributes such as `#[Route]` / `#[Test]`; Kotlin `operator fun` and Swift `callAsFunction`; program entrypoints — C/C++ global `main`, Kotlin top-level `fun main` and `@JvmStatic fun main` in an `object` / `companion object`, Java non-private `void main` with no parameter or one `String[]`, C# `static Main` — plus the Java / C# / Kotlin types declaring them) are auto-excluded. A bin-only Rust crate's `pub fn` is excluded from `review`'s `api_changes` (unreachable from outside the crate).
-
-### `session` — NDJSON Batch Mode
-
-Multiple queries in one process (avoids repeated startup):
-
-```bash
-printf '%s\n' \
-  '{"command":"refs","name":"MyType","dir":"src/"}' \
-  '{"command":"calls","path":"src/main.rs","function":"main"}' \
-  | astro-sight session
-```
-
-Supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only).
-
-## Workflow Examples
-
-Single-command uses are in Quick Reference above; these are multi-command flows.
-
-### "How does this module work?"
-```bash
-astro-sight symbols --dir src/engine/               # all files in directory
-astro-sight calls --path src/main.rs --function main
-astro-sight sequence --path src/main.rs --function main
-```
-
-### "Is it safe to rename this function?"
-```bash
-astro-sight refs --name old_name --dir .              # every definition, call site, and import
-# ...rename...
-astro-sight impact --dir . --git                      # any caller left outside the diff?
-```
-
-### "What changed together with this file recently?"
-```bash
-astro-sight cochange --dir . --paths src/service.rs
-```
-
-### "Several different queries in one request"
 ```bash
 printf '%s\n' \
   '{"command":"symbols","path":"src/main.rs"}' \
   '{"command":"calls","path":"src/main.rs","function":"main"}' \
-  '{"command":"context","dir":".","diff":"..."}' \
   | astro-sight session
 ```
 
-## Notes
+PowerShell:
 
-- **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`; ambiguous forms such as spaced index assignment, bare lambda parameters followed by a block, empty regex literals, blocks after paren-less calls, and empty-identifier heredocs are parsed without error nodes.
-- Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
-- **`--format json|toon|auto`** は出力形式を切り替える。既定は JSON、CLI 指定は `~/.config/astro-sight/config.toml` の `format` より優先。TOON は [v4.1 仕様](https://github.com/toon-format/spec/blob/main/SPEC.md) に従い、配列・表をインデント付きで表す。空配列は `[]`、省略された DTO 列は必要に応じて null または既定値で補完する。`--pretty` は JSON 専用。TOON はバッチと `auto` を含め末尾改行なし、JSON / NDJSON は改行終端。
-- **`--format auto`** encodes both and emits whichever is estimated to use fewer tokens (character count plus a per-line penalty, since BPE spends roughly one token per newline+indent; ties go to JSON), so it is never worse than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first 32 records (a fixed sample, so the choice does not change with the worker count / `ASTRO_SIGHT_BATCH_WORKERS`) and applied to the rest, since results are streamed rather than fully buffered.
-- **Always JSON regardless of `--format`**: `session` (line-oriented NDJSON protocol), `review --hook` / `impact --hook` (Stop hook contract), and the `{"error":{...}}` envelope. Passing `--format toon` explicitly to those is an `INVALID_REQUEST`; a config-file default silently falls back to JSON so setting `format = "toon"` never breaks hooks. `--format auto` is accepted there and simply yields JSON.
-- With `--format toon`, batch modes (`--paths` / `--paths-file` / `--dir`) emit **one root-array document** (`[N]:` followed by `- ` items, or `[]` when empty) instead of NDJSON. Optional fields that compact JSON omits (e.g. `cx`) appear as explicit `null` cells so uniform tables stay possible.
-- `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
-- A zero-result identifier query is still an AST analysis result; do not repeat the same search with Grep/rg. The exception is a file listed in `truncations` (`unanalyzable_source`): `refs` did not search inside it.
-- **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/` (except Cargo's `src/bin/`), `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. Generated files (a header such as `Automatically @generated by tree-sitter`) stay in this caller search, like dead-code reference counting: a generated `parser.c` that declares and calls a hand-written scanner function is a real caller. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
-- **Input validation**: empty `--name` / `--names` / `--paths` / `--paths-file` rejected with `INVALID_REQUEST`; `--paths-file` capped at 100MB; `cochange` rejects out-of-range `--min-confidence` / negative smoothing priors; `--base` rejects values starting with `-` (blocks git option injection).
-- Batch `--paths` output uses a dedicated rayon pool, defaulting to `min(available CPUs, 4)` workers to bound thread-local parser memory. Set a positive `ASTRO_SIGHT_BATCH_WORKERS` value to tune concurrency up to the available CPU count. Output preserves input order while retaining only `8 × workers` pending results; a closed stdout stops processing at the current window.
-- With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` resolve from the workspace root (invalid values fail closed). stdout broken pipes are handled gracefully (`symbols --dir src | head` won't panic).
-- **Large repos (10k+ files)**: `review --dir .` is the heaviest command (context + cochange + API diff + dead-code in one process) and can exhaust memory. Narrow `--dir` to a subtree, bound diff commands with `--base HEAD~N`, restrict with `--glob`, or split `review` into per-command runs (`impact` → `dead-code` → `cochange`). `symbols --path` is memory-light. dead-code candidate extraction and reference counting parse files of 64 KiB or more only while their total size fits a budget (`ASTRO_SIGHT_PARSE_BUDGET_MIB`, default 32; `0` parses them one at a time), so huge generated files such as a vendored `parser.c` are not parsed once per worker thread at the same time; a lower budget trades time for memory without changing results.
+```powershell
+@(
+  '{"command":"symbols","path":"src/main.rs"}'
+  '{"command":"calls","path":"src/main.rs","function":"main"}'
+) | astro-sight session
+```
+
+Session commands: `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`,
+`imports`, `lint`, `sequence`, `cochange`. `review`, `impact`, and `dead-code`
+are CLI-only. Session fields are not CLI flags: use `column` rather than `col`,
+`context_lines` rather than `context`, and arrays for `names` / `source_files`.
+Session `symbols` needs a file `path`; it does not provide CLI `symbols --dir`.
+Session `context` needs the actual diff in `diff`; it does not run `--git`.
+Session `cochange` needs nonempty `source_files`, even when a base is supplied.
+
+Session paths stay within the workspace. `ASTRO_SIGHT_WORKSPACE`, when set,
+selects that root and the base for relative paths; invalid roots fail closed.
+Do not work around `PATH_OUT_OF_BOUNDS`; use the intended workspace.
+
+Most file-oriented CLI commands also accept `--paths a.rs,b.rs` or
+`--paths-file files.txt`. Batch by that mechanism when repeating one command.
+For command-specific schemas or less common options, consult `--help` instead
+of transferring flags between commands.
+
+## Output and operational notes
+
+- JSON locations (`ln` / `line`, `col` / `column`) and `ast --line` / `--col`
+  inputs are zero-based; tree-sitter columns count UTF-8 bytes. Human-readable
+  `impact` stderr locations are one-based. Convert JSON line numbers when linking
+  to an editor; do not reuse display coordinates as AST input without conversion.
+- Compact JSON is the default unless config selects another format. `--format
+  json|toon|auto` overrides config. `--pretty` formats JSON; `symbols --full`
+  requests its legacy full schema and `--doc` includes docstrings.
+- JSON batch results are normally NDJSON; TOON batches are one root-array document.
+  `auto` uses an estimate, sampling streamed batches; it does not guarantee the
+  fewest tokens for a particular model. Use explicit JSON when parsing output.
+- `session`, hook protocols, and `{"error":{...}}` errors stay JSON. Explicit TOON
+  is rejected for JSON-only commands; config defaults fall back and `auto` uses
+  JSON. `impact` findings themselves remain stderr text.
+- Supported tree-sitter languages: Rust, C, C++, Python, JavaScript, TypeScript,
+  TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Unsupported embedded
+  formats need separate inspection. `doctor` can check installed capabilities.
+- Cross-file impact scans exclude vendor/build trees by default; generated files
+  otherwise selected remain callers. Extra `--exclude-dir` / `--exclude-glob`
+  filters on `context`, `impact`, or `review` narrow evidence. On review they also
+  affect dead candidates; `--framework` affects dead candidates only. Report
+  exclusions that matter to the conclusion.
+- For large repositories, prefer targeted queries first. `review` has no `--glob`;
+  `refs`, `symbols --dir`, and `dead-code` do. Narrowing `--dir` can lose callers
+  outside that subtree; `--base` changes the diff, not the cross-file parse scope.
+  Report that tradeoff. `ASTRO_SIGHT_PARSE_BUDGET_MIB` controls large-file parse
+  concurrency (default 32; 0 serializes large files) without narrowing results.
+- If an update appears ineffective, check `astro-sight --version` and executable
+  resolution (`command -v astro-sight` in Bash; `Get-Command astro-sight` in
+  PowerShell). For a mise shim, use `mise which astro-sight`. When installing from
+  source, set `INSTALL_PATH` to the intended executable directory if necessary.
