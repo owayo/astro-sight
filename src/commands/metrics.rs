@@ -13,7 +13,7 @@ pub(crate) fn attach_baseline(
     let Some(base) = &opts.base else {
         return Ok(());
     };
-    let (snapshot, commit, omissions) = super::review::prepare_commit_snapshot(dir, base)?;
+    let (snapshot, commit, omissions) = super::git_snapshot::prepare_commit_snapshot(dir, base)?;
     let baseline_options = MetricsOptions {
         dir: snapshot.dir()?.to_string(),
         base: None,

@@ -11,7 +11,7 @@ use crate::models::metrics::MetricsDiagnostic;
 
 use super::resolve::{diagnostic, join, js_candidates, parent};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Config {
     base: Option<String>,
     mappings: BTreeMap<String, Vec<String>>,
@@ -19,15 +19,22 @@ struct Config {
     unsupported: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Package {
     name: String,
     external: BTreeSet<String>,
 }
 
+struct FileSettings {
+    config: usize,
+    package: usize,
+}
+
 #[derive(Default)]
 pub(super) struct JsConfigs {
-    files: BTreeMap<String, (Config, Package)>,
+    files: BTreeMap<String, FileSettings>,
+    configs: Vec<Config>,
+    packages: Vec<Package>,
     pub diagnostics: Vec<MetricsDiagnostic>,
 }
 
@@ -37,7 +44,11 @@ impl JsConfigs {
         paths: &BTreeMap<String, usize>,
         validate: &impl Fn(&Path) -> Result<()>,
     ) -> Result<Self> {
-        let mut result = Self::default();
+        let mut result = Self {
+            configs: vec![Config::default()],
+            packages: vec![Package::default()],
+            ..Self::default()
+        };
         let mut configs = BTreeMap::new();
         let mut packages = BTreeMap::new();
         for file in paths.keys() {
@@ -55,11 +66,13 @@ impl JsConfigs {
             let config = if let Some(path) = nearest(dir, file, &names)? {
                 if !configs.contains_key(&path) {
                     let config = load_config(dir, &path, validate, &mut result.diagnostics)?;
-                    configs.insert(path.clone(), config);
+                    let id = result.configs.len();
+                    result.configs.push(config);
+                    configs.insert(path.clone(), id);
                 }
-                configs[&path].clone()
+                configs[&path]
             } else {
-                Config::default()
+                0
             };
             let package = if let Some(path) = nearest(dir, file, &["package.json"])? {
                 if !packages.contains_key(&path) {
@@ -100,21 +113,25 @@ impl JsConfigs {
                             }
                         }
                     }
-                    packages.insert(path.clone(), package);
+                    let id = result.packages.len();
+                    result.packages.push(package);
+                    packages.insert(path.clone(), id);
                 }
-                packages[&path].clone()
+                packages[&path]
             } else {
-                Package::default()
+                0
             };
-            result.files.insert(file.clone(), (config, package));
+            result
+                .files
+                .insert(file.clone(), FileSettings { config, package });
         }
         let local_names: BTreeSet<_> = result
-            .files
-            .values()
-            .map(|(_, package)| package.name.clone())
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
             .filter(|name| !name.is_empty())
             .collect();
-        for (_, package) in result.files.values_mut() {
+        for package in &mut result.packages {
             package.external.retain(|name| !local_names.contains(name));
         }
         result.diagnostics.sort_by(|a, b| {
@@ -145,9 +162,11 @@ impl JsConfigs {
                 "local_target_unresolved",
             );
         }
-        let Some((config, package)) = self.files.get(file) else {
+        let Some(settings) = self.files.get(file) else {
             return (Vec::new(), "bare_import", "bare_specifier_unresolved");
         };
+        let config = &self.configs[settings.config];
+        let package = &self.packages[settings.package];
         if config.unsupported {
             return (Vec::new(), "unsupported_config", "unsupported_config");
         }
