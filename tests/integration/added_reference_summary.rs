@@ -92,6 +92,114 @@ fn counts(summary: &Value, inside: usize, outside: usize) {
     );
 }
 
+fn summary_for<'a>(value: &'a Value, is_hook: bool, file: &str, name: &str) -> &'a Value {
+    let summaries = if is_hook {
+        &value["added_reference_summary"]
+    } else {
+        &value["api_changes"]["added_reference_summary"]
+    };
+    summaries
+        .as_array()
+        .expect("added reference summaries")
+        .iter()
+        .find(|summary| summary["file"] == file && summary["name"] == name)
+        .expect("producer-local summary")
+}
+
+#[test]
+fn added_reference_summary_counts_producer_local_calls_before_add_filter() {
+    for (file, baseline, source) in [
+        (
+            "math.py",
+            "pass\n",
+            "def cube(v):\n    return v * v * v\n\ndef describe():\n    return f'cube={cube(3)}'\n",
+        ),
+        (
+            "math.ts",
+            "export {};\n",
+            "export function cube(v: number): number { return v * v * v; }\nexport function describe(): string { return String(cube(3)); }\n",
+        ),
+    ] {
+        for added_file in [true, false] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.write("base.py", "print('base')\n");
+            if !added_file {
+                repo.write(file, baseline);
+            }
+            repo.commit_all("base");
+            repo.write(file, source);
+            let normal = repo.run_json("review", &["--git"]);
+            let summary = summary_for(&normal, false, file, "cube");
+            counts(summary, 1, 0);
+            assert_eq!(summary["scan"]["scan_failed"], false, "{summary}");
+            assert_eq!(summary["scan"]["failed_files"], 0, "{summary}");
+            let added = normal["api_changes"]["added"].as_array().unwrap();
+            assert!(added.iter().all(|item| item["name"] != "cube"), "{normal}");
+            assert!(
+                added.iter().any(|item| item["name"] == "describe"),
+                "{normal}"
+            );
+            let value = hook(&repo, &["--git"]);
+            assert_eq!(summary_for(&value, true, file, "cube"), summary);
+            counts(summary_for(&value, true, file, "describe"), 0, 0);
+        }
+    }
+}
+
+#[test]
+fn added_reference_summary_counts_producer_local_qualified_methods() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"summary\"\nversion = \"0.1.0\"\n[lib]\npath = \"lib.rs\"\n",
+    );
+    repo.write("lib.rs", "");
+    repo.commit_all("base");
+    repo.write("lib.rs", "pub struct Shape;\nimpl Shape {\n    pub fn cube(v: i32) -> i32 { v * v * v }\n    pub fn describe() -> i32 { Self::cube(3) }\n}\n");
+    let normal = repo.run_json("review", &["--git"]);
+    let summary = summary_for(&normal, false, "lib.rs", "Shape.cube");
+    counts(summary, 1, 0);
+    assert_eq!(summary["scan"]["scan_failed"], false, "{summary}");
+    assert!(
+        normal["api_changes"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["name"] != "Shape.cube"),
+        "{normal}"
+    );
+    let value = hook(&repo, &["--git"]);
+    assert_eq!(summary_for(&value, true, "lib.rs", "Shape.cube"), summary);
+}
+
+#[test]
+fn added_reference_summary_counts_producer_local_calls_from_index() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("math.py", "pass\n");
+    repo.commit_all("base");
+    repo.write(
+        "math.py",
+        "def cube(v):\n    return v * v * v\n\ndef describe():\n    return cube(3)\n",
+    );
+    repo.git(["add", "math.py"]);
+    repo.write(
+        "math.py",
+        "def cube(v):\n    return v * v * v\n\ndef describe():\n    return 0\n",
+    );
+    let working = hook(&repo, &["--git"]);
+    counts(summary_for(&working, true, "math.py", "cube"), 0, 0);
+    let value = hook(&repo, &["--git", "--staged"]);
+    let summary = summary_for(&value, true, "math.py", "cube");
+    counts(summary, 1, 0);
+    assert_eq!(summary["scope"]["new_side"], "index");
+    assert_eq!(summary["scan"]["scan_failed"], false, "{summary}");
+    let normal = repo.run_json("review", &["--git", "--staged"]);
+    assert_eq!(summary_for(&normal, false, "math.py", "cube"), summary);
+}
+
 #[test]
 fn added_reference_summary_keeps_add_policy_and_partitions_same_workspace() {
     let repo = fixture();

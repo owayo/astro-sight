@@ -708,11 +708,8 @@ impl PreparedDiff {
         let in_file_callees = facts.callees;
         if let Some(syms) = &new_syms {
             for (name, _, _) in syms {
-                // per-symbol 実装と同じ短絡: ファイル内から呼ばれるシンボルは
-                // `is_used_in_diff_paths` に到達しないため検索対象に入れない。
-                if !is_internally_connected(&in_file_callees, name) {
-                    self.index_names.insert(bare_name(name).to_string());
-                }
+                // api.add から省く名前も、参照サマリでは自ファイルの使用を数える。
+                self.index_names.insert(bare_name(name).to_string());
             }
         }
         PreparedDiffFile::Added {
@@ -881,7 +878,6 @@ impl PreparedDiff {
             collect_modified_file_index_names(
                 old,
                 new,
-                &in_file_callees,
                 &parameter_pattern_only_names,
                 is_bash_script_path(&df.old_path),
                 ts_namespace::recovery_language(&df.old_path, &df.new_path),
@@ -941,7 +937,6 @@ fn collect_deleted_bash_index_names(
 pub(crate) fn collect_modified_file_index_names(
     old_syms: &[(String, String, String)],
     new_syms: &[(String, String, String)],
-    in_file_callees: &std::collections::HashSet<String>,
     parameter_pattern_only_names: &HashSet<String>,
     is_bash_old_file: bool,
     lang: Option<crate::language::LangId>,
@@ -965,9 +960,7 @@ pub(crate) fn collect_modified_file_index_names(
         match old_map.get(name.as_str()) {
             None => {
                 has_new_only_symbol = true;
-                if !is_internally_connected(in_file_callees, name) {
-                    index_names.insert(bare_name(name).to_string());
-                }
+                index_names.insert(bare_name(name).to_string());
             }
             Some(old_sig)
                 if old_sig != &sig.as_str() && !parameter_pattern_only_names.contains(name) =>

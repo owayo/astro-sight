@@ -385,7 +385,6 @@ mod tests {
                 &old,
                 &new,
                 &HashSet::new(),
-                &HashSet::new(),
                 false,
                 Some(lang),
                 &mut names,
