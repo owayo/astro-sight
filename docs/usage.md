@@ -360,6 +360,7 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 astro-sight metrics --dir .
 astro-sight metrics --dir src --component directory --component-depth 2
 astro-sight metrics --dir . --glob '**/*.ts' --format toon
+astro-sight metrics --dir . --component directory --component-depth 2 --base HEAD
 ```
 
 `metrics` reports function cyclomatic complexity using the same branch-count convention as `symbols`, plus file and project counts, totals, averages and maxima. Anonymous functions not exposed by `symbols` are outside this inventory. Lines are zero-based.
@@ -377,11 +378,37 @@ An edge `from → to` means from imports to. Each component reports direct `fan_
 
 All are 0 for an empty scope. Three isolated components have CCD=3, ACD=1 and PC=1/3. A chain A→B→C has CCD=6, ACD=2 and PC=2/3; a three-component cycle has CCD=9 and PC=1. Definitions include the diagonal; see [component dependency metrics](https://blog.hello2morrow.com/2014/12/assess-and-control-component-coupling-with-sonargraph-explorer/) and the [propagation-cost visibility matrix](https://www.hbs.edu/ris/Publication%20Files/05-016.pdf).
 
-The graph uses **static local imports**, without compiler/type resolution. It resolves conventional anchored Rust `use` trees and module declarations, relative JS/TS/TSX imports and re-exports, Python root/`src` and relative module imports, quoted C/C++ includes, Ruby `require_relative`, and Zig file imports. Rust bare imports and custom module paths, runtime paths (including Bash `source`), external packages, aliases and configured search paths can remain unresolved. Go, Java, Kotlin, Swift, C# and PHP report `dependency_resolution_unsupported` while still measuring complexity. Conditional declarations are included syntactically regardless of active build configuration. C/C++ source/header files remain separate in file mode.
+### Dependency Resolution and Coverage
+
+The graph uses **static local imports**. Configuration is read only inside `--dir`; this is not full compiler or package-manager resolution.
+
+| Language | Resolved scope |
+| --- | --- |
+| Rust | Declared modules, anchored `crate` / `self` / `super` and grouped `use`, verifiable bare imports, and literal/raw-string `#[path]`. Conventional roots, explicit and automatic Cargo targets, library names, and editions inform resolution |
+| JS / TS / TSX | Relative imports and re-exports; JSONC `tsconfig.json` / `jsconfig.json` with `baseUrl`, `paths`, and single relative-file `extends` chains. Exact patterns take priority, then longest wildcard prefix, with ordered fallback targets |
+| Python / C・C++ / Ruby / Zig | Root/`src` and relative modules / quoted includes / `require_relative` / file imports |
+
+Unverified Rust alias/glob bindings, block-local imports, extern-crate bindings, files shared by several modules, conditional paths, and unknown editions remain conservative. Package or multiple `extends`, `rootDirs`, and `moduleSuffixes` produce diagnostics. Invalid configs, out-of-scope configs, and symlinked configs fail explicitly. Go, Java, Kotlin, Swift, C#, and PHP report `dependency_resolution_unsupported` while still measuring complexity. Runtime paths such as Bash `source`, qualified names without imports, and active cfg conditions are not evaluated. Conditional declarations are syntactic candidates. C/C++ sources and headers remain separate in file mode.
+
+Verifiable nonlocal Cargo / package.json dependencies and standard-library specifiers appear separately in `external_dependencies`. Path/workspace dependencies and local overrides are not assumed external. `resolution_summary` counts observed static targets resolved locally, external, unresolved, or ambiguous, plus dynamic imports and unsupported/failed files. Counts include expanded Rust grouped imports, so they differ from deduplicated graph edges. Ambiguous imports are a subset of unresolved imports. `all_static_imports_resolved` means no unresolved targets or coverage diagnostics in the selected scope, not proof of runtime completeness.
 
 Read `unresolved_dependencies`, `diagnostics`, `truncations`, `skipped` and `limitations` before interpreting the values. Ambiguous targets are reported rather than guessed. Failed sources remain in the inventory with diagnostics; their unobserved complexity and edges are absent. Ignore rules are respected. Generated files are excluded and reported unless `--include-generated` is set. `--glob` narrows the component inventory, leaving other targets unresolved. Empty `cycles` do not prove the full project acyclic. Processing retains neither all ASTs nor an N×N matrix: reachability traverses the condensed graph from each strongly connected component with linear working memory.
 
-Session request: `{"command":"metrics","dir":"src","component":"directory","component_depth":2}`. MCP exposes `metrics_analyze` with the same options. Session output remains JSON; CLI and MCP content support JSON/TOON/auto.
+### Edge and Representative Cycle Evidence
+
+`edges` / `file_edges` include `evidence`: declaration `path`, zero-based `line`, import specifier `source`, resolved file `target`, declaration `kind`, and `resolution` rule. Several declarations can support one edge.
+
+`cycle_evidence` provides one representative closed path per strongly connected component (`cycle_evidence_mode: one_representative_per_scc`). `components` lists the entire SCC; `steps` contains real edges returning to the starting component, with their source evidence. A path need not visit every SCC member, and does not enumerate all simple cycles. Directory grouping retains the underlying file evidence; different steps can originate in different files.
+
+### Baseline Commit Comparisons
+
+`--base <rev>` resolves a commit SHA and remeasures its sources with the same engine, scope, glob, generated-file policy, and component granularity. The current side is the working tree, including selected untracked files. `comparison` contains `base_commit`, the full `baseline` with diagnostics, current-minus-baseline `delta`, and added/removed/changed components, edges, and SCC groups. Edge identity uses from/to, so moving a declaration alone is not an added dependency. `function_changes` pairs unique file/container/name functions by complexity; overloads and other ambiguous groups retain all candidates with `pairing: ambiguous_name_and_container`. Renames appear as additions/removals.
+
+`normalization_changed` reports changes to N; read ACD/PC deltas alongside their denominators. `coverage_changed` reports changes in unresolved targets and other coverage evidence. Either side having unresolved targets or diagnostics yields `assessment: partial_observed_graphs`; a numerical decrease alone does not prove improvement. `added_cycle_groups` / `removed_cycle_groups` compare SCC member sets, not every possible cycle path.
+
+Raw baseline blobs are written to a safe temporary Git snapshot without changing the original index, HEAD, or working tree. Materialization has repository-wide limits of 50,000 regular files and 512 MiB; exceeding them or encountering unsafe paths fails explicitly. Baseline source/config symlinks and submodules are not expanded; omissions in the selected scope are diagnosed.
+
+Session request: `{"command":"metrics","dir":"src","component":"directory","component_depth":2,"base":"HEAD"}`. `base` is optional. MCP exposes `metrics_analyze` with the same options. Session output remains JSON; CLI and MCP content support JSON/TOON/auto.
 
 ## Batch Processing (ast, symbols, calls, imports, lint, sequence)
 

@@ -31,6 +31,7 @@ pub fn handle_request(
                 component: req.component,
                 component_depth: req.component_depth.unwrap_or(1),
                 include_generated: req.include_generated,
+                base: req.base,
             },
         )?)?),
         Command::Ast => {

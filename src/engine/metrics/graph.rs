@@ -102,6 +102,58 @@ fn reachable_counts(graph: &[BTreeSet<usize>], sizes: &[usize]) -> Vec<usize> {
     counts
 }
 
+pub(super) fn representative_cycles(
+    count: usize,
+    groups: &[Vec<usize>],
+    edges: &BTreeSet<(usize, usize)>,
+) -> anyhow::Result<Vec<Vec<(usize, usize)>>> {
+    let mut outgoing = vec![Vec::new(); count];
+    for &(a, b) in edges {
+        outgoing[a].push(b);
+    }
+    let mut owners = vec![usize::MAX; count];
+    for (id, group) in groups.iter().enumerate() {
+        for &node in group {
+            owners[node] = id;
+        }
+    }
+    let mut parents = vec![usize::MAX; count];
+    let mut cycles = Vec::new();
+    for (id, group) in groups.iter().enumerate() {
+        let start = group[0];
+        let &next = outgoing[start]
+            .iter()
+            .find(|&&to| owners[to] == id)
+            .ok_or_else(|| anyhow::anyhow!("No edge inside a cyclic component"))?;
+        let mut pending = std::collections::VecDeque::from([next]);
+        parents[next] = next;
+        while let Some(node) = pending.pop_front() {
+            if node == start {
+                break;
+            }
+            for &child in &outgoing[node] {
+                if owners[child] == id && parents[child] == usize::MAX {
+                    parents[child] = node;
+                    pending.push_back(child);
+                }
+            }
+        }
+        if parents[start] == usize::MAX {
+            anyhow::bail!("No representative cycle found");
+        }
+        let mut tail = vec![start];
+        let mut current = start;
+        while current != next {
+            current = parents[current];
+            tail.push(current);
+        }
+        tail.reverse();
+        let nodes: Vec<_> = std::iter::once(start).chain(tail).collect();
+        cycles.push(nodes.windows(2).map(|pair| (pair[0], pair[1])).collect());
+    }
+    Ok(cycles)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +177,8 @@ mod tests {
         assert_eq!(result.cycles.len(), 1);
         assert_eq!(result.depends_on, vec![count; count]);
         assert_eq!(result.used_by, vec![count; count]);
+        let witnesses = representative_cycles(count, &result.cycles, &edges).unwrap();
+        assert_eq!(witnesses[0].len(), count);
     }
 
     #[test]
@@ -139,6 +193,13 @@ mod tests {
                 .filter_map(|(bit, &edge)| (mask & (1 << bit) != 0).then_some(edge))
                 .collect();
             let result = analyze(4, &edges);
+            let witnesses = representative_cycles(4, &result.cycles, &edges).unwrap();
+            assert_eq!(witnesses.len(), result.cycles.len());
+            for witness in witnesses {
+                assert_eq!(witness.first().unwrap().0, witness.last().unwrap().1);
+                assert!(witness.iter().all(|edge| edges.contains(edge)));
+                assert!(witness.windows(2).all(|pair| pair[0].1 == pair[1].0));
+            }
             let mut reachable = [[false; 4]; 4];
             for (id, row) in reachable.iter_mut().enumerate() {
                 row[id] = true;

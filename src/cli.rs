@@ -64,6 +64,9 @@ pub enum Commands {
         /// Directory component depth relative to --dir (positive, default 1)
         #[arg(long, default_value = "1")]
         component_depth: usize,
+        /// Compare the selected scope with this Git revision (current side is the working tree)
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Extract AST fragment at a given position or range
     Ast {

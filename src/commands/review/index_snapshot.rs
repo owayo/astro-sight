@@ -33,6 +33,7 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = git_command_for_dir(dir)
         .args(args)
         .current_dir(dir)
+        .stdin(Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
@@ -109,6 +110,7 @@ struct TreeManifest {
     files: Vec<PathBuf>,
     /// サブモジュールは親 index にコードを持たないため、空ディレクトリだけを作る。
     gitlinks: Vec<PathBuf>,
+    symlinks: Vec<PathBuf>,
     total_bytes: u64,
 }
 
@@ -129,7 +131,7 @@ fn read_manifest(listing: &[u8]) -> Result<TreeManifest> {
         match (*mode, *kind) {
             ("160000", "commit") => manifest.gitlinks.push(path),
             // 共通 walker はリンクを辿らない。外部・dangling を含め展開しない。
-            ("120000", "blob") => {}
+            ("120000", "blob") => manifest.symlinks.push(path),
             ("100644" | "100755", "blob") => {
                 let size: u64 = size.parse()?;
                 manifest.total_bytes = manifest
@@ -526,6 +528,140 @@ impl IndexSnapshot {
     }
 }
 
+/// コミットの raw tree を、元の index を変更せず展開する。
+pub(in crate::commands) fn prepare_commit_snapshot(
+    original: &Path,
+    revision: &str,
+) -> Result<(
+    IndexSnapshot,
+    String,
+    Vec<crate::models::metrics::MetricsDiagnostic>,
+)> {
+    prepare_commit_snapshot_with_budget(original, revision, SnapshotBudget::DEFAULT)
+}
+
+fn prepare_commit_snapshot_with_budget(
+    original: &Path,
+    revision: &str,
+    budget: SnapshotBudget,
+) -> Result<(
+    IndexSnapshot,
+    String,
+    Vec<crate::models::metrics::MetricsDiagnostic>,
+)> {
+    crate::git_support::validate_git_revision(revision, "metrics --base")?;
+    let commit = git_text(
+        original,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{revision}^{{commit}}"),
+        ],
+    )?;
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(failure("Invalid metrics baseline commit"));
+    }
+    let repository = OriginalRepository::read(original)?;
+    let temporary = tempfile::Builder::new()
+        .prefix("astro-sight-baseline-")
+        .tempdir()?;
+    let root = temporary.path();
+    let initialized = isolated_git_command()
+        .args(["init", "--quiet", "--template="])
+        .arg(format!("--object-format={}", repository.object_format))
+        .arg(root)
+        .output()?;
+    if !initialized.status.success() {
+        return Err(failure("Cannot initialize metrics baseline snapshot"));
+    }
+    let mut objects = BTreeSet::new();
+    for path in [
+        PathBuf::from(&repository.objects),
+        PathBuf::from(&repository.common).join("objects"),
+    ] {
+        let path = fs::canonicalize(if path.is_absolute() {
+            path
+        } else {
+            original.join(path)
+        })?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| failure("Non-UTF-8 Git object directory"))?
+            .to_string();
+        if path.contains(['\n', '\r']) {
+            return Err(failure("Unsupported Git object directory"));
+        }
+        objects.insert(path);
+    }
+    fs::write(
+        root.join(".git/objects/info/alternates"),
+        objects
+            .into_iter()
+            .map(|p| format!("{p}\n"))
+            .collect::<String>(),
+    )?;
+    let tree = git_text(root, &["rev-parse", &format!("{commit}^{{tree}}")])?;
+    fs::write(root.join(".git").join(INDEX_SNAPSHOT_MARKER), &tree)?;
+    git_bytes(root, &["update-ref", "HEAD", &commit])?;
+    git_bytes(root, &["read-tree", &tree])?;
+    let manifest = read_manifest(&git_bytes(root, &["ls-tree", "-r", "-l", "-z", &tree])?)?;
+    if manifest.files.len() > budget.files || manifest.total_bytes > budget.bytes {
+        return Err(failure(format!(
+            "Metrics baseline snapshot exceeds budget: {} files / {} bytes; limits: {} files / {} bytes",
+            manifest.files.len(),
+            manifest.total_bytes,
+            budget.files,
+            budget.bytes
+        )));
+    }
+    let mut omissions = Vec::new();
+    for (paths, reason) in [
+        (&manifest.gitlinks, "baseline_submodule_omitted"),
+        (&manifest.symlinks, "baseline_symlink_omitted"),
+    ] {
+        for path in paths {
+            let Ok(relative) = path.strip_prefix(&repository.prefix) else {
+                continue;
+            };
+            if reason == "baseline_symlink_omitted"
+                && crate::language::LangId::from_path(
+                    camino::Utf8Path::from_path(relative).unwrap_or(camino::Utf8Path::new("")),
+                )
+                .is_err()
+                && !relative
+                    .extension()
+                    .is_some_and(|e| e == "json" || e == "toml")
+            {
+                continue;
+            }
+            omissions.push(crate::models::metrics::MetricsDiagnostic {
+                path: crate::git_support::normalize_workspace_separators(
+                    &relative.to_string_lossy(),
+                ),
+                line: None,
+                reason: reason.into(),
+                message: "This tree entry is not expanded in the baseline snapshot".into(),
+            });
+        }
+    }
+    omissions.sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
+    create_directories(root, &manifest)?;
+    checkout_files(root, &manifest.files)?;
+    let analysis_dir = root.join(repository.prefix);
+    fs::create_dir_all(&analysis_dir)?;
+    let attributes = crate::engine::gitattributes::register_snapshot(root, original);
+    Ok((
+        IndexSnapshot {
+            _temporary: temporary,
+            analysis_dir,
+            _attributes: attributes,
+        },
+        commit,
+        omissions,
+    ))
+}
+
 /// 明示 diff の hunk を、offset の移動を許さず new 側のソースと照合する。
 pub(super) fn verify_explicit_new_side(
     dir: &str,
@@ -630,6 +766,33 @@ mod tests {
             PreparedSnapshot::Ready(snapshot) => snapshot,
             PreparedSnapshot::OverBudget(_) => panic!("small staged tree must be materialized"),
         }
+    }
+
+    #[test]
+    fn metrics_commit_snapshot_budget_excess_is_an_error() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "astro-sight@example.com"],
+        );
+        git(repo.path(), &["config", "user.name", "astro-sight"]);
+        write(repo.path(), "a.py", b"x = 1\n");
+        commit_all(repo.path(), "baseline");
+        let before = git(repo.path(), &["status", "--porcelain=v1", "-z"]);
+        let error = prepare_commit_snapshot_with_budget(
+            repo.path(),
+            "HEAD",
+            SnapshotBudget { files: 0, bytes: 0 },
+        );
+        let Err(error) = error else {
+            panic!("snapshot budget must fail explicitly");
+        };
+        assert!(error.to_string().contains("exceeds budget"));
+        assert_eq!(
+            before,
+            git(repo.path(), &["status", "--porcelain=v1", "-z"])
+        );
     }
 
     /// 元のリポジトリの値を 2 回の rev-parse で読んでも、1 項目ずつ読んだ場合と同じになる。

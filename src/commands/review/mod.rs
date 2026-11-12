@@ -24,6 +24,7 @@ use missing_cochange::{ReviewCochangeInput, detect_missing_cochanges_scoped};
 mod cochange_scope;
 pub mod hook;
 mod index_snapshot;
+pub(super) use index_snapshot::prepare_commit_snapshot;
 pub(crate) mod missing_cochange;
 mod recent_cochange;
 mod rename_candidates;

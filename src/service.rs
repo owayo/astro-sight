@@ -64,14 +64,19 @@ impl AppService {
             )
             .into());
         }
+        if let Some(base) = &opts.base {
+            crate::git_support::validate_git_revision(base, "metrics --base")?;
+        }
         let dir = self.validate_dir(&opts.dir)?;
-        crate::engine::metrics::analyze(&dir, opts, |path| {
+        let mut result = crate::engine::metrics::analyze(&dir, opts, |path| {
             let path = path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 source path"))?;
             self.validate_path(path)?;
             Ok(())
-        })
+        })?;
+        crate::commands::metrics::attach_baseline(&dir, opts, &mut result)?;
+        Ok(result)
     }
 
     /// 制限なしのサービスを生成する（CLI モード）。

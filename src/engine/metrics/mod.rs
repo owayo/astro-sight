@@ -7,8 +7,11 @@ use crate::engine::{parser, refs, symbols};
 use crate::git_support::normalize_workspace_separators;
 use crate::models::metrics::*;
 
+pub(crate) mod comparison;
 mod graph;
+mod js_config;
 mod resolve;
+mod rust_modules;
 
 pub(crate) fn analyze(
     dir: &Path,
@@ -35,8 +38,12 @@ pub(crate) fn analyze(
         .map(|(id, path)| (relative(dir, path), id))
         .collect();
     let mut components = Vec::new();
+    let resolution = resolve::ResolutionIndex {
+        rust: rust_modules::RustModules::build(dir, &paths, &validate_path)?,
+        javascript: js_config::JsConfigs::build(dir, &paths, &validate_path)?,
+    };
     let mut dependencies = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = resolution.javascript.diagnostics.clone();
     let mut total = ComplexityStats::default();
     // 逐次解析し、ファイルの処理が済んだら Tree を解放する。
     for path in &collection.files {
@@ -57,6 +64,13 @@ pub(crate) fn analyze(
             let utf8 = camino::Utf8Path::from_path(path)
                 .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 source path"))?;
             let source = parser::read_file(utf8)?;
+            if !resolution.rust.matches_source(&name, &source) {
+                return Err(crate::error::AstroError::new(
+                    crate::error::ErrorCode::ReviewInputChanged,
+                    "Source changed while building the metrics module index; rerun metrics",
+                )
+                .into());
+            }
             let lang = parser::detect_lang(utf8, &source)?;
             component.language = lang.to_string();
             if lang.is_lexer_only() {
@@ -100,11 +114,25 @@ pub(crate) fn analyze(
                     .then(a.container.cmp(&b.container))
                     .then(a.complexity.cmp(&b.complexity))
             });
-            resolve::extract(root, &source, lang, &name, &paths, &mut diagnostics)
+            resolve::extract(
+                root,
+                &source,
+                lang,
+                &name,
+                &paths,
+                &resolution,
+                &mut diagnostics,
+            )
         })();
         match analyzed {
             Ok(imports) => dependencies.push(imports),
             Err(error) => {
+                if error
+                    .downcast_ref::<crate::error::AstroError>()
+                    .is_some_and(|e| e.code == crate::error::ErrorCode::ReviewInputChanged)
+                {
+                    return Err(error);
+                }
                 diagnostics.push(resolve::diagnostic(
                     &name,
                     None,
@@ -117,20 +145,52 @@ pub(crate) fn analyze(
         components.push(component);
     }
     let mut edges = BTreeSet::new();
+    let mut evidence: BTreeMap<(usize, usize), BTreeSet<DependencyEvidence>> = BTreeMap::new();
+    let mut summary = ResolutionSummary::default();
+    let mut external = Vec::new();
     let mut unresolved = Vec::new();
     for (from, imports) in dependencies.into_iter().enumerate() {
         for import in imports {
+            summary.static_imports += 1;
             match import.resolve(&paths) {
                 Ok(to) if from != to => {
+                    summary.resolved_local_imports += 1;
                     edges.insert((from, to));
+                    evidence
+                        .entry((from, to))
+                        .or_default()
+                        .insert(DependencyEvidence {
+                            path: components[from].path.clone(),
+                            line: import.line,
+                            source: import.source,
+                            target: components[to].path.clone(),
+                            kind: import.kind,
+                            resolution: import.rule.into(),
+                        });
                 }
-                Ok(_) => {}
-                Err(reason) => unresolved.push(UnresolvedDependency {
-                    path: components[from].path.clone(),
-                    line: import.line,
-                    source: import.source,
-                    reason: reason.into(),
-                }),
+                Ok(_) => {
+                    summary.resolved_local_imports += 1;
+                }
+                Err("external") => {
+                    summary.external_imports += 1;
+                    external.push(UnresolvedDependency {
+                        path: components[from].path.clone(),
+                        line: import.line,
+                        source: import.source,
+                        reason: "declared_external".into(),
+                    });
+                }
+                Err(reason) => {
+                    summary.unresolved_imports += 1;
+                    summary.ambiguous_imports +=
+                        usize::from(matches!(reason, "ambiguous" | "ambiguous_path_mapping"));
+                    unresolved.push(UnresolvedDependency {
+                        path: components[from].path.clone(),
+                        line: import.line,
+                        source: import.source,
+                        reason: reason.into(),
+                    });
+                }
             }
         }
     }
@@ -170,6 +230,16 @@ pub(crate) fn analyze(
         .iter()
         .filter_map(|&(a, b)| (owners[a] != owners[b]).then_some((owners[a], owners[b])))
         .collect();
+    let mut grouped_evidence: BTreeMap<(usize, usize), BTreeSet<DependencyEvidence>> =
+        BTreeMap::new();
+    for (&(a, b), proof) in &evidence {
+        if owners[a] != owners[b] {
+            grouped_evidence
+                .entry((owners[a], owners[b]))
+                .or_default()
+                .extend(proof.iter().cloned());
+        }
+    }
     let grouped = if opts.component == ComponentUnit::File {
         graph
     } else {
@@ -195,6 +265,57 @@ pub(crate) fn analyze(
         ccd as f64 / count as f64
     };
     let pc = if count == 0 { 0.0 } else { acd / count as f64 };
+    let edge_output: Vec<_> = component_edges
+        .iter()
+        .map(|&(a, b)| DependencyEdge {
+            from: components[a].path.clone(),
+            to: components[b].path.clone(),
+            evidence: grouped_evidence[&(a, b)].iter().cloned().collect(),
+        })
+        .collect();
+    let cycle_paths = graph::representative_cycles(count, &grouped.cycles, &component_edges)?;
+    let cycle_evidence = grouped
+        .cycles
+        .iter()
+        .zip(cycle_paths)
+        .map(|(group, path)| CycleEvidence {
+            components: group
+                .iter()
+                .map(|&id| components[id].path.clone())
+                .collect(),
+            steps: path
+                .into_iter()
+                .map(|(a, b)| DependencyEdge {
+                    from: components[a].path.clone(),
+                    to: components[b].path.clone(),
+                    evidence: grouped_evidence[&(a, b)].iter().cloned().collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    summary.dynamic_imports = diagnostics
+        .iter()
+        .filter(|d| d.reason == "dynamic_import")
+        .count();
+    summary.unsupported_files = diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.reason.as_str(),
+                "unsupported_language" | "dependency_resolution_unsupported"
+            )
+        })
+        .map(|d| &d.path)
+        .collect::<BTreeSet<_>>()
+        .len();
+    summary.failed_files = diagnostics
+        .iter()
+        .filter(|d| matches!(d.reason.as_str(), "analysis_failed" | "parse_error"))
+        .map(|d| &d.path)
+        .collect::<BTreeSet<_>>()
+        .len();
+    summary.all_static_imports_resolved =
+        summary.unresolved_imports == 0 && diagnostics.is_empty() && truncations.is_empty();
     Ok(MetricsResult {
         component_unit: opts.component,
         component_depth: (opts.component == ComponentUnit::Directory)
@@ -204,8 +325,8 @@ pub(crate) fn analyze(
         include_generated: opts.include_generated,
         limitations: vec![
             "Metrics describe the selected files and resolved static imports, not a compiler-verified dependency graph.",
-            "Runtime loading, fully-qualified uses without imports, build-system aliases/search paths and conditional compilation are not evaluated.",
-            "Unresolved/external imports and diagnostics can make coupling metrics lower bounds; empty cycles do not prove the full project acyclic.",
+            "Rust declared modules and selected TypeScript configuration rules are resolved; runtime loading, arbitrary build-system rules, fully-qualified uses without imports and active cfg conditions are not evaluated.",
+            "Unresolved imports and diagnostics can omit local edges; declared external packages are counted separately. Empty cycles do not prove the full project acyclic.",
         ],
         complexity: total,
         dependencies: DependencyMetrics {
@@ -217,13 +338,11 @@ pub(crate) fn analyze(
             propagation_cost: pc,
             propagation_cost_percent: pc * 100.0,
         },
-        edges: component_edges
-            .into_iter()
-            .map(|(from, to)| DependencyEdge {
-                from: components[from].path.clone(),
-                to: components[to].path.clone(),
-            })
-            .collect(),
+        edges: edge_output,
+        cycle_evidence_mode: "one_representative_per_scc",
+        cycle_evidence,
+        resolution_summary: summary,
+        external_dependencies: external,
         cycles: grouped
             .cycles
             .into_iter()
@@ -240,6 +359,7 @@ pub(crate) fn analyze(
             .map(|(a, b)| DependencyEdge {
                 from: files[a].path.clone(),
                 to: files[b].path.clone(),
+                evidence: evidence[&(a, b)].iter().cloned().collect(),
             })
             .collect(),
         files,
@@ -247,6 +367,7 @@ pub(crate) fn analyze(
         diagnostics,
         skipped: collection.skipped(dir),
         truncations,
+        comparison: None,
     })
 }
 
