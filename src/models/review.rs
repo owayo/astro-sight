@@ -384,6 +384,33 @@ pub struct ApiSymbolChange {
     pub unverified: Option<ApiModificationUnverified>,
 }
 
+impl ApiSymbolChange {
+    /// 判定する前の変更 1 件。inline module の経路・根拠 (`change_evidence`・`reference_evidence`)・
+    /// 呼び出し参照の有無・契約の種別・未証明の理由は、判定と記録の段階で埋める。旧新の
+    /// signature は、宣言を組にできなかった変更では無く、値を転送する変更では新しい側が無い。
+    pub fn new(
+        name: String,
+        kind: String,
+        file: String,
+        old_signature: Option<String>,
+        new_signature: Option<String>,
+    ) -> Self {
+        Self {
+            change_evidence: None,
+            reference_evidence: None,
+            name,
+            inline_module: None,
+            kind,
+            file,
+            old_signature,
+            new_signature,
+            no_resolved_internal_callers: false,
+            contract_change: None,
+            unverified: None,
+        }
+    }
+}
+
 /// 証明できなかったことを示し、型の不適合を断定するものではない。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApiModificationUnverified {

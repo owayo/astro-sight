@@ -33,6 +33,20 @@ impl ApiSymbolCandidate {
             ..self.into_api_symbol()
         }
     }
+
+    /// 旧い版の signature `old_signature` から、この候補 (新しい版の宣言) の signature へ変わった変更。
+    pub(crate) fn into_modified(self, old_signature: String) -> ApiSymbolChange {
+        ApiSymbolChange {
+            inline_module: self.inline_module,
+            ..ApiSymbolChange::new(
+                self.name,
+                self.kind,
+                self.file,
+                Some(old_signature),
+                Some(self.signature),
+            )
+        }
+    }
 }
 
 /// 通常の modified ファイル (old_path / new_path がどちらも `/dev/null` でない) で、
@@ -137,19 +151,17 @@ fn collect_python_contract_changes(
             parsed.new_root,
             parsed.new_source,
         ) {
+            // 疑似シンボルを bare 名で解決すると、無関係な同名変数を呼び出し元にしてしまうので、
+            // 参照の証拠は付けない。
             state.buckets.modified.push(ApiSymbolChange {
-                change_evidence: None,
-                inline_module: None,
-                unverified: None,
-                name: change.name,
-                kind: "type".to_string(),
-                file: df.new_path.clone(),
-                old_signature: Some(change.old_signature),
-                new_signature: Some(change.new_signature),
-                // 疑似シンボルを bare 名で解決すると、無関係な同名変数を呼び出し元にしてしまう。
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
                 contract_change: change.contract,
+                ..ApiSymbolChange::new(
+                    change.name,
+                    "type".to_string(),
+                    df.new_path.clone(),
+                    Some(change.old_signature),
+                    Some(change.new_signature),
+                )
             });
         }
     }
@@ -215,20 +227,17 @@ fn collect_python_typed_dict_field_changes(
             parsed.new_source,
             class_name,
         ) {
+            // 疑似シンボルなので呼び出し元の解決はしない。`field` を bare 名で引くと
+            // 無関係な同名フィールド / ローカル変数に当たる。
             state.buckets.modified.push(ApiSymbolChange {
-                change_evidence: None,
-                inline_module: None,
-                unverified: None,
-                name: change.name,
-                kind: "field".to_string(),
-                file: df.new_path.clone(),
-                old_signature: Some(change.old_signature),
-                new_signature: Some(change.new_signature),
-                // 疑似シンボルなので呼び出し元の解決はしない。`field` を bare 名で引くと
-                // 無関係な同名フィールド / ローカル変数に当たる。
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
                 contract_change: Some(change.contract),
+                ..ApiSymbolChange::new(
+                    change.name,
+                    "field".to_string(),
+                    df.new_path.clone(),
+                    Some(change.old_signature),
+                    Some(change.new_signature),
+                )
             });
         }
     }
@@ -346,12 +355,7 @@ fn collect_added_symbols(
     facts: &ModifiedFileFacts<'_>,
     maps: &SymbolMaps<'_>,
 ) -> std::collections::HashSet<String> {
-    let &DetectionInputs {
-        dir,
-        diff_new_paths,
-        ref_index,
-        ..
-    } = inputs;
+    let &DetectionInputs { dir, .. } = inputs;
     let &ModifiedFileFacts {
         old_syms,
         new_syms,
@@ -419,36 +423,16 @@ fn collect_added_symbols(
                 file: df.new_path.clone(),
                 signature: sig.clone(),
             };
-            state.buckets.all_new_candidates.push(candidate.clone());
-            if is_binary_rust_crate {
-                continue;
-            }
-            // inherent impl の項目は impl の対象の型で決める (Issue #315)。
-            if rust_declaration_outside_public_api_surface(
-                inputs.rust_crates,
-                state.rust_public,
-                dir,
-                inputs.base_blobs,
-                false,
-                &df.new_path,
-                name,
+            record_added_candidate(
+                inputs,
+                state,
+                candidate,
+                is_binary_rust_crate,
                 facts
                     .rust_declarations
                     .and_then(|declarations| declarations.new.get(index)),
-            ) {
-                continue;
-            }
-            state
-                .buckets
-                .added_reference_candidates
-                .push(candidate.clone());
-            if is_internally_connected(in_file_callees, name) {
-                continue;
-            }
-            if is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths) {
-                continue;
-            }
-            state.buckets.added.push(candidate);
+                in_file_callees,
+            );
         }
     }
     new_symbols_in_current_file
@@ -597,22 +581,13 @@ fn collect_removed_symbols(
                     });
                     // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
                     if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {
-                        state.buckets.modified.push(ApiSymbolChange {
-                            change_evidence: None,
-                            inline_module: None,
-                            unverified: None,
-                            name: name.clone(),
-                            kind: kind.clone(),
-                            file: df.new_path.clone(),
-                            old_signature: Some(sig.clone()),
-                            new_signature: signatures
-                                .as_ref()
-                                .and_then(|map| map.get(name))
-                                .cloned(),
-                            reference_evidence: None,
-                            no_resolved_internal_callers: false,
-                            contract_change: None,
-                        });
+                        state.buckets.modified.push(ApiSymbolChange::new(
+                            name.clone(),
+                            kind.clone(),
+                            df.new_path.clone(),
+                            Some(sig.clone()),
+                            signatures.as_ref().and_then(|map| map.get(name)).cloned(),
+                        ));
                     }
                 } else if is_rust_pair && REEXPORT_COMPARED_KINDS.contains(&kind.as_str()) {
                     // Rust は、再公開の先の宣言と組にして比べる (Issue #281)。
@@ -797,19 +772,13 @@ fn collect_modified_symbols(
                         .unwrap_or(SignatureDecision::Omit),
                 }
             };
-            let change = ApiSymbolChange {
-                change_evidence: None,
-                inline_module: None,
-                unverified: None,
-                name: name.clone(),
-                kind: kind.clone(),
-                file: df.new_path.clone(),
-                old_signature: Some(old_sig.to_string()),
-                new_signature: Some(new_sig.clone()),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
-            };
+            let change = ApiSymbolChange::new(
+                name.clone(),
+                kind.clone(),
+                df.new_path.clone(),
+                Some(old_sig.to_string()),
+                Some(new_sig.clone()),
+            );
             record_signature_decision(inputs, state, change, decision);
             continue;
         }
@@ -1057,26 +1026,17 @@ fn collect_rust_modified_symbols(
         };
         let (name, kind, _) = &facts.old_syms[first];
         let change = ApiSymbolChange {
-            change_evidence: None,
             inline_module: declarations.old_inline_module(first),
-            unverified: None,
-            name: name.clone(),
-            kind: kind.clone(),
-            file: df.new_path.clone(),
-            old_signature: None,
-            new_signature: None,
-            reference_evidence: None,
-            no_resolved_internal_callers: false,
-            contract_change: None,
+            ..ApiSymbolChange::new(name.clone(), kind.clone(), df.new_path.clone(), None, None)
         };
-        record_signature_decision(
+        record_unverified_modification(
             inputs,
             state,
             change,
-            SignatureDecision::Unverified(ApiModificationUnverified {
+            ApiModificationUnverified {
                 reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
                 first_unproven: None,
-            }),
+            },
         );
     }
 }
@@ -1233,27 +1193,14 @@ fn record_availability_change(
             if !removable {
                 return;
             }
-            let change = ApiSymbolChange {
-                change_evidence: None,
-                inline_module: candidate.inline_module,
-                unverified: None,
-                name: candidate.name,
-                kind: candidate.kind,
-                file: candidate.file,
-                old_signature: Some(old_signature),
-                new_signature: Some(candidate.signature),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
-            };
-            record_signature_decision(
+            record_unverified_modification(
                 inputs,
                 state,
-                change,
-                SignatureDecision::Unverified(ApiModificationUnverified {
+                candidate.into_modified(old_signature),
+                ApiModificationUnverified {
                     reason: ApiModificationUnverifiedReason::RustCfgAvailabilityUnverified,
                     first_unproven: None,
-                }),
+                },
             );
         }
         AvailabilityChange::Changed { lost, gained } => {
@@ -1369,27 +1316,14 @@ pub(crate) fn record_module_availability(
                 candidate,
                 old_signature,
             } => {
-                let change = ApiSymbolChange {
-                    change_evidence: None,
-                    inline_module: candidate.inline_module.clone(),
-                    unverified: None,
-                    name: candidate.name.clone(),
-                    kind: candidate.kind.clone(),
-                    file: candidate.file.clone(),
-                    old_signature: Some(old_signature.clone()),
-                    new_signature: Some(candidate.signature.clone()),
-                    reference_evidence: None,
-                    no_resolved_internal_callers: false,
-                    contract_change: None,
-                };
-                record_signature_decision(
+                record_unverified_modification(
                     inputs,
                     state,
-                    change,
-                    SignatureDecision::Unverified(ApiModificationUnverified {
+                    candidate.clone().into_modified(old_signature.clone()),
+                    ApiModificationUnverified {
                         reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
                         first_unproven: None,
-                    }),
+                    },
                 );
             }
         }
@@ -1468,27 +1402,14 @@ pub(crate) fn record_reexport_names(inputs: &DetectionInputs<'_>, state: &mut De
                 candidate,
                 old_signature,
             } => {
-                let change = ApiSymbolChange {
-                    change_evidence: None,
-                    inline_module: candidate.inline_module.clone(),
-                    unverified: None,
-                    name: candidate.name.clone(),
-                    kind: candidate.kind.clone(),
-                    file: candidate.file.clone(),
-                    old_signature: Some(old_signature.clone()),
-                    new_signature: Some(candidate.signature.clone()),
-                    reference_evidence: None,
-                    no_resolved_internal_callers: false,
-                    contract_change: None,
-                };
-                record_signature_decision(
+                record_unverified_modification(
                     inputs,
                     state,
-                    change,
-                    SignatureDecision::Unverified(ApiModificationUnverified {
+                    candidate.clone().into_modified(old_signature.clone()),
+                    ApiModificationUnverified {
                         reason: ApiModificationUnverifiedReason::RustCfgAvailabilityUnverified,
                         first_unproven: None,
-                    }),
+                    },
                 );
             }
         }
@@ -1649,26 +1570,23 @@ pub(crate) fn compare_moved_availability(
         });
         if duplicated {
             let change = ApiSymbolChange {
-                change_evidence: None,
                 inline_module: symbol.to_inline_module.clone(),
-                unverified: None,
-                name: symbol.name.clone(),
-                kind: symbol.kind.clone(),
-                file: symbol.to.clone(),
-                old_signature: Some(old_side[0].0.2.clone()),
-                new_signature: Some(new_side[0].0.2.clone()),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
+                ..ApiSymbolChange::new(
+                    symbol.name.clone(),
+                    symbol.kind.clone(),
+                    symbol.to.clone(),
+                    Some(old_side[0].0.2.clone()),
+                    Some(new_side[0].0.2.clone()),
+                )
             };
-            record_signature_decision(
+            record_unverified_modification(
                 inputs,
                 state,
                 change,
-                SignatureDecision::Unverified(ApiModificationUnverified {
+                ApiModificationUnverified {
                     reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
                     first_unproven: None,
-                }),
+                },
             );
             continue;
         }
@@ -1723,26 +1641,23 @@ pub(crate) fn compare_moved_availability(
         }
         if split {
             let change = ApiSymbolChange {
-                change_evidence: None,
                 inline_module: symbol.to_inline_module.clone(),
-                unverified: None,
-                name: symbol.name.clone(),
-                kind: symbol.kind.clone(),
-                file: symbol.to.clone(),
-                old_signature: Some(old_side[0].0.2.clone()),
-                new_signature: Some(new_side[0].0.2.clone()),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
+                ..ApiSymbolChange::new(
+                    symbol.name.clone(),
+                    symbol.kind.clone(),
+                    symbol.to.clone(),
+                    Some(old_side[0].0.2.clone()),
+                    Some(new_side[0].0.2.clone()),
+                )
             };
-            record_signature_decision(
+            record_unverified_modification(
                 inputs,
                 state,
                 change,
-                SignatureDecision::Unverified(ApiModificationUnverified {
+                ApiModificationUnverified {
                     reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
                     first_unproven: None,
-                }),
+                },
             );
             continue;
         }
@@ -1862,17 +1777,14 @@ pub(crate) fn compare_moved_availability(
                         }
                     };
                     let change = ApiSymbolChange {
-                        change_evidence: None,
                         inline_module: symbol.to_inline_module.clone(),
-                        unverified: None,
-                        name: symbol.name.clone(),
-                        kind: symbol.kind.clone(),
-                        file: symbol.to.clone(),
-                        old_signature: Some(shown(old_header, old_sig)),
-                        new_signature: Some(shown(new_header, new_sig)),
-                        reference_evidence: None,
-                        no_resolved_internal_callers: false,
-                        contract_change: None,
+                        ..ApiSymbolChange::new(
+                            symbol.name.clone(),
+                            symbol.kind.clone(),
+                            symbol.to.clone(),
+                            Some(shown(old_header, old_sig)),
+                            Some(shown(new_header, new_sig)),
+                        )
                     };
                     record_signature_decision(inputs, state, change, decision);
                 }
@@ -2078,19 +1990,10 @@ pub(crate) fn process_moved_member_changes(
         if moved_member_header(inputs, change, &mut sources).is_some_and(|header| {
             header.change == super::rust_type_api::ShapeChange::Breaking || header.value_changed
         }) {
-            let symbol = ApiSymbolChange {
-                change_evidence: None,
-                inline_module: change.new.inline_module.clone(),
-                unverified: None,
-                name: change.new.name.clone(),
-                kind: change.new.kind.clone(),
-                file: change.new.file.clone(),
-                old_signature: Some(change.old.signature.clone()),
-                new_signature: Some(change.new.signature.clone()),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
-            };
+            let symbol = change
+                .new
+                .clone()
+                .into_modified(change.old.signature.clone());
             record_signature_decision(inputs, state, symbol, SignatureDecision::Blocking(None));
             continue;
         }
@@ -2473,20 +2376,17 @@ pub(crate) fn process_reexported_removals(
     let mut moved_files = MovedSymbolFiles::new(inputs.dir, inputs.base_blobs);
     for ((old, reexporting_file), pair) in removals.iter().zip(&pairs) {
         let blocking = |new_signature: Option<String>, unverified: bool| ApiSymbolChange {
-            change_evidence: None,
-            inline_module: None,
             unverified: unverified.then_some(ApiModificationUnverified {
                 reason: ApiModificationUnverifiedReason::ReexportTargetUnresolved,
                 first_unproven: None,
             }),
-            name: old.name.clone(),
-            kind: old.kind.clone(),
-            file: reexporting_file.clone(),
-            old_signature: Some(old.signature.clone()),
-            new_signature,
-            reference_evidence: None,
-            no_resolved_internal_callers: false,
-            contract_change: None,
+            ..ApiSymbolChange::new(
+                old.name.clone(),
+                old.kind.clone(),
+                reexporting_file.clone(),
+                Some(old.signature.clone()),
+                new_signature,
+            )
         };
         let Some(pair) = pair else {
             state.buckets.modified.push(blocking(None, true));
@@ -2806,21 +2706,15 @@ impl<'a> ChangedSignatureFiles<'a> {
         state: &mut DetectionState<'_>,
         candidate: SignatureCandidate<'_>,
     ) -> (ApiSymbolChange, SignatureDecision) {
-        let change = ApiSymbolChange {
-            change_evidence: None,
-            inline_module: None,
-            unverified: None,
-            name: candidate.name.to_owned(),
-            kind: candidate.kind.to_owned(),
-            file: self.new_path.to_owned(),
-            old_signature: Some(candidate.old_sig.to_owned()),
-            new_signature: Some(candidate.new_sig.to_owned()),
-            // blocking な api.mod に確定した時点でのみ算出する (record_signature_decision)。
-            reference_evidence: None,
-            no_resolved_internal_callers: false,
-            // 型契約変更として種別が確定した時点で埋める (record_signature_decision)。
-            contract_change: None,
-        };
+        // 参照の証拠と契約の種別は、blocking な api.mod に確定した時点で埋める
+        // (record_signature_decision)。
+        let change = ApiSymbolChange::new(
+            candidate.name.to_owned(),
+            candidate.kind.to_owned(),
+            self.new_path.to_owned(),
+            Some(candidate.old_sig.to_owned()),
+            Some(candidate.new_sig.to_owned()),
+        );
         if let Some(decision) = self.rust_dependency_decision(inputs, state, &candidate) {
             return (change, decision);
         }
@@ -3912,6 +3806,22 @@ fn closure_or_blocking_decision(
 }
 
 /// 分類結果を対応する bucket へ格納する。bucket を書き換えるのはここだけ。
+/// 互換・追随の証明を完了できなかった変更 1 件を、その理由 (と最初に証明できなかった場所) を
+/// 添えて blocking の api.mod として記録する。記録は [`record_signature_decision`] に任せる。
+fn record_unverified_modification(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    change: ApiSymbolChange,
+    unverified: ApiModificationUnverified,
+) {
+    record_signature_decision(
+        inputs,
+        state,
+        change,
+        SignatureDecision::Unverified(unverified),
+    );
+}
+
 fn record_signature_decision(
     inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
@@ -4194,12 +4104,7 @@ pub(crate) fn process_added_file(
     df: &crate::models::impact::DiffFile,
     facts: &AddedFileFacts<'_>,
 ) {
-    let &DetectionInputs {
-        dir,
-        diff_new_paths,
-        ref_index,
-        ..
-    } = inputs;
+    let &DetectionInputs { dir, .. } = inputs;
     let &AddedFileFacts {
         new_syms,
         in_file_callees,
@@ -4231,33 +4136,59 @@ pub(crate) fn process_added_file(
             file: df.new_path.clone(),
             signature: sig.clone(),
         };
-        state.buckets.all_new_candidates.push(candidate.clone());
-        if is_binary_rust_crate {
-            continue;
-        }
-        // inherent impl の項目は impl の対象の型で決める (Issue #315)。
-        if rust_declaration_outside_public_api_surface(
+        record_added_candidate(
+            inputs,
+            state,
+            candidate,
+            is_binary_rust_crate,
+            rust_declarations.and_then(|declarations| declarations.get(index)),
+            in_file_callees,
+        );
+    }
+}
+
+/// 新しい版に現れた宣言の候補 1 件を、追加の bucket へ振り分ける (変更ファイルと追加ファイルで同じ規則)。
+///
+/// 移動の突き合わせには常に候補にする。bin-only crate と公開 API 面の外 (inherent impl の項目は
+/// impl の対象の型で決める。Issue #315) は外す。参照の要約には載せ、同じファイルの中か差分の
+/// ほかのファイルで使われていれば api.add には載せない。
+fn record_added_candidate(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    candidate: ApiSymbolCandidate,
+    is_binary_rust_crate: bool,
+    declaration: Option<&RustDeclarationContext>,
+    in_file_callees: &std::collections::HashSet<String>,
+) {
+    state.buckets.all_new_candidates.push(candidate.clone());
+    if is_binary_rust_crate
+        || rust_declaration_outside_public_api_surface(
             inputs.rust_crates,
             state.rust_public,
-            dir,
+            inputs.dir,
             inputs.base_blobs,
             false,
-            &df.new_path,
-            name,
-            rust_declarations.and_then(|declarations| declarations.get(index)),
-        ) {
-            continue;
-        }
-        state
-            .buckets
-            .added_reference_candidates
-            .push(candidate.clone());
-        if is_internally_connected(in_file_callees, name) {
-            continue;
-        }
-        if is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths) {
-            continue;
-        }
-        state.buckets.added.push(candidate);
+            &candidate.file,
+            &candidate.name,
+            declaration,
+        )
+    {
+        return;
     }
+    state
+        .buckets
+        .added_reference_candidates
+        .push(candidate.clone());
+    if is_internally_connected(in_file_callees, &candidate.name)
+        || is_used_in_diff_paths(
+            inputs.ref_index,
+            inputs.dir,
+            &candidate.name,
+            &candidate.file,
+            inputs.diff_new_paths,
+        )
+    {
+        return;
+    }
+    state.buckets.added.push(candidate);
 }

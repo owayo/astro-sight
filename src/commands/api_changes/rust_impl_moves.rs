@@ -249,16 +249,7 @@ pub(super) fn verify(
             continue;
         }
         modified.push(ApiSymbolChange {
-            change_evidence: None,
             inline_module: symbol.to_inline_module.clone(),
-            name: symbol.name.clone(),
-            kind: symbol.kind.clone(),
-            file: symbol.to.clone(),
-            old_signature: old.first().map(|(signature, _)| signature.2.clone()),
-            new_signature: new.first().map(|(signature, _)| signature.2.clone()),
-            reference_evidence: None,
-            no_resolved_internal_callers: false,
-            contract_change: None,
             unverified: Some(ApiModificationUnverified {
                 reason: if old_owner.is_some() && new_owner.is_some() {
                     ApiModificationUnverifiedReason::RustSignatureDependencyChanged
@@ -267,6 +258,13 @@ pub(super) fn verify(
                 },
                 first_unproven: None,
             }),
+            ..ApiSymbolChange::new(
+                symbol.name.clone(),
+                symbol.kind.clone(),
+                symbol.to.clone(),
+                old.first().map(|(signature, _)| signature.2.clone()),
+                new.first().map(|(signature, _)| signature.2.clone()),
+            )
         });
     }
     kept

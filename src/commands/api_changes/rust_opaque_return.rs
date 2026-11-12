@@ -723,20 +723,18 @@ pub(super) fn record(
                     && change.inline_module == inline_module)
             });
             state.buckets.modified.push(ApiSymbolChange {
-                change_evidence: None,
-                name: new_function.name.clone(),
-                kind: new_function.kind.clone(),
-                file: path.clone(),
                 inline_module,
-                old_signature: old_function.map(|function| function.signature.clone()),
-                new_signature: Some(new_function.signature.clone()),
-                reference_evidence: None,
-                no_resolved_internal_callers: false,
-                contract_change: None,
                 unverified: Some(ApiModificationUnverified {
                     reason: ApiModificationUnverifiedReason::RustSignatureDependencyUnresolved,
                     first_unproven: None,
                 }),
+                ..ApiSymbolChange::new(
+                    new_function.name.clone(),
+                    new_function.kind.clone(),
+                    path.clone(),
+                    old_function.map(|function| function.signature.clone()),
+                    Some(new_function.signature.clone()),
+                )
             });
         }
     }
