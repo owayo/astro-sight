@@ -295,6 +295,17 @@ fn attribute_applies(node: tree_sitter::Node<'_>, source: &[u8], name: &str) -> 
 /// スタックで辿る (深い入れ子でコールスタックを溢れさせない)。辿る順は再帰と同じく、書いた順に
 /// 属性を調べ、入れ子の `cfg_attr` は見つけた位置で先に調べて、最初に付けると分かった時点で終える。
 fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str) -> bool {
+    cfg_attr_applies_visiting(arguments, source, name, |_| {})
+}
+
+/// [`cfg_attr_applies`] の本体。`visit` は、調べる `cfg_attr` の引数の字句の木を調べる順に受け取る
+/// (テストで辿る順と短絡を確かめる)。
+fn cfg_attr_applies_visiting<'tree>(
+    arguments: tree_sitter::Node<'tree>,
+    source: &[u8],
+    name: &str,
+    mut visit: impl FnMut(tree_sitter::Node<'tree>),
+) -> bool {
     let text = |node: &tree_sitter::Node<'_>| unraw(node.utf8_text(source).unwrap_or_default());
     /// `cfg_attr` の引数の、条件の後ろの属性 (書いた順の逆に積み、末尾から取り出す)。
     fn attributes(arguments: tree_sitter::Node<'_>) -> Vec<Vec<tree_sitter::Node<'_>>> {
@@ -315,6 +326,7 @@ fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str)
         attributes.reverse();
         attributes
     }
+    visit(arguments);
     let mut pending = vec![attributes(arguments)];
     while let Some(frame) = pending.last_mut() {
         let Some(attribute) = frame.pop() else {
@@ -335,6 +347,7 @@ fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str)
                     && text(path) == "cfg_attr"
                     && nested.kind() == "token_tree" =>
             {
+                visit(*nested);
                 pending.push(attributes(*nested));
             }
             _ => {}
@@ -1335,7 +1348,7 @@ pub(crate) fn reexport_change(
 
 #[cfg(test)]
 mod tests {
-    use super::{attribute_applies, attribute_text};
+    use super::{attribute_applies, attribute_text, cfg_attr_applies_visiting};
     use crate::engine::tree_walk::{Children, Walk, walk_preorder};
     use crate::language::LangId;
     use std::ops::ControlFlow;
@@ -1394,6 +1407,42 @@ mod tests {
             );
             assert_eq!(attribute_applies(attribute, siblings, "allow"), Some(true));
             assert_eq!(attribute_applies(attribute, siblings, "macro_export"), None);
+        });
+    }
+
+    /// 入れ子の `cfg_attr` は書いた順の深さ優先で調べ、付けると分かった時点で終える。`macro_use` は
+    /// 外側と最初の入れ子だけを調べ、後ろの兄弟とその入れ子へは進まない (後ろの兄弟から先に辿ると、
+    /// 兄弟の入れ子の数に比例して走査が増える)。後ろの入れ子の中の名前は、書いた順に辿って見つける。
+    #[test]
+    fn cfg_attr_search_is_depth_first_in_written_order_and_stops_early() {
+        let source = b"#[cfg_attr(all(),\n    cfg_attr(all(), macro_use),\n    cfg_attr(all(), cfg_attr(all(), allow(dead_code)), cfg_attr(all(), allow(dead_code)))\n)]\nmod m {}\n";
+        with_first_attribute(source, |attribute| {
+            let mut cursor = attribute.walk();
+            let arguments = attribute
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "attribute")
+                .and_then(|attribute| attribute.child_by_field_name("arguments"))
+                .expect("cfg_attr の引数");
+            let position = |node: tree_sitter::Node<'_>| {
+                let point = node.start_position();
+                (point.row, point.column)
+            };
+            let mut visited = Vec::new();
+            assert!(cfg_attr_applies_visiting(
+                arguments,
+                source,
+                "macro_use",
+                |node| visited.push(position(node))
+            ));
+            assert_eq!(visited, vec![(0, 10), (1, 12)]);
+            let mut visited = Vec::new();
+            assert!(cfg_attr_applies_visiting(
+                arguments,
+                source,
+                "allow",
+                |node| visited.push(position(node))
+            ));
+            assert_eq!(visited, vec![(0, 10), (1, 12), (2, 12), (2, 28)]);
         });
     }
 
