@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header};
+use crate::engine::diff::{DiffLine, DiffLines, HunkBodyLine, strip_header_path};
 use crate::engine::{diff, parser};
 use crate::language::LangId;
 
@@ -533,69 +533,58 @@ struct ChangedLines {
 
 /// unified diff から Rust ファイルの追加行 / 削除行だけを収集する。
 ///
-/// ヘッダ判定の規約は `diff::extract_changed_new_lines` と揃える (hunk 本体を消費中は
-/// ヘッダに見える行も本体行として扱い、本文中の `+++ b/...` で誤ってファイルが
-/// 切り替わるのを防ぐ)。
+/// 行の分類は `diff::DiffLines` に任せる (hunk 本体を消費中はヘッダに見える行も本体行として
+/// 扱い、本文中の `+++ b/...` で誤ってファイルが切り替わるのを防ぐ)。
 fn collect_rust_changed_lines(input: &str) -> HashMap<String, ChangedLines> {
     let mut result: HashMap<String, ChangedLines> = HashMap::new();
     let mut added_path: Option<String> = None;
     let mut removed_path: Option<String> = None;
     let mut old_path: Option<String> = None;
-    let mut active_hunk: Option<HunkProgress> = None;
 
-    for line in input.lines() {
-        if let Some(progress) = active_hunk.as_mut() {
-            let consumed = progress.consume(line);
-            match consumed {
-                HunkBodyLine::Added(text) => {
-                    if let Some(path) = added_path.as_ref() {
-                        result
-                            .entry(path.clone())
-                            .or_default()
-                            .added
-                            .push(text.to_string());
-                    }
+    for line in DiffLines::new(input) {
+        match line {
+            DiffLine::Body(HunkBodyLine::Added(text)) => {
+                if let Some(path) = added_path.as_ref() {
+                    result
+                        .entry(path.clone())
+                        .or_default()
+                        .added
+                        .push(text.to_string());
                 }
-                HunkBodyLine::Removed(text) => {
-                    if let Some(path) = removed_path.as_ref() {
-                        result
-                            .entry(path.clone())
-                            .or_default()
-                            .removed
-                            .push(text.to_string());
-                    }
+            }
+            DiffLine::Body(HunkBodyLine::Removed(text)) => {
+                if let Some(path) = removed_path.as_ref() {
+                    result
+                        .entry(path.clone())
+                        .or_default()
+                        .removed
+                        .push(text.to_string());
                 }
-                HunkBodyLine::Context | HunkBodyLine::Metadata => {}
             }
-            if progress.is_complete() {
-                active_hunk = None;
+            DiffLine::OldHeader(header) => {
+                old_path = strip_header_path(header, "--- a/")
+                    .filter(|path| path.ends_with(".rs"))
+                    .map(str::to_string);
+                added_path = None;
+                removed_path = None;
             }
-            continue;
-        }
-
-        if let Some(path) = crate::engine::diff::strip_header_path(line, "--- a/") {
-            old_path = path.ends_with(".rs").then(|| path.to_string());
-            added_path = None;
-            removed_path = None;
-        } else if line.starts_with("--- ") {
-            old_path = None;
-            added_path = None;
-            removed_path = None;
-        } else if let Some(path) = crate::engine::diff::strip_header_path(line, "+++ b/") {
-            // Rust から別拡張子への rename も旧側の削除名は保持する。
-            added_path = path.ends_with(".rs").then(|| path.to_string());
-            removed_path = added_path.clone().or_else(|| old_path.clone());
-        } else if line == "+++ /dev/null" {
-            // 削除ファイルには新側のパスが無い。旧側の宣言名を索引へ残す。
-            added_path = None;
-            removed_path = old_path.clone();
-        } else if line.starts_with("+++ ") {
-            added_path = None;
-            removed_path = None;
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
-        {
-            active_hunk = Some(HunkProgress::new(&hunk));
+            DiffLine::NewHeader(header) => {
+                if let Some(path) = strip_header_path(header, "+++ b/") {
+                    // Rust から別拡張子への rename も旧側の削除名は保持する。
+                    added_path = path.ends_with(".rs").then(|| path.to_string());
+                    removed_path = added_path.clone().or_else(|| old_path.clone());
+                } else if header == "+++ /dev/null" {
+                    // 削除ファイルには新側のパスが無い。旧側の宣言名を索引へ残す。
+                    added_path = None;
+                    removed_path = old_path.clone();
+                } else {
+                    added_path = None;
+                    removed_path = None;
+                }
+            }
+            DiffLine::Body(HunkBodyLine::Context(_) | HunkBodyLine::Metadata)
+            | DiffLine::Hunk(_)
+            | DiffLine::Other => {}
         }
     }
 

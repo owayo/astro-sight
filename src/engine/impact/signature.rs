@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header, strip_header_path};
+use crate::engine::diff::{FileDiffLine, FileDiffLines, HunkBodyLine};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
 
@@ -84,47 +84,19 @@ pub(crate) fn collect_changed_line_texts(
     diff_input: &str,
     file_path: &str,
 ) -> (Vec<String>, Vec<String>) {
-    let mut in_file = false;
-    let mut active_hunk: Option<HunkProgress> = None;
     let mut removed_lines = Vec::new();
     let mut added_lines = Vec::new();
 
-    for line in diff_input.lines() {
-        // hunk 本体を消費中はヘッダに見える行も本体行として扱う
-        // (削除/追加行コンテンツが `--- a/...` / `+++ b/...` の形でも誤認しない)。
-        if let Some(progress) = active_hunk.as_mut() {
-            let consumed = progress.consume(line);
-            if in_file {
-                match consumed {
-                    HunkBodyLine::Removed(c) => removed_lines.push(c.to_string()),
-                    HunkBodyLine::Added(c) => added_lines.push(c.to_string()),
-                    HunkBodyLine::Context | HunkBodyLine::Metadata => {}
-                }
-            }
-            if progress.is_complete() {
-                active_hunk = None;
-            }
-            continue;
-        }
-
-        // `diff.rs` の state machine と同じリセット規約を持つ。`--- ` と未認識の `+++ `
-        // で必ず false へ落とさないと、削除ファイルの新側ヘッダ (`+++ /dev/null`) が
-        // どちらの分岐にも当たらず in_file が直前ファイルの true のまま残り、削除ファイル
-        // 本文の `-` 行が対象ファイルの偽 signature 変更として計上される。
-        if line.starts_with("--- ") {
-            in_file = false;
-        } else if let Some(path) = strip_header_path(line, "+++ b/") {
-            in_file = path == file_path;
-            if in_file {
+    for line in FileDiffLines::new(diff_input, file_path) {
+        match line {
+            FileDiffLine::Header => {
                 removed_lines.clear();
                 added_lines.clear();
             }
-        } else if line.starts_with("+++ ") {
-            in_file = false;
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
-        {
-            active_hunk = Some(HunkProgress::new(&hunk));
+            FileDiffLine::Body(HunkBodyLine::Removed(c)) => removed_lines.push(c.to_string()),
+            FileDiffLine::Body(HunkBodyLine::Added(c)) => added_lines.push(c.to_string()),
+            FileDiffLine::Hunk(_)
+            | FileDiffLine::Body(HunkBodyLine::Context(_) | HunkBodyLine::Metadata) => {}
         }
     }
 
@@ -272,46 +244,13 @@ pub(crate) fn is_symbol_in_changed_lines(
     symbol_name: &str,
     lang_id: LangId,
 ) -> bool {
-    let mut in_file = false;
-    let mut active_hunk: Option<HunkProgress> = None;
-
-    for line in diff_input.lines() {
-        // hunk 本体を消費中はヘッダに見える行も本体行として扱う (FN 防止)。
-        if let Some(progress) = active_hunk.as_mut() {
-            let consumed = progress.consume(line);
-            if in_file {
-                let content = match consumed {
-                    HunkBodyLine::Added(c) | HunkBodyLine::Removed(c) => Some(c),
-                    HunkBodyLine::Context | HunkBodyLine::Metadata => None,
-                };
-                if let Some(content) = content
-                    && line_has_identifier(content, symbol_name, lang_id)
-                {
-                    return true;
-                }
-            }
-            if progress.is_complete() {
-                active_hunk = None;
-            }
-            continue;
-        }
-
-        // `detect_signature_changes` と同じリセット規約 (削除ファイルの `+++ /dev/null` で
-        // in_file を落とす)。
-        if line.starts_with("--- ") {
-            in_file = false;
-        } else if let Some(path) = strip_header_path(line, "+++ b/") {
-            in_file = path == file_path;
-        } else if line.starts_with("+++ ") {
-            in_file = false;
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
-        {
-            active_hunk = Some(HunkProgress::new(&hunk));
-        }
-    }
-
-    false
+    FileDiffLines::new(diff_input, file_path).any(|line| {
+        matches!(
+            line,
+            FileDiffLine::Body(HunkBodyLine::Added(content) | HunkBodyLine::Removed(content))
+                if line_has_identifier(content, symbol_name, lang_id)
+        )
+    })
 }
 
 /// 行を識別子境界 (非英数+アンダースコア以外) で分割し、`symbol` と一致する
