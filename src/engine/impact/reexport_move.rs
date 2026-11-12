@@ -1584,4 +1584,54 @@ mod tests {
         });
         assert!(!covers(&index));
     }
+
+    /// 変更行を、旧側と新側のヘッダーの両方からパスへ振り分ける規則を固定する: Rust 同士の rename は
+    /// 新側へまとめ、Rust 以外への rename と削除ファイルは削除行を旧側に残す。認識できない新側
+    /// ヘッダーの区間と、hunk 本体のヘッダーに見える行はパスを切り替えない。
+    #[test]
+    fn collect_rust_changed_lines_attributes_lines_by_both_headers() {
+        let diff = concat!(
+            "--- a/a.rs\n",
+            "+++ b/b.rs\n",
+            "@@ -1 +1 @@\n",
+            "-pub fn x() {}\n",
+            "+pub fn y() {}\n",
+            "--- a/c.rs\n",
+            "+++ b/c.txt\n",
+            "@@ -1 +1 @@\n",
+            "-pub fn z() {}\n",
+            "+text\n",
+            "--- a/d.rs\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n",
+            "-pub fn d() {}\n",
+            "--- a/q.rs\n",
+            "+++ \"b/q\\tx.rs\"\n",
+            "@@ -1 +1 @@\n",
+            "-pub fn q() {}\n",
+            "+pub fn q2() {}\n",
+            "--- a/e.rs\n",
+            "+++ b/e.rs\n",
+            "@@ -1,2 +1,2 @@\n",
+            "---- a/x.rs\n",
+            "++++ b/x.rs\n",
+            " fn ctx() {}\n",
+        );
+        let per_file = collect_rust_changed_lines(diff);
+        let mut summary: Vec<_> = per_file
+            .iter()
+            .map(|(path, lines)| (path.as_str(), lines.added.clone(), lines.removed.clone()))
+            .collect();
+        summary.sort();
+        let lines = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                ("b.rs", lines(&["pub fn y() {}"]), lines(&["pub fn x() {}"])),
+                ("c.rs", lines(&[]), lines(&["pub fn z() {}"])),
+                ("d.rs", lines(&[]), lines(&["pub fn d() {}"])),
+                ("e.rs", lines(&["+++ b/x.rs"]), lines(&["--- a/x.rs"])),
+            ]
+        );
+    }
 }

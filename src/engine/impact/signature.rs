@@ -944,4 +944,61 @@ mod tests {
         // 括弧が無い signature は保守的に不一致 (blocking 維持)
         assert!(!same_top_level_arity("const X: u32", "const X: u64"));
     }
+
+    /// シグネチャ比較用の変更行は、同じファイルの最後の区間だけを使う (最後の区間が空でも集め直す)。
+    /// 識別子の出現は全区間から探す。削除ファイル (`+++ /dev/null`) の行は直前の対象に混ぜない。
+    #[test]
+    fn changed_line_texts_use_the_last_section_but_identifier_search_uses_all() {
+        let reappearing = concat!(
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-fn a() {}\n",
+            "+fn a(x: u8) {}\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+        );
+        assert_eq!(
+            collect_changed_line_texts(reappearing, "a.rs"),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        assert!(is_symbol_in_changed_lines(
+            reappearing,
+            "a.rs",
+            "a",
+            LangId::Rust
+        ));
+
+        let with_deleted_file = concat!(
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-fn a() {}\n",
+            "+fn a(x: u8) {}\n",
+            "--- a/gone.rs\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n",
+            "-fn gone() {}\n",
+        );
+        assert_eq!(
+            collect_changed_line_texts(with_deleted_file, "a.rs"),
+            (
+                vec!["fn a() {}".to_string()],
+                vec!["fn a(x: u8) {}".to_string()]
+            )
+        );
+        assert!(!is_symbol_in_changed_lines(
+            with_deleted_file,
+            "a.rs",
+            "gone",
+            LangId::Rust
+        ));
+
+        // CRLF の `\r` は落とし、改行の無い末尾の `\r` は残す (`str::lines` と同じ)。
+        let trailing_cr = "--- a/r.rs\n+++ b/r.rs\n@@ -1 +1 @@\n-old\r\n+new\r";
+        assert_eq!(
+            collect_changed_line_texts(trailing_cr, "r.rs"),
+            (vec!["old".to_string()], vec!["new\r".to_string()])
+        );
+    }
 }

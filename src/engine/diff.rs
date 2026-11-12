@@ -1465,4 +1465,121 @@ index e69de29..0000000
         // 内容同一の rename だけを返す既存の関数は変えない。
         assert_eq!(parse_hunkless_renames(diff).len(), 1);
     }
+
+    /// diff を行ごとに読む処理 (区間の索引・変更行・削除位置・旧版の復元・ファイル一覧) の、
+    /// 行の分類と区間の扱いを固定する。
+    ///
+    /// 同じパスの再登場 (最後の区間は hunk 無し) / hunk 完了直後の metadata / 片側だけクォート
+    /// されたヘッダー / CRLF / 対象外のファイルの切れた hunk を 1 つの diff に混ぜる。
+    #[test]
+    fn diff_readers_share_line_classification_and_sections() {
+        let diff = concat!(
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-fn a() {}\r\n",
+            "+fn a(x: u8) {}\r\n",
+            " fn keep() {}\n",
+            // hunk の行数を消費し切った後の metadata は hunk の外の行として読み飛ばす。
+            "\\ No newline at end of file\n",
+            "--- a/q.rs\n",
+            // 認識できない新側ヘッダーは区間を閉じ、どのファイルの区間も開かない。
+            "+++ \"b/q\\tx.rs\"\n",
+            "@@ -1 +1 @@\n",
+            "-fn q() {}\n",
+            "+fn q2() {}\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "--- a/cut.rs\n",
+            "+++ b/cut.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            "-fn cut() {}\n",
+        );
+
+        let sections = FileSections::split(diff);
+        assert_eq!(
+            sections.get("a.rs"),
+            concat!(
+                "+++ b/a.rs\n",
+                "@@ -1,2 +1,2 @@\n",
+                "-fn a() {}\r\n",
+                "+fn a(x: u8) {}\r\n",
+                " fn keep() {}\n",
+                "\\ No newline at end of file\n",
+                "+++ b/a.rs\n",
+            )
+        );
+        assert_eq!(
+            sections.get("cut.rs"),
+            "+++ b/cut.rs\n@@ -1,3 +1,3 @@\n-fn cut() {}\n"
+        );
+        assert!(sections.get("q\tx.rs").is_empty());
+
+        let a = extract_changed_line_facts(diff, "a.rs");
+        assert_eq!(a.added_lines, HashSet::from([0]));
+        assert_eq!(a.deletion_gaps, HashSet::from([0]));
+        let cut = extract_changed_line_facts(diff, "cut.rs");
+        assert!(cut.added_lines.is_empty());
+        assert_eq!(cut.deletion_gaps, HashSet::from([0]));
+        assert!(has_deletion_in_new_range(diff, "a.rs", 0, 0));
+        assert!(!has_deletion_in_new_range(diff, "a.rs", 1, 5));
+
+        // 復元は CRLF の new 側と比べ、対象の区間の切れた hunk だけを失敗にする。
+        let rec = reconstruct_old_source(diff, "a.rs", b"fn a(x: u8) {}\r\nfn keep() {}")
+            .expect("a.rs は復元できる");
+        assert_eq!(rec.source, b"fn a() {}\nfn keep() {}\n");
+        assert_eq!(rec.removed_lines, HashSet::from([0]));
+        assert!(reconstruct_old_source(diff, "cut.rs", b"x\ny\nz\n").is_none());
+
+        let files: Vec<_> = parse_unified_diff(diff)
+            .into_iter()
+            .map(|file| {
+                let hunks: Vec<_> = file
+                    .hunks
+                    .iter()
+                    .map(|h| (h.old_start, h.old_count, h.new_start, h.new_count))
+                    .collect();
+                (file.old_path, file.new_path, hunks)
+            })
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("a.rs".to_string(), "a.rs".to_string(), vec![(1, 2, 1, 2)]),
+                (
+                    "cut.rs".to_string(),
+                    "cut.rs".to_string(),
+                    vec![(1, 3, 1, 3)]
+                ),
+            ]
+        );
+    }
+
+    /// 削除だけのゼロ幅 hunk の位置は、変更行の削除位置 (直後の new 側行) と、削除範囲の近似判定
+    /// (直前の new 側行) で意図して違う。同じ規則にまとめない。
+    #[test]
+    fn zero_width_deletion_positions_differ_between_gaps_and_range_check() {
+        let diff = "--- a/z.rs\n+++ b/z.rs\n@@ -5 +4,0 @@\n-gone\n";
+        assert_eq!(
+            extract_changed_line_facts(diff, "z.rs").deletion_gaps,
+            HashSet::from([4])
+        );
+        assert!(has_deletion_in_new_range(diff, "z.rs", 3, 3));
+        assert!(!has_deletion_in_new_range(diff, "z.rs", 4, 4));
+    }
+
+    /// 改行の無い末尾の `\r` は `str::lines` と同じく行に残す (CRLF の `\r` だけを落とす)。
+    #[test]
+    fn trailing_carriage_return_without_newline_stays_in_the_line() {
+        let diff = "--- a/r.rs\n+++ b/r.rs\n@@ -1 +1 @@\n-old\n+new\r";
+        assert_eq!(
+            extract_changed_line_facts(diff, "r.rs").added_lines,
+            HashSet::from([0])
+        );
+        // new 側の `\r` は比較から外すので、diff 側の行に残った `\r` とは一致しない。
+        assert!(reconstruct_old_source(diff, "r.rs", b"new\r\n").is_none());
+        let crlf = "--- a/r.rs\n+++ b/r.rs\n@@ -1 +1 @@\n-old\r\n+new\r\n";
+        let rec = reconstruct_old_source(crlf, "r.rs", b"new\r\n").expect("CRLF は復元できる");
+        assert_eq!(rec.source, b"old\n");
+    }
 }
