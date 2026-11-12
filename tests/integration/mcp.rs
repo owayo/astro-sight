@@ -54,12 +54,13 @@ fn mcp_tools_list() {
         .as_array()
         .expect("tools 配列が必要");
     assert!(
-        tools.len() >= 11,
-        "11ツール以上が必要、実際: {}",
+        tools.len() >= 12,
+        "12ツール以上が必要、実際: {}",
         tools.len()
     );
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     for expected in [
+        "metrics_analyze",
         "ast_extract",
         "symbols_extract",
         "calls_extract",

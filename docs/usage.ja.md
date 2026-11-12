@@ -356,6 +356,35 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 
 `refs` を session で使う場合も `name` または `names` の指定が必須（空文字不可）。
 
+## metrics - 複雑度と依存構造の測定
+
+```bash
+astro-sight metrics --dir .
+astro-sight metrics --dir src --component directory --component-depth 2
+astro-sight metrics --dir . --glob '**/*.ts' --format toon
+```
+
+循環的複雑度は `symbols` と同じ分岐の計上規約を使い、関数ごとの値とファイル別・全体の件数・合計・平均・最大値を返す。`symbols` が抽出しない無名関数は集計外。行番号は 0 始まり。
+
+依存構造を測るコンポーネントの粒度は `--component file|directory` で選ぶ（既定 `file`）。`directory` の場合、`--dir` からの親ディレクトリの先頭 `--component-depth` 階層までで集約する（正の整数、既定 1）。例えば depth=2 では `src/core/a.ts` と `src/core/b.ts` が `src/core` にまとまり、ルート直下のファイルは `.` に属する。コンポーネント内の辺を除き、コンポーネント間の重複辺をまとめてから、循環・結合度を再計算する。ファイル単位の値と辺は `files` / `file_edges` に残す。
+
+辺 `from → to` は from が to を import することを表す。各コンポーネントに直接の `fan_in` / `fan_out`、`instability = fan_out / (fan_in + fan_out)`（孤立時 0）、推移的な `depends_on` / `used_by`（いずれも自己を含む）を返す。`cycles` は2個以上のメンバーからなる強連結成分。全経路を列挙せず、自己 import はファイル間依存に数えない。
+
+| フィールド | 定義（N は選択したコンポーネント数） |
+| --- | --- |
+| `ccd` | 自己を含む到達可能コンポーネント数 `depends_on` の総和 |
+| `acd` | CCD / N（平均コンポーネント依存値） |
+| `propagation_cost` | CCD / N²（伝搬コスト、0〜1） |
+| `propagation_cost_percent` | 伝搬コスト × 100 |
+
+空スコープではいずれも 0。孤立した3個なら CCD=3、ACD=1、PC=1/3、鎖 A→B→C なら CCD=6、ACD=2、PC=2/3、3個の循環なら CCD=9、PC=1。自己依存を含む定義は [Lakos 系のコンポーネント依存指標](https://blog.hello2morrow.com/2014/12/assess-and-control-component-coupling-with-sonargraph-explorer/) と [伝搬コストの可視性行列](https://www.hbs.edu/ris/Publication%20Files/05-016.pdf) を参照。
+
+依存グラフは**静的なローカル import** に基づく。Rust の慣例的な配置での anchored `use`（`crate` / `self` / `super`、グループを含む）とモジュール宣言、JS/TS/TSX の相対 import・再 export、Python のルート/`src` と相対モジュール、C/C++ の引用符付き include、Ruby の `require_relative`、Zig のファイル import を解決する。Rust の bare import・独自モジュールパス、Bash の `source` のような実行時パス、外部パッケージ、別名・検索パス設定は未解決になり得る。Go・Java・Kotlin・Swift・C#・PHP は複雑度を測定し、ローカル依存の解決は `dependency_resolution_unsupported` として申告する。条件付き宣言は有効なビルド構成を判定せず構文上の候補を含める。C/C++ のヘッダーと実装は file モードでは別コンポーネント。
+
+`unresolved_dependencies` / `diagnostics` / `truncations` / `skipped` / `limitations` を読んで値を解釈する。曖昧な指定は推測で辺にしない。読取・解析失敗のファイルも一覧に残すが、そのファイルで観測できなかった複雑度や依存は値に入らない。生成物は除外して申告し、`--include-generated` で含められる。ignore 規則を尊重し、`--glob` で選択範囲を狭めた場合は範囲外の依存先が未解決となる。循環 0 件はプロジェクト全体が非循環である証明ではない。全 AST や N×N 行列を保持せず、強連結成分に縮約したグラフの到達探索を線形の作業メモリで行う。
+
+session は `{"command":"metrics","dir":"src","component":"directory","component_depth":2}`、MCP は同じオプションの `metrics_analyze` で利用できる。session は常に JSON、CLI と MCP の本文は JSON/TOON/auto に対応する。
+
 ## バッチ処理（ast, symbols, calls, imports, lint, sequence）
 
 複数ファイルを一度に処理し、NDJSON（1 ファイル 1 行）で出力。専用の rayon pool で並列処理しつつ入力順を維持する。ワーカー数は既定で、利用可能 CPU 数と 4 の小さい方に制限する。tree-sitter の Parser が巨大ファイルの作業領域を thread-local に保持しても、ピーク RSS が CPU 数に比例して増えないようにするため。`ASTRO_SIGHT_BATCH_WORKERS` に正の整数を指定すれば、利用可能 CPU 数を上限に並列度を変更できる。まだ出力していない結果はワーカー数の 8 倍までの窓に収めるので、入力件数に比例してピーク RSS が増えることはない。stdout が閉じた場合は現在の窓で停止し、残りのファイルを解析しない。
@@ -391,7 +420,9 @@ stdio 上で JSON-RPC 2.0（Model Context Protocol）サーバーとして動作
 astro-sight mcp
 ```
 
-公開ツール（11 種）:
+公開ツール（12 種）:
+
+- `metrics_analyze` - 複雑度・依存関係・循環・ACD・伝搬コストの測定
 - `ast_extract` - AST 断片抽出
 - `symbols_extract` - シンボル抽出
 - `calls_extract` - コールグラフ抽出

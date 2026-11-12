@@ -354,6 +354,35 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 
 `refs` in a session also requires `name` or `names` (not an empty string).
 
+## metrics: Complexity and Dependency Metrics
+
+```bash
+astro-sight metrics --dir .
+astro-sight metrics --dir src --component directory --component-depth 2
+astro-sight metrics --dir . --glob '**/*.ts' --format toon
+```
+
+`metrics` reports function cyclomatic complexity using the same branch-count convention as `symbols`, plus file and project counts, totals, averages and maxima. Anonymous functions not exposed by `symbols` are outside this inventory. Lines are zero-based.
+
+Choose dependency components with `--component file|directory` (default `file`). Directory mode groups files by up to `--component-depth` parent segments relative to `--dir` (positive, default 1). At depth 2, `src/core/a.ts` and `src/core/b.ts` belong to `src/core`; root files belong to `.`. Internal edges are removed, duplicate edges are merged, and coupling and cycles are recalculated after grouping. `files` and `file_edges` retain file-level detail.
+
+An edge `from → to` means from imports to. Each component reports direct `fan_in` / `fan_out`, `instability = fan_out / (fan_in + fan_out)` (0 for isolated components), and transitive `depends_on` / `used_by` (including self). `cycles` lists strongly connected components with at least two members, rather than enumerating every cycle. Self-imports add no file-to-file edge.
+
+| Field | Definition (N = selected components) |
+| --- | --- |
+| `ccd` | Sum of unique reachable component counts, including self |
+| `acd` | CCD / N |
+| `propagation_cost` | CCD / N², between 0 and 1 |
+| `propagation_cost_percent` | 100 × propagation cost |
+
+All are 0 for an empty scope. Three isolated components have CCD=3, ACD=1 and PC=1/3. A chain A→B→C has CCD=6, ACD=2 and PC=2/3; a three-component cycle has CCD=9 and PC=1. Definitions include the diagonal; see [component dependency metrics](https://blog.hello2morrow.com/2014/12/assess-and-control-component-coupling-with-sonargraph-explorer/) and the [propagation-cost visibility matrix](https://www.hbs.edu/ris/Publication%20Files/05-016.pdf).
+
+The graph uses **static local imports**, without compiler/type resolution. It resolves conventional anchored Rust `use` trees and module declarations, relative JS/TS/TSX imports and re-exports, Python root/`src` and relative module imports, quoted C/C++ includes, Ruby `require_relative`, and Zig file imports. Rust bare imports and custom module paths, runtime paths (including Bash `source`), external packages, aliases and configured search paths can remain unresolved. Go, Java, Kotlin, Swift, C# and PHP report `dependency_resolution_unsupported` while still measuring complexity. Conditional declarations are included syntactically regardless of active build configuration. C/C++ source/header files remain separate in file mode.
+
+Read `unresolved_dependencies`, `diagnostics`, `truncations`, `skipped` and `limitations` before interpreting the values. Ambiguous targets are reported rather than guessed. Failed sources remain in the inventory with diagnostics; their unobserved complexity and edges are absent. Ignore rules are respected. Generated files are excluded and reported unless `--include-generated` is set. `--glob` narrows the component inventory, leaving other targets unresolved. Empty `cycles` do not prove the full project acyclic. Processing retains neither all ASTs nor an N×N matrix: reachability traverses the condensed graph from each strongly connected component with linear working memory.
+
+Session request: `{"command":"metrics","dir":"src","component":"directory","component_depth":2}`. MCP exposes `metrics_analyze` with the same options. Session output remains JSON; CLI and MCP content support JSON/TOON/auto.
+
 ## Batch Processing (ast, symbols, calls, imports, lint, sequence)
 
 These commands process several files at once and print NDJSON (one line per file). A dedicated rayon pool processes the files in parallel while keeping the input order. By default the number of workers is the smaller of the available CPUs and 4, so that peak RSS does not grow with the number of CPUs even when tree-sitter parsers keep working memory for huge files in thread-local storage. A positive integer in `ASTRO_SIGHT_BATCH_WORKERS` changes the parallelism, up to the number of available CPUs. Results not yet printed are kept within a window of 8 times the number of workers, so peak RSS does not grow with the number of inputs. When stdout is closed, processing stops at the current window and the remaining files are not analyzed.
@@ -389,7 +418,9 @@ An error for an individual file is printed as a JSON error on its line (the proc
 astro-sight mcp
 ```
 
-Tools (11):
+Tools (12):
+
+- `metrics_analyze` - measure complexity, dependencies, cycles, ACD and propagation cost
 - `ast_extract` - extract AST fragments
 - `symbols_extract` - extract symbols
 - `calls_extract` - extract the call graph

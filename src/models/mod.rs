@@ -10,6 +10,7 @@ pub mod impact;
 pub mod import;
 pub mod lint;
 pub mod location;
+pub mod metrics;
 pub mod python_import_rebinding;
 pub mod reference;
 pub mod reference_evidence;

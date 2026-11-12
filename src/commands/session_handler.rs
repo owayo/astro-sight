@@ -24,6 +24,15 @@ pub fn handle_request(
     use crate::models::request::Command;
 
     match req.command {
+        Command::Metrics => Ok(serde_json::to_value(service.analyze_metrics(
+            &crate::models::metrics::MetricsOptions {
+                dir: req.dir.unwrap_or_else(|| ".".into()),
+                glob: req.glob,
+                component: req.component,
+                component_depth: req.component_depth.unwrap_or(1),
+                include_generated: req.include_generated,
+            },
+        )?)?),
         Command::Ast => {
             let params = AstParams {
                 path: &req.path,

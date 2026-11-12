@@ -7,6 +7,7 @@
 
 mod integration {
     mod added_reference_summary;
+    mod metrics;
     mod support;
 
     mod ast_symbols;

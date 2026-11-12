@@ -53,6 +53,27 @@ impl Default for AppService {
 }
 
 impl AppService {
+    pub fn analyze_metrics(
+        &self,
+        opts: &crate::models::metrics::MetricsOptions,
+    ) -> Result<crate::models::metrics::MetricsResult> {
+        if opts.component_depth == 0 {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "component_depth must be positive",
+            )
+            .into());
+        }
+        let dir = self.validate_dir(&opts.dir)?;
+        crate::engine::metrics::analyze(&dir, opts, |path| {
+            let path = path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 source path"))?;
+            self.validate_path(path)?;
+            Ok(())
+        })
+    }
+
     /// 制限なしのサービスを生成する（CLI モード）。
     pub fn new() -> Self {
         Self {

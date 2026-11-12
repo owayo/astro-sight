@@ -18,6 +18,7 @@ pub(crate) mod jsx;
 pub mod lexer;
 pub(crate) mod lexical_binding;
 pub mod lint;
+pub mod metrics;
 pub mod parse_budget;
 pub mod parser;
 pub mod phpunit_refs;
