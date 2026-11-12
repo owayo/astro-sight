@@ -988,3 +988,20 @@ fn metrics_rust_inline_scope_and_lexical_shadowing_keep_binding_boundaries() {
         false
     );
 }
+
+#[test]
+fn metrics_rust_invalid_target_configuration_fails() {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "pub fn f() {}");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='demo'\n[[bin]]\nname='bad'\npath='../outside.rs'\n",
+    );
+    let output = cargo_bin()
+        .args(["metrics", "--dir", repo.root().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+}

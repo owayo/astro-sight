@@ -142,6 +142,13 @@ impl RustModules {
             let targets =
                 crate::engine::rust_targets::RustTargets::parse(&content, Path::new(&directory))
                     .ok_or_else(|| anyhow::anyhow!("Invalid Cargo targets in metrics scope"))?;
+            if !targets.roots_complete {
+                return Err(crate::error::AstroError::new(
+                    crate::error::ErrorCode::InvalidRequest,
+                    "Cargo target paths are invalid or leave the selected metrics scope",
+                )
+                .into());
+            }
             for target in targets.explicit_roots() {
                 let target =
                     crate::git_support::normalize_workspace_separators(&target.to_string_lossy());
