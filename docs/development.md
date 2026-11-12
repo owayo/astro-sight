@@ -100,3 +100,21 @@ python tools/bench-refs.py --suite symbols --mode session --repeats 9 `
 ```
 
 The ownership index preserves the existing smallest-line-span rule, including extraction-order ties, exact column boundaries, and known Go receivers. Large inputs use O((C+F) log(C+F)) time and O(C+F) auxiliary space for C containers and F unassigned functions. Small inputs use direct comparison. This bound describes ownership assignment, not parsing or the entire `symbols` command. Results and limits from the maintenance run are in [the measurement record](benchmarks/2026-10-30-symbols/README.md).
+
+## Omitted Reference Summary Performance
+
+`build_rollup` counts records by kind and path, then derives language totals from the path counts. This avoids a second path index and allocating kind/language strings for every omitted reference. Ordering, token-budget selection, and counts for unknown extensions are preserved.
+
+Build `examples/bench-result-summary.rs` at each revision with the same toolchain and release settings, saving the first executable before rebuilding the second:
+
+```powershell
+mise exec -- cargo build --release --locked --example bench-result-summary
+# Save the executable from target/release/examples at each revision.
+python tools/bench-result-summary.py --repeats 9 `
+  --baseline C:/temp/rollup-before.exe --candidate C:/temp/rollup-after.exe `
+  --output-directory C:/temp/astro-rollup-bench
+```
+
+The benchmark measures summary aggregation only; it excludes source parsing, filesystem traversal, and output rendering. Cases cover small inputs, repeated paths, many paths, unique paths, and empty input. The harness warms up both executables, alternates execution order, verifies all summary fields on every run, and saves raw timings, medians, ranges, and executable hashes. On Windows, peak working set covers the entire benchmark process across all cases; other platforms record null. These timings do not establish a speedup for an entire `refs` command.
+
+Results, the empty-input tradeoff, and raw samples are in [the measurement record](benchmarks/2026-11-12-result-summary/README.md).

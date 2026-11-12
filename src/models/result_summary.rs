@@ -313,24 +313,21 @@ pub fn build_rollup<T: RollupRecord>(
     omitted: &[T],
     token_budget: Option<usize>,
 ) -> RollupBreakdown {
-    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
-    let mut by_lang: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
-    // 言語判定はパス単位で 1 回だけ行う (省略分は数千件になりうるので、
-    // レコードごとに拡張子を引き直さない)。
-    let mut lang_of_path: BTreeMap<&str, Option<&'static str>> = BTreeMap::new();
     for record in omitted {
         if let Some(kind) = record.rollup_kind() {
-            *by_kind.entry(kind.to_string()).or_insert(0) += 1;
+            *by_kind.entry(kind).or_insert(0) += 1;
         }
-        let path = record.rollup_path();
-        let lang = *lang_of_path
-            .entry(path)
-            .or_insert_with(|| lang_name_for_path(path));
-        if let Some(lang) = lang {
-            *by_lang.entry(lang.to_string()).or_insert(0) += 1;
+        *per_file.entry(record.rollup_path()).or_insert(0) += 1;
+    }
+
+    // 言語別件数は集計済みのパスから作る。パスの再検索と参照ごとの文字列確保を避ける。
+    let mut by_lang: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for (path, count) in &per_file {
+        if let Some(lang) = lang_name_for_path(path) {
+            *by_lang.entry(lang).or_insert(0) += count;
         }
-        *per_file.entry(path).or_insert(0) += 1;
     }
 
     // BTreeMap はパス昇順なので、件数降順で stable sort すれば
@@ -362,8 +359,14 @@ pub fn build_rollup<T: RollupRecord>(
     };
 
     RollupBreakdown {
-        by_kind,
-        by_lang,
+        by_kind: by_kind
+            .into_iter()
+            .map(|(kind, count)| (kind.to_owned(), count))
+            .collect(),
+        by_lang: by_lang
+            .into_iter()
+            .map(|(lang, count)| (lang.to_owned(), count))
+            .collect(),
         files,
         other_files,
         rollup_truncated,
@@ -502,6 +505,59 @@ mod tests {
             rollup.files.iter().map(|f| f.count).sum::<usize>(),
             omitted.len()
         );
+    }
+
+    /// 同じパスの種類が混在しても、言語・種類・省略分を独立して数える。
+    #[test]
+    fn rollup_repeated_paths_keep_counts_and_budget_order_independent() {
+        let mut omitted = vec![
+            Rec("z.rs", Some("ref")),
+            Rec("z.rs", Some("def")),
+            Rec("z.rs", None),
+            Rec("a.ts", Some("ref")),
+            Rec("a.ts", None),
+            Rec("unknown.bin", Some("def")),
+            Rec("unknown.bin", None),
+            Rec("m.php", Some("ref")),
+        ];
+        let full = build_rollup(&omitted, None);
+        assert_eq!(
+            full.by_kind,
+            BTreeMap::from([("def".into(), 2), ("ref".into(), 3)])
+        );
+        assert_eq!(
+            full.by_lang,
+            BTreeMap::from([
+                ("php".into(), 1),
+                ("rust".into(), 3),
+                ("typescript".into(), 2)
+            ])
+        );
+        assert_eq!(
+            full.files
+                .iter()
+                .map(|file| (file.path.as_str(), file.count))
+                .collect::<Vec<_>>(),
+            [("z.rs", 3), ("a.ts", 2), ("unknown.bin", 2), ("m.php", 1)]
+        );
+        let limited = build_rollup(&omitted, Some(1));
+        assert_eq!(limited.by_kind, full.by_kind);
+        assert_eq!(limited.by_lang, full.by_lang);
+        assert_eq!(limited.files, full.files[..1]);
+        assert_eq!(
+            limited.other_files,
+            Some(OmittedOtherFiles { files: 3, count: 5 })
+        );
+        assert_eq!(
+            limited.rollup_truncated,
+            Some(RollupTruncation {
+                shown: 1,
+                available: 4
+            })
+        );
+        omitted.reverse();
+        assert_eq!(build_rollup(&omitted, None), full);
+        assert_eq!(build_rollup(&omitted, Some(1)), limited);
     }
 
     /// 空の省略集合では rollup も空になる (呼び出し側が summary を作らないことの前提)。

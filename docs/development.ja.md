@@ -100,3 +100,21 @@ python tools/bench-refs.py --suite symbols --mode session --repeats 9 `
 ```
 
 所属索引は従来の行数差による選択、同順位の抽出順、列境界、確定済みの Go receiver 等を維持します。コンテナ数 C・未確定の関数数 F に対し、大きい入力の所属判定は O((C+F) log(C+F))、追加領域は O(C+F) です。小さい入力は直接比較します。これは所属判定の計算量であり、パースや `symbols` 全体の計算量ではありません。[点検時の測定記録](benchmarks/2026-10-30-symbols/README.md)も参照してください。
+
+## 省略した参照のサマリ集計の性能
+
+`build_rollup` は種類別・パス別の件数を数え、パス別件数から言語別件数を求めます。パスの索引を二重に持たず、種類名・言語名の文字列を参照ごとに確保しません。出力順、トークン予算による選択、拡張子不明のパスの件数は維持します。
+
+同じツールチェーン・release 設定で各版の `examples/bench-result-summary.rs` をビルドし、再ビルドする前に旧版の実行ファイルを保存します。
+
+```powershell
+mise exec -- cargo build --release --locked --example bench-result-summary
+# 各版の実行ファイルを target/release/examples から保存する。
+python tools/bench-result-summary.py --repeats 9 `
+  --baseline C:/temp/rollup-before.exe --candidate C:/temp/rollup-after.exe `
+  --output-directory C:/temp/astro-rollup-bench
+```
+
+集計だけを測るため、ソースのパース、ファイル探索、出力の描画は含みません。少量、同じパスの繰り返し、多数パス、全件異なるパス、空入力を比較します。旧新版をウォームアップして順序を交互に変え、全試行のサマリ全フィールドの一致を検証し、生データ・中央値・範囲・実行ファイルのハッシュを保存します。Windows のピーク working set は全ケースを実行するプロセス全体の値で、他の環境では null です。`refs` コマンド全体の高速化率を示す測定ではありません。
+
+結果、空入力での差、生データは[点検時の測定記録](benchmarks/2026-11-12-result-summary/README.md)にあります。

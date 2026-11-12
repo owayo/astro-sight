@@ -1,0 +1,92 @@
+{
+  "repeats": 9,
+  "os": "Windows-11-10.0.26300-SP0",
+  "python": "3.12.9",
+  "memory_scope": "whole benchmark process (all cases)",
+  "cases": [
+    {
+      "case": "small",
+      "before": {
+        "median_ms": 0.004608580000000001,
+        "min_ms": 0.0045084899999999995,
+        "max_ms": 0.00478195,
+        "max_working_set_bytes": 13225984
+      },
+      "after": {
+        "median_ms": 0.00217451,
+        "min_ms": 0.0021349900000000002,
+        "max_ms": 0.00241975,
+        "max_working_set_bytes": 13271040
+      },
+      "improvement_percent": 52.816051799035726
+    },
+    {
+      "case": "repeated",
+      "before": {
+        "median_ms": 6.563703333333334,
+        "min_ms": 6.4183,
+        "max_ms": 6.646016666666666,
+        "max_working_set_bytes": 13225984
+      },
+      "after": {
+        "median_ms": 2.6802966666666665,
+        "min_ms": 2.59546,
+        "max_ms": 2.75564,
+        "max_working_set_bytes": 13271040
+      },
+      "improvement_percent": 59.16487186349577
+    },
+    {
+      "case": "many_files",
+      "before": {
+        "median_ms": 24.658089999999998,
+        "min_ms": 24.23921,
+        "max_ms": 25.42037,
+        "max_working_set_bytes": 13225984
+      },
+      "after": {
+        "median_ms": 11.69849,
+        "min_ms": 11.500409999999999,
+        "max_ms": 11.95615,
+        "max_working_set_bytes": 13271040
+      },
+      "improvement_percent": 52.55719319704
+    },
+    {
+      "case": "unique_files",
+      "before": {
+        "median_ms": 3.3983100000000004,
+        "min_ms": 3.2975133333333333,
+        "max_ms": 3.44578,
+        "max_working_set_bytes": 13225984
+      },
+      "after": {
+        "median_ms": 1.8463999999999998,
+        "min_ms": 1.7966266666666664,
+        "max_ms": 1.9331433333333332,
+        "max_working_set_bytes": 13271040
+      },
+      "improvement_percent": 45.66711100517611
+    },
+    {
+      "case": "empty",
+      "before": {
+        "median_ms": 2.414e-05,
+        "min_ms": 2.364e-05,
+        "max_ms": 3.519e-05,
+        "max_working_set_bytes": 13225984
+      },
+      "after": {
+        "median_ms": 3.897e-05,
+        "min_ms": 3.796e-05,
+        "max_ms": 5.0759999999999995e-05,
+        "max_working_set_bytes": 13271040
+      },
+      "improvement_percent": -61.43330571665287
+    }
+  ],
+  "executable_sha256": {
+    "before": "1d4adca082ce40fe86a553fca11e7456f1bdd76971db57e2373a6312b1a05ba3",
+    "after": "0ef35d3fa21a2e6afd2ed8b96a9b9510fb4bf773c1db4f88071a69900aaac3b8"
+  }
+}

@@ -52,7 +52,7 @@ TypeScript review follows same-file private types used in exported signatures, s
 - **Structured review**: `review` combines the impact, files that usually change together according to git blame (`cochange`), public API changes, and dead symbols in one run
 - **File structure**: `symbols`, `calls`, `imports`, and `ast` return a file's outline, call graph, dependencies, and exact syntax nodes, and `sequence` draws the call flow as a Mermaid sequence diagram
 - **Dead code and rules**: `dead-code` reports exported symbols that nothing references, leaving out the ones test runners and frameworks call at run time, and `lint` checks AST pattern rules written in YAML
-- **Token-aware output**: compact JSON, TOON, or `--format auto`; results for frequent names stop at 100 references or about 3,000 tokens by default, with a `result_summary` of what was left out
+- **Token-aware output**: compact JSON, TOON, or `--format auto`; results for frequent names stop at 100 references or about 3,000 tokens by default, with a `result_summary` of what was left out. See [summary aggregation benchmarks](docs/development.md#omitted-reference-summary-performance) for the cost of counting omitted references
 - **Agent integration**: skills for Claude Code and Codex, an MCP server, and an NDJSON `session` that batches queries
 
 Supported languages (extensions and parser versions are in [docs/languages.md](docs/languages.md)):

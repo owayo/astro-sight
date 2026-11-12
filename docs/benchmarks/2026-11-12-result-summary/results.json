@@ -1,0 +1,247 @@
+{
+  "small": {
+    "by_kind": {
+      "def": 33,
+      "ref": 34
+    },
+    "by_lang": {
+      "php": 25,
+      "rust": 25,
+      "typescript": 25
+    },
+    "files": [
+      {
+        "path": "src/dir0000/file00000.rs",
+        "count": 25
+      },
+      {
+        "path": "src/dir0001/file00001.ts",
+        "count": 25
+      },
+      {
+        "path": "src/dir0002/file00002.php",
+        "count": 25
+      },
+      {
+        "path": "src/dir0003/file00003.unknown",
+        "count": 25
+      }
+    ],
+    "other_files": null,
+    "rollup_truncated": null
+  },
+  "repeated": {
+    "by_kind": {
+      "def": 33333,
+      "ref": 33334
+    },
+    "by_lang": {
+      "php": 25000,
+      "rust": 25000,
+      "typescript": 25000
+    },
+    "files": [
+      {
+        "path": "src/dir0000/file00000.rs",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0001/file00001.ts",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0002/file00002.php",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0003/file00003.unknown",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0004/file00004.rs",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0005/file00005.ts",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0006/file00006.php",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0007/file00007.unknown",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0008/file00008.rs",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0009/file00009.ts",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0010/file00010.php",
+        "count": 6250
+      },
+      {
+        "path": "src/dir0011/file00011.unknown",
+        "count": 6250
+      }
+    ],
+    "other_files": {
+      "files": 4,
+      "count": 25000
+    },
+    "rollup_truncated": {
+      "shown": 12,
+      "available": 16
+    }
+  },
+  "many_files": {
+    "by_kind": {
+      "def": 33333,
+      "ref": 33334
+    },
+    "by_lang": {
+      "php": 25000,
+      "rust": 25000,
+      "typescript": 25000
+    },
+    "files": [
+      {
+        "path": "src/dir0000/file00000.rs",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00127.unknown",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00254.php",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00381.ts",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00508.rs",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00635.unknown",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00762.php",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file00889.ts",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file01016.rs",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file01143.unknown",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file01270.php",
+        "count": 10
+      },
+      {
+        "path": "src/dir0000/file01397.ts",
+        "count": 10
+      }
+    ],
+    "other_files": {
+      "files": 9988,
+      "count": 99880
+    },
+    "rollup_truncated": {
+      "shown": 12,
+      "available": 10000
+    }
+  },
+  "unique_files": {
+    "by_kind": {
+      "def": 3333,
+      "ref": 3334
+    },
+    "by_lang": {
+      "php": 2500,
+      "rust": 2500,
+      "typescript": 2500
+    },
+    "files": [
+      {
+        "path": "src/dir0000/file00000.rs",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00127.unknown",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00254.php",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00381.ts",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00508.rs",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00635.unknown",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00762.php",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file00889.ts",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file01016.rs",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file01143.unknown",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file01270.php",
+        "count": 1
+      },
+      {
+        "path": "src/dir0000/file01397.ts",
+        "count": 1
+      }
+    ],
+    "other_files": {
+      "files": 9988,
+      "count": 9988
+    },
+    "rollup_truncated": {
+      "shown": 12,
+      "available": 10000
+    }
+  },
+  "empty": {
+    "by_kind": {},
+    "by_lang": {},
+    "files": [],
+    "other_files": null,
+    "rollup_truncated": null
+  }
+}

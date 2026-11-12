@@ -52,7 +52,7 @@ TypeScript の review は、公開シグネチャから同じファイルの非�
 - **構造化レビュー**: `review` は影響範囲、git blame から見て一緒に変わりやすいファイル (`cochange`)、公開 API の差分、死蔵シンボルを 1 回でまとめて返します
 - **ファイルの構造**: `symbols`・`calls`・`imports`・`ast` がファイルの輪郭、コールグラフ、依存、構文ノードを返し、`sequence` は呼び出しの流れを Mermaid のシーケンス図にします
 - **デッドコードとルール**: `dead-code` はどこからも参照されない export を報告し、テストランナーやフレームワークが実行時に呼ぶものは除きます。`lint` は YAML で書いた AST パターンのルールで検査します
-- **トークンを意識した出力**: compact JSON・TOON・`--format auto` から選べます。頻出する名前の結果は既定で 100 件か約 3,000 トークンで打ち切り、省いた分の内訳を `result_summary` に出します
+- **トークンを意識した出力**: compact JSON・TOON・`--format auto` から選べます。頻出する名前の結果は既定で 100 件か約 3,000 トークンで打ち切り、省いた分の内訳を `result_summary` に出します。省略分を数える費用は[サマリ集計の性能確認](docs/development.ja.md#省略した参照のサマリ集計の性能)で比較できます
 - **AI エージェントとの連携**: Claude Code と Codex のスキル、MCP サーバー、問い合わせをまとめて流せる NDJSON の `session` があります
 
 対応言語 (拡張子とパーサの版は [docs/languages.ja.md](docs/languages.ja.md) にあります):
