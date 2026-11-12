@@ -6,6 +6,324 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn python_io_protocol_methods_follow_base_contracts() {
+    for (base, methods, unrelated) in [
+        (
+            "IOBase",
+            &[
+                "fileno",
+                "seek",
+                "truncate",
+                "close",
+                "flush",
+                "isatty",
+                "readable",
+                "readline",
+                "readlines",
+                "seekable",
+                "tell",
+                "writable",
+                "writelines",
+                "read",
+                "write",
+            ][..],
+            "readinto",
+        ),
+        (
+            "RawIOBase",
+            &["readinto", "write", "read", "readall", "close"][..],
+            "detach",
+        ),
+        (
+            "BufferedIOBase",
+            &[
+                "detach",
+                "read",
+                "read1",
+                "write",
+                "readinto",
+                "readinto1",
+                "seek",
+            ][..],
+            "readall",
+        ),
+        (
+            "TextIOBase",
+            &["detach", "read", "readline", "write", "tell"][..],
+            "readinto",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        let mut source = format!("import io\nclass Stream(io.{base}):\n");
+        for method in methods.iter().copied().chain([unrelated, "unused_helper"]) {
+            source.push_str(&format!(
+                "    def {method}(self, *args):\n        return None\n"
+            ));
+        }
+        source.push_str("stream = Stream()\n");
+        repo.write("stream.py", source);
+        let json = repo.run_json("dead-code", &[]);
+        let names: Vec<_> = json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        for method in methods {
+            assert!(
+                !names.contains(&format!("Stream.{method}").as_str()),
+                "{base}: {method} reported dead: {json}"
+            );
+            assert!(
+                !json["unverified_symbols"]
+                    .as_array()
+                    .is_some_and(|symbols| symbols
+                        .iter()
+                        .any(|symbol| symbol["name"] == format!("Stream.{method}"))),
+                "{base}: ownership not resolved: {json}"
+            );
+        }
+        for method in [unrelated, "unused_helper"] {
+            assert!(
+                names.contains(&format!("Stream.{method}").as_str()),
+                "{base}: {method} missing from dead: {json}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python_io_protocol_methods_resolve_aliases_and_indirect_bases() {
+    for prelude in [
+        "import io as streams\nclass Parent(streams.RawIOBase):\n    pass\n",
+        "from io import RawIOBase as Raw\nclass Parent(Raw):\n    pass\n",
+        "from io import RawIOBase\nAlias = RawIOBase\nclass Parent(Alias):\n    pass\n",
+        "from bases import Parent\n",
+        "import bases as helpers\nParent = helpers.Parent\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "bases.py",
+            "import io\nclass Parent(io.RawIOBase):\n    pass\n",
+        );
+        repo.write("stream.py", format!("{prelude}class Stream(Parent):\n    def readinto(self, buffer):\n        return 0\n    def unused_helper(self):\n        return None\nstream = Stream()\n"));
+        let json = repo.run_json("dead-code", &[]);
+        let names: Vec<_> = json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"Stream.readinto"), "{prelude}: {json}");
+        assert!(
+            !json["unverified_symbols"]
+                .as_array()
+                .is_some_and(|symbols| symbols
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Stream.readinto")),
+            "{prelude}: ownership not resolved: {json}"
+        );
+        assert!(names.contains(&"Stream.unused_helper"), "{prelude}: {json}");
+    }
+}
+
+#[test]
+fn python_io_protocol_methods_preserve_unrelated_and_unknown_owners() {
+    for prelude in [
+        "class Parent:\n    pass\n",
+        "class Parent(object):\n    pass\n",
+        "class RawIOBase:\n    pass\nParent = RawIOBase\n",
+        "from local_io import RawIOBase as Parent\n",
+        "import local_io as io\nParent = io.RawIOBase\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write("local_io.py", "class RawIOBase:\n    pass\n");
+        repo.write("stream.py", format!("{prelude}class Stream(Parent):\n    def readinto(self, buffer):\n        return 0\n    def unused_helper(self):\n        return None\nstream = Stream()\n"));
+        let json = repo.run_json("dead-code", &[]);
+        for method in ["readinto", "unused_helper"] {
+            assert!(
+                json["dead_symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol["name"] == format!("Stream.{method}")),
+                "{prelude}: {json}"
+            );
+        }
+    }
+    for prelude in [
+        "from unknown_streams import Raw as Parent\n",
+        "import io as streams\nimport unknown_streams as streams\nParent = streams.RawIOBase\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write("stream.py", format!("{prelude}class Stream(Parent):\n    def readinto(self, buffer):\n        return 0\n    def unused_helper(self):\n        return None\nstream = Stream()\n"));
+        let json = repo.run_json("dead-code", &[]);
+        assert!(
+            json["unverified_symbols"]
+                .as_array()
+                .is_some_and(|symbols| symbols
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Stream.readinto")),
+            "{prelude}: {json}"
+        );
+        assert!(
+            json["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Stream.unused_helper"),
+            "{prelude}: {json}"
+        );
+    }
+}
+
+#[test]
+fn python_io_protocol_methods_keep_absolute_io_module_collisions_unverified() {
+    for (prelude, base, path, ambiguous) in [
+        (
+            "from .io import RawIOBase as Parent\n",
+            "Parent",
+            "pkg/stream.py",
+            false,
+        ),
+        ("import io\n", "io.RawIOBase", "stream.py", true),
+        (
+            "from io import RawIOBase as Parent\n",
+            "Parent",
+            "stream.py",
+            true,
+        ),
+        ("from io import *\n", "RawIOBase", "stream.py", true),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("io.py", "class RawIOBase:\n    pass\n");
+        repo.create_dir_all("pkg");
+        repo.write("pkg/__init__.py", "");
+        repo.write("pkg/io.py", "class RawIOBase:\n    pass\n");
+        repo.write(path, format!("{prelude}import io\nimport shutil\nclass Stream({base}):\n    def __init__(self, size):\n        self.remaining = size\n    def readinto(self, buffer):\n        n = min(len(buffer), self.remaining)\n        buffer[:n] = bytes(n)\n        self.remaining -= n\n        return n\n    def unused_helper(self):\n        return None\nout = io.BytesIO()\nshutil.copyfileobj(Stream(4), out)\n"));
+        let json = repo.run_json("dead-code", &[]);
+        let in_category = |category: &str, name: &str| {
+            json[category]
+                .as_array()
+                .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == name))
+        };
+        assert_eq!(
+            in_category("unverified_symbols", "Stream.readinto"),
+            ambiguous,
+            "{prelude}: {json}"
+        );
+        assert_eq!(
+            in_category("dead_symbols", "Stream.readinto"),
+            !ambiguous,
+            "{prelude}: {json}"
+        );
+        assert!(
+            in_category("dead_symbols", "Stream.unused_helper"),
+            "{prelude}: {json}"
+        );
+    }
+}
+
+#[test]
+fn python_io_protocol_methods_do_not_hide_same_named_unrelated_methods() {
+    let repo = TestRepo::new();
+    repo.write("stream.py", "import io\nclass Stream(io.RawIOBase):\n    def readinto(self, buffer):\n        return 0\nclass Plain:\n    def readinto(self, buffer):\n        return 0\nstream = Stream()\nplain = Plain()\n");
+    let json = repo.run_json("dead-code", &[]);
+    let names: Vec<_> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Plain.readinto"], "{json}");
+    let refs = repo.run_json("refs", &["--name", "readinto"]);
+    assert_eq!(refs["refs"].as_array().unwrap().len(), 2, "{refs}");
+}
+
+#[test]
+fn python_io_protocol_methods_cover_properties_and_mixin_implementations() {
+    for (source, protected) in [
+        (
+            "import io\nclass Mixin(object):\n    def readinto(self, buffer):\n        return 0\n    def unused_helper(self):\n        return None\nclass Stream(Mixin, io.RawIOBase):\n    pass\nstream = Stream()\n",
+            vec!["Mixin.readinto"],
+        ),
+        (
+            "import io\nclass Stream(io.TextIOBase):\n    @property\n    def closed(self):\n        return False\n    @property\n    def encoding(self):\n        return 'utf-8'\n    @property\n    def errors(self):\n        return 'strict'\n    @property\n    def newlines(self):\n        return None\n    def unused_helper(self):\n        return None\nstream = Stream()\n",
+            vec![
+                "Stream.closed",
+                "Stream.encoding",
+                "Stream.errors",
+                "Stream.newlines",
+            ],
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("stream.py", source);
+        let json = repo.run_json("dead-code", &[]);
+        for name in protected {
+            for category in ["dead_symbols", "unverified_symbols"] {
+                assert!(
+                    !json[category]
+                        .as_array()
+                        .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["name"] == name)),
+                    "{name} in {category}: {json}"
+                );
+            }
+        }
+        let names: Vec<_> = json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 1, "{json}");
+        assert!(names[0].ends_with(".unused_helper"), "{json}");
+    }
+}
+
+#[test]
+fn python_io_protocol_methods_do_not_block_review_hook() {
+    let repo = TestRepo::new();
+    repo.write("base.py", "print('base')\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    let source = "import io\nimport shutil\nimport unittest\nclass Zeros(io.RawIOBase):\n    def __init__(self, size):\n        self.remaining = size\n    def readinto(self, buffer):\n        n = min(len(buffer), self.remaining)\n        buffer[:n] = bytes(n)\n        self.remaining -= n\n        return n\nclass ZerosTests(unittest.TestCase):\n    def test_copy(self):\n        out = io.BytesIO()\n        shutil.copyfileobj(Zeros(4), out)\n        self.assertEqual(bytes(4), out.getvalue())\n";
+    repo.write("test_zeros.py", source);
+    let dead = repo.run_json("dead-code", &["--git"]);
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dead["dead_symbols"].as_array().unwrap().is_empty(),
+        "{dead}"
+    );
+    repo.write(
+        "test_zeros.py",
+        source.replace(
+            "    def readinto",
+            "    def unused_helper(self):\n        return None\n    def readinto",
+        ),
+    );
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(hook["blocking_categories"], serde_json::json!(["dead"]));
+    assert_eq!(hook["dead"].as_array().unwrap().len(), 1, "{hook}");
+    assert_eq!(hook["dead"][0]["n"], "Zeros.unused_helper");
+}
+
+#[test]
 fn dead_code_swift_protocol_witnesses_preserve_helpers_and_dead_owners() {
     let repo = TestRepo::new();
     repo.write("Witnesses.swift", r#"import AppKit

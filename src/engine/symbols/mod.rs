@@ -39,8 +39,8 @@ pub use operator::is_syntax_invoked_method;
 pub use overrides::is_override_method;
 pub use python_decorator::{PythonDecoratorImports, has_framework_entrypoint_decorator_python};
 pub(crate) use python_tests::{
-    ProjectModule, ProjectTests, PythonModuleFacts, PythonTestEntrypoints, is_runner_member_name,
-    is_runner_name,
+    ProjectModule, ProjectTests, PythonModuleFacts, PythonTestEntrypoints, is_io_protocol_name,
+    is_runner_member_name, is_runner_name,
 };
 pub(crate) use rust_allow_dead::rust_has_allow_dead_marker;
 pub use scope::is_local_scope_symbol;

@@ -486,6 +486,8 @@ pub(super) struct ClassFacts {
     pub(super) test_marker: bool,
     /// 名前空間の `test*` と、テストランナーが名前で呼ぶメソッドの (名前, 開始位置)。
     pub(super) members: Vec<(String, (usize, usize))>,
+    /// io の ABC の契約になりうるメソッドとプロパティの定義。
+    pub(super) io_members: Vec<(String, (usize, usize))>,
     /// 名前空間の直下で定義したクラスの添字。
     pub(super) nested: Vec<usize>,
     /// 名前空間の別名の (名前, 右辺)。
@@ -758,6 +760,7 @@ impl PythonModuleFacts {
             new: OwnBinding::Absent,
             test_marker: false,
             members: Vec::new(),
+            io_members: Vec::new(),
             nested: Vec::new(),
             aliases: Vec::new(),
             imports: Vec::new(),
@@ -793,6 +796,9 @@ impl PythonModuleFacts {
                 class.observe_constructor(name, plain_def);
                 if Runner::Pytest.calls(name) || Runner::Unittest.calls(name) {
                     class.members.push((name.to_string(), start));
+                }
+                if super::is_io_protocol_name(name) {
+                    class.io_members.push((name.to_string(), start));
                 }
             }
         }

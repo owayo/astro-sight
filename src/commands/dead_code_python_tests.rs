@@ -1,4 +1,4 @@
-//! dead-code の段階で、Python のテストランナーがモジュールをまたいで集めるテストを候補と照合する。
+//! dead-code の段階で、Python のテストと io の契約をモジュールをまたいで候補と照合する。
 //!
 //! ファイル単位の除外 (`ExportSurfaceContext`) は、同じファイルの中で分かる入口だけを候補から
 //! 外す。ここでは走査集合の Python のファイルすべての facts から import をたどって基底と束縛を
@@ -7,6 +7,7 @@
 //! 別ファイルの TestCase の連鎖など) を外す。名前の解決を確かめられないために集めるかどうか
 //! 分からない候補と、中身を見られないファイルのためにたどれなかった候補、構文エラーのある
 //! ファイルのクラスとテストランナーが名前で集めうる関数は、dead と断定せず unverified に回す。
+//! io の ABC の契約メソッドも同じ基底の解決で除外し、所有権が不明なら unverified に回す。
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::parse_budget::ParseBudget;
 use crate::engine::symbols::{
-    ProjectModule, ProjectTests, PythonModuleFacts, is_runner_member_name, is_runner_name,
+    ProjectModule, ProjectTests, PythonModuleFacts, is_io_protocol_name, is_runner_member_name,
+    is_runner_name,
 };
 use crate::git_support::normalize_workspace_separators;
 use crate::language::LangId;
@@ -22,7 +24,7 @@ use crate::language::LangId;
 /// 定義のキー (`dir` 相対のパス, 定義の開始位置)。
 type DefinitionKey = (String, (usize, usize));
 
-/// モジュールをまたぐ Python のテストの入口。
+/// モジュールをまたぐ Python のテストの入口と io の契約。
 #[derive(Default)]
 pub(super) struct PythonTestLiveness {
     live: HashSet<DefinitionKey>,
@@ -44,10 +46,12 @@ enum Target {
     Class,
     /// クラスのメンバーのうち、テストランナーが名前で集めるか呼ぶもの。
     Member,
+    /// io の ABC が呼びうるメソッドとプロパティ。
+    IoMember,
 }
 
 /// 候補 (qualname, kind) の結果が、モジュールをまたぐ判定で変わりうるか (クラスと、
-/// テストランナーが名前で集めうる関数とメソッド。構文エラーのあるファイルの module 直下の
+/// テストランナーや io が名前で呼びうる関数とメソッド。構文エラーのあるファイルの module 直下の
 /// 関数を含む)。
 pub(super) fn is_python_test_target(name: &str, kind: &str) -> bool {
     target(name, kind).is_some()
@@ -58,10 +62,15 @@ pub(super) fn is_python_test_target(name: &str, kind: &str) -> bool {
 fn target(name: &str, kind: &str) -> Option<Target> {
     match kind {
         "class" => Some(Target::Class),
-        "function" | "method" => name
-            .rsplit_once('.')
-            .is_some_and(|(_, member)| is_runner_member_name(member))
-            .then_some(Target::Member),
+        "function" | "method" => name.rsplit_once('.').and_then(|(_, member)| {
+            if is_runner_member_name(member) {
+                Some(Target::Member)
+            } else if is_io_protocol_name(member) {
+                Some(Target::IoMember)
+            } else {
+                None
+            }
+        }),
         _ => None,
     }
 }
@@ -77,7 +86,7 @@ impl PythonTestLiveness {
         scan_files: &[PathBuf],
         parse_budget: ParseBudget,
     ) -> Self {
-        // 集めうる候補 (クラスか、テストランナーが名前で集めるか呼ぶ関数とメソッド) が残って
+        // クラスか、テストランナーや io が名前で呼びうる候補が残って
         // いなければ読まない。
         let has_target = candidates
             .iter()
@@ -212,7 +221,8 @@ impl PythonTestLiveness {
         if self.broken.contains(file)
             && (kind == "class"
                 || (matches!(kind, "function" | "method")
-                    && is_runner_name(name.rsplit('.').next().unwrap_or(name))))
+                    && (is_runner_name(name.rsplit('.').next().unwrap_or(name))
+                        || is_io_protocol_name(name.rsplit('.').next().unwrap_or(name)))))
         {
             return true;
         }

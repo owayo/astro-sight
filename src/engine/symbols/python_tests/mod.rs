@@ -17,6 +17,7 @@
 //! 基底や束縛の名前をクラスへ解決する [`Universe`] だけを差し替える。ファイル単位の判定
 //! ([`PythonTestEntrypoints`]) は同じファイルの中だけで解決し、dead-code の段階
 //! ([`ProjectTests`]) は import をたどってプロジェクト全体で解決する。
+//! 同じ事実と名前の解決を io の ABC の契約メソッドの判定にも使う ([`io_protocol`])。
 //!
 //! dead と断定しない側に倒す。クラスを集めない (pytest が `__init__` / `__new__` を持つクラスを
 //! 飛ばす) と言うのは、`object` 以外の基底・metaclass・デコレータを持たず、本体の直下に
@@ -32,6 +33,7 @@
 //! 正規化は見ない。
 
 mod facts;
+mod io_protocol;
 mod project;
 #[cfg(test)]
 mod tests;
@@ -42,6 +44,7 @@ use crate::models::location::Range;
 
 use facts::Base;
 pub(crate) use facts::PythonModuleFacts;
+pub(crate) use io_protocol::is_io_protocol_name;
 pub(crate) use project::{ProjectModule, ProjectTests};
 
 /// module 直下に書くと pytest が名前で呼ぶ関数 (`setUpModule` は unittest の名前)。
@@ -181,6 +184,8 @@ struct Resolution {
     root: bool,
     /// 推測した経路でだけ unittest の TestCase に届きうる。
     guessed_root: bool,
+    /// 標準ライブラリの io の ABC が持つ契約 (ビット集合)。
+    io_bases: u8,
     /// 静的に解決しきれず、プロジェクトの外のもの (第三者のモジュールのクラスなど) も指しうる。
     incomplete: bool,
     /// プロジェクトのどのクラスも指しうる (module の `__getattr__`、読めないモジュール、
@@ -205,6 +210,7 @@ impl Resolution {
         self.modules.extend(other.modules.iter().cloned());
         self.root |= other.root;
         self.guessed_root |= other.guessed_root;
+        self.io_bases |= other.io_bases;
         self.incomplete |= other.incomplete;
         self.wildcard |= other.wildcard;
         self.object |= other.object;

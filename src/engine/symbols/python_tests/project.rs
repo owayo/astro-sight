@@ -231,7 +231,9 @@ impl ProjectTests {
     }
 
     pub(crate) fn collect(&self) -> Collected {
-        super::collect(self)
+        let mut collected = super::collect(self);
+        super::io_protocol::collect(self, &mut collected);
+        collected
     }
 
     /// 接頭辞 `prefix` の下の `relative` (`a/b`、空なら接頭辞のパッケージ自身) のモジュール。
@@ -351,7 +353,7 @@ impl ProjectTests {
                 let found = self.resolve_apart(module, scope, value, walk);
                 walk.out.root |= found.root;
                 walk.out.guessed_root |= found.guessed_root;
-                walk.out.incomplete |= found.incomplete;
+                walk.out.incomplete |= found.incomplete || found.io_bases != 0;
                 // 入れ物やインスタンスの要素 (`registry["x"]`) は実行時に決まる。
                 walk.out.wildcard |= found.wildcard || found.object;
                 for &(id, confirmed) in &found.classes {
@@ -731,6 +733,14 @@ impl ProjectTests {
         if scope.is_none() {
             for star in &facts.star_imports {
                 let targets = self.resolve_module(module, star);
+                if star.level == 0 && star.path == ["io"] {
+                    let contracts = super::io_protocol::base_contracts(name);
+                    if contracts != 0 {
+                        walk.out.io_bases |= contracts;
+                        walk.out.incomplete = true;
+                        found = true;
+                    }
+                }
                 if targets.unobserved {
                     walk.out.wildcard = true;
                     found = true;
@@ -764,6 +774,17 @@ impl ProjectTests {
     /// `importer` の `from target import name`。
     fn find_from(&self, importer: usize, target: &ModuleRef, name: &str, walk: &mut Walk) {
         let targets = self.resolve_module(importer, target);
+        if target.level == 0 && target.path == ["io"] {
+            let contracts = super::io_protocol::base_contracts(name);
+            if contracts != 0 {
+                walk.out.io_bases |= contracts;
+                // frozen の標準 io と同名のプロジェクトファイルは、どちらも候補に残す。
+                walk.out.incomplete |= targets.exists() || !walk.confirmed;
+                if !targets.exists() {
+                    return;
+                }
+            }
+        }
         if targets.unobserved {
             walk.out.wildcard = true;
         }
@@ -843,6 +864,7 @@ impl ProjectTests {
                 (left, a.level, &a.path).cmp(&(right, b.level, &b.path))
             });
             modules.dedup();
+            let ambiguous_io_owner = object || !classes.is_empty() || modules.len() != 1;
             let mut step = Resolution::default();
             let mut bound = false;
             let mut next_modules: Vec<(usize, ModuleRef)> = Vec::new();
@@ -863,6 +885,15 @@ impl ProjectTests {
                     });
                     step.absorb(&members);
                 }
+                if target.level == 0 && target.path == ["io"] {
+                    let contracts = super::io_protocol::base_contracts(segment);
+                    if contracts != 0 {
+                        step.io_bases |= contracts;
+                        step.incomplete |=
+                            targets.exists() || !walk.confirmed || ambiguous_io_owner;
+                        bound = true;
+                    }
+                }
                 next_modules.push((*importer, target.child(segment)));
             }
             for &((class_module, class), confirmed) in &classes {
@@ -878,8 +909,9 @@ impl ProjectTests {
             if last {
                 walk.out.root |= step.root;
                 walk.out.guessed_root |= step.guessed_root;
+                walk.out.io_bases |= step.io_bases;
                 found |= bound;
-            } else if step.root || step.guessed_root {
+            } else if step.root || step.guessed_root || step.io_bases != 0 {
                 // TestCase の属性はプロジェクトの外のもの。
                 walk.out.incomplete = true;
             }
