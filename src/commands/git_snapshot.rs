@@ -1,4 +1,4 @@
-//! staged の AST と参照検索を、同じ index tree の raw blob に揃える。
+//! index とコミットの raw tree を、解析用の一時ディレクトリへ展開する。
 
 use std::collections::BTreeSet;
 use std::fs;
