@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -812,7 +812,8 @@ fn collect_hook_impact_groups(
 #[derive(Default)]
 struct HookReport {
     fields: serde_json::Map<String, serde_json::Value>,
-    blocking_categories: Vec<HookBlockingCategory>,
+    /// hook を止める理由 (enum の順に並び、重複しない)。
+    blocking_categories: BTreeSet<HookBlockingCategory>,
     notifies: bool,
 }
 
@@ -831,15 +832,17 @@ impl HookReport {
         self.notifies = true;
     }
 
-    /// hook を止める理由を足す (出力の順と重複の除去は `finish` で行う)。
+    /// hook を止める理由を足す。止める理由は `blocking_categories` に載せて出力するので、ほかの
+    /// 項目を載せていなくても hook の出力を出す (止める理由を黙って捨てない)。
     fn block(&mut self, category: HookBlockingCategory) {
-        self.blocking_categories.push(category);
+        self.blocking_categories.insert(category);
+        self.notifies = true;
     }
 
     fn finish(self) -> HookJsonBuild {
         let Self {
             mut fields,
-            mut blocking_categories,
+            blocking_categories,
             notifies,
         } = self;
         if !notifies {
@@ -849,8 +852,6 @@ impl HookReport {
             };
         }
         // 空配列も「情報提供だけで停止しない」という事実なので省略しない。
-        blocking_categories.sort_unstable();
-        blocking_categories.dedup();
         let is_blocking = !blocking_categories.is_empty();
         fields.insert(
             "blocking_categories".into(),
@@ -1171,4 +1172,32 @@ pub(crate) fn review_hook_output(
 
     eprintln!("{hook_output}");
     Ok(build.is_blocking)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 止める理由を足したら、ほかの項目を載せていなくても出力を出して hook を止める。理由は
+    /// enum の順に重複なく並ぶ。
+    #[test]
+    fn blocking_category_alone_is_reported_once() {
+        let mut report = HookReport::default();
+        report.block(HookBlockingCategory::Dead);
+        report.block(HookBlockingCategory::ApiDiffBaseMismatch);
+        report.block(HookBlockingCategory::Dead);
+        let build = report.finish();
+        assert!(build.is_blocking);
+        let value = build.value.expect("止める理由は出力する");
+        assert_eq!(
+            value["blocking_categories"],
+            serde_json::json!(["api.diff_base_mismatch", "dead"])
+        );
+
+        // 対照: 添えるだけの項目しか無ければ出力しない。
+        let mut attached = HookReport::default();
+        attached.attach("change_evidence", serde_json::json!([]));
+        let build = attached.finish();
+        assert!(build.value.is_none() && !build.is_blocking);
+    }
 }
