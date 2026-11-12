@@ -11,6 +11,7 @@ mod integration {
 
     mod ast_symbols;
     mod bash_grammar;
+    mod c_headers;
     mod change_evidence;
     mod cli_basics;
     mod cochange;

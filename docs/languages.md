@@ -23,6 +23,8 @@ All 16 languages get precise symbol extraction through tree-sitter queries. Ruby
 
 `.h` is treated as a C header by default. It is parsed as C++ only when it contains markers of C++-only syntax and the C++ parser gives clearly fewer parse errors. This keeps C headers from being treated as C++ by accident, while `symbols` / `review` / `dead-code` do not miss definitions in C++ headers such as `class Foo { public: ... }` or `struct X : Base<X> {}`.
 
+When C parsing fails on a shared header's conditional `extern "C" {` / `}` wrapper, matching `__cplusplus` guards can be parsed with those C++ tokens excluded. The opening and closing wrappers must share the same surrounding preprocessor branch. `#ifdef __cplusplus`, `#if defined(__cplusplus)`, comments, and CRLF are supported. Guard identifiers, declarations, comments, and their original byte/line positions remain available; unmatched or unproven wrappers retain diagnostics. This is a C parsing fallback, not general macro expansion. C/C++ `symbols` continues to list function definitions with bodies; bodyless prototypes remain available through `ast` and `refs`.
+
 > **\* About the Kotlin version:** `tree-sitter-kotlin` 0.3.8 and later depend on `tree-sitter` `>=0.21, <0.23`. `tree-sitter` in that range declares `links = "tree-sitter"`, just like the 0.27 that astro-sight itself uses. Cargo allows only one package with the same `links` value in a dependency graph, so dependency resolution fails. `tree-sitter` 0.20, which 0.3.5 depends on, does not declare `links` and can coexist with 0.27, so the dependency is pinned to 0.3.5.
 >
 > ```text
