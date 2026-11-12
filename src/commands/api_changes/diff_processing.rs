@@ -22,7 +22,7 @@ mod signature;
 pub(crate) use availability::*;
 use contract::*;
 pub(crate) use files::*;
-pub(crate) use moved_availability::*;
+pub(crate) use moved_availability::compare_moved_availability;
 pub(crate) use moves::*;
 use python_contracts::*;
 use record::*;

@@ -3,22 +3,21 @@
 use super::*;
 
 /// 移動元・移動先のファイルの公開の項目と宣言 (読めなければ None)。
-pub(super) type MovedFacts = Option<(ExportedSymbols, Vec<RustDeclarationContext>)>;
+type MovedFacts = Option<(ExportedSymbols, Vec<RustDeclarationContext>)>;
 
 /// 宣言と、その (名前, 種類, signature)。
-pub(super) type MovedDeclarations<'a> =
-    Vec<(&'a (String, String, String), &'a RustDeclarationContext)>;
+type MovedDeclarations<'a> = Vec<(&'a (String, String, String), &'a RustDeclarationContext)>;
 
 /// 囲む impl の見出しを比べる構文木 (読めなければ None)。
-pub(super) type MovedTree = Option<std::rc::Rc<super::rust_declarations::ParsedSource>>;
+type MovedTree = Option<std::rc::Rc<super::rust_declarations::ParsedSource>>;
 
 /// 宣言の、そろえた impl の対象の型と signature。
-pub(super) type MovedKey = (Vec<String>, String);
+type MovedKey = (Vec<String>, String);
 
 /// 移動元 (base) と移動先 (作業ツリー) のファイルの事実。ファイルごとに 1 度だけ読み、読めなかった
 /// ことも覚えて読み直さない。
 #[derive(Default)]
-pub(super) struct MovedFileFacts {
+struct MovedFileFacts {
     old: std::collections::HashMap<String, MovedFacts>,
     new: std::collections::HashMap<String, MovedFacts>,
 }
@@ -54,7 +53,7 @@ impl MovedFileFacts {
 }
 
 /// 同じ名前・種類・inline module の宣言 (`#[cfg]` の分岐を含む) と、その signature。無ければ None。
-pub(super) fn select_moved_declarations<'a>(
+fn select_moved_declarations<'a>(
     facts: &'a MovedFacts,
     symbol: &crate::models::review::MovedSymbol,
     inline_module: &Option<String>,
@@ -76,7 +75,7 @@ pub(super) fn select_moved_declarations<'a>(
 /// 覚える) と、(移動元, 移動先) ごとの見出しの比較 (並べ替えの探索の結果を、同じファイルの組の移動で
 /// 共有する。Issue #307)。
 #[derive(Default)]
-pub(super) struct MovedImplTrees {
+struct MovedImplTrees {
     old: std::collections::HashMap<String, MovedTree>,
     new: std::collections::HashMap<String, MovedTree>,
     headers: std::collections::HashMap<(String, String), super::rust_declarations::ImplHeaders>,
@@ -106,13 +105,13 @@ impl MovedImplTrees {
 
 /// 移動した項目の、比べる旧新の宣言の組 (添字)。`news` が空の組は、条件の付いた (か読めない) 宣言が
 /// あってどれと比べるか決められなかったもので、有る設定を比べられなかった変更にする。
-pub(super) struct MovedGroup {
+struct MovedGroup {
     olds: Vec<usize>,
     news: Vec<usize>,
 }
 
 /// 移動した項目の旧新の宣言の組み分け。
-pub(super) enum MovedDeclarationPairing {
+enum MovedDeclarationPairing {
     Groups(Vec<MovedGroup>),
     /// どの宣言どうしを比べるか決められない (移動先で同じ型の宣言が同じ設定に並ぶようになった、
     /// 移動とともに 1 つの impl を複数の対象の型の impl に分けたかまとめた)。
@@ -226,7 +225,7 @@ pub(crate) fn compare_moved_availability(
 /// する。それでも一意に決まらず、条件の付いた (か読めない) 宣言があれば、比べられなかったものと
 /// する。片方にしかない signature の宣言 (移動先に元からある別のメソッドなど) は比べない。
 /// `old_owners` / `new_owners` は宣言と同じ順の、そろえた impl の対象の型。
-pub(super) fn pair_moved_declarations(
+fn pair_moved_declarations(
     old_side: &MovedDeclarations<'_>,
     old_owners: &[Vec<String>],
     new_side: &MovedDeclarations<'_>,
@@ -314,7 +313,7 @@ pub(super) fn pair_moved_declarations(
 }
 
 /// `side` のうち、そろえた対象の型 (`owners`、同じ順) が `owner` の宣言。
-pub(super) fn declarations_of_owner<'a>(
+fn declarations_of_owner<'a>(
     side: &[(&'a (String, String, String), &'a RustDeclarationContext)],
     owners: &[Vec<String>],
     owner: &[String],
@@ -330,7 +329,7 @@ pub(super) fn declarations_of_owner<'a>(
 /// それと他方のどれとも比べる (`#[cfg]` の分岐に分けた・まとめた)。両方が複数なら、有る条件の等しい
 /// 分岐どうしを比べ、1 対 1 に組めなければ、どれどうしを比べるか決められないので壊す。見出しの変わった
 /// 組のうち最も悪い変化 (同じなら最初のもの) を、見出しを添えた signature で記録する。
-pub(super) fn record_moved_impl_header(
+fn record_moved_impl_header(
     inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
     trees: &mut MovedImplTrees,
@@ -434,7 +433,7 @@ pub(super) fn record_moved_impl_header(
 /// 移動した項目の有る設定を比べて記録する。組を決められなかったとき (`new_declarations` が空) は、
 /// 比べられなかったものとする。組を決めたら、移動元の旧い置き場と移動先の新しい置き場の条件も足して
 /// 比べる (Issue #316)。`new_sig` は比べた新しい宣言の signature (組を決められなければ None)。
-pub(super) fn record_moved_availability(
+fn record_moved_availability(
     inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
     symbol: &crate::models::review::MovedSymbol,
@@ -492,7 +491,7 @@ pub(super) fn record_moved_availability(
 /// impl の外の宣言は空。構文木を読めなければ、字面から型の名前の前の経路を除いたもの。
 ///
 /// [`ParsedSource::normalized_owner`]: super::rust_declarations::ParsedSource::normalized_owner
-pub(super) fn moved_owners(
+fn moved_owners(
     side: &[(&(String, String, String), &RustDeclarationContext)],
     parsed: Option<&super::rust_declarations::ParsedSource>,
 ) -> Vec<Vec<String>> {
@@ -513,7 +512,7 @@ pub(super) fn moved_owners(
 /// 両方が複数の宣言 (`#[cfg]` の分岐) を、有る条件がどの設定でも同じく成り立つものどうしの 1 対 1 の組に
 /// する (`#[cfg]` の書き方の違いは同じとみなす)。数が違うか、有る条件を読めないか、同じものが 1 つに決まら
 /// なければ None。
-pub(super) fn paired_by_availability<'d>(
+fn paired_by_availability<'d>(
     olds: &[&'d RustDeclarationContext],
     news: &[&'d RustDeclarationContext],
 ) -> Option<Vec<(&'d RustDeclarationContext, &'d RustDeclarationContext)>> {
