@@ -4,6 +4,7 @@ use serde::Serialize;
 use crate::commands::DiffCallerResolution;
 use crate::models::impact::ImpactedCaller;
 use crate::models::review::{ApiChanges, ReviewResult};
+use crate::models::truncation::TruncationReason;
 
 /// `--hook` の出力判定結果。
 /// - `value`: stderr に書き出す JSON (何もなければ None)
@@ -44,6 +45,29 @@ enum HookBlockingCategory {
     PolicyTypeAnnotation,
     #[serde(rename = "dead")]
     Dead,
+}
+
+impl HookBlockingCategory {
+    /// 打ち切りの理由のうち、API の判定を確かめられないので hook を止めるもの。ほかの理由は申告だけ
+    /// にする。理由を足したら、止めるかどうかをここで決める (`_` を置かない)。
+    fn for_truncation(reason: TruncationReason) -> Option<Self> {
+        match reason {
+            TruncationReason::DiffBaseMismatch => Some(Self::ApiDiffBaseMismatch),
+            TruncationReason::RustDependentsIncomplete => Some(Self::ApiRustDependentsIncomplete),
+            TruncationReason::RustModuleAvailabilityIncomplete => {
+                Some(Self::ApiRustModuleAvailabilityIncomplete)
+            }
+            TruncationReason::RustReexportsIncomplete => Some(Self::ApiRustReexportsIncomplete),
+            TruncationReason::ParseErrorRegion
+            | TruncationReason::UntrackedFileTooLarge
+            | TruncationReason::UnanalyzableSource
+            | TruncationReason::StagedSnapshotUnavailable
+            | TruncationReason::SourceAnalysisFailed
+            | TruncationReason::TsExtensionProofUnavailable
+            | TruncationReason::GeneratedDetectionUnavailable
+            | TruncationReason::TsStripInternalUnavailable => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -237,12 +261,13 @@ struct HookCochange<'a> {
 
 /// 打ち切り (解析対象から外したもの) の hook 用 DTO。
 /// 未追跡の巨大ファイルを除外した場合など「レビュー範囲が欠けた」ことを hook でも伝える。
-/// blocking にはしない (検出ではなく解析範囲の申告) が、沈黙させると「全部見た」と読める。
+/// 沈黙させると「全部見た」と読める。止めるかは理由ごとに決める
+/// ([`HookBlockingCategory::for_truncation`])。`r` はモデルの安定キー (`TruncationReason` の serde 名)。
 #[derive(Serialize)]
 struct HookTruncation<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     f: Option<&'a str>,
-    r: &'a str,
+    r: TruncationReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     d: Option<HookUnanalyzableSourceSummary<'a>>,
 }
@@ -260,7 +285,7 @@ struct HookUncertainRemoval<'a> {
     n: &'a str,
     f: &'a str,
     l: usize,
-    r: crate::models::truncation::TruncationReason,
+    r: TruncationReason,
 }
 
 #[derive(Serialize)]
@@ -966,76 +991,22 @@ pub(crate) fn build_review_hook_json_for_diff(
     }
 
     // trunc: [{f,r,d?}] — 解析対象から外したものの申告。
-    // 削除前ソースと base の不整合だけは API 判定不能として停止する。
+    // API の判定を確かめられない理由 (削除前ソースと base の不整合など) だけは停止する。
     if !result.truncations.is_empty() {
-        if result
-            .truncations
-            .iter()
-            .any(|t| t.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch)
-        {
-            blocking_categories.push(HookBlockingCategory::ApiDiffBaseMismatch);
-        }
-        if result.truncations.iter().any(|t| {
-            t.reason == crate::models::truncation::TruncationReason::RustDependentsIncomplete
-        }) {
-            blocking_categories.push(HookBlockingCategory::ApiRustDependentsIncomplete);
-        }
-        if result.truncations.iter().any(|t| {
-            t.reason
-                == crate::models::truncation::TruncationReason::RustModuleAvailabilityIncomplete
-        }) {
-            blocking_categories.push(HookBlockingCategory::ApiRustModuleAvailabilityIncomplete);
-        }
-        if result.truncations.iter().any(|t| {
-            t.reason == crate::models::truncation::TruncationReason::RustReexportsIncomplete
-        }) {
-            blocking_categories.push(HookBlockingCategory::ApiRustReexportsIncomplete);
-        }
+        blocking_categories.extend(
+            result
+                .truncations
+                .iter()
+                .filter_map(|t| HookBlockingCategory::for_truncation(t.reason)),
+        );
         has_any_output = true;
         let truncs: Vec<HookTruncation<'_>> = result
             .truncations
             .iter()
             .map(|t| HookTruncation {
                 f: t.path.as_deref(),
-                r: match t.reason {
-                    crate::models::truncation::TruncationReason::DiffBaseMismatch => {
-                        "diff_base_mismatch"
-                    }
-                    crate::models::truncation::TruncationReason::ParseErrorRegion => {
-                        "parse_error_region"
-                    }
-                    crate::models::truncation::TruncationReason::UntrackedFileTooLarge => {
-                        "untracked_file_too_large"
-                    }
-                    crate::models::truncation::TruncationReason::UnanalyzableSource => {
-                        "unanalyzable_source"
-                    }
-                    crate::models::truncation::TruncationReason::StagedSnapshotUnavailable => {
-                        "staged_snapshot_unavailable"
-                    }
-                    crate::models::truncation::TruncationReason::SourceAnalysisFailed => {
-                        "source_analysis_failed"
-                    }
-                    crate::models::truncation::TruncationReason::TsExtensionProofUnavailable => {
-                        "ts_extension_proof_unavailable"
-                    }
-                    crate::models::truncation::TruncationReason::GeneratedDetectionUnavailable => {
-                        "generated_detection_unavailable"
-                    }
-                    crate::models::truncation::TruncationReason::TsStripInternalUnavailable => {
-                        "ts_strip_internal_unavailable"
-                    }
-                    crate::models::truncation::TruncationReason::RustDependentsIncomplete => {
-                        "rust_dependents_incomplete"
-                    }
-                    crate::models::truncation::TruncationReason::RustModuleAvailabilityIncomplete => {
-                        "rust_module_availability_incomplete"
-                    }
-                    crate::models::truncation::TruncationReason::RustReexportsIncomplete => {
-                        "rust_reexports_incomplete"
-                    }
-                },
-                d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
+                r: t.reason,
+                d: if t.reason == TruncationReason::UnanalyzableSource {
                     t.detail
                         .as_ref()
                         .map(|detail| HookUnanalyzableSourceSummary {
