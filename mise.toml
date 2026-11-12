@@ -9,7 +9,7 @@
 # components だけを足すと、手元と CI で同じものが入り、使わない component (rust-docs など) を取らない
 rust = { version = "1.99.1", profile = "minimal", components = ["rustfmt", "clippy"] }
 # テストランナー (make test と CI のテストジョブ。設定は .config/nextest.toml)。公開から 14 日以上たった版を固定する
-"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.149"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.150"
 
 [env]
 # macOS: cc crate (tree-sitter の C パーサ) と rustc のデプロイメントターゲットをそろえる。
