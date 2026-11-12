@@ -5,6 +5,8 @@ use tree_sitter::{ParseOptions, Parser, Tree};
 use crate::error::AstroError;
 use crate::language::LangId;
 
+mod c_linkage;
+
 /// ソースファイルをパースし tree-sitter Tree を返す。
 pub fn parse_file(path: &Utf8Path, source: &[u8]) -> Result<(Tree, LangId)> {
     let lang_id = detect_lang(path, source)?;
@@ -140,26 +142,45 @@ pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
         };
 
         let timeout_secs = parse_timeout_secs();
-        let tree = if timeout_secs > 0 {
-            use std::ops::ControlFlow;
-            let start = Instant::now();
-            let limit = Duration::from_secs(timeout_secs);
-            let mut callback = |_state: &tree_sitter::ParseState| {
-                if start.elapsed() > limit {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            };
-            let options = ParseOptions::new().progress_callback(&mut callback);
-            parser.parse_with_options(
-                &mut |byte, _| &source[byte.min(source.len())..],
-                None,
-                Some(options),
-            )
-        } else {
-            parser.parse(source, None)
+        let start = Instant::now();
+        let parse = |parser: &mut Parser, input: &[u8]| {
+            if timeout_secs > 0 {
+                use std::ops::ControlFlow;
+                let limit = Duration::from_secs(timeout_secs);
+                let mut callback = |_state: &tree_sitter::ParseState| {
+                    if start.elapsed() > limit {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                };
+                let options = ParseOptions::new().progress_callback(&mut callback);
+                parser.parse_with_options(
+                    &mut |byte, _| &input[byte.min(input.len())..],
+                    None,
+                    Some(options),
+                )
+            } else {
+                parser.parse(input, None)
+            }
         };
+        let mut tree = parse(parser, source);
+        if lang_id == LangId::C
+            && let Some(raw) = tree.as_ref().filter(|tree| tree.root_node().has_error())
+            && memchr::memmem::find(source, b"__cplusplus").is_some()
+            && memchr::memmem::find(source, b"extern").is_some()
+            && let Some(ranges) = c_linkage::included_ranges(raw, source)
+        {
+            // 最終解析ではコメントも戻し、C++ 用の包装だけを外す。識別子と位置は保つ。
+            drop(tree.take());
+            parser
+                .set_included_ranges(&ranges)
+                .context("Invalid C linkage ranges")?;
+            tree = parse(parser, source);
+            parser
+                .set_included_ranges(&[])
+                .context("Failed to reset C linkage ranges")?;
+        }
 
         if tree.is_none() {
             // タイムアウト等で halt した Parser は resume 状態を保持し、次の parse が
@@ -332,6 +353,110 @@ mod tests {
         let source = b"struct plain_c_header { int value; };\n";
         let lang = detect_lang(camino::Utf8Path::new("plain.h"), source).unwrap();
         assert_eq!(lang, LangId::C);
+    }
+
+    #[test]
+    fn c_conditional_linkage_preserves_declarations_and_byte_positions() {
+        use crate::engine::tree_walk::{Children, any_node};
+        for guard in ["#ifdef __cplusplus", "#if defined(__cplusplus)"] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "/* 日本語 */\n#ifndef SAMPLE_H\n#define SAMPLE_H\n{guard}\nextern \"C\" {{\n#endif\nvoid sample_run(void);\nstatic inline int sample_value(int x) {{ return x; }}\n{guard}\n}}\n#endif\n#endif\n"
+                ).replace('\n', newline);
+                let (tree, lang) =
+                    parse_file(Utf8Path::new("sample.h"), source.as_bytes()).unwrap();
+                assert_eq!(lang, LangId::C);
+                assert!(
+                    !tree.root_node().has_error(),
+                    "{guard}: {}",
+                    tree.root_node().to_sexp()
+                );
+                let expected_byte = source.find("sample_run(void)").unwrap();
+                assert!(any_node(tree.root_node(), Children::Named, |node| {
+                    node.kind() == "function_declarator"
+                        && node.start_byte() == expected_byte
+                        && node.start_position() == tree_sitter::Point::new(6, 5)
+                        && node.utf8_text(source.as_bytes()).ok() == Some("sample_run(void)")
+                }));
+                let symbols = crate::engine::symbols::extract_symbols(
+                    tree.root_node(),
+                    source.as_bytes(),
+                    lang,
+                )
+                .unwrap();
+                assert!(symbols.iter().any(|symbol| symbol.name == "sample_value"));
+                // 本体なしプロトタイプを定義として採用しない既存仕様も保つ。
+                assert!(!symbols.iter().any(|symbol| symbol.name == "sample_run"));
+            }
+        }
+        // 範囲を使って再パースした後も、同じ Parser で次のファイル全体を読める。
+        let tree = parse_source(b"int after(void) { return 42; }\n", LangId::C).unwrap();
+        assert!(!tree.root_node().has_error());
+        assert_eq!(tree.root_node().named_child(0).unwrap().start_byte(), 0);
+    }
+
+    #[test]
+    fn c_conditional_linkage_keeps_real_errors_and_unproven_guards() {
+        let source = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid sample_run(void);\n#ifdef __cplusplus\n}\n#endif\n";
+        for broken in [
+            source.replace("sample_run(void)", "sample_run( ;"),
+            source.replace("__cplusplus", "OTHER_FEATURE"),
+            source.replacen("#ifdef", "#ifndef", 1),
+            source.replacen("#endif", "#else", 1),
+            source.replacen("}\n#endif", "}\n", 1),
+            source.replace("extern", "ex/* split */tern"),
+            source.replace("\n#ifdef __cplusplus\n}\n", "\n#ifdef OTHER_FEATURE\n}\n"),
+            source.replace("#ifdef __cplusplus", "#if defined__cplusplus"),
+            format!("/* {source} */\nint broken(;\n"),
+        ] {
+            let tree = parse_source(broken.as_bytes(), LangId::C).unwrap();
+            assert!(tree.root_node().has_error(), "{broken}");
+        }
+        let source = b"extern \"C\" { int ordinary(void) { return 1; } }\n";
+        let tree = parse_source(source, LangId::C).unwrap();
+        assert!(!tree.root_node().has_error());
+        assert_eq!(
+            tree.root_node().named_child(0).unwrap().kind(),
+            "linkage_specification"
+        );
+    }
+
+    #[test]
+    fn c_conditional_linkage_preserves_guard_identifiers_with_multiple_wrappers() {
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+        let wrapper = |name: &str| {
+            format!(
+                "#ifdef __cplusplus /* guard */\n/* 包装 */ extern \"C\" {{\n/* begin */ # endif // begin\nint {name}(void) {{ return 1; }}\n#ifdef __cplusplus // guard\n}} /* end */\n#endif /* end */\n"
+            )
+        };
+        let source = format!("{}{}", wrapper("first"), wrapper("second"));
+        let tree = parse_source(source.as_bytes(), LangId::C).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut guards = 0;
+        let _: std::ops::ControlFlow<()> =
+            walk_preorder(tree.root_node(), Children::Named, |node, _| {
+                if node.kind() == "identifier"
+                    && node.utf8_text(source.as_bytes()).ok() == Some("__cplusplus")
+                {
+                    guards += 1;
+                }
+                std::ops::ControlFlow::Continue(Walk::Descend)
+            });
+        assert_eq!(guards, 4);
+        let symbols =
+            crate::engine::symbols::extract_symbols(tree.root_node(), source.as_bytes(), LangId::C)
+                .unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
     }
 
     /// 修正前の再帰版。反復版と数が一致することを確かめる参照実装 (浅い入力でだけ使う)。
