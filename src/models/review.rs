@@ -25,6 +25,12 @@ pub struct ReviewResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub rename_candidate_diagnostics: Vec<super::rename_candidate::RenameCandidateDiagnostic>,
     pub dead_symbols: Vec<DeadSymbol>,
+    /// マニフェストまたは理由付きの明示宣言で確認したホストの入口。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub external_entry_symbols: Vec<DeadSymbol>,
+    /// ホストとのソース対応などを証明できず、dead と断定しなかった候補。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unverified_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub test_only_symbols: Vec<DeadSymbol>,
     /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。

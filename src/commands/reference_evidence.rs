@@ -284,6 +284,9 @@ pub(crate) fn clear_staged_fallback(
     if snapshot_available || !matches!(side, crate::models::impact::DiffNewSide::Index) {
         return;
     }
+    result
+        .unverified_symbols
+        .append(&mut result.external_entry_symbols);
     let api = &mut result.api_changes;
     for change in api
         .modified
@@ -307,6 +310,7 @@ pub(crate) fn clear_staged_fallback(
         .dead_symbols
         .iter_mut()
         .chain(result.test_only_symbols.iter_mut())
+        .chain(result.unverified_symbols.iter_mut())
     {
         symbol.reference_evidence = None;
     }

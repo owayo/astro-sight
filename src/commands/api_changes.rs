@@ -997,6 +997,7 @@ mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
 mod jsonc;
+pub(crate) use jsonc::json_bytes as jsonc_bytes;
 mod moved_members;
 mod moved_symbols;
 pub(crate) mod prepare;
