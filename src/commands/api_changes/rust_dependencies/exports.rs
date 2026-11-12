@@ -292,11 +292,12 @@ fn attribute_applies(node: tree_sitter::Node<'_>, source: &[u8], name: &str) -> 
 
 /// `cfg_attr` の引数の字句の木 `arguments` (`(条件, 属性, ..)`) の、条件の後ろの属性に `name` があるか
 /// (入れ子の `cfg_attr` も)。属性は、最上位の `,` の字句で分ける。入れ子の `cfg_attr` は明示的な
-/// スタックで辿る (深い入れ子でコールスタックを溢れさせない)。
+/// スタックで辿る (深い入れ子でコールスタックを溢れさせない)。辿る順は再帰と同じく、書いた順に
+/// 属性を調べ、入れ子の `cfg_attr` は見つけた位置で先に調べて、最初に付けると分かった時点で終える。
 fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str) -> bool {
     let text = |node: &tree_sitter::Node<'_>| unraw(node.utf8_text(source).unwrap_or_default());
-    let mut pending = vec![arguments];
-    while let Some(arguments) = pending.pop() {
+    /// `cfg_attr` の引数の、条件の後ろの属性 (書いた順の逆に積み、末尾から取り出す)。
+    fn attributes(arguments: tree_sitter::Node<'_>) -> Vec<Vec<tree_sitter::Node<'_>>> {
         let mut cursor = arguments.walk();
         let tokens: Vec<tree_sitter::Node<'_>> = arguments
             .children(&mut cursor)
@@ -306,25 +307,37 @@ fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str)
         let inner = tokens
             .get(1..tokens.len().saturating_sub(1))
             .unwrap_or_default();
-        for attribute in inner.split(|token| token.kind() == ",").skip(1) {
-            match attribute {
-                [path, rest @ ..] if path.kind() == "identifier" && text(path) == name => {
-                    if rest
-                        .first()
-                        .is_none_or(|next| matches!(next.kind(), "token_tree" | "="))
-                    {
-                        return true;
-                    }
-                }
-                [path, nested, ..]
-                    if path.kind() == "identifier"
-                        && text(path) == "cfg_attr"
-                        && nested.kind() == "token_tree" =>
+        let mut attributes: Vec<Vec<tree_sitter::Node<'_>>> = inner
+            .split(|token| token.kind() == ",")
+            .skip(1)
+            .map(<[tree_sitter::Node<'_>]>::to_vec)
+            .collect();
+        attributes.reverse();
+        attributes
+    }
+    let mut pending = vec![attributes(arguments)];
+    while let Some(frame) = pending.last_mut() {
+        let Some(attribute) = frame.pop() else {
+            pending.pop();
+            continue;
+        };
+        match attribute.as_slice() {
+            [path, rest @ ..] if path.kind() == "identifier" && text(path) == name => {
+                if rest
+                    .first()
+                    .is_none_or(|next| matches!(next.kind(), "token_tree" | "="))
                 {
-                    pending.push(*nested);
+                    return true;
                 }
-                _ => {}
             }
+            [path, nested, ..]
+                if path.kind() == "identifier"
+                    && text(path) == "cfg_attr"
+                    && nested.kind() == "token_tree" =>
+            {
+                pending.push(attributes(*nested));
+            }
+            _ => {}
         }
     }
     false
@@ -1370,6 +1383,17 @@ mod tests {
         let words = b"#[doc(en r\"x\")]\nfn f() {}\n";
         with_first_attribute(words, |attribute| {
             assert_eq!(attribute_text(attribute, words), "#[doc(en r\"x\")]");
+        });
+        // 兄弟の入れ子の `cfg_attr` は書いた順に深さ優先で調べ、付けると分かった時点で終える
+        // (後ろの兄弟は調べない)。どの兄弟の中にある属性も見つける。
+        let siblings = b"#[cfg_attr(all(),\n    cfg_attr(all(), macro_use),\n    cfg_attr(all(), cfg_attr(all(), allow(dead_code)), cfg_attr(all(), allow(dead_code)))\n)]\nmod m {}\n";
+        with_first_attribute(siblings, |attribute| {
+            assert_eq!(
+                attribute_applies(attribute, siblings, "macro_use"),
+                Some(true)
+            );
+            assert_eq!(attribute_applies(attribute, siblings, "allow"), Some(true));
+            assert_eq!(attribute_applies(attribute, siblings, "macro_export"), None);
         });
     }
 
