@@ -12,6 +12,7 @@ pub struct ReferenceEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceClassification {
+    ExternalEntry,
     NoReferencesInScope,
     TestReferencesOnly,
     NoResolvedDirectCallers,

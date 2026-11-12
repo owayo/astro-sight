@@ -14,6 +14,9 @@ pub struct DeadCodeResult {
     pub dir: String,
     pub scanned_files: usize,
     pub dead_symbols: Vec<DeadSymbol>,
+    /// マニフェストまたは理由付きの明示宣言で確認した、ホストが呼ぶ JS/TS の入口。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub external_entry_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub test_only_symbols: Vec<DeadSymbol>,
     /// 参照の件数だけなら dead / test_only だが、参照を数えられなかったファイル

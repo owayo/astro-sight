@@ -11,6 +11,7 @@ use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
 mod common;
+mod host_entries;
 pub(crate) mod metrics;
 mod reference_evidence;
 

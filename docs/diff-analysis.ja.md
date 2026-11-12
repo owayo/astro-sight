@@ -964,7 +964,7 @@ Bash / zsh の関数が抽出結果から消えても、`ERROR` 内に同名の�
 
 ## 参照と外部入口の証拠
 
-`dead_symbols` と `test_only_symbols` の各項目、および既存の `no_resolved_internal_callers: true` を持つ `api_changes.modified` に `reference_evidence` を添えます。hook でも `dead`・`test_only`・`api.mod` に同じ証拠を出します。集合と blocking の条件は変えません。
+`dead_symbols` と `test_only_symbols` の各項目、および既存の `no_resolved_internal_callers: true` を持つ `api_changes.modified` に `reference_evidence` を添えます。hook でも `dead`・`test_only`・`api.mod` に同じ証拠を出します。JS/TS のホスト入口は、下記の登録情報を確認して別の集合へ分けます。
 
 `classification` は `no_references_in_scope` (走査範囲で参照ゼロ)、`test_references_only` (観測した参照がテストのみ)、`no_resolved_direct_callers` (直接呼び出しを解決できなかった)、`unverified` (既存の保留候補、または証拠の入力が不完全) を区別します。いずれも実行時に利用されないことの証明ではありません。`attribution` が示す名前照合の観測と、所有元・呼び出し元の解決は別です。
 
@@ -972,6 +972,22 @@ Bash / zsh の関数が抽出結果から消えても、`ERROR` 内に同名の�
 
 参照と走査ファイルの代表パスは各 32 件まで表示します。`total`・`shown`・`omitted` と `total_files`・`omitted_files` に省略件数を残し、参照自体は全件を数えます。入力を読めなかった・解析できなかった場合は `scope.complete: false` と `diagnostics` を確認してください。件数ゼロだけで全体に参照が無いとは扱えません。
 
-`external_entry.status: proven` は、Python の解析対象ファイルと callable を `[project.scripts]` の `module:callable` が正確に指す登録を確認した場合だけです。同じ callable への複数の script 登録はすべて保持します。対象は pyproject のディレクトリを起点に解ける通常の `.py` / `__init__.py` 配置と ASCII のドット区切り名です。現在は module 直下の一意な関数を、module 文が関数定義とコメントだけの場合に証明します。入れ子、class、decorator、import、代入、削除、定義時に評価される default や複雑な型注釈は証明しません。任意の import 設定、src 配置の推測、外部 Protocol、gui-scripts も対象外です。メタデータは 1 MiB まで読み、欠落・不正・読取不可・上限超過・対応範囲外は `unproven_reasons` を付けて `unproven` に残します。未証明は「未登録」を意味しません。登録事実があっても dead/test_only/no_callers の既存判定は変わりません。
+Python の `external_entry.status: proven` は、解析対象ファイルと callable を `[project.scripts]` の `module:callable` が正確に指す登録を確認した場合です。同じ callable への複数の script 登録はすべて保持します。対象は pyproject のディレクトリを起点に解ける通常の `.py` / `__init__.py` 配置と ASCII のドット区切り名です。現在は module 直下の一意な関数を、module 文が関数定義とコメントだけの場合に証明します。入れ子、class、decorator、import、代入、削除、定義時に評価される default や複雑な型注釈は証明しません。任意の import 設定、src 配置の推測、外部 Protocol、gui-scripts も対象外です。メタデータは 1 MiB まで読み、欠落・不正・読取不可・上限超過・対応範囲外は `unproven_reasons` を付けて `unproven` に残します。未証明は「未登録」を意味しません。Python の登録事実があっても dead/test_only/no_callers の既存判定は変わりません。
 
-`review --staged` の解析ルートは既存の index snapshot です。snapshot を使えなかった場合は `reference_evidence` を省きます。走査・降格の制約は、review の既存 `truncations` も確認してください。証拠の追加によって作業ツリーの参照を index の参照と同一視することはありません。
+### JS/TS のホスト入口
+
+VS Code 拡張機能は、最も近い `package.json` の `engines.vscode` と `main` / `browser` を確認します。直接指された JS ファイル、または同じパッケージの `tsconfig.json` の明示した `rootDir` / `outDir` から一意に対応する TS ソースの、名前付き `activate` / `deactivate` を対象にします。JSX の出力拡張子も区別します。直接の関数宣言・関数式・arrow の export と一意な束縛を確認し、名前だけでは除外しません。
+
+確認できた候補は `external_entry_symbols`、hook では `external_entry` に出し、`dead` の blocking に数えません。`reference_evidence.classification: external_entry` と登録元のファイル・0始まり行・項目・対象を保持します。同名の別パッケージや対象外のファイル、規約外の export は通常の判定を続けます。API の互換性や未解決の呼び出し元の判定は変更しません。
+
+ソース対応を確認できない候補は `unverified_symbols`、hook では `unverified` に理由付きで残します。例えば、`main` が `out/extension.js` を指す一方で tsconfig が無い場合、同じ basename の TS ファイルを候補として保留し、`out` → `src` を証明したとは扱いません。`extends`・project references・`outFile` などの未対応の出力設定、複数のソース候補や値の束縛が曖昧な場合も保留します。
+
+未知のホストは、解析ルートの `.astro-sight/entrypoints.json` で対象のファイル・export・理由を宣言できます。Claude Code hooks のようなコマンド設定から、TypeScript の export 名を推測することはありません。
+
+```json
+{"entries":[{"file":"src/hooks.ts","export":"afterEdit","reason":"Editor host calls this registered export"}]}
+```
+
+`file` は解析ルート相対、`export` は直接の名前付き関数 export です。宣言を根拠として扱い、同じファイル・名前の候補だけに適用します。理由の空欄、不明な項目、存在しないファイル/export、default export、曖昧な束縛、ワークスペース外・symlink・1 MiB超過・不正なメタデータは明示的に失敗します。ファイルや export を移動・削除したら宣言も更新してください。
+
+`review --staged` の解析ルートは既存の index snapshot です。snapshot を使えなかった場合は `reference_evidence` を省きます。走査・降格の制約は、review の既存 `truncations` も確認してください。JS/TS の変更を含む `dead-code --staged` も index snapshot から読み、snapshot を作れない場合は明示的に失敗します。証拠の追加によって作業ツリーの参照を index の参照と同一視することはありません。

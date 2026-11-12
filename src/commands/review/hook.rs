@@ -1096,6 +1096,27 @@ pub(crate) fn build_review_hook_json_for_diff(
         has_any_output = true;
     }
 
+    for (key, symbols) in [
+        ("external_entry", &result.external_entry_symbols),
+        ("unverified", &result.unverified_symbols),
+    ] {
+        if !symbols.is_empty() {
+            let symbols: Vec<_> = symbols
+                .iter()
+                .map(|symbol| HookDeadSymbol {
+                    reference_evidence: symbol.reference_evidence.as_ref(),
+                    n: &symbol.name,
+                    f: &symbol.file,
+                    line: symbol.line,
+                })
+                .collect();
+            hook_obj.insert(
+                key.into(),
+                serde_json::to_value(symbols).expect("host entry evidence serializes"),
+            );
+            has_any_output = true;
+        }
+    }
     if !has_any_output {
         return HookJsonBuild {
             value: None,

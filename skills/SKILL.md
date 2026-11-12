@@ -192,6 +192,13 @@ within the scan are counted because generated code can call handwritten code.
 `--include-generated` also makes their symbols candidates. `--framework` adjusts
 dead-symbol conventions; it does not establish API compatibility.
 
+Read `external_entry_symbols` and their registration evidence alongside
+`unverified_symbols`. Verified host entries do not block as dead code; host
+registration and API compatibility are separate evidence. VS Code entries need
+manifest and source-mapping evidence; unsupported mappings remain unverified.
+Other hosts can declare an exact file, named export, and reason in
+`.astro-sight/entrypoints.json`; invalid or stale declarations fail explicitly.
+
 `missing_cochanges` and `expected_with` are legacy names for historical
 associations. Their `interpretation`, frequency ratios, and ranking scores do not
 prove that a change is required or complete. Even `verification_target` or a

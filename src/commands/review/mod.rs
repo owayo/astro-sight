@@ -78,7 +78,7 @@ pub(super) fn prepare_dead_code_snapshot(
         index_snapshot::PreparedSnapshot::Ready(snapshot) => Ok(snapshot),
         index_snapshot::PreparedSnapshot::OverBudget(_) => Err(AstroError::new(
             ErrorCode::InvalidRequest,
-            "staged Swift dead-code snapshot exceeds the analysis limit",
+            "staged dead-code snapshot exceeds the analysis limit",
         )
         .into()),
     }
@@ -422,6 +422,8 @@ fn review_attempt_with_swift_protocols(
     let ReviewDeadSymbols {
         dead: dead_symbols,
         test_only: test_only_symbols,
+        external_entry: external_entry_symbols,
+        unverified: unverified_symbols,
         truncations: dead_truncations,
     } = dead_phase;
     let mut truncations = truncations;
@@ -448,10 +450,13 @@ fn review_attempt_with_swift_protocols(
         api_changes,
         dead_symbols,
         test_only_symbols,
+        external_entry_symbols,
+        unverified_symbols,
         skipped: None,
         truncations,
     };
 
+    super::host_entries::attach_api_proofs(&mut result);
     super::reference_evidence::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
     rename_candidates::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
     before_check(&result, analysis_dir);
@@ -1463,6 +1468,8 @@ struct ReviewDeadSymbolsOpts<'a> {
 struct ReviewDeadSymbols {
     dead: Vec<DeadSymbol>,
     test_only: Vec<DeadSymbol>,
+    external_entry: Vec<DeadSymbol>,
+    unverified: Vec<DeadSymbol>,
     /// 参照カウントの走査対象から外れた「解析できないソース」の申告。
     /// dead が 1 件も無ければ誤検出のしようが無いので空 (走査自体を行わない)。
     truncations: Vec<crate::models::truncation::TruncationInfo>,
@@ -1473,6 +1480,8 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
         return Ok(ReviewDeadSymbols {
             dead: Vec::new(),
             test_only: Vec::new(),
+            external_entry: Vec::new(),
+            unverified: Vec::new(),
             truncations: Vec::new(),
         });
     };
@@ -1542,6 +1551,8 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
     Ok(ReviewDeadSymbols {
         dead: dead_symbols,
         test_only: test_only_symbols,
+        external_entry: detection.external_entry,
+        unverified: detection.unverified,
         truncations,
     })
 }

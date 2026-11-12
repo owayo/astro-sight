@@ -6,6 +6,7 @@ use crate::engine::parse_budget::ParseBudget;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
 use crate::git_support::normalize_workspace_separators;
+use crate::language::LangId;
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::DeadSymbol;
 
@@ -27,6 +28,7 @@ use crate::output::{OutputOptions, serialize_cli_document};
 #[derive(Debug, Default)]
 pub(crate) struct DeadCodeDetection {
     pub(crate) dead: Vec<DeadSymbol>,
+    pub(crate) external_entry: Vec<DeadSymbol>,
     pub(crate) test_only: Vec<DeadSymbol>,
     /// 生成物として dead 候補から外したファイル (`dir` 相対、`/` 区切り)。
     /// 参照の集計には含めている。
@@ -91,6 +93,7 @@ pub(crate) fn detect_dead_symbols(
         include_generated,
         &SwiftProtocolMethods::default(),
         ParseBudget::default(),
+        None,
     )
 }
 
@@ -103,12 +106,14 @@ pub(crate) fn detect_dead_symbols_with_swift_protocols(
     swift_protocols: &SwiftProtocolMethods,
 ) -> Result<DeadCodeDetection> {
     let budget = ParseBudget::from_env()?;
+    let entries = super::host_entries::HostEntries::build(dir, files)?;
     Ok(detect_dead_symbols_with_budget(
         dir,
         files,
         include_generated,
         swift_protocols,
         budget,
+        Some(&entries),
     ))
 }
 
@@ -118,6 +123,7 @@ fn detect_dead_symbols_with_budget(
     include_generated: bool,
     swift_protocols: &SwiftProtocolMethods,
     parse_budget: ParseBudget,
+    host_entries: Option<&super::host_entries::HostEntries>,
 ) -> DeadCodeDetection {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
@@ -173,7 +179,6 @@ fn detect_dead_symbols_with_budget(
 
     let mut index =
         build_dead_code_name_index(&candidates, &canonical_dir, files, &scan.files, &is_test);
-
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
     let ref_counts = match crate::engine::refs::count_non_definition_refs_split_in_files(
@@ -212,6 +217,18 @@ fn detect_dead_symbols_with_budget(
         return DeadCodeDetection::without_dead(generated.clone());
     }
 
+    if let Some(entries) = host_entries {
+        for (name, _, file, lang) in &candidates.all_syms {
+            if entries.is_proven(file, name)
+                && let Some(count) = index
+                    .name_counts
+                    .get_mut(&normalized_bare_name(*lang, name))
+            {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
     let default_liveness =
         DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
@@ -228,6 +245,28 @@ fn detect_dead_symbols_with_budget(
         &unobserved,
         &python_tests,
     );
+    if let Some(entries) = host_entries {
+        let mut reported: std::collections::BTreeSet<_> = classified
+            .dead
+            .iter()
+            .chain(classified.test_only.iter())
+            .chain(classified.unverified.iter())
+            .map(|s| (s.file.clone(), s.name.clone(), s.kind.clone()))
+            .collect();
+        for (name, kind, file, _) in &candidates.all_syms {
+            if entries.is_known(file, name)
+                && reported.insert((file.clone(), name.clone(), kind.clone()))
+            {
+                classified.dead.push(DeadSymbol {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: file.clone(),
+                    line: None,
+                    reference_evidence: None,
+                });
+            }
+        }
+    }
     attach_declaration_lines(dir, &mut classified.dead, &mut classified.test_only);
     attach_declaration_lines(dir, &mut classified.unverified, &mut []);
     let uncounted = uncounted_truncations(
@@ -250,8 +289,18 @@ fn detect_dead_symbols_with_budget(
         &mut classified.unverified,
         &evidence_diagnostics,
     );
+    let external_entry = host_entries
+        .map(|entries| {
+            entries.classify(
+                &mut classified.dead,
+                &mut classified.test_only,
+                &mut classified.unverified,
+            )
+        })
+        .unwrap_or_default();
     DeadCodeDetection {
         dead: classified.dead,
+        external_entry,
         test_only: classified.test_only,
         generated_candidates_skipped: generated.skipped,
         generated_undetermined: generated.undetermined,
@@ -2090,6 +2139,7 @@ pub fn cmd_dead_code_with_swift_protocols(
                     dir: canonical_dir.to_string_lossy().to_string(),
                     scanned_files: 0,
                     dead_symbols: Vec::new(),
+                    external_entry_symbols: Vec::new(),
                     test_only_symbols: Vec::new(),
                     unverified_symbols: Vec::new(),
                     skipped: None,
@@ -2113,6 +2163,7 @@ pub fn cmd_dead_code_with_swift_protocols(
                 dir: canonical_dir.to_string_lossy().to_string(),
                 scanned_files: 0,
                 dead_symbols: Vec::new(),
+                external_entry_symbols: Vec::new(),
                 test_only_symbols: Vec::new(),
                 unverified_symbols: Vec::new(),
                 skipped: Some(skip),
@@ -2135,9 +2186,12 @@ pub fn cmd_dead_code_with_swift_protocols(
         super::git_input::diff_new_side(diff, diff_file, git, staged),
         crate::models::impact::DiffNewSide::Index
     ) && resolved_diff.files.as_ref().is_some_and(|files| {
-        files
-            .iter()
-            .any(|file| file.new_path.to_ascii_lowercase().ends_with(".swift"))
+        files.iter().any(|file| {
+            matches!(
+                LangId::from_path(camino::Utf8Path::new(&file.new_path)),
+                Ok(LangId::Swift | LangId::Javascript | LangId::Typescript | LangId::Tsx)
+            )
+        })
     }) {
         Some(super::review::prepare_dead_code_snapshot(
             dir,
@@ -2216,6 +2270,7 @@ pub fn cmd_dead_code_with_swift_protocols(
         dir: output_dir.to_string_lossy().to_string(),
         scanned_files,
         dead_symbols,
+        external_entry_symbols: detection.external_entry,
         test_only_symbols,
         unverified_symbols: detection.unverified,
         skipped: None,
