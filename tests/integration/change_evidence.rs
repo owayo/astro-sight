@@ -211,3 +211,204 @@ fn change_evidence_parse_error_keeps_unknown_boolean_values() {
     assert!(evidence["annotation_only"].is_null());
     assert!(evidence["call_shape_unchanged"].is_null());
 }
+
+fn assert_added_typescript_bindings(arrow: bool, replace_body: bool) {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let header = if arrow {
+        "export const attach = (on: (event: string, hook: Hook) => void) => {"
+    } else {
+        "export function attach(on: (event: string, hook: Hook) => void) {"
+    };
+    let prefix = "type Hook = (name: string) => void\nconst seen = new Map<string, number>()\n";
+    let old_body = "  on('start', (name) => seen.set(name, 1))\n";
+    repo.write("events.ts", format!("{prefix}\n{header}\n{old_body}}}\n"));
+    repo.write(
+        "entry.ts",
+        "import { attach } from './events'\nattach((event, hook) => hook(event))\n",
+    );
+    repo.commit_all("initial");
+    let body = if replace_body {
+        "  on('start', (name) => {\n    starts += 1\n    seen.set(name, starts)\n  })\n  on('stop', () => {\n    stops += 1\n  })\n"
+            .to_owned()
+    } else {
+        format!("{old_body}  starts += 1\n  stops += 1\n")
+    };
+    repo.write(
+        "events.ts",
+        format!("{prefix}let starts = 0\nlet stops = 0\n\n{header}\n{body}}}\n"),
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+        }
+        let args = if staged {
+            vec!["--git", "--staged"]
+        } else {
+            vec!["--git"]
+        };
+        let normal = repo.run_json("review", &args);
+        let context = repo.run_json("context", &args);
+        assert_eq!(normal["impact"]["changes"], context["changes"]);
+        let symbols = normal["impact"]["changes"][0]["affected_symbols"]
+            .as_array()
+            .unwrap();
+        for name in ["starts", "stops"] {
+            let symbol = symbols
+                .iter()
+                .find(|symbol| symbol["name"] == name)
+                .unwrap();
+            assert_eq!(symbol["change_type"], "added", "{normal}");
+            assert!(symbol.get("change_evidence").is_none(), "{symbol}");
+        }
+        let attach = symbols
+            .iter()
+            .find(|symbol| symbol["name"] == "attach")
+            .unwrap();
+        assert_eq!(attach["change_type"], "modified", "{attach}");
+        assert_eq!(
+            attach["change_evidence"]["changed_parts"],
+            json!([if arrow { "initializer" } else { "body" }])
+        );
+        let (output, code) = hook(&repo, staged);
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(output["blocking_categories"], json!([]));
+        let evidence = output["change_evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1, "{output}");
+        assert_eq!(evidence[0]["n"], "attach");
+        assert_eq!(evidence[0]["change_evidence"], attach["change_evidence"]);
+        let impact = cargo_bin()
+            .args(["impact", "--dir"])
+            .arg(repo.root())
+            .args(&args)
+            .arg("--hook")
+            .output()
+            .unwrap();
+        assert!(impact.status.success(), "{impact:?}");
+    }
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_in_replaced_function_hunk() {
+    assert_added_typescript_bindings(false, true);
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_in_replaced_arrow_hunk() {
+    assert_added_typescript_bindings(true, true);
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_in_addition_only_hunk() {
+    assert_added_typescript_bindings(false, false);
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_keep_ambiguous_and_kind_changes() {
+    for (old, reason) in [
+        (
+            "let starts = 1;\nlet starts = 2;\n",
+            Some("declaration_pairing_ambiguous"),
+        ),
+        (
+            "function starts() {}\n",
+            Some("declaration_pairing_ambiguous"),
+        ),
+        ("class starts {}\n", Some("declaration_pairing_ambiguous")),
+        (
+            "import { starts } from './source';\n",
+            Some("declaration_pairing_ambiguous"),
+        ),
+        ("const { starts } = source;\n", None),
+        ("let starts = (", Some("parse_error")),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("events.ts", old);
+        repo.commit_all("initial");
+        repo.write("events.ts", "let starts = 0;\n");
+        let review = repo.run_json("review", &["--git"]);
+        let symbol = &review["impact"]["changes"][0]["affected_symbols"][0];
+        assert_eq!(symbol["name"], "starts", "{old}: {review}");
+        assert_eq!(symbol["change_type"], "modified", "{old}: {review}");
+        assert_eq!(
+            symbol["change_evidence"]["unknown_reason"],
+            json!(reason),
+            "{old}: {review}"
+        );
+    }
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_keep_file_and_cross_file_moves() {
+    for rename in [false, true] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(
+            "source.ts",
+            "let starts = 1;\nexport function attach() {}\n",
+        );
+        repo.write("events.ts", "export function attach() { return 1; }\n");
+        repo.commit_all("initial");
+        if rename {
+            repo.git(["mv", "source.ts", "moved.ts"]);
+            repo.write("moved.ts", "let starts = 0;\nexport function attach() {}\n");
+        } else {
+            repo.write("source.ts", "export function attach() {}\n");
+            repo.write(
+                "events.ts",
+                "let starts = 0;\nexport function attach() { return 0; }\n",
+            );
+        }
+        let review = repo.run_json("review", &["--git"]);
+        let path = if rename { "moved.ts" } else { "events.ts" };
+        let file = review["impact"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .unwrap();
+        let symbol = file["affected_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == "starts")
+            .unwrap();
+        assert_eq!(symbol["change_type"], "modified", "{review}");
+    }
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_keep_signature_changes_blocking() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "events.ts",
+        "export function attach(value: number) { return value; }\n",
+    );
+    repo.write(
+        "entry.ts",
+        "import { attach } from './events';\nattach(1);\n",
+    );
+    repo.commit_all("initial");
+    repo.write(
+        "events.ts",
+        "let starts = 0;\nexport function attach(value: string) { return starts + value; }\n",
+    );
+    let (review, code) = hook(&repo, false);
+    assert_eq!(code, 1, "{review}");
+    assert!(
+        review["blocking_categories"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("api.mod")),
+        "{review}"
+    );
+    let impact = cargo_bin()
+        .args(["impact", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .unwrap();
+    assert_eq!(impact.status.code(), Some(1), "{impact:?}");
+}

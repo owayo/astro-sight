@@ -633,6 +633,23 @@ fn collect_affected_symbols(
             t.elapsed().as_millis(),
         );
 
+        let syntax_evidence = crate::engine::change_evidence::ChangeEvidenceIndex::from_diff(
+            file_diff,
+            &df.new_path,
+            root,
+            &source,
+            lang_id,
+        );
+        // 他ファイルからの移動を追加と誤認しないよう、単一の同一パス差分に限る。
+        if diff_files.len() == 1 && df.old_path == df.new_path {
+            for symbol in &mut affected {
+                if symbol.change_type == "modified"
+                    && syntax_evidence.proves_added(&symbol.name, &symbol.kind, lang_id)
+                {
+                    symbol.change_type = "added".to_owned();
+                }
+            }
+        }
         let t = std::time::Instant::now();
         let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
         // 複数行ヘッダや宣言移動の差分は、旧側 AST と突き合わせて補う。
@@ -978,13 +995,6 @@ fn collect_affected_symbols(
             } else {
                 HashMap::new()
             };
-        let syntax_evidence = crate::engine::change_evidence::ChangeEvidenceIndex::from_diff(
-            file_diff,
-            &df.new_path,
-            root,
-            &source,
-            lang_id,
-        );
         for symbol in &mut affected {
             if symbol.change_type == "modified" {
                 symbol.change_evidence =

@@ -1,6 +1,6 @@
 //! 旧新 AST の宣言を対応付け、意味や互換性を判定せず構文の差だけを記録する。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use tree_sitter::Node;
@@ -19,6 +19,8 @@ const MAX_EVIDENCE_SOURCE_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct ChangeEvidenceIndex {
     entries: BTreeMap<(String, String), ChangeEvidence>,
+    // 構文差の分類とは独立した、旧側に名前が無い新規宣言の証明。
+    added_declarations: BTreeSet<(String, String)>,
     fallback: ChangeUnknownReason,
 }
 
@@ -26,6 +28,7 @@ impl ChangeEvidenceIndex {
     pub(crate) fn unavailable() -> Self {
         Self {
             entries: BTreeMap::new(),
+            added_declarations: BTreeSet::new(),
             fallback: ChangeUnknownReason::SourceUnavailable,
         }
     }
@@ -108,6 +111,8 @@ impl ChangeEvidenceIndex {
         }
         let old_parts = declarations(old_root, old, lang);
         let new_parts = declarations(new_root, new, lang);
+        let added_declarations =
+            proven_added_declarations(old_root, old, new_root, new, lang, &new_parts);
         let mut entries = BTreeMap::new();
         for (key, current) in new_parts {
             let evidence = match (old_parts.get(&key), current.as_slice()) {
@@ -124,8 +129,16 @@ impl ChangeEvidenceIndex {
         }
         Self {
             entries,
+            added_declarations,
             fallback: ChangeUnknownReason::DeclarationPairingAmbiguous,
         }
+    }
+
+    pub(crate) fn proves_added(&self, name: &str, kind: &str, lang: LangId) -> bool {
+        self.added_declarations.contains(&(
+            normalize_identifier(lang, name).into_owned(),
+            kind.to_owned(),
+        ))
     }
 
     pub(crate) fn get(&self, name: &str, kind: &str, lang: LangId) -> ChangeEvidence {
@@ -143,6 +156,52 @@ impl ChangeEvidenceIndex {
             .cloned()
             .unwrap_or_else(|| ChangeEvidence::unknown(self.fallback))
     }
+}
+
+fn proven_added_declarations(
+    old_root: Node<'_>,
+    old: &[u8],
+    new_root: Node<'_>,
+    new: &[u8],
+    lang: LangId,
+    new_parts: &BTreeMap<(String, String), Vec<Option<Parts>>>,
+) -> BTreeSet<(String, String)> {
+    if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
+        // JS の Unicode escape は normalize_identifier で同一視できない。
+        || old.windows(2).any(|bytes| bytes == b"\\u")
+        || new.windows(2).any(|bytes| bytes == b"\\u")
+    {
+        return BTreeSet::new();
+    }
+    let Ok(new_symbols) = symbols::extract_symbols_without_complexity(new_root, new, lang) else {
+        return BTreeSet::new();
+    };
+    let mut new_counts = BTreeMap::<_, usize>::new();
+    for symbol in new_symbols {
+        *new_counts
+            .entry(normalize_identifier(lang, &symbol.name).into_owned())
+            .or_default() += 1;
+    }
+    // 旧側の宣言抽出に依存せず、同名の名前付き葉があれば保留する。
+    let mut old_names = BTreeSet::new();
+    let _: ControlFlow<()> = walk_preorder(old_root, Children::Named, |node, _| {
+        if node.named_child_count() == 0 {
+            if let Ok(text) = node.utf8_text(old) {
+                old_names.insert(normalize_identifier(lang, text).into_owned());
+            }
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    new_parts
+        .iter()
+        .filter(|((name, _), parts)| {
+            matches!(parts.as_slice(), [Some(_)])
+                && new_counts.get(name) == Some(&1)
+                && !old_names.contains(name)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 fn supported(lang: LangId) -> bool {
@@ -692,5 +751,99 @@ mod tests {
             "function",
         );
         assert_eq!(proof.changed_parts, [ChangedPart::Body]);
+    }
+
+    #[test]
+    fn evidence_added_declaration_requires_old_name_absence_and_unique_new_binding() {
+        let new = b"let starts = 0;\nexport function attach() { starts += 1; }\n";
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            let index =
+                ChangeEvidenceIndex::from_sources(b"export function attach() {}\n", new, lang);
+            assert!(index.proves_added("starts", "variable", lang));
+            assert!(!index.proves_added("attach", "function", lang));
+        }
+        for old in [
+            "let starts = 1;\n",
+            "let starts = 1;\nlet starts = 2;\n",
+            "function starts() {}\n",
+            "class starts {}\n",
+            "import { starts } from './counter';\n",
+            "const { starts } = counter;\n",
+            "const [starts] = counter;\n",
+            "declare let starts: number;\n",
+            "function attach(starts: number) {}\n",
+            "let \\u0073tarts = 1;\n",
+        ] {
+            let index = ChangeEvidenceIndex::from_sources(old.as_bytes(), new, LangId::Typescript);
+            assert!(
+                !index.proves_added("starts", "variable", LangId::Typescript),
+                "{old}"
+            );
+        }
+        for new in [
+            "let starts = 0;\nlet starts = 1;\n",
+            "let starts = 0;\nclass starts {}\n",
+            "let starts = 0;\nfunction attach() { let starts = 1; }\n",
+            "let starts = 0;\nconst { starts } = counter;\n",
+            "let starts = 0;\nlet \\u0073tarts = 1;\n",
+            "function attach() { let starts = 0; }\n",
+        ] {
+            let index = ChangeEvidenceIndex::from_sources(b"", new.as_bytes(), LangId::Typescript);
+            assert!(
+                !index.proves_added("starts", "variable", LangId::Typescript),
+                "{new}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_added_declaration_keeps_unavailable_parse_error_and_resource_limit_unknown() {
+        let new = b"let starts = 0;\n";
+        let oversized = vec![b' '; MAX_EVIDENCE_SOURCE_BYTES + 1];
+        for (index, reason) in [
+            (
+                ChangeEvidenceIndex::unavailable(),
+                ChangeUnknownReason::SourceUnavailable,
+            ),
+            (
+                ChangeEvidenceIndex::from_sources(b"let starts = (", new, LangId::Typescript),
+                ChangeUnknownReason::ParseError,
+            ),
+            (
+                ChangeEvidenceIndex::from_sources(b"", b"let starts = (", LangId::Typescript),
+                ChangeUnknownReason::ParseError,
+            ),
+            (
+                ChangeEvidenceIndex::from_sources(&oversized, new, LangId::Typescript),
+                ChangeUnknownReason::ResourceLimit,
+            ),
+            (
+                ChangeEvidenceIndex::from_sources(b"", &oversized, LangId::Typescript),
+                ChangeUnknownReason::ResourceLimit,
+            ),
+        ] {
+            assert!(!index.proves_added("starts", "variable", LangId::Typescript));
+            assert_eq!(
+                index
+                    .get("starts", "variable", LangId::Typescript)
+                    .unknown_reason,
+                Some(reason)
+            );
+        }
+        let new_tree = parser::parse_source(new, LangId::Typescript).unwrap();
+        let index = ChangeEvidenceIndex::from_diff(
+            "--- a/events.ts\n+++ b/events.ts\n@@ -1 +1 @@\n-old\n+different\n",
+            "events.ts",
+            new_tree.root_node(),
+            new,
+            LangId::Typescript,
+        );
+        assert!(!index.proves_added("starts", "variable", LangId::Typescript));
+        assert_eq!(
+            index
+                .get("starts", "variable", LangId::Typescript)
+                .unknown_reason,
+            Some(ChangeUnknownReason::SourceUnavailable)
+        );
     }
 }
