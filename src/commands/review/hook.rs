@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use anyhow::Result;
 use serde::Serialize;
 
@@ -543,10 +545,8 @@ impl<'a> HookApi<'a> {
     }
 }
 
-fn impact_groups_value(
-    groups: &std::collections::BTreeMap<String, HookImpactGroup>,
-) -> serde_json::Value {
-    let impacts: Vec<HookImpact<'_>> = groups
+fn impact_groups(groups: &BTreeMap<String, HookImpactGroup>) -> Vec<HookImpact<'_>> {
+    groups
         .iter()
         .map(|(changed_path, group)| HookImpact {
             src: changed_path,
@@ -561,8 +561,7 @@ fn impact_groups_value(
                 })
                 .collect(),
         })
-        .collect();
-    serde_json::to_value(impacts).expect("hook impact DTO should serialize")
+        .collect()
 }
 
 /// diff 外の caller を `HookImpactGroup` に集約する共通ループ。
@@ -570,7 +569,7 @@ fn impact_groups_value(
 /// 述語で絞って `BTreeMap<changed_path, group>` に積む」構造が同一で、残す symbol の条件
 /// (`keep_symbol`) だけが異なるため、述語を渡して共通化する。
 fn accumulate_hook_impacts(
-    target: &mut std::collections::BTreeMap<String, HookImpactGroup>,
+    target: &mut BTreeMap<String, HookImpactGroup>,
     change_path: &str,
     callers: &[ImpactedCaller],
     resolution: &DiffCallerResolution,
@@ -600,6 +599,277 @@ fn accumulate_hook_impacts(
     }
 }
 
+/// api の判定に合わせて、Stop hook の impact の参照を振り分けるための `(ファイル, 名前)` の集合。
+///
+/// api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、Stop hook の impact
+/// でも informational として扱う。ここを揃えないと api.mod_compat 自体は非 blocking なのに、同じ
+/// シンボルの参照一覧が impacts として blocking になる。
+struct HookImpactPolicy<'a> {
+    /// 参照を hook の停止に使わない modified 系シンボル。
+    informational_modified: HashSet<(&'a str, &'a str)>,
+    /// 型注釈だけの変更。互換性は未確認なので、strict でも参照の分類は保ち、専用 policy で確認を求める。
+    annotation_info: HashSet<(&'a str, &'a str)>,
+    /// 同じ値を指すと証明した Python の import の付け替え。
+    import_rebinding_info: HashSet<(&'a str, &'a str)>,
+    /// 省略可能な引数・props の削除。リポジトリ内の利用の証拠に基づく分類なので、証拠にした
+    /// 呼び出し箇所を確認箇所として残す。
+    optional_removal_info: HashSet<(&'a str, &'a str)>,
+}
+
+impl<'a> HookImpactPolicy<'a> {
+    fn new(api: &'a ApiChanges, strict_const_values: bool) -> Self {
+        let annotation_info: HashSet<(&str, &str)> = api
+            .type_annotation_changes
+            .iter()
+            .map(|m| (m.change.file.as_str(), m.change.name.as_str()))
+            .chain(
+                api.unchanged_type_annotations
+                    .iter()
+                    .map(|m| (m.file.as_str(), m.name.as_str())),
+            )
+            .collect();
+        let mut informational_modified: HashSet<(&str, &str)> = api
+            .compatible_modified
+            .iter()
+            // `const` の追加は qualname ごとの証明なので、同じ素の名前の別の宣言 (別の impl の
+            // メソッド・cfg の分岐) の呼び出し元までまとめて外さない。呼び出し元は impact
+            // エンジンが同名の宣言まで確かめて情報提供に分ける。
+            .filter(|m| m.reason != "rust_const_fn_added")
+            .map(|m| (m.file.as_str(), m.name.as_str()))
+            .chain(
+                api.modified_closed_in_diff
+                    .iter()
+                    .map(|m| (m.file.as_str(), m.name.as_str())),
+            )
+            .chain(
+                api.unchanged_static_consts
+                    .iter()
+                    .map(|m| (m.file.as_str(), m.name.as_str())),
+            )
+            .chain(annotation_info.iter().copied())
+            .collect();
+        if !strict_const_values {
+            informational_modified.extend(
+                api.callback_body_changes
+                    .iter()
+                    .map(|m| (m.change.file.as_str(), m.change.name.as_str())),
+            );
+            informational_modified.extend(
+                api.const_value_changes
+                    .iter()
+                    .map(|m| (m.file.as_str(), m.name.as_str())),
+            );
+        }
+        let import_rebinding_info = api
+            .import_rebindings
+            .iter()
+            .filter(|entry| {
+                entry.equivalence
+                    == crate::models::python_import_rebinding::RebindingEquivalence::Proven
+            })
+            .map(|entry| (entry.file.as_str(), entry.name.as_str()))
+            .collect();
+        let optional_removal_info = api
+            .compatible_modified
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.reason.as_str(),
+                    "trailing_optional_params_removed" | "optional_object_props_removed"
+                )
+            })
+            .map(|m| (m.file.as_str(), m.name.as_str()))
+            .collect();
+        Self {
+            informational_modified,
+            annotation_info,
+            import_rebinding_info,
+            optional_removal_info,
+        }
+    }
+
+    /// `impacted_callers` の参照のうち、hook を止める原因に残すシンボルか。breaking な変更
+    /// (modified / removed) だけを残し、`added` 由来と informational 扱いの modified api シンボルは外す。
+    fn blocks(&self, path: &str, flags: Option<&HookChangeFlags>, symbol: &str) -> bool {
+        flags.is_some_and(|flags| flags.has_non_added)
+            && !self.informational_modified.contains(&(path, symbol))
+    }
+
+    /// `impacted_callers` の参照のうち、確認箇所として `impact_info` に残すシンボルか
+    /// (型注釈の変更・省略可能な引数や props の削除・証明済みの import の付け替え)。
+    fn informs(&self, path: &str, flags: Option<&HookChangeFlags>, symbol: &str) -> bool {
+        (flags.is_some_and(|flags| flags.has_modified)
+            && (self.annotation_info.contains(&(path, symbol))
+                || self.optional_removal_info.contains(&(path, symbol))))
+            || self.import_rebinding_info.contains(&(path, symbol))
+    }
+}
+
+/// hook を止める参照 (`impacts`) と、確認箇所として残す参照 (`impact_info`) のグループ。
+/// キーは変更したファイル。
+#[derive(Default)]
+struct HookImpactGroups {
+    unresolved: BTreeMap<String, HookImpactGroup>,
+    informational: BTreeMap<String, HookImpactGroup>,
+}
+
+/// 影響分析の呼び出し側を、diff 内で解決済みのものを除いて hook の 2 つのグループに振り分ける。
+fn collect_hook_impact_groups(
+    result: &ReviewResult,
+    policy: &HookImpactPolicy<'_>,
+    resolution: &DiffCallerResolution,
+    dir: &str,
+) -> HookImpactGroups {
+    let mut groups = HookImpactGroups::default();
+    for change in &result.impact.changes {
+        if change.affected_symbols.is_empty() {
+            continue;
+        }
+        // hook の `syms` には「実際に cross-file caller を発生させた causal シンボル」だけを残す。
+        // `change.affected_symbols` を丸ごと入れると、is_symbol_exported で cross-file 検索を
+        // 弾かれた非 export const や、隣接 hunk の context に巻き込まれた未変更 export まで
+        // hook 出力に混ざる。`caller.symbols` (cross-file 検索を通過した causal name) と
+        // `affected_symbols` の交差で causal だけを抽出する。
+        //
+        // また `change_type == "added"` のシンボルは「同コミットで新規追加され、まだ既存
+        // 呼び出し側を持っていない export」。hook (stop blocking 判定) では「新規依存関係」
+        // として価値はあるが、breaking change ではないため除外する。通常 `review` の
+        // `impact.changes[].impacted_callers` には引き続き残る (情報価値を維持)。
+        // (Issue: 2026-05-27-added-symbol-initial-reference)
+        // caller 側は名前だけを持つ。同名の別 owner に added と modified が混在しても、
+        // 後から現れた added で breaking な変更を上書きしない。
+        let mut affected_change_types: HashMap<&str, HookChangeFlags> = HashMap::new();
+        for symbol in &change.affected_symbols {
+            let flags = affected_change_types
+                .entry(symbol.name.as_str())
+                .or_default();
+            flags.has_non_added |= symbol.change_type != "added";
+            flags.has_modified |= symbol.change_type == "modified";
+        }
+        let path = change.path.as_str();
+        let flags = |symbol: &str| affected_change_types.get(symbol);
+        accumulate_hook_impacts(
+            &mut groups.unresolved,
+            path,
+            &change.impacted_callers,
+            resolution,
+            dir,
+            |symbol| policy.blocks(path, flags(symbol), symbol),
+        );
+        accumulate_hook_impacts(
+            &mut groups.informational,
+            path,
+            &change.impacted_callers,
+            resolution,
+            dir,
+            |symbol| policy.informs(path, flags(symbol), symbol),
+        );
+        // informational: modified 由来のみを低信号として残す。
+        accumulate_hook_impacts(
+            &mut groups.informational,
+            path,
+            &change.informational_callers,
+            resolution,
+            dir,
+            |symbol| flags(symbol).is_some_and(|flags| flags.has_modified),
+        );
+    }
+
+    // API の呼び出し契約で未証明だった参照は、ファイルや行の変更だけでは解決済みにしない。
+    for call in &result.api_changes.unresolved_modified_callers {
+        if !result
+            .api_changes
+            .modified
+            .iter()
+            .any(|change| change.file == call.file && change.name == call.name)
+        {
+            continue;
+        }
+        let group = groups.unresolved.entry(call.file.clone()).or_default();
+        group.changed_symbols.insert(call.name.clone());
+        if let Some((_, _, symbols)) = group
+            .refs
+            .iter_mut()
+            .find(|(path, line, _)| *path == call.reference.path && *line == call.reference.line)
+        {
+            symbols.push(call.name.clone());
+            symbols.sort_unstable();
+            symbols.dedup();
+        } else {
+            group.refs.push((
+                call.reference.path.clone(),
+                call.reference.line,
+                vec![call.name.clone()],
+            ));
+        }
+        group.refs.sort_unstable();
+    }
+    groups
+}
+
+/// hook の JSON の組み立て。項目を載せること・hook の出力を出すこと・hook を止めることは一致しない
+/// (未確定の構文の証拠は、ほかの通知に添えるだけで、それ単独では出力を出さない) ので分けて持つ。
+#[derive(Default)]
+struct HookReport {
+    fields: serde_json::Map<String, serde_json::Value>,
+    blocking_categories: Vec<HookBlockingCategory>,
+    notifies: bool,
+}
+
+impl HookReport {
+    /// 項目を載せる。それ単独では hook の出力を出さない。
+    fn attach(&mut self, key: &str, value: impl Serialize) {
+        self.fields.insert(
+            key.to_owned(),
+            serde_json::to_value(value).expect("hook DTO should serialize"),
+        );
+    }
+
+    /// 項目を載せ、hook の出力を出す。
+    fn notify(&mut self, key: &str, value: impl Serialize) {
+        self.attach(key, value);
+        self.notifies = true;
+    }
+
+    /// hook を止める理由を足す (出力の順と重複の除去は `finish` で行う)。
+    fn block(&mut self, category: HookBlockingCategory) {
+        self.blocking_categories.push(category);
+    }
+
+    fn finish(self) -> HookJsonBuild {
+        let Self {
+            mut fields,
+            mut blocking_categories,
+            notifies,
+        } = self;
+        if !notifies {
+            return HookJsonBuild {
+                value: None,
+                is_blocking: false,
+            };
+        }
+        // 空配列も「情報提供だけで停止しない」という事実なので省略しない。
+        blocking_categories.sort_unstable();
+        blocking_categories.dedup();
+        let is_blocking = !blocking_categories.is_empty();
+        fields.insert(
+            "blocking_categories".into(),
+            serde_json::to_value(blocking_categories).expect("hook categories should serialize"),
+        );
+        fields.insert(
+            "hint".into(),
+            serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
+        );
+        // TOON 用の preserve_order に依らず、従来の JSON キー順を保つ。
+        let mut value = serde_json::Value::Object(fields);
+        value.sort_all_objects();
+        HookJsonBuild {
+            value: Some(value),
+            is_blocking,
+        }
+    }
+}
+
 /// diff を持たない呼び出し (単体テスト) 用。「diff 内で解決済み」の判定は影響分析の結果に
 /// 現れたファイルだけで行う。
 #[cfg(test)]
@@ -621,215 +891,58 @@ pub(crate) fn build_review_hook_json_for_diff(
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> HookJsonBuild {
-    // api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、
-    // Stop hook の impact でも informational として扱う。ここを揃えないと api.mod_compat
-    // 自体は非 blocking なのに、同じシンボルの参照一覧が impacts として blocking になる。
-    let mut informational_modified_api_symbols: std::collections::HashSet<(&str, &str)> =
-        std::collections::HashSet::new();
-    informational_modified_api_symbols.extend(
-        result
-            .api_changes
-            .compatible_modified
-            .iter()
-            // `const` の追加は qualname ごとの証明なので、同じ素の名前の別の宣言 (別の impl の
-            // メソッド・cfg の分岐) の呼び出し元までまとめて外さない。呼び出し元は impact
-            // エンジンが同名の宣言まで確かめて情報提供に分ける。
-            .filter(|m| m.reason != "rust_const_fn_added")
-            .map(|m| (m.file.as_str(), m.name.as_str())),
-    );
-    informational_modified_api_symbols.extend(
-        result
-            .api_changes
-            .modified_closed_in_diff
-            .iter()
-            .map(|m| (m.file.as_str(), m.name.as_str())),
-    );
-    informational_modified_api_symbols.extend(
-        result
-            .api_changes
-            .unchanged_static_consts
-            .iter()
-            .map(|m| (m.file.as_str(), m.name.as_str())),
-    );
-    // 型注釈の互換性は未確認。strict でも参照の分類は保ち、専用 policy で確認を求める。
-    let annotation_info_symbols: std::collections::HashSet<(&str, &str)> = result
-        .api_changes
-        .type_annotation_changes
-        .iter()
-        .map(|m| (m.change.file.as_str(), m.change.name.as_str()))
-        .chain(
-            result
-                .api_changes
-                .unchanged_type_annotations
-                .iter()
-                .map(|m| (m.file.as_str(), m.name.as_str())),
-        )
-        .collect();
-    informational_modified_api_symbols.extend(annotation_info_symbols.iter().copied());
-    let import_rebinding_info_symbols: std::collections::HashSet<(&str, &str)> = result
-        .api_changes
-        .import_rebindings
-        .iter()
-        .filter(|entry| {
-            entry.equivalence
-                == crate::models::python_import_rebinding::RebindingEquivalence::Proven
-        })
-        .map(|entry| (entry.file.as_str(), entry.name.as_str()))
-        .collect();
-    // 省略可能な引数・props の削除は、リポジトリ内の利用の証拠に基づく分類なので、
-    // 証拠にした呼び出し箇所を確認箇所として残す。
-    let optional_removal_info_symbols: std::collections::HashSet<(&str, &str)> = result
-        .api_changes
-        .compatible_modified
-        .iter()
-        .filter(|m| {
-            matches!(
-                m.reason.as_str(),
-                "trailing_optional_params_removed" | "optional_object_props_removed"
-            )
-        })
-        .map(|m| (m.file.as_str(), m.name.as_str()))
-        .collect();
-    if !strict_const_values {
-        informational_modified_api_symbols.extend(
-            result
-                .api_changes
-                .callback_body_changes
-                .iter()
-                .map(|m| (m.change.file.as_str(), m.change.name.as_str())),
-        );
-        informational_modified_api_symbols.extend(
-            result
-                .api_changes
-                .const_value_changes
-                .iter()
-                .map(|m| (m.file.as_str(), m.name.as_str())),
-        );
-    }
-
-    // 未解決 impact を収集。呼び出し側が diff 内で解決済みかは `impact --hook` と同じ判定
-    // (`DiffCallerResolution`) にする。影響分析の結果 (`impact.changes`) だけで判定すると、
-    // トップレベルの呼び出しだけを更新したファイルが diff 外扱いになり誤ってブロックする。
+    let policy = HookImpactPolicy::new(&result.api_changes, strict_const_values);
+    // 呼び出し側が diff 内で解決済みかは `impact --hook` と同じ判定 (`DiffCallerResolution`) にする。
+    // 影響分析の結果 (`impact.changes`) だけで判定すると、トップレベルの呼び出しだけを更新した
+    // ファイルが diff 外扱いになり誤ってブロックする。
     let resolution = DiffCallerResolution::build(
         dir,
         result.impact.changes.iter().map(|c| c.path.as_str()),
         diff_input,
         diff_files,
     );
+    let groups = collect_hook_impact_groups(result, &policy, &resolution, dir);
 
-    let mut unresolved: std::collections::BTreeMap<String, HookImpactGroup> =
-        std::collections::BTreeMap::new();
-    let mut informational: std::collections::BTreeMap<String, HookImpactGroup> =
-        std::collections::BTreeMap::new();
-    for change in &result.impact.changes {
-        if change.affected_symbols.is_empty() {
-            continue;
-        }
-        // hook の `syms` には「実際に cross-file caller を発生させた causal シンボル」だけを残す。
-        // `change.affected_symbols` を丸ごと入れると、is_symbol_exported で cross-file 検索を
-        // 弾かれた非 export const や、隣接 hunk の context に巻き込まれた未変更 export まで
-        // hook 出力に混ざる。`caller.symbols` (cross-file 検索を通過した causal name) と
-        // `affected_symbols` の交差で causal だけを抽出する。
-        //
-        // また `change_type == "added"` のシンボルは「同コミットで新規追加され、まだ既存
-        // 呼び出し側を持っていない export」。hook (stop blocking 判定) では「新規依存関係」
-        // として価値はあるが、breaking change ではないため除外する。通常 `review` の
-        // `impact.changes[].impacted_callers` には引き続き残る (情報価値を維持)。
-        // (Issue: 2026-05-27-added-symbol-initial-reference)
-        // caller 側は名前だけを持つ。同名の別 owner に added と modified が混在しても、
-        // 後から現れた added で breaking な変更を上書きしない。
-        let mut affected_change_types: std::collections::HashMap<&str, HookChangeFlags> =
-            std::collections::HashMap::new();
-        for symbol in &change.affected_symbols {
-            let flags = affected_change_types
-                .entry(symbol.name.as_str())
-                .or_default();
-            flags.has_non_added |= symbol.change_type != "added";
-            flags.has_modified |= symbol.change_type == "modified";
-        }
-        // impacted: breaking causal シンボル (modified / removed) だけを残す。
-        // `added` 由来と informational 扱いの modified api シンボルは hook blocking から除外する。
-        accumulate_hook_impacts(
-            &mut unresolved,
-            &change.path,
-            &change.impacted_callers,
-            &resolution,
-            dir,
-            |sym| {
-                affected_change_types
-                    .get(sym)
-                    .is_some_and(|flags| flags.has_non_added)
-                    && !informational_modified_api_symbols.contains(&(change.path.as_str(), sym))
-            },
-        );
-        // 型注釈変更と、省略可能な引数・props の削除の参照を、確認箇所として残す。
-        accumulate_hook_impacts(
-            &mut informational,
-            &change.path,
-            &change.impacted_callers,
-            &resolution,
-            dir,
-            |sym| {
-                (affected_change_types
-                    .get(sym)
-                    .is_some_and(|flags| flags.has_modified)
-                    && (annotation_info_symbols.contains(&(change.path.as_str(), sym))
-                        || optional_removal_info_symbols.contains(&(change.path.as_str(), sym))))
-                    || import_rebinding_info_symbols.contains(&(change.path.as_str(), sym))
-            },
-        );
-        // informational: modified 由来のみを低信号として残す。
-        accumulate_hook_impacts(
-            &mut informational,
-            &change.path,
-            &change.informational_callers,
-            &resolution,
-            dir,
-            |sym| {
-                affected_change_types
-                    .get(sym)
-                    .is_some_and(|flags| flags.has_modified)
-            },
+    let mut report = HookReport::default();
+    add_change_evidence(&mut report, result);
+    // impacts: [{src,syms,refs:[{p,ln,s}]}]
+    if !groups.unresolved.is_empty() {
+        report.block(HookBlockingCategory::Impacts);
+        report.notify("impacts", impact_groups(&groups.unresolved));
+    }
+    // impact_info: import-only など blocking しない低信号 impact。`impacts` と分ける。
+    if !groups.informational.is_empty() {
+        report.notify("impact_info", impact_groups(&groups.informational));
+    }
+    add_cochanges(&mut report, result);
+    if !result.rename_candidates.is_empty() {
+        report.notify("rename_candidates", &result.rename_candidates);
+    }
+    if !result.rename_candidate_diagnostics.is_empty() {
+        report.notify(
+            "rename_candidate_diagnostics",
+            &result.rename_candidate_diagnostics,
         );
     }
-
-    // API の呼び出し契約で未証明だった参照は、ファイルや行の変更だけでは解決済みにしない。
-    for call in &result.api_changes.unresolved_modified_callers {
-        if !result
-            .api_changes
-            .modified
-            .iter()
-            .any(|change| change.file == call.file && change.name == call.name)
-        {
-            continue;
-        }
-        let group = unresolved.entry(call.file.clone()).or_default();
-        group.changed_symbols.insert(call.name.clone());
-        if let Some((_, _, symbols)) = group
-            .refs
-            .iter_mut()
-            .find(|(path, line, _)| *path == call.reference.path && *line == call.reference.line)
-        {
-            symbols.push(call.name.clone());
-            symbols.sort_unstable();
-            symbols.dedup();
-        } else {
-            group.refs.push((
-                call.reference.path.clone(),
-                call.reference.line,
-                vec![call.name.clone()],
-            ));
-        }
-        group.refs.sort_unstable();
+    add_api(
+        &mut report,
+        result,
+        strict_const_values,
+        strict_type_annotations,
+    );
+    if !result.api_changes.added_reference_summary.is_empty() {
+        report.notify(
+            "added_reference_summary",
+            &result.api_changes.added_reference_summary,
+        );
     }
+    add_truncations(&mut report, result);
+    add_dead_code(&mut report, result);
+    report.finish()
+}
 
-    // 空セクションは省略した compact JSON を構築
-    let mut hook_obj = serde_json::Map::new();
-    // has_any_output: 出力すべき検出 (上記 + cochange)
-    let mut blocking_categories = Vec::new();
-    let mut has_any_output = false;
-
-    // 呼び出し側を持たない本体変更も証拠を残す。停止カテゴリは従来の判定だけで決める。
+/// 呼び出し側を持たない本体変更も証拠を残す。停止カテゴリは従来の判定だけで決める。
+fn add_change_evidence(report: &mut HookReport, result: &ReviewResult) {
     let syntax_changes: Vec<_> = result
         .impact
         .changes
@@ -845,96 +958,83 @@ pub(crate) fn build_review_hook_json_for_diff(
             })
         })
         .collect();
-    if !syntax_changes.is_empty() {
-        // 未確定・トークン不変だけでは通知を増やさず、既存の通知には証拠を残す。
-        has_any_output |= syntax_changes.iter().any(|change| {
-            change.change_evidence.analysis == crate::models::change_evidence::ChangeAnalysis::Known
-                && !change.change_evidence.changed_parts.is_empty()
-        });
-        hook_obj.insert(
-            "change_evidence".into(),
-            serde_json::to_value(syntax_changes).expect("hook syntax evidence should serialize"),
-        );
+    if syntax_changes.is_empty() {
+        return;
     }
+    // 未確定・トークン不変だけでは通知を増やさず、既存の通知には証拠を残す。
+    let proven = syntax_changes.iter().any(|change| {
+        change.change_evidence.analysis == crate::models::change_evidence::ChangeAnalysis::Known
+            && !change.change_evidence.changed_parts.is_empty()
+    });
+    if proven {
+        report.notify("change_evidence", syntax_changes);
+    } else {
+        report.attach("change_evidence", syntax_changes);
+    }
+}
 
-    // impacts: [{src,syms,refs:[{p,ln,s}]}]
-    if !unresolved.is_empty() {
-        blocking_categories.push(HookBlockingCategory::Impacts);
-        has_any_output = true;
-        hook_obj.insert("impacts".into(), impact_groups_value(&unresolved));
+/// cochange: [{f,w,c}] — 情報提供のみ。hook は止めない。
+fn add_cochanges(report: &mut HookReport, result: &ReviewResult) {
+    if result.missing_cochanges.is_empty() {
+        return;
     }
+    let cochanges: Vec<HookCochange<'_>> = result
+        .missing_cochanges
+        .iter()
+        .map(|cochange| HookCochange {
+            f: cochange.file.as_str(),
+            w: cochange.expected_with.as_str(),
+            c: (cochange.confidence * 100.0).round() as u32,
+            n: cochange.co_changes,
+            d: cochange.denominator,
+            e: match cochange.evidence {
+                Some(crate::models::cochange::CoChangeEvidence::History) => Some("history"),
+                Some(crate::models::cochange::CoChangeEvidence::Blame) | None => Some("blame"),
+            },
+            i: cochange.interpretation.clone(),
+            s: cochange.ranking_score,
+        })
+        .collect();
+    report.notify("cochange", cochanges);
+}
 
-    // impact_info: import-only など blocking しない低信号 impact。`impacts` と分ける。
-    if !informational.is_empty() {
-        has_any_output = true;
-        hook_obj.insert("impact_info".into(), impact_groups_value(&informational));
+/// api: {add,rm,mod,moved,property_to_field,rm_dead,const_value} — 空でないセクションのみ。
+///
+/// api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
+/// 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
+/// api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
+/// const_value (値のみ変更) は `--strict-public-const-values` 指定時のみ blocking に昇格する。
+fn add_api(
+    report: &mut HookReport,
+    result: &ReviewResult,
+    strict_const_values: bool,
+    strict_type_annotations: bool,
+) {
+    let api = HookApi::from_api_changes(&result.api_changes);
+    if api.is_empty() {
+        return;
     }
-
-    // cochange: [{f,w,c}] — 情報提供のみ。is_blocking にはしない
-    if !result.missing_cochanges.is_empty() {
-        has_any_output = true;
-        let cochanges: Vec<HookCochange<'_>> = result
-            .missing_cochanges
-            .iter()
-            .map(|cochange| HookCochange {
-                f: cochange.file.as_str(),
-                w: cochange.expected_with.as_str(),
-                c: (cochange.confidence * 100.0).round() as u32,
-                n: cochange.co_changes,
-                d: cochange.denominator,
-                e: match cochange.evidence {
-                    Some(crate::models::cochange::CoChangeEvidence::History) => Some("history"),
-                    Some(crate::models::cochange::CoChangeEvidence::Blame) | None => Some("blame"),
-                },
-                i: cochange.interpretation.clone(),
-                s: cochange.ranking_score,
-            })
-            .collect();
-        hook_obj.insert(
-            "cochange".into(),
-            serde_json::to_value(cochanges).expect("hook cochange DTO should serialize"),
-        );
-    }
-
-    if !result.rename_candidates.is_empty() {
-        has_any_output = true;
-        hook_obj.insert(
-            "rename_candidates".into(),
-            serde_json::to_value(&result.rename_candidates).expect("rename candidates serialize"),
-        );
-    }
-    if !result.rename_candidate_diagnostics.is_empty() {
-        has_any_output = true;
-        hook_obj.insert(
-            "rename_candidate_diagnostics".into(),
-            serde_json::to_value(&result.rename_candidate_diagnostics)
-                .expect("rename diagnostics serialize"),
-        );
-    }
-
-    // api: {add,rm,mod,moved,property_to_field,rm_dead,const_value} — 空でないセクションのみ
     // test-only の根拠は同じレビューの宣言に限る。解析範囲が欠けた結果や、宣言位置が
     // 分からない候補は停止判定の降格に使わない。表示する API の分類・項目は維持する。
-    let test_only_api_symbols: std::collections::HashSet<(&str, &str, &str)> =
-        if result.truncations.is_empty()
-            && result.impact.truncations.is_empty()
-            && result.skipped.is_none()
-        {
-            result
-                .test_only_symbols
-                .iter()
-                .filter(|symbol| symbol.line.is_some())
-                .map(|symbol| {
-                    (
-                        symbol.file.as_str(),
-                        symbol.name.as_str(),
-                        symbol.kind.as_str(),
-                    )
-                })
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
+    let test_only_api_symbols: HashSet<(&str, &str, &str)> = if result.truncations.is_empty()
+        && result.impact.truncations.is_empty()
+        && result.skipped.is_none()
+    {
+        result
+            .test_only_symbols
+            .iter()
+            .filter(|symbol| symbol.line.is_some())
+            .map(|symbol| {
+                (
+                    symbol.file.as_str(),
+                    symbol.name.as_str(),
+                    symbol.kind.as_str(),
+                )
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let is_test_only = |change: &crate::models::review::ApiSymbolChange| {
         test_only_api_symbols.contains(&(
             change.file.as_str(),
@@ -942,180 +1042,100 @@ pub(crate) fn build_review_hook_json_for_diff(
             change.kind.as_str(),
         ))
     };
-    let api = HookApi::from_api_changes(&result.api_changes);
-    // api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
-    // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
-    // api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
-    // const_value (値のみ変更) は `--strict-public-const-values` 指定時のみ blocking に昇格する。
-    if !api.is_empty() {
-        if !api.removed.is_empty() {
-            blocking_categories.push(HookBlockingCategory::ApiRm);
-        }
-        if result
+    if !api.removed.is_empty() {
+        report.block(HookBlockingCategory::ApiRm);
+    }
+    if result
+        .api_changes
+        .modified
+        .iter()
+        .any(|change| !is_test_only(change))
+    {
+        report.block(HookBlockingCategory::ApiMod);
+    }
+    if strict_const_values
+        && result
             .api_changes
-            .modified
+            .const_value_changes
             .iter()
             .any(|change| !is_test_only(change))
-        {
-            blocking_categories.push(HookBlockingCategory::ApiMod);
-        }
-        if strict_const_values
-            && result
-                .api_changes
-                .const_value_changes
-                .iter()
-                .any(|change| !is_test_only(change))
-        {
-            blocking_categories.push(HookBlockingCategory::ApiConstValue);
-        }
-        if strict_const_values && !api.callback_body_changes.is_empty() {
-            blocking_categories.push(HookBlockingCategory::ApiCallbackBody);
-        }
-        if strict_type_annotations && !api.type_annotation_changes.is_empty() {
-            blocking_categories.push(HookBlockingCategory::PolicyTypeAnnotation);
-        }
-        has_any_output = true;
-        hook_obj.insert(
-            "api".into(),
-            serde_json::to_value(api).expect("hook API DTO should serialize"),
-        );
+    {
+        report.block(HookBlockingCategory::ApiConstValue);
     }
-
-    if !result.api_changes.added_reference_summary.is_empty() {
-        has_any_output = true;
-        hook_obj.insert(
-            "added_reference_summary".into(),
-            serde_json::to_value(&result.api_changes.added_reference_summary)
-                .expect("added reference summary should serialize"),
-        );
+    if strict_const_values && !api.callback_body_changes.is_empty() {
+        report.block(HookBlockingCategory::ApiCallbackBody);
     }
-
-    // trunc: [{f,r,d?}] — 解析対象から外したものの申告。
-    // API の判定を確かめられない理由 (削除前ソースと base の不整合など) だけは停止する。
-    if !result.truncations.is_empty() {
-        blocking_categories.extend(
-            result
-                .truncations
-                .iter()
-                .filter_map(|t| HookBlockingCategory::for_truncation(t.reason)),
-        );
-        has_any_output = true;
-        let truncs: Vec<HookTruncation<'_>> = result
-            .truncations
-            .iter()
-            .map(|t| HookTruncation {
-                f: t.path.as_deref(),
-                r: t.reason,
-                d: if t.reason == TruncationReason::UnanalyzableSource {
-                    t.detail
-                        .as_ref()
-                        .map(|detail| HookUnanalyzableSourceSummary {
-                            x: &detail.extension,
-                            n: detail.count,
-                            e: &detail.examples,
-                        })
-                } else {
-                    None
-                },
-            })
-            .collect();
-        hook_obj.insert(
-            "trunc".into(),
-            serde_json::to_value(truncs).expect("hook truncation DTO should serialize"),
-        );
+    if strict_type_annotations && !api.type_annotation_changes.is_empty() {
+        report.block(HookBlockingCategory::PolicyTypeAnnotation);
     }
+    report.notify("api", api);
+}
 
-    // dead: [{n,f,l}]
+/// trunc: [{f,r,d?}] — 解析対象から外したものの申告。API の判定を確かめられない理由だけ hook を止める。
+fn add_truncations(report: &mut HookReport, result: &ReviewResult) {
+    if result.truncations.is_empty() {
+        return;
+    }
+    for truncation in &result.truncations {
+        if let Some(category) = HookBlockingCategory::for_truncation(truncation.reason) {
+            report.block(category);
+        }
+    }
+    let truncations: Vec<HookTruncation<'_>> = result
+        .truncations
+        .iter()
+        .map(|t| HookTruncation {
+            f: t.path.as_deref(),
+            r: t.reason,
+            d: if t.reason == TruncationReason::UnanalyzableSource {
+                t.detail
+                    .as_ref()
+                    .map(|detail| HookUnanalyzableSourceSummary {
+                        x: &detail.extension,
+                        n: detail.count,
+                        e: &detail.examples,
+                    })
+            } else {
+                None
+            },
+        })
+        .collect();
+    report.notify("trunc", truncations);
+}
+
+/// dead: [{n,f,l}] と、参照の証拠を伴う test-only・外部入口・未確認のシンボル。
+fn add_dead_code(report: &mut HookReport, result: &ReviewResult) {
     if !result.dead_symbols.is_empty() {
-        blocking_categories.push(HookBlockingCategory::Dead);
-        has_any_output = true;
-        let dead: Vec<HookDeadSymbol<'_>> = result
-            .dead_symbols
-            .iter()
-            .map(|symbol| HookDeadSymbol {
-                reference_evidence: symbol.reference_evidence.as_ref(),
-                n: symbol.name.as_str(),
-                f: symbol.file.as_str(),
-                line: symbol.line,
-            })
-            .collect();
-        hook_obj.insert(
-            "dead".into(),
-            serde_json::to_value(dead).expect("hook dead-symbol DTO should serialize"),
-        );
+        report.block(HookBlockingCategory::Dead);
+        report.notify("dead", hook_dead_symbols(&result.dead_symbols));
     }
-
     if result
         .test_only_symbols
         .iter()
         .any(|symbol| symbol.reference_evidence.is_some())
     {
-        let evidence: Vec<_> = result
-            .test_only_symbols
-            .iter()
-            .map(|symbol| HookDeadSymbol {
-                reference_evidence: symbol.reference_evidence.as_ref(),
-                n: &symbol.name,
-                f: &symbol.file,
-                line: symbol.line,
-            })
-            .collect();
-        hook_obj.insert(
-            "test_only".to_owned(),
-            serde_json::to_value(evidence).expect("test-only evidence serializes"),
-        );
-        has_any_output = true;
+        report.notify("test_only", hook_dead_symbols(&result.test_only_symbols));
     }
-
     for (key, symbols) in [
         ("external_entry", &result.external_entry_symbols),
         ("unverified", &result.unverified_symbols),
     ] {
         if !symbols.is_empty() {
-            let symbols: Vec<_> = symbols
-                .iter()
-                .map(|symbol| HookDeadSymbol {
-                    reference_evidence: symbol.reference_evidence.as_ref(),
-                    n: &symbol.name,
-                    f: &symbol.file,
-                    line: symbol.line,
-                })
-                .collect();
-            hook_obj.insert(
-                key.into(),
-                serde_json::to_value(symbols).expect("host entry evidence serializes"),
-            );
-            has_any_output = true;
+            report.notify(key, hook_dead_symbols(symbols));
         }
     }
-    if !has_any_output {
-        return HookJsonBuild {
-            value: None,
-            is_blocking: false,
-        };
-    }
+}
 
-    // 空配列も「情報提供だけで停止しない」という事実なので省略しない。
-    blocking_categories.sort_unstable();
-    blocking_categories.dedup();
-    let is_blocking = !blocking_categories.is_empty();
-    hook_obj.insert(
-        "blocking_categories".into(),
-        serde_json::to_value(blocking_categories).expect("hook categories should serialize"),
-    );
-
-    hook_obj.insert(
-        "hint".into(),
-        serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
-    );
-
-    // TOON 用の preserve_order に依らず、従来の JSON キー順を保つ。
-    let mut value = serde_json::Value::Object(hook_obj);
-    value.sort_all_objects();
-    HookJsonBuild {
-        value: Some(value),
-        is_blocking,
-    }
+fn hook_dead_symbols(symbols: &[crate::models::review::DeadSymbol]) -> Vec<HookDeadSymbol<'_>> {
+    symbols
+        .iter()
+        .map(|symbol| HookDeadSymbol {
+            reference_evidence: symbol.reference_evidence.as_ref(),
+            n: &symbol.name,
+            f: &symbol.file,
+            line: symbol.line,
+        })
+        .collect()
 }
 
 /// --hook 時の review 出力: compact JSON を stderr に出力する。
