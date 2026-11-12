@@ -374,3 +374,34 @@ fn metrics_nested_complexity_keeps_function_boundaries() {
     assert_eq!(result["files"][0]["functions"][0]["complexity"], 2);
     assert_eq!(result["files"][0]["functions"][1]["complexity"], 2);
 }
+
+#[test]
+fn metrics_file_components_keep_identity_with_nested_prefix_paths() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("a");
+    repo.write("a.js", "import './c.js';");
+    repo.write("a/b.js", "export const b = 1;");
+    repo.write("c.js", "import './a/b.js';");
+    let result = repo.run_json("metrics", &[]);
+    for file in result["files"].as_array().unwrap() {
+        let component = result["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["path"] == file["path"])
+            .unwrap();
+        for field in ["fan_in", "fan_out", "depends_on", "used_by", "instability"] {
+            assert_eq!(component[field], file[field], "{}: {field}", file["path"]);
+        }
+    }
+    assert_eq!(result["components"][0]["path"], "a.js");
+    assert_eq!(result["components"][0]["depends_on"], 3);
+    assert_eq!(result["components"][1]["path"], "a/b.js");
+    assert_eq!(result["components"][1]["depends_on"], 1);
+    assert_eq!(result["cycles"], serde_json::json!([]));
+
+    repo.write("c.js", "import './a.js';");
+    let cyclic = repo.run_json("metrics", &[]);
+    assert_eq!(cyclic["cycles"], serde_json::json!([["a.js", "c.js"]]));
+    assert_eq!(cyclic["dependencies"]["ccd"], 5);
+}

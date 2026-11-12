@@ -22,7 +22,10 @@ pub(crate) fn analyze(
             include_generated: opts.include_generated,
         },
     )?;
-    collection.files.sort();
+    // ファイルとコンポーネントで同じ ID を使えるよう、出力パスの文字列順にそろえる。
+    collection
+        .files
+        .sort_by_cached_key(|path| relative(dir, path));
     let mut truncations = collection.generated_undetermined_truncations(dir);
     truncations.extend(collection.unanalyzable_truncations(dir));
     let paths: BTreeMap<String, usize> = collection
