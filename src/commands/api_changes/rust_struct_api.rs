@@ -41,11 +41,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::ops::ControlFlow;
 
 use tree_sitter::Node;
-
-use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
 use super::rust_cfg_predicate::{Atoms, Predicate, effective_repr};
 use super::rust_type_api::*;
@@ -616,27 +613,6 @@ pub(crate) fn classify(
     change
 }
 
-/// ファイルの中の、名前が `name` の `struct_item` (入れ子の module の中も)。
-pub(crate) fn struct_items_named<'tree>(
-    root: Node<'tree>,
-    source: &[u8],
-    name: &str,
-) -> Vec<Node<'tree>> {
-    let mut found = Vec::new();
-    let _ = walk_preorder(root, Children::Named, |node, _| {
-        if node.kind() == "struct_item"
-            && node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                == Some(name)
-        {
-            found.push(node);
-        }
-        ControlFlow::<(), Walk>::Continue(Walk::Descend)
-    });
-    found
-}
-
 /// シンボル `sym` の構造体の公開の形の signature。形を読めない構造体は、前に付いた属性と宣言全体の
 /// 空白を詰めた字面にする (どの変更も signature に現れ、判定で blocking に残る)。構造体を特定
 /// できなければ None (呼び出し側は従来の先頭行に戻る)。
@@ -668,7 +644,7 @@ pub(crate) fn struct_signature(
 /// ソースの中で名前が `name` の構造体が 1 つだけなら、その公開の形。
 pub(crate) fn unique_struct_shape(source: &[u8], name: &str) -> Option<RustStructShape> {
     let tree = crate::engine::parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    let items = struct_items_named(tree.root_node(), source, name);
+    let items = rust_items_named(tree.root_node(), source, "struct_item", name);
     let [item] = items.as_slice() else {
         return None;
     };

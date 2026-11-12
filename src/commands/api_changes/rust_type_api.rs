@@ -1126,6 +1126,29 @@ pub(super) fn tuple_fields(body: Node<'_>, source: &[u8], inherited: bool) -> Op
     (attributes.is_empty() && visibility.is_none()).then_some(fields)
 }
 
+/// ファイルの中の、名前が `name` の `item_kind` (`struct_item`・`enum_item`・`union_item`) の項目
+/// (入れ子の module の中も、書いた順)。
+pub(crate) fn rust_items_named<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    item_kind: &str,
+    name: &str,
+) -> Vec<Node<'tree>> {
+    let mut found = Vec::new();
+    let _ = walk_preorder(root, Children::Named, |node, _| {
+        if node.kind() == item_kind
+            && node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                == Some(name)
+        {
+            found.push(node);
+        }
+        ControlFlow::<(), Walk>::Continue(Walk::Descend)
+    });
+    found
+}
+
 /// 旧新の公開の形を比べた結果 (重い順に並べる)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ShapeChange {
