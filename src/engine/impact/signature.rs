@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header, strip_header_path};
+use crate::engine::diff::{FileDiffLine, FileDiffLines, HunkBodyLine};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
 
@@ -84,47 +84,19 @@ pub(crate) fn collect_changed_line_texts(
     diff_input: &str,
     file_path: &str,
 ) -> (Vec<String>, Vec<String>) {
-    let mut in_file = false;
-    let mut active_hunk: Option<HunkProgress> = None;
     let mut removed_lines = Vec::new();
     let mut added_lines = Vec::new();
 
-    for line in diff_input.lines() {
-        // hunk 本体を消費中はヘッダに見える行も本体行として扱う
-        // (削除/追加行コンテンツが `--- a/...` / `+++ b/...` の形でも誤認しない)。
-        if let Some(progress) = active_hunk.as_mut() {
-            let consumed = progress.consume(line);
-            if in_file {
-                match consumed {
-                    HunkBodyLine::Removed(c) => removed_lines.push(c.to_string()),
-                    HunkBodyLine::Added(c) => added_lines.push(c.to_string()),
-                    HunkBodyLine::Context | HunkBodyLine::Metadata => {}
-                }
-            }
-            if progress.is_complete() {
-                active_hunk = None;
-            }
-            continue;
-        }
-
-        // `diff.rs` の state machine と同じリセット規約を持つ。`--- ` と未認識の `+++ `
-        // で必ず false へ落とさないと、削除ファイルの新側ヘッダ (`+++ /dev/null`) が
-        // どちらの分岐にも当たらず in_file が直前ファイルの true のまま残り、削除ファイル
-        // 本文の `-` 行が対象ファイルの偽 signature 変更として計上される。
-        if line.starts_with("--- ") {
-            in_file = false;
-        } else if let Some(path) = strip_header_path(line, "+++ b/") {
-            in_file = path == file_path;
-            if in_file {
+    for line in FileDiffLines::new(diff_input, file_path) {
+        match line {
+            FileDiffLine::Header => {
                 removed_lines.clear();
                 added_lines.clear();
             }
-        } else if line.starts_with("+++ ") {
-            in_file = false;
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
-        {
-            active_hunk = Some(HunkProgress::new(&hunk));
+            FileDiffLine::Body(HunkBodyLine::Removed(c)) => removed_lines.push(c.to_string()),
+            FileDiffLine::Body(HunkBodyLine::Added(c)) => added_lines.push(c.to_string()),
+            FileDiffLine::Hunk(_)
+            | FileDiffLine::Body(HunkBodyLine::Context(_) | HunkBodyLine::Metadata) => {}
         }
     }
 
@@ -272,46 +244,13 @@ pub(crate) fn is_symbol_in_changed_lines(
     symbol_name: &str,
     lang_id: LangId,
 ) -> bool {
-    let mut in_file = false;
-    let mut active_hunk: Option<HunkProgress> = None;
-
-    for line in diff_input.lines() {
-        // hunk 本体を消費中はヘッダに見える行も本体行として扱う (FN 防止)。
-        if let Some(progress) = active_hunk.as_mut() {
-            let consumed = progress.consume(line);
-            if in_file {
-                let content = match consumed {
-                    HunkBodyLine::Added(c) | HunkBodyLine::Removed(c) => Some(c),
-                    HunkBodyLine::Context | HunkBodyLine::Metadata => None,
-                };
-                if let Some(content) = content
-                    && line_has_identifier(content, symbol_name, lang_id)
-                {
-                    return true;
-                }
-            }
-            if progress.is_complete() {
-                active_hunk = None;
-            }
-            continue;
-        }
-
-        // `detect_signature_changes` と同じリセット規約 (削除ファイルの `+++ /dev/null` で
-        // in_file を落とす)。
-        if line.starts_with("--- ") {
-            in_file = false;
-        } else if let Some(path) = strip_header_path(line, "+++ b/") {
-            in_file = path == file_path;
-        } else if line.starts_with("+++ ") {
-            in_file = false;
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
-        {
-            active_hunk = Some(HunkProgress::new(&hunk));
-        }
-    }
-
-    false
+    FileDiffLines::new(diff_input, file_path).any(|line| {
+        matches!(
+            line,
+            FileDiffLine::Body(HunkBodyLine::Added(content) | HunkBodyLine::Removed(content))
+                if line_has_identifier(content, symbol_name, lang_id)
+        )
+    })
 }
 
 /// 行を識別子境界 (非英数+アンダースコア以外) で分割し、`symbol` と一致する
@@ -943,5 +882,62 @@ mod tests {
         ));
         // 括弧が無い signature は保守的に不一致 (blocking 維持)
         assert!(!same_top_level_arity("const X: u32", "const X: u64"));
+    }
+
+    /// シグネチャ比較用の変更行は、同じファイルの最後の区間だけを使う (最後の区間が空でも集め直す)。
+    /// 識別子の出現は全区間から探す。削除ファイル (`+++ /dev/null`) の行は直前の対象に混ぜない。
+    #[test]
+    fn changed_line_texts_use_the_last_section_but_identifier_search_uses_all() {
+        let reappearing = concat!(
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-fn a() {}\n",
+            "+fn a(x: u8) {}\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+        );
+        assert_eq!(
+            collect_changed_line_texts(reappearing, "a.rs"),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        assert!(is_symbol_in_changed_lines(
+            reappearing,
+            "a.rs",
+            "a",
+            LangId::Rust
+        ));
+
+        let with_deleted_file = concat!(
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-fn a() {}\n",
+            "+fn a(x: u8) {}\n",
+            "--- a/gone.rs\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n",
+            "-fn gone() {}\n",
+        );
+        assert_eq!(
+            collect_changed_line_texts(with_deleted_file, "a.rs"),
+            (
+                vec!["fn a() {}".to_string()],
+                vec!["fn a(x: u8) {}".to_string()]
+            )
+        );
+        assert!(!is_symbol_in_changed_lines(
+            with_deleted_file,
+            "a.rs",
+            "gone",
+            LangId::Rust
+        ));
+
+        // CRLF の `\r` は落とし、改行の無い末尾の `\r` は残す (`str::lines` と同じ)。
+        let trailing_cr = "--- a/r.rs\n+++ b/r.rs\n@@ -1 +1 @@\n-old\r\n+new\r";
+        assert_eq!(
+            collect_changed_line_texts(trailing_cr, "r.rs"),
+            (vec!["old".to_string()], vec!["new\r".to_string()])
+        );
     }
 }

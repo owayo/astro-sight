@@ -606,15 +606,13 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
         .extend(compatible.into_iter().map(|change| ApiSymbolChange {
             change_evidence: change.change_evidence,
             inline_module: change.inline_module,
-            unverified: None,
-            name: change.name,
-            kind: change.kind,
-            file: change.file,
-            old_signature: change.old_signature,
-            new_signature: change.new_signature,
-            reference_evidence: None,
-            no_resolved_internal_callers: false,
-            contract_change: None,
+            ..ApiSymbolChange::new(
+                change.name,
+                change.kind,
+                change.file,
+                change.old_signature,
+                change.new_signature,
+            )
         }));
     let dead = std::mem::take(&mut api.removed_dead);
     api.removed.extend(dead);

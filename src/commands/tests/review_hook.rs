@@ -2721,3 +2721,134 @@ fn build_review_hook_json_blocks_incomplete_rust_reexports() {
     );
     assert!(build.is_blocking, "探し切れなければ hook を止める: {value}");
 }
+
+/// 打ち切りの理由ごとの `trunc[].r` の文字列と、hook を止める理由を固定する (Stop hook の JSON 契約)。
+/// 期待値はモデルの serde から作らず、文字列で書く。止めるのは API の判定を確かめられない 4 種類だけ。
+#[test]
+fn hook_truncation_reasons_have_fixed_keys_and_stop_categories() {
+    use crate::models::truncation::{TruncationInfo, TruncationReason};
+    let reasons = [
+        (TruncationReason::DiffBaseMismatch, "diff_base_mismatch"),
+        (TruncationReason::ParseErrorRegion, "parse_error_region"),
+        (
+            TruncationReason::UntrackedFileTooLarge,
+            "untracked_file_too_large",
+        ),
+        (TruncationReason::UnanalyzableSource, "unanalyzable_source"),
+        (
+            TruncationReason::StagedSnapshotUnavailable,
+            "staged_snapshot_unavailable",
+        ),
+        (
+            TruncationReason::SourceAnalysisFailed,
+            "source_analysis_failed",
+        ),
+        (
+            TruncationReason::TsExtensionProofUnavailable,
+            "ts_extension_proof_unavailable",
+        ),
+        (
+            TruncationReason::GeneratedDetectionUnavailable,
+            "generated_detection_unavailable",
+        ),
+        (
+            TruncationReason::TsStripInternalUnavailable,
+            "ts_strip_internal_unavailable",
+        ),
+        (
+            TruncationReason::RustDependentsIncomplete,
+            "rust_dependents_incomplete",
+        ),
+        (
+            TruncationReason::RustModuleAvailabilityIncomplete,
+            "rust_module_availability_incomplete",
+        ),
+        (
+            TruncationReason::RustReexportsIncomplete,
+            "rust_reexports_incomplete",
+        ),
+    ];
+    let stopping = [
+        ("diff_base_mismatch", "api.diff_base_mismatch"),
+        (
+            "rust_dependents_incomplete",
+            "api.rust_dependents_incomplete",
+        ),
+        (
+            "rust_module_availability_incomplete",
+            "api.rust_module_availability_incomplete",
+        ),
+        ("rust_reexports_incomplete", "api.rust_reexports_incomplete"),
+    ];
+    for (reason, key) in reasons {
+        let result = ReviewResult {
+            truncations: vec![TruncationInfo::new(
+                Some("a.rs".into()),
+                reason,
+                "msg".into(),
+            )],
+            ..Default::default()
+        };
+        let build = build_review_hook_json(&result, ".", false);
+        let value = build.value.expect("打ち切りは hook でも申告する");
+        assert_eq!(
+            value["trunc"],
+            serde_json::json!([{"f": "a.rs", "r": key}]),
+            "{key}"
+        );
+        let expected: Vec<&str> = stopping
+            .iter()
+            .filter(|(stopping_key, _)| *stopping_key == key)
+            .map(|(_, category)| *category)
+            .collect();
+        assert_eq!(
+            value["blocking_categories"],
+            serde_json::json!(expected),
+            "{key}"
+        );
+        assert_eq!(build.is_blocking, !expected.is_empty(), "{key}");
+    }
+
+    // 全理由を逆順に 2 件ずつ並べても、停止カテゴリは enum の順に重複なく並び、`trunc` は入力の順を保つ。
+    let all = ReviewResult {
+        truncations: reasons
+            .iter()
+            .rev()
+            .flat_map(|(reason, _)| {
+                [
+                    TruncationInfo::new(None, *reason, "m".into()),
+                    TruncationInfo::new(None, *reason, "m".into()),
+                ]
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let value = build_review_hook_json(&all, ".", false)
+        .value
+        .expect("打ち切りは hook でも申告する");
+    assert_eq!(
+        value["blocking_categories"],
+        serde_json::json!([
+            "api.diff_base_mismatch",
+            "api.rust_dependents_incomplete",
+            "api.rust_module_availability_incomplete",
+            "api.rust_reexports_incomplete"
+        ])
+    );
+    let keys: Vec<&str> = value["trunc"]
+        .as_array()
+        .expect("trunc は配列")
+        .iter()
+        .map(|entry| {
+            // パスの無い打ち切りでは `f` を省く。
+            assert!(entry.get("f").is_none(), "{entry}");
+            entry["r"].as_str().expect("r は文字列")
+        })
+        .collect();
+    let expected_keys: Vec<&str> = reasons
+        .iter()
+        .rev()
+        .flat_map(|(_, key)| [*key, *key])
+        .collect();
+    assert_eq!(keys, expected_keys);
+}

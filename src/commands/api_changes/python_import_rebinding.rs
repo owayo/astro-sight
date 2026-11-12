@@ -236,20 +236,18 @@ pub(super) fn partition(
             });
         } else {
             buckets.modified.push(ApiSymbolChange {
-                change_evidence: None,
-                reference_evidence: None,
-                name: candidate.name,
                 inline_module: candidate.inline_module,
-                kind: candidate.kind,
-                file: candidate.file,
-                old_signature: Some(candidate.signature),
-                new_signature: Some(new_signature),
-                no_resolved_internal_callers: false,
-                contract_change: None,
                 unverified: Some(ApiModificationUnverified {
                     reason: ApiModificationUnverifiedReason::PythonImportRebindingUnverified,
                     first_unproven: None,
                 }),
+                ..ApiSymbolChange::new(
+                    candidate.name,
+                    candidate.kind,
+                    candidate.file,
+                    Some(candidate.signature),
+                    Some(new_signature),
+                )
             });
         }
         rebindings.push(evidence);

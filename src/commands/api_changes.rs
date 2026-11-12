@@ -986,6 +986,7 @@ pub(crate) fn fill_modification_diagnostics(changes: &mut [ApiSymbolChange]) {
 }
 
 pub(crate) mod added_reference_summary;
+mod candidate;
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
@@ -1064,6 +1065,7 @@ mod ts_module_paths;
 mod ts_signature;
 mod type_dependency_symbols;
 
+pub(crate) use candidate::ApiSymbolCandidate;
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
 pub(crate) use impact_compatibility::compatible_impact_names;

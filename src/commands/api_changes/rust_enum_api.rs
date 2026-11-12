@@ -35,13 +35,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::ops::ControlFlow;
 
 use tree_sitter::Node;
 
 use super::rust_cfg_predicate::*;
 use super::rust_type_api::*;
-use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
 /// 整数の表現 (`repr(u8)` など)。
 const INTEGER_REPRS: [&str; 12] = [
@@ -934,27 +932,6 @@ pub(crate) fn classify(
     change
 }
 
-/// ファイルの中の、名前が `name` の `enum_item` (入れ子の module の中も)。
-pub(crate) fn enum_items_named<'tree>(
-    root: Node<'tree>,
-    source: &[u8],
-    name: &str,
-) -> Vec<Node<'tree>> {
-    let mut found = Vec::new();
-    let _ = walk_preorder(root, Children::Named, |node, _| {
-        if node.kind() == "enum_item"
-            && node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                == Some(name)
-        {
-            found.push(node);
-        }
-        ControlFlow::<(), Walk>::Continue(Walk::Descend)
-    });
-    found
-}
-
 /// シンボル `sym` の enum の公開の形の signature。形を読めない enum は、前に付いた属性と宣言全体の
 /// 空白を詰めた字面にする (どの変更も signature に現れ、判定で blocking に残る)。enum を特定
 /// できなければ None (呼び出し側は従来の先頭行に戻る)。
@@ -980,7 +957,7 @@ pub(crate) fn enum_signature(
 /// ソースの中で名前が `name` の enum が 1 つだけなら、その公開の形。
 pub(crate) fn unique_enum_shape(source: &[u8], name: &str) -> Option<RustEnumShape> {
     let tree = crate::engine::parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    let items = enum_items_named(tree.root_node(), source, name);
+    let items = rust_items_named(tree.root_node(), source, "enum_item", name);
     let [item] = items.as_slice() else {
         return None;
     };

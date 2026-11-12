@@ -38,13 +38,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::ops::ControlFlow;
 
 use tree_sitter::Node;
 
 use super::rust_cfg_predicate::*;
 use super::rust_type_api::*;
-use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
 /// union 1 つの公開の形。
 #[derive(Clone, Debug)]
@@ -428,27 +426,6 @@ pub(crate) fn classify(
     change
 }
 
-/// ファイルの中の、名前が `name` の `union_item` (入れ子の module の中も)。
-pub(crate) fn union_items_named<'tree>(
-    root: Node<'tree>,
-    source: &[u8],
-    name: &str,
-) -> Vec<Node<'tree>> {
-    let mut found = Vec::new();
-    let _ = walk_preorder(root, Children::Named, |node, _| {
-        if node.kind() == "union_item"
-            && node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                == Some(name)
-        {
-            found.push(node);
-        }
-        ControlFlow::<(), Walk>::Continue(Walk::Descend)
-    });
-    found
-}
-
 /// シンボル `sym` の union の公開の形の signature。形を読めない union は、前に付いた属性と宣言全体の
 /// 空白を詰めた字面にする (どの変更も signature に現れ、判定で blocking に残る)。union を特定
 /// できなければ None (呼び出し側は従来の先頭行に戻る)。
@@ -474,7 +451,7 @@ pub(crate) fn union_signature(
 /// ソースの中で名前が `name` の union が 1 つだけなら、その公開の形。
 pub(crate) fn unique_union_shape(source: &[u8], name: &str) -> Option<RustUnionShape> {
     let tree = crate::engine::parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    let items = union_items_named(tree.root_node(), source, name);
+    let items = rust_items_named(tree.root_node(), source, "union_item", name);
     let [item] = items.as_slice() else {
         return None;
     };

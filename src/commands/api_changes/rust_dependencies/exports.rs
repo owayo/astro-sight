@@ -291,34 +291,69 @@ fn attribute_applies(node: tree_sitter::Node<'_>, source: &[u8], name: &str) -> 
 }
 
 /// `cfg_attr` の引数の字句の木 `arguments` (`(条件, 属性, ..)`) の、条件の後ろの属性に `name` があるか
-/// (入れ子の `cfg_attr` も)。属性は、最上位の `,` の字句で分ける。
+/// (入れ子の `cfg_attr` も)。属性は、最上位の `,` の字句で分ける。入れ子の `cfg_attr` は明示的な
+/// スタックで辿る (深い入れ子でコールスタックを溢れさせない)。辿る順は再帰と同じく、書いた順に
+/// 属性を調べ、入れ子の `cfg_attr` は見つけた位置で先に調べて、最初に付けると分かった時点で終える。
 fn cfg_attr_applies(arguments: tree_sitter::Node<'_>, source: &[u8], name: &str) -> bool {
-    let mut cursor = arguments.walk();
-    let tokens: Vec<tree_sitter::Node<'_>> = arguments
-        .children(&mut cursor)
-        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
-        .collect();
-    // 最初と最後の字句は括弧。
-    let inner = tokens
-        .get(1..tokens.len().saturating_sub(1))
-        .unwrap_or_default();
+    cfg_attr_applies_visiting(arguments, source, name, |_| {})
+}
+
+/// [`cfg_attr_applies`] の本体。`visit` は、調べる `cfg_attr` の引数の字句の木を調べる順に受け取る
+/// (テストで辿る順と短絡を確かめる)。
+fn cfg_attr_applies_visiting<'tree>(
+    arguments: tree_sitter::Node<'tree>,
+    source: &[u8],
+    name: &str,
+    mut visit: impl FnMut(tree_sitter::Node<'tree>),
+) -> bool {
     let text = |node: &tree_sitter::Node<'_>| unraw(node.utf8_text(source).unwrap_or_default());
-    inner
-        .split(|token| token.kind() == ",")
-        .skip(1)
-        .any(|attribute| match attribute {
-            [path, rest @ ..] if path.kind() == "identifier" && text(path) == name => rest
-                .first()
-                .is_none_or(|next| matches!(next.kind(), "token_tree" | "=")),
+    /// `cfg_attr` の引数の、条件の後ろの属性 (書いた順の逆に積み、末尾から取り出す)。
+    fn attributes(arguments: tree_sitter::Node<'_>) -> Vec<Vec<tree_sitter::Node<'_>>> {
+        let mut cursor = arguments.walk();
+        let tokens: Vec<tree_sitter::Node<'_>> = arguments
+            .children(&mut cursor)
+            .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+            .collect();
+        // 最初と最後の字句は括弧。
+        let inner = tokens
+            .get(1..tokens.len().saturating_sub(1))
+            .unwrap_or_default();
+        let mut attributes: Vec<Vec<tree_sitter::Node<'_>>> = inner
+            .split(|token| token.kind() == ",")
+            .skip(1)
+            .map(<[tree_sitter::Node<'_>]>::to_vec)
+            .collect();
+        attributes.reverse();
+        attributes
+    }
+    visit(arguments);
+    let mut pending = vec![attributes(arguments)];
+    while let Some(frame) = pending.last_mut() {
+        let Some(attribute) = frame.pop() else {
+            pending.pop();
+            continue;
+        };
+        match attribute.as_slice() {
+            [path, rest @ ..] if path.kind() == "identifier" && text(path) == name => {
+                if rest
+                    .first()
+                    .is_none_or(|next| matches!(next.kind(), "token_tree" | "="))
+                {
+                    return true;
+                }
+            }
             [path, nested, ..]
                 if path.kind() == "identifier"
                     && text(path) == "cfg_attr"
                     && nested.kind() == "token_tree" =>
             {
-                cfg_attr_applies(*nested, source, name)
+                visit(*nested);
+                pending.push(attributes(*nested));
             }
-            _ => false,
-        })
+            _ => {}
+        }
+    }
+    false
 }
 
 /// 節 `node` の中に、字面が `name` の字句 (葉) があるか。
@@ -353,30 +388,26 @@ fn inner_macro_use(body: tree_sitter::Node<'_>, source: &[u8]) -> Option<String>
 /// なら空白 1 つを挟む (`docs!(en r"x")` の `en` と `r"x"` を 1 つにしない)。字句は tree-sitter の読みのまま
 /// (文字列・raw 文字列・文字は 1 つの字句)。
 fn attribute_text(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
-    fn token(text: &str, out: &mut String) {
-        let word = |c: char| c.is_alphanumeric() || c == '_';
-        if out.chars().next_back().is_some_and(word) && text.chars().next().is_some_and(word) {
-            out.push(' ');
-        }
-        out.push_str(text);
-    }
-    fn walk(node: tree_sitter::Node<'_>, source: &[u8], out: &mut String) {
-        match node.kind() {
-            "line_comment" | "block_comment" => {}
-            "string_literal" | "raw_string_literal" | "char_literal" => {
-                token(node.utf8_text(source).unwrap_or_default(), out);
-            }
-            _ if node.child_count() == 0 => token(node.utf8_text(source).unwrap_or_default(), out),
-            _ => {
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    walk(child, source, out);
-                }
-            }
-        }
-    }
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    let word = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = String::new();
-    walk(node, source, &mut out);
+    let _ = walk_preorder(node, Children::All, |current, _| {
+        let (token, action) = match current.kind() {
+            "line_comment" | "block_comment" => (None, Walk::Skip),
+            "string_literal" | "raw_string_literal" | "char_literal" => (Some(current), Walk::Skip),
+            _ if current.child_count() == 0 => (Some(current), Walk::Skip),
+            _ => (None, Walk::Descend),
+        };
+        if let Some(token) = token {
+            let text = token.utf8_text(source).unwrap_or_default();
+            if out.chars().next_back().is_some_and(word) && text.chars().next().is_some_and(word) {
+                out.push(' ');
+            }
+            out.push_str(text);
+        }
+        ControlFlow::<(), Walk>::Continue(action)
+    });
     out
 }
 
@@ -1312,5 +1343,138 @@ pub(crate) fn reexport_change(
             imports,
             declarations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attribute_applies, attribute_text, cfg_attr_applies_visiting};
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use crate::language::LangId;
+    use std::ops::ControlFlow;
+
+    /// `source` を Rust として読み、最初の属性の節 (`attribute_item`) を `check` に渡す。
+    fn with_first_attribute(source: &[u8], check: impl FnOnce(tree_sitter::Node<'_>)) {
+        let tree = crate::engine::parser::parse_source(source, LangId::Rust).expect("parse");
+        let found = walk_preorder(tree.root_node(), Children::Named, |node, _| {
+            if node.kind() == "attribute_item" {
+                ControlFlow::Break(node)
+            } else {
+                ControlFlow::Continue(Walk::Descend)
+            }
+        });
+        let ControlFlow::Break(attribute) = found else {
+            panic!("attribute_item が無い");
+        };
+        check(attribute);
+    }
+
+    /// 浅い入れ子では、`cfg_attr` の判定と属性の字面は従来どおり。字面はコメントを除いて字句を詰め、
+    /// 語の文字どうしの境にだけ空白を挟む。
+    #[test]
+    fn attribute_helpers_keep_results_for_shallow_attributes() {
+        let nested = b"#[cfg_attr(feature = \"x\", /* c */ cfg_attr(unix, macro_use))]\nmod m;\n";
+        with_first_attribute(nested, |attribute| {
+            assert_eq!(
+                attribute_applies(attribute, nested, "macro_use"),
+                Some(true)
+            );
+            assert_eq!(attribute_applies(attribute, nested, "macro_export"), None);
+            assert_eq!(
+                attribute_text(attribute, nested),
+                "#[cfg_attr(feature=\"x\",cfg_attr(unix,macro_use))]"
+            );
+        });
+        let direct = b"#[macro_use]\nmod m;\n";
+        with_first_attribute(direct, |attribute| {
+            assert_eq!(
+                attribute_applies(attribute, direct, "macro_use"),
+                Some(false)
+            );
+            assert_eq!(attribute_text(attribute, direct), "#[macro_use]");
+        });
+        let words = b"#[doc(en r\"x\")]\nfn f() {}\n";
+        with_first_attribute(words, |attribute| {
+            assert_eq!(attribute_text(attribute, words), "#[doc(en r\"x\")]");
+        });
+        // 兄弟の入れ子の `cfg_attr` は書いた順に深さ優先で調べ、付けると分かった時点で終える
+        // (後ろの兄弟は調べない)。どの兄弟の中にある属性も見つける。
+        let siblings = b"#[cfg_attr(all(),\n    cfg_attr(all(), macro_use),\n    cfg_attr(all(), cfg_attr(all(), allow(dead_code)), cfg_attr(all(), allow(dead_code)))\n)]\nmod m {}\n";
+        with_first_attribute(siblings, |attribute| {
+            assert_eq!(
+                attribute_applies(attribute, siblings, "macro_use"),
+                Some(true)
+            );
+            assert_eq!(attribute_applies(attribute, siblings, "allow"), Some(true));
+            assert_eq!(attribute_applies(attribute, siblings, "macro_export"), None);
+        });
+    }
+
+    /// 入れ子の `cfg_attr` は書いた順の深さ優先で調べ、付けると分かった時点で終える。`macro_use` は
+    /// 外側と最初の入れ子だけを調べ、後ろの兄弟とその入れ子へは進まない (後ろの兄弟から先に辿ると、
+    /// 兄弟の入れ子の数に比例して走査が増える)。後ろの入れ子の中の名前は、書いた順に辿って見つける。
+    #[test]
+    fn cfg_attr_search_is_depth_first_in_written_order_and_stops_early() {
+        let source = b"#[cfg_attr(all(),\n    cfg_attr(all(), macro_use),\n    cfg_attr(all(), cfg_attr(all(), allow(dead_code)), cfg_attr(all(), allow(dead_code)))\n)]\nmod m {}\n";
+        with_first_attribute(source, |attribute| {
+            let mut cursor = attribute.walk();
+            let arguments = attribute
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "attribute")
+                .and_then(|attribute| attribute.child_by_field_name("arguments"))
+                .expect("cfg_attr の引数");
+            let position = |node: tree_sitter::Node<'_>| {
+                let point = node.start_position();
+                (point.row, point.column)
+            };
+            let mut visited = Vec::new();
+            assert!(cfg_attr_applies_visiting(
+                arguments,
+                source,
+                "macro_use",
+                |node| visited.push(position(node))
+            ));
+            assert_eq!(visited, vec![(0, 10), (1, 12)]);
+            let mut visited = Vec::new();
+            assert!(cfg_attr_applies_visiting(
+                arguments,
+                source,
+                "allow",
+                |node| visited.push(position(node))
+            ));
+            assert_eq!(visited, vec![(0, 10), (1, 12), (2, 12), (2, 28)]);
+        });
+    }
+
+    /// 深く入れ子にした `cfg_attr` (字句の木) でも、`cfg_attr` の判定と属性の字面がコールスタックを
+    /// 溢れさせない (小さいスタックの子プロセスで確かめる)。
+    #[test]
+    fn attribute_helpers_handle_deeply_nested_attributes() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "attribute_helpers_handle_deeply_nested_attributes",
+            || {
+                const DEPTH: usize = 5_000;
+                let source = format!(
+                    "#[{}macro_use{}]\nmod m;\n",
+                    "cfg_attr(a, ".repeat(DEPTH),
+                    ")".repeat(DEPTH)
+                );
+                with_first_attribute(source.as_bytes(), |attribute| {
+                    assert_eq!(
+                        attribute_applies(attribute, source.as_bytes(), "macro_use"),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        attribute_text(attribute, source.as_bytes()),
+                        format!(
+                            "#[{}macro_use{}]",
+                            "cfg_attr(a,".repeat(DEPTH),
+                            ")".repeat(DEPTH)
+                        )
+                    );
+                });
+            },
+        );
     }
 }
