@@ -37,6 +37,7 @@ TODO comments, and filename discovery.
 | Definitions and complexity | `astro-sight symbols --path <file>` |
 | Complexity, dependency cycles, CCD, ACD and propagation cost | `astro-sight metrics --dir .` |
 | Architecture metrics grouped by directory | `astro-sight metrics --dir . --component directory --component-depth 2` |
+| Metrics compared against a Git commit | `astro-sight metrics --dir . --base HEAD` |
 | Directory inventory | `astro-sight symbols --dir <dir>` |
 | Calls made by a function | `astro-sight calls --path <file> --function <name>` |
 | Imports and exports | `astro-sight imports --path <file>` |
@@ -214,10 +215,24 @@ Internal edges are removed and coupling/cycles recalculated after grouping.
 `files` / `file_edges` preserve file detail. CD includes self, CCD sums CD,
 ACD = CCD/N, and propagation cost = CCD/N² (all 0 for empty input).
 Dependencies are static local imports with bounded language/resolution coverage,
-not compiler-verified bindings. Read `unresolved_dependencies`, `diagnostics`,
-`truncations`, `skipped`, and `limitations`; an empty `cycles` does not prove the
-project acyclic. `--glob` narrows the graph inventory. Session accepts
-`{"command":"metrics","dir":".","component":"directory","component_depth":2}`;
+not compiler-verified bindings. Rust uses declared module ownership and literal
+`#[path]`; JS/TS supports selected `baseUrl` / `paths` and relative `extends`
+rules. Read `resolution_summary`, `external_dependencies`,
+`unresolved_dependencies`, `diagnostics`, `truncations`, `skipped`, and
+`limitations`; an empty `cycles` does not prove the project acyclic. Edge
+`evidence` retains source files and zero-based lines; `cycle_evidence` gives one
+real representative path per SCC, not all cycles or necessarily all its members.
+
+`--base <rev>` remeasures a raw commit snapshot with the same options and compares
+it with the working tree, including selected untracked files. Inspect the full
+`comparison.baseline`, `delta`, `normalization_changed` (N), `coverage_changed`,
+and `assessment`; partial coverage or a changed denominator can change ACD/PC
+without establishing improvement. Cycle-group differences compare SCC member
+sets. Function changes retain ambiguous name groups rather than guessing overload
+identity. Snapshot budget/path failures are errors; omitted links/submodules are
+diagnosed. `--glob` narrows the graph inventory and metadata is read only inside
+`--dir`. Session accepts
+`{"command":"metrics","dir":".","component":"directory","component_depth":2,"base":"HEAD"}`;
 MCP exposes `metrics_analyze` with the same options.
 
 For multiple queries, send one JSON request per line to `session`. Each response

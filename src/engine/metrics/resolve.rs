@@ -9,10 +9,18 @@ use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::language::LangId;
 use crate::models::metrics::MetricsDiagnostic;
 
+pub(super) struct ResolutionIndex {
+    pub rust: super::rust_modules::RustModules,
+    pub javascript: super::js_config::JsConfigs,
+}
+
 pub(super) struct Dependency {
     pub source: String,
     pub line: usize,
     pub tiers: Vec<Vec<String>>,
+    pub kind: String,
+    pub rule: &'static str,
+    pub failure: &'static str,
 }
 
 impl Dependency {
@@ -26,7 +34,7 @@ impl Dependency {
                 return Ok(id);
             }
         }
-        Err("external_or_unresolved")
+        Err(self.failure)
     }
 }
 
@@ -36,10 +44,17 @@ pub(super) fn extract(
     lang: LangId,
     path: &str,
     paths: &BTreeMap<String, usize>,
+    index: &ResolutionIndex,
     diagnostics: &mut Vec<MetricsDiagnostic>,
 ) -> anyhow::Result<Vec<Dependency>> {
     if lang == LangId::Rust {
-        return Ok(rust_dependencies(root, source, path, paths, diagnostics));
+        return Ok(rust_dependencies(
+            root,
+            source,
+            path,
+            &index.rust,
+            diagnostics,
+        ));
     }
     let supported = match lang {
         LangId::Javascript
@@ -69,6 +84,9 @@ pub(super) fn extract(
                 source: import.source,
                 line: import.line,
                 tiers: Vec::new(),
+                kind: format!("{:?}", import.kind).to_lowercase(),
+                rule: "unsupported_language",
+                failure: "unsupported_language",
             })
             .collect());
     }
@@ -117,14 +135,14 @@ pub(super) fn extract(
     let mut dependencies = Vec::new();
     for import in imports {
         let target = import.source.as_str();
+        let javascript = matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx);
+        let (js_tiers, js_rule, js_failure) = if javascript {
+            index.javascript.candidates(path, target, lang)
+        } else {
+            (Vec::new(), "static_local_import", "external_or_unresolved")
+        };
         let tiers = match lang {
-            LangId::Javascript | LangId::Typescript | LangId::Tsx => {
-                if !(target.starts_with("./") || target.starts_with("../")) {
-                    Vec::new()
-                } else {
-                    js_candidates(&join(&parent, target), lang)
-                }
-            }
+            LangId::Javascript | LangId::Typescript | LangId::Tsx => js_tiers,
             LangId::Python => python_candidates(&parent, target),
             LangId::C | LangId::Cpp => {
                 if import.context.contains('"') && !target.contains(['\n', '$']) {
@@ -167,6 +185,13 @@ pub(super) fn extract(
             source: import.source,
             line: import.line,
             tiers,
+            kind: if import.context.trim_start().starts_with("export") {
+                "reexport".into()
+            } else {
+                format!("{:?}", import.kind).to_lowercase()
+            },
+            rule: js_rule,
+            failure: js_failure,
         });
     }
     // `from . import child` の child は package initializer と別の依存先になり得る。
@@ -192,6 +217,9 @@ pub(super) fn extract(
                             source: target,
                             line: node.start_position().row,
                             tiers,
+                            kind: "import".into(),
+                            rule: "python_module",
+                            failure: "external_or_unresolved",
                         });
                     }
                 }
@@ -202,7 +230,7 @@ pub(super) fn extract(
     Ok(dependencies)
 }
 
-fn js_candidates(base: &str, lang: LangId) -> Vec<Vec<String>> {
+pub(super) fn js_candidates(base: &str, lang: LangId) -> Vec<Vec<String>> {
     let exact = vec![base.to_string()];
     let typescript = matches!(lang, LangId::Typescript | LangId::Tsx);
     if typescript && let Some(stem) = base.strip_suffix(".js") {
@@ -258,44 +286,23 @@ fn rust_dependencies(
     root: Node<'_>,
     source: &[u8],
     path: &str,
-    paths: &BTreeMap<String, usize>,
+    index: &super::rust_modules::RustModules,
     diagnostics: &mut Vec<MetricsDiagnostic>,
 ) -> Vec<Dependency> {
-    let mut crate_dir = parent(path);
-    loop {
-        if paths.contains_key(&join(&crate_dir, "lib.rs"))
-            || paths.contains_key(&join(&crate_dir, "main.rs"))
-        {
-            break;
-        }
-        if crate_dir.is_empty() {
-            crate_dir = parent(path);
-            diagnostics.push(diagnostic(
-                path,
-                None,
-                "rust_crate_root_unverified",
-                "No lib.rs/main.rs in the selected ancestors; crate-root imports may be unresolved"
-                    .into(),
-            ));
-            break;
-        }
-        crate_dir = parent(&crate_dir);
-    }
-    let relative = path.strip_prefix(&format!("{crate_dir}/")).unwrap_or(path);
-    let mut module: Vec<String> = relative
-        .trim_end_matches(".rs")
-        .split('/')
-        .map(str::to_string)
-        .collect();
-    if module
-        .last()
-        .is_some_and(|s| matches!(s.as_str(), "lib" | "main" | "mod"))
-    {
-        module.pop();
-    }
+    let context = index.context(path);
+    let mut module = context
+        .map(|context| context.module.clone())
+        .unwrap_or_default();
     let mut scopes = Vec::new();
+    let mut lexical_scopes = Vec::new();
     let mut out = Vec::new();
     let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+        while lexical_scopes.last().is_some_and(|&d| d >= depth) {
+            lexical_scopes.pop();
+        }
+        if node.kind() == "block" {
+            lexical_scopes.push(depth);
+        }
         while scopes.last().is_some_and(|&(d, _)| d >= depth) {
             let (_, len) = scopes.pop().unwrap();
             module.truncate(len);
@@ -303,23 +310,38 @@ fn rust_dependencies(
         if node.kind() == "mod_item"
             && let Some(name) = node.child_by_field_name("name")
         {
-            let name = text(name, source);
+            let name = text(name, source)
+                .strip_prefix("r#")
+                .unwrap_or(text(name, source));
             if node.child_by_field_name("body").is_some() {
                 scopes.push((depth, module.len()));
                 module.push(name.to_string());
             } else {
                 let mut target = module.clone();
                 target.push(name.to_string());
+                let targets = context
+                    .filter(|_| lexical_scopes.is_empty())
+                    .map(|context| index.module(context, &target))
+                    .unwrap_or_default();
                 out.push(Dependency {
                     source: format!("mod {name}"),
                     line: node.start_position().row,
-                    tiers: if has_custom_module_path(node, source) {
-                        Vec::new()
-                    } else {
-                        vec![rust_module_candidates(&crate_dir, &target)]
-                    },
+                    tiers: (!targets.is_empty())
+                        .then_some(targets)
+                        .into_iter()
+                        .collect(),
+                    kind: "module".into(),
+                    rule: "rust_module_declaration",
+                    failure: "rust_module_unresolved",
                 });
             }
+        } else if node.kind() == "extern_crate_declaration" {
+            diagnostics.push(diagnostic(
+                path,
+                Some(node.start_position().row),
+                "rust_extern_crate_unverified",
+                "Extern crate bindings are not resolved by metrics".into(),
+            ));
         } else if node.kind() == "use_declaration"
             && let Some(argument) = node.child_by_field_name("argument")
         {
@@ -343,7 +365,7 @@ fn rust_dependencies(
                 ));
             }
             for edge in edges {
-                let anchored = edge.origin() == UsePathOrigin::Anchored;
+                let origin = edge.origin();
                 let (mut target, item) = match edge {
                     RustPubUseEdge::Named {
                         target_module,
@@ -355,82 +377,73 @@ fn rust_dependencies(
                 if let Some(item) = item {
                     target.push(item);
                 }
-                let mut tiers = Vec::new();
-                // bare imports は extern prelude / alias と区別できないため確定しない。
-                if anchored {
-                    for length in (1..=target.len()).rev() {
-                        tiers.push(rust_module_candidates(&crate_dir, &target[..length]));
-                    }
-                    if target.is_empty() {
-                        tiers.push(vec![
-                            join(&crate_dir, "lib.rs"),
-                            join(&crate_dir, "main.rs"),
-                        ]);
-                    }
+                for segment in &mut target {
+                    *segment = segment.strip_prefix("r#").unwrap_or(segment).to_string();
                 }
+                let mut current = context.cloned();
+                if let Some(current) = &mut current {
+                    current.module.clone_from(&module);
+                }
+                let (targets, rule) = match current.as_ref() {
+                    // ブロック内の束縛はモジュールの索引だけでは証明できない。
+                    _ if !lexical_scopes.is_empty() => {
+                        (Vec::new(), "rust_lexical_scope_unverified")
+                    }
+                    Some(context) if origin == UsePathOrigin::Anchored => (
+                        index.lookup(context, &target).unwrap_or_default(),
+                        "rust_module_index",
+                    ),
+                    Some(context) if origin == UsePathOrigin::Global => {
+                        let mut global = context.clone();
+                        global.module = vec!["<extern-prelude>".into()];
+                        index.bare(&global, path, &target)
+                    }
+                    Some(context) => index.bare(context, path, &target),
+                    None => (Vec::new(), "rust_module_context_unverified"),
+                };
                 out.push(Dependency {
                     source: text(argument, source).into(),
                     line: node.start_position().row,
-                    tiers,
+                    tiers: (!targets.is_empty())
+                        .then_some(targets)
+                        .into_iter()
+                        .collect(),
+                    kind: "use".into(),
+                    rule,
+                    failure: match rule {
+                        "external"
+                        | "rust_lexical_scope_unverified"
+                        | "rust_module_context_unverified" => rule,
+                        _ => "rust_binding_unresolved",
+                    },
                 });
             }
         }
-        if node.kind() == "attribute"
-            && node
-                .named_child(0)
-                .is_some_and(|name| text(name, source) == "path")
-        {
-            diagnostics.push(diagnostic(
-                path,
-                Some(node.start_position().row),
-                "rust_path_attribute_unresolved",
-                "Custom module paths are not resolved; conventional module paths may be incomplete"
-                    .into(),
-            ));
-        }
         ControlFlow::Continue(Walk::Descend)
     });
+    if context.is_none() && !out.is_empty() {
+        diagnostics.push(diagnostic(
+            path,
+            None,
+            "rust_module_context_unverified",
+            "The file has no unique declared module owner in the selected scope".into(),
+        ));
+    }
     out
 }
 
-fn has_custom_module_path(node: Node<'_>, source: &[u8]) -> bool {
-    let mut previous = node.prev_named_sibling();
-    while let Some(attribute) = previous {
-        match attribute.kind() {
-            "attribute_item" => {
-                if attribute
-                    .named_child(0)
-                    .and_then(|attr| attr.named_child(0))
-                    .is_some_and(|name| text(name, source) == "path")
-                {
-                    return true;
-                }
-            }
-            "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        previous = attribute.prev_named_sibling();
-    }
-    false
-}
-
-fn rust_module_candidates(crate_dir: &str, module: &[String]) -> Vec<String> {
-    let base = join(crate_dir, &module.join("/"));
-    vec![format!("{base}.rs"), format!("{base}/mod.rs")]
-}
-
-fn text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
+pub(super) fn text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-fn parent(path: &str) -> String {
+pub(super) fn parent(path: &str) -> String {
     path.rsplit_once('/')
         .map(|(p, _)| p)
         .unwrap_or("")
         .to_string()
 }
 
-fn join(base: &str, target: &str) -> String {
+pub(super) fn join(base: &str, target: &str) -> String {
     if target.starts_with('/') || target.contains(['\\', ':', '$']) {
         return format!("<unresolved>/{target}");
     }

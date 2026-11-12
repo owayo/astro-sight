@@ -12,7 +12,7 @@ AGENTS.md (CLAUDE.md はこのファイルへの symlink) は、セッション�
 
 CLI (`src/cli.rs` の clap derive と `src/main.rs` のディスパッチ)、`session` (NDJSON)、`mcp` (rmcp による stdio の MCP サーバー) は、どれも `src/service.rs` の `AppService` を通してコアの処理を呼ぶ。session と MCP はワークスペースの外のパスを拒否する。主なディレクトリの役割は次のとおり。
 
-- `src/engine/` は解析エンジン。`parser.rs` が tree-sitter の Parser を言語ごとに再利用し、`query_cache.rs` がクエリのコンパイル結果を保持する。主なモジュールは `symbols/` (シンボル抽出・循環的複雑度)、`metrics/` (複雑度集計・依存グラフ・循環・ACD・伝搬コスト。ファイル／ディレクトリ単位)、`refs/` (参照検索。走査は `walker.rs` の `walk_refs` 1 本)、`impact/` (diff の影響分析)、`diff.rs` (unified diff のパーサ)、`calls.rs`、`imports.rs`、`cochange.rs`、`sequence.rs`、`lint.rs`
+- `src/engine/` は解析エンジン。`parser.rs` が tree-sitter の Parser を言語ごとに再利用し、`query_cache.rs` がクエリのコンパイル結果を保持する。主なモジュールは `symbols/` (シンボル抽出・循環的複雑度)、`metrics/` (依存解決・複雑度・グラフ指標・循環経路・基準比較。ファイル／ディレクトリ単位)、`refs/` (参照検索。走査は `walker.rs` の `walk_refs` 1 本)、`impact/` (diff の影響分析)、`diff.rs` (unified diff のパーサ)、`calls.rs`、`imports.rs`、`cochange.rs`、`sequence.rs`、`lint.rs`
 - `src/commands/` は各コマンドの実装で、`commands.rs` が入口。`api_changes/` は API 差分 (api.add / api.rm / api.mod) とその互換判定、`review/` は影響・共変更・API 差分・dead-code をまとめ、Stop hook 用の出力も作る (`--staged` は index のスナップショットを解析する)。dead-code は `dead_code.rs` と `dead_code_member_liveness/`、`--git` の差分入力は `git_input.rs`
 - `src/output/` は出力。既定は compact JSON で、`--format toon` か `--format auto` で TOON も選べる (`toon/` は TOON v4.1 の自前エンコーダ)。`limit.rs` は `refs` の出力に件数とトークン予算の上限を掛け、省いたときだけ `result_summary` で申告する。session・hook・エラー行は常に JSON
 - `src/models/` は入出力の型、`src/error.rs` はエラー (`{"error":{"code":"...","message":"..."}}` を stdout に出す)、`src/cache/` はキャッシュ (BLAKE3、`~/.cache/astro-sight/v<version>/`)、`src/config.rs` は設定 (`~/.config/astro-sight/config.toml`)、`src/git_support.rs` は git の共通処理

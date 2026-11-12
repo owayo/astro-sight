@@ -362,6 +362,7 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 astro-sight metrics --dir .
 astro-sight metrics --dir src --component directory --component-depth 2
 astro-sight metrics --dir . --glob '**/*.ts' --format toon
+astro-sight metrics --dir . --component directory --component-depth 2 --base HEAD
 ```
 
 循環的複雑度は `symbols` と同じ分岐の計上規約を使い、関数ごとの値とファイル別・全体の件数・合計・平均・最大値を返す。`symbols` が抽出しない無名関数は集計外。行番号は 0 始まり。
@@ -379,11 +380,37 @@ astro-sight metrics --dir . --glob '**/*.ts' --format toon
 
 空スコープではいずれも 0。孤立した3個なら CCD=3、ACD=1、PC=1/3、鎖 A→B→C なら CCD=6、ACD=2、PC=2/3、3個の循環なら CCD=9、PC=1。自己依存を含む定義は [Lakos 系のコンポーネント依存指標](https://blog.hello2morrow.com/2014/12/assess-and-control-component-coupling-with-sonargraph-explorer/) と [伝搬コストの可視性行列](https://www.hbs.edu/ris/Publication%20Files/05-016.pdf) を参照。
 
-依存グラフは**静的なローカル import** に基づく。Rust の慣例的な配置での anchored `use`（`crate` / `self` / `super`、グループを含む）とモジュール宣言、JS/TS/TSX の相対 import・再 export、Python のルート/`src` と相対モジュール、C/C++ の引用符付き include、Ruby の `require_relative`、Zig のファイル import を解決する。Rust の bare import・独自モジュールパス、Bash の `source` のような実行時パス、外部パッケージ、別名・検索パス設定は未解決になり得る。Go・Java・Kotlin・Swift・C#・PHP は複雑度を測定し、ローカル依存の解決は `dependency_resolution_unsupported` として申告する。条件付き宣言は有効なビルド構成を判定せず構文上の候補を含める。C/C++ のヘッダーと実装は file モードでは別コンポーネント。
+### 依存解決と解析範囲
+
+依存グラフは**静的なローカル import** に基づく。設定ファイルも `--dir` の内側だけを参照する。コンパイラやパッケージマネージャーの完全な名前解決は行わない。
+
+| 言語 | 解決する範囲 |
+| --- | --- |
+| Rust | 宣言されたモジュールの `crate` / `self` / `super` と `use` ツリー、確認できる bare import、文字列・raw 文字列の `#[path]`。慣例的なルート、Cargo の明示ターゲットと自動ターゲット、ライブラリ名・edition を参照する |
+| JS / TS / TSX | 相対 import・再 export、JSONC の `tsconfig.json` / `jsconfig.json` にある `baseUrl`・`paths`、単一の相対ファイルによる `extends`。完全一致を優先し、ワイルドカードは最長の接頭辞と配列順のフォールバックを使う |
+| Python / C・C++ / Ruby / Zig | ルート・`src` と相対モジュール／引用符付き include／`require_relative`／ファイル import |
+
+Rust の別名・glob による未確認の束縛、ブロック内の import、extern crate の束縛、複数のモジュールから共有されるファイル、条件付き `path`、不明な edition は保守的に未解決へ残す。JS/TS のパッケージ指定や複数指定の `extends`、`rootDirs`・`moduleSuffixes` は診断を返す。不正な設定やスコープ外・symlink の設定ファイルはエラーにする。Go・Java・Kotlin・Swift・C#・PHP は複雑度を測定し、依存解決は `dependency_resolution_unsupported` として申告する。Bash の `source` などの実行時パス、import を伴わない完全修飾名、ビルドの有効な cfg は評価しない。条件付き宣言は構文上の候補を含む。C/C++ のヘッダーと実装は file モードでは別コンポーネント。
+
+確認できる非ローカルの Cargo / package.json 依存と標準ライブラリ指定は `external_dependencies` に分ける。path・workspace 依存やローカルの上書きは外部と断定しない。`resolution_summary` は観測した静的 import のローカル解決・外部・未解決・曖昧の件数、動的 import、未対応・失敗ファイル数を返す。Rust のグループ展開後の指定を数えるため、重複をまとめたグラフの辺数とは異なる。`ambiguous_imports` は `unresolved_imports` の内数。`all_static_imports_resolved` は選択範囲で未解決や診断がなかったことを表し、実行時を含む完全性の保証ではない。
 
 `unresolved_dependencies` / `diagnostics` / `truncations` / `skipped` / `limitations` を読んで値を解釈する。曖昧な指定は推測で辺にしない。読取・解析失敗のファイルも一覧に残すが、そのファイルで観測できなかった複雑度や依存は値に入らない。生成物は除外して申告し、`--include-generated` で含められる。ignore 規則を尊重し、`--glob` で選択範囲を狭めた場合は範囲外の依存先が未解決となる。循環 0 件はプロジェクト全体が非循環である証明ではない。全 AST や N×N 行列を保持せず、強連結成分に縮約したグラフの到達探索を線形の作業メモリで行う。
 
-session は `{"command":"metrics","dir":"src","component":"directory","component_depth":2}`、MCP は同じオプションの `metrics_analyze` で利用できる。session は常に JSON、CLI と MCP の本文は JSON/TOON/auto に対応する。
+### 依存辺と代表循環経路の根拠
+
+`edges` / `file_edges` の `evidence` に、宣言元 `path`、0始まりの `line`、import 指定 `source`、解決先ファイル `target`、宣言の `kind`、解決規則 `resolution` を返す。同じ辺の複数の根拠を保持する。
+
+`cycle_evidence` は各強連結成分につき代表経路を1本返す（`cycle_evidence_mode: one_representative_per_scc`）。`components` は成分の全メンバー、`steps` は始点へ戻る実在の辺とその根拠で、すべてのメンバーを通るとは限らない。全単純循環の列挙ではない。ディレクトリ集約後の経路も元ファイルの根拠を保持し、各辺の宣言ファイルが異なる場合がある。
+
+### 基準コミットとの比較
+
+`--base <rev>` は解決済み SHA のソースを同じエンジン・スコープ・glob・生成物設定・コンポーネント粒度で再測定し、現在の作業ツリーと比較する。現在側は選択された未追跡ファイルも含む。`comparison` に `base_commit`、診断を含む `baseline` 全体、現在−基準の `delta`、コンポーネント・辺・強連結成分の増減を返す。辺の同一性は from/to で比較し、行の移動だけでは追加と扱わない。`function_changes` はファイル・コンテナ・名前が一意な関数の複雑度を比較し、オーバーロードなどは `pairing: ambiguous_name_and_container` として候補をまとめる。リネームは追加・削除として扱う。
+
+`normalization_changed` は N の変化を示す。ACD・PC の差は分母も合わせて読む。`coverage_changed` は未解決や診断などの観測範囲の変化を示す。どちらかに未解決や診断があれば `assessment: partial_observed_graphs` とし、数値差だけで改善と断定しない。`added_cycle_groups` / `removed_cycle_groups` は強連結成分のメンバー集合の差であり、全循環経路の増減ではない。
+
+基準の raw blob は安全な一時 Git スナップショットに書き出し、元の index・HEAD・作業ツリーを変更しない。リポジトリ全体で通常ファイル50,000件・512 MiBまでを展開し、超過や危険なパスは明示的に失敗する。基準側のソース・設定の symlink と submodule は展開せず、選択範囲の省略を診断に残す。
+
+session は `{"command":"metrics","dir":"src","component":"directory","component_depth":2,"base":"HEAD"}`、MCP は同じオプションの `metrics_analyze` で利用できる。`base` は省略可能。session は常に JSON、CLI と MCP の本文は JSON/TOON/auto に対応する。
 
 ## バッチ処理（ast, symbols, calls, imports, lint, sequence）
 

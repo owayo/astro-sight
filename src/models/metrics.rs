@@ -21,7 +21,7 @@ pub enum ComponentUnit {
     Directory,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MetricsOptions {
     /// Directory to analyze
@@ -34,6 +34,8 @@ pub struct MetricsOptions {
     pub component_depth: usize,
     /// Include generated sources
     pub include_generated: bool,
+    /// Compare the same scope against this Git commit, tag or revision
+    pub base: Option<String>,
 }
 
 impl Default for MetricsOptions {
@@ -44,11 +46,12 @@ impl Default for MetricsOptions {
             component: ComponentUnit::File,
             component_depth: 1,
             include_generated: false,
+            base: None,
         }
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct ComplexityStats {
     pub count: usize,
     pub total: usize,
@@ -65,7 +68,7 @@ impl ComplexityStats {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionComplexity {
     pub name: String,
     pub line: usize,
@@ -74,7 +77,7 @@ pub struct FunctionComplexity {
     pub complexity: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileMetrics {
     pub path: String,
     pub language: String,
@@ -90,7 +93,7 @@ pub struct FileMetrics {
     pub instability: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ComponentMetrics {
     pub path: String,
     pub files: Vec<String>,
@@ -102,7 +105,7 @@ pub struct ComponentMetrics {
     pub instability: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DependencyMetrics {
     pub component_count: usize,
     pub edge_count: usize,
@@ -113,13 +116,43 @@ pub struct DependencyMetrics {
     pub propagation_cost_percent: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DependencyEdge {
     pub from: String,
     pub to: String,
+    pub evidence: Vec<DependencyEvidence>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct DependencyEvidence {
+    pub path: String,
+    pub line: usize,
+    pub source: String,
+    pub target: String,
+    pub kind: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CycleEvidence {
+    pub components: Vec<String>,
+    pub steps: Vec<DependencyEdge>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ResolutionSummary {
+    pub static_imports: usize,
+    pub resolved_local_imports: usize,
+    pub external_imports: usize,
+    pub unresolved_imports: usize,
+    pub ambiguous_imports: usize,
+    pub dynamic_imports: usize,
+    pub unsupported_files: usize,
+    pub failed_files: usize,
+    pub all_static_imports_resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MetricsDiagnostic {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,7 +161,7 @@ pub struct MetricsDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnresolvedDependency {
     pub path: String,
     pub line: usize,
@@ -136,7 +169,7 @@ pub struct UnresolvedDependency {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MetricsResult {
     pub component_unit: ComponentUnit,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,10 +186,66 @@ pub struct MetricsResult {
     pub edges: Vec<DependencyEdge>,
     /// 強連結成分。自己 import はファイル間依存から除く。
     pub cycles: Vec<Vec<String>>,
+    pub cycle_evidence_mode: &'static str,
+    pub cycle_evidence: Vec<CycleEvidence>,
+    pub resolution_summary: ResolutionSummary,
+    pub external_dependencies: Vec<UnresolvedDependency>,
     pub unresolved_dependencies: Vec<UnresolvedDependency>,
     pub diagnostics: Vec<MetricsDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<SkippedFiles>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub truncations: Vec<TruncationInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<MetricsComparison>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsDelta {
+    pub component_count: i64,
+    pub edge_count: i64,
+    pub cyclic_component_count: i64,
+    pub ccd: i64,
+    pub acd: f64,
+    pub propagation_cost: f64,
+    pub complexity_count: i64,
+    pub complexity_total: i64,
+    pub complexity_average: f64,
+    pub complexity_max: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComponentChange {
+    pub path: String,
+    pub before: ComponentMetrics,
+    pub after: ComponentMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsComparison {
+    pub base_commit: String,
+    pub target: &'static str,
+    pub baseline: Box<MetricsResult>,
+    pub delta: MetricsDelta,
+    pub normalization_changed: bool,
+    pub coverage_changed: bool,
+    pub assessment: &'static str,
+    pub added_components: Vec<String>,
+    pub removed_components: Vec<String>,
+    pub changed_components: Vec<ComponentChange>,
+    pub function_changes: Vec<FunctionChange>,
+    pub added_edges: Vec<DependencyEdge>,
+    pub removed_edges: Vec<DependencyEdge>,
+    pub added_cycle_groups: Vec<Vec<String>>,
+    pub removed_cycle_groups: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionChange {
+    pub path: String,
+    pub name: String,
+    pub container: Option<String>,
+    pub pairing: &'static str,
+    pub before: Vec<FunctionComplexity>,
+    pub after: Vec<FunctionComplexity>,
 }

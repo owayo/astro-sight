@@ -31,17 +31,9 @@
 
 ---
 
-astro-sight は、AI エージェントがコードを編集しながら確かめたい構造の情報を返します。シンボルがどこで定義されどこで使われているか、diff が何を壊すか、公開 API のどこが変わったか、どこからも呼ばれなくなった export はどれか、に答えます。
+astro-sight は、AI エージェントがコードを編集するときに必要な構造情報を返す CLI です。識別子の定義・参照、差分の影響、公開 API の変更、デッドコード候補、複雑度と依存構造を調べられます。
 
-tree-sitter の構文木の識別子ノードだけを照合するので、`refs --name new` は `grep new` のようにコメントや文字列の中の同じ綴りを拾いません。出力の既定は compact JSON で、トークンを減らしたいときは TOON か自動選択に切り替えられます。同じ問い合わせを CLI、NDJSON の session、MCP サーバーのどれからでも実行できます。
-
-Bash / zsh の解析失敗は結果に明示する。エラー領域で識別できた宣言候補は `refs.kind: "unknown"` として返し、`review` は削除未確認の候補を確定した削除と分ける。[シェルの解析エラー](docs/diff-analysis.ja.md#シェルの解析エラー)を参照。
-
-Rust の cfg 条件判定は走査中の祖先列を再利用し、深い `use` パスで親ノードを繰り返し探索する処理を避けます。参照の位置・順序と cfg キーの除外規則は維持します。再現可能な比較方法は[性能確認](docs/development.ja.md#参照走査の性能)を参照してください。
-
-シンボル抽出では、宣言範囲の索引からメソッドの所属型を決め、大きなファイルで全メソッドと全型を比較する処理を避けます。所属の選択規則と出力順は維持します。[シンボル抽出の性能確認](docs/development.ja.md#シンボル抽出の性能)で比較方法を説明しています。
-
-TypeScript の review は、公開シグネチャから同じファイルの非公開型をたどります。型エイリアスや interface が変われば、公開ヘッダが不変でも API の変更と影響する呼び出し元を報告します。[シグネチャが参照する型](docs/diff-analysis.ja.md#typescript-のシグネチャが参照する型)を参照してください。
+tree-sitter の構文木を使い、識別子の検索ではコメントや文字列を除外します。出力は compact JSON が既定で、TOON も選べます。CLI・NDJSON session・MCP から利用できます。
 
 ## 機能
 
@@ -49,8 +41,6 @@ TypeScript の review は、公開シグネチャから同じファイルの非�
 
 - **識別子単位の参照検索**: `refs` はディレクトリ全体からシンボルの定義と参照を探し、`refs --names` は複数の名前を 1 回の走査で調べます
 - **diff の影響分析**: `context` は unified diff から、変わったシンボル、シグネチャの変更、呼び出し元を洗い出します。`impact` は diff の外に未解決の呼び出し元が残っていれば exit 1 を返します (Stop hook 向け)
-- **Rust の型エイリアス**: 同じファイルに追加した公開型エイリアスへの置き換えが、旧・新ソースの構文木から同じ型と証明できる場合、関数シグネチャの変更と呼び出し元への影響を情報提供として扱います
-- **Rust の引数パターン**: 通常引数の名前・分解パターンだけの変更は、呼び出し契約が同じと証明できれば除外します。型や receiver は引き続き比べます。[証明の範囲と容器の制約](docs/diff-analysis.ja.md#rust-の引数パターン)を参照してください。
 - **構造化レビュー**: `review` は影響範囲、git blame から見て一緒に変わりやすいファイル (`cochange`)、公開 API の差分、死蔵シンボルを 1 回でまとめて返します
 - **ファイルの構造**: `symbols`・`calls`・`imports`・`ast` がファイルの輪郭、コールグラフ、依存、構文ノードを返し、`sequence` は呼び出しの流れを Mermaid のシーケンス図にします
 - **デッドコードとルール**: `dead-code` はどこからも参照されない export を報告し、テストランナーやフレームワークが実行時に呼ぶものは除きます。`lint` は YAML で書いた AST パターンのルールで検査します
@@ -167,108 +157,21 @@ printf '%s\n' \
   | astro-sight session
 ```
 
-### 参照を探す
+### 複雑度と依存構造を比較する
 
 ```bash
-astro-sight refs --name extract_symbols --dir .
+astro-sight metrics --dir . --component directory --component-depth 2 --base HEAD
 ```
 
-```json
-{
-  "symbol": "extract_symbols",
-  "refs": [
-    { "path": "src/engine/symbols/mod.rs", "ln": 107, "col": 7, "ctx": "pub fn extract_symbols(...)", "kind": "def" },
-    { "path": "src/commands/api_changes/exported.rs", "ln": 45, "col": 39, "ctx": "let syms = crate::engine::symbols::extract_symbols(root, source, lang_id).ok()?;", "kind": "ref" }
-  ]
-}
-```
+ファイル／ディレクトリ単位で循環的複雑度・依存関係・循環・CCD・ACD・伝搬コストを測定します。`--base` は基準コミットとの差分を返し、依存辺と代表循環経路にはソース上の根拠が付きます。
 
-`path` は `--dir` からの相対パスで、`ln` と `col` は 0 始まりです。参照が 100 件を超えるか、出力が約 3,000 トークンを超える名前では、そこで出力を打ち切り、省いた参照の内訳を `result_summary` に出します。上限は `--max-results` と `--token-budget` で変えられます (`unlimited` で上限なし)。
+`impact` は未解決の呼び出し元が残ると exit 1、残っていなければ何も出さず exit 0 になります。JSON の位置は 0 始まり、`impact` の表示位置は 1 始まりです。解析できない入力や未解決の依存は診断に残るため、空の結果だけで影響や循環がないとは判断できません。
 
-検索名を含み得る未対応ソース (`.vue`、`.m`、`.mm`、`.applescript` など) は `truncations` に並べます。どのファイルも解析できない範囲では、空の結果ではなく `UNSUPPORTED_LANGUAGE` を返します。詳しくは [解析できない言語のファイル](docs/usage.ja.md#解析できない言語のファイル) を参照してください。
-
-### 未解決の影響を確かめる
-
-```bash
-astro-sight impact --dir . --git
-```
-
-```text
-Unresolved impacts found:
-
-src/engine/symbols/mod.rs changed [extract_symbols]:
-  → src/service.rs:284 [extract_symbols]
-  → src/commands/api_changes/exported.rs:45 [extract_symbols]
-```
-
-呼び出し元をすべて直してあれば、`impact` は何も出力せずに exit 0 で終わります。未解決の影響が残っていれば、上の一覧を stderr に出して exit 1 を返します。このテキストの行番号は、エディタでそのまま開けるよう 1 始まりです。
-
-TS/TSX の関数の末尾にある省略可能な引数 (`?` 付きか既定値付き) を消した変更は、`review --hook` が `mod_compat` の理由 `trailing_optional_params_removed` として報告します。条件は、残りの引数と明示の戻り値型が変わらず、リポジトリ内の直接呼び出しを閉じた一覧で調べて、どの呼び出しも新しい引数の数に収まると確かめられることです。呼び出し箇所は `impact_info` に残ります。別名・動的な依存・解決が曖昧な依存があるときや、ソースを読み切れないときは、従来の判定を維持します。この証明が扱うのは解析したリポジトリ内の呼び出しだけで、外部の利用者との互換性や、実行時に同じ動作をすることは保証しません。
-
-TS/TSX で export した関数の引数が 1 個だけのとき、その inline object 型から省略可能なプロパティを消した変更も、`mod_compat` の理由 `optional_object_props_removed` として報告します。条件は、残りのプロパティと分割代入の束縛を含め、宣言のほかの部分が AST のトークンで変わらないことです。残りのプロパティと戻り値型が参照する型も、変わらないことを求めます。そのうえで、リポジトリのソースを閉じた一覧で調べ、関数を使う JSX 要素と直接呼び出しのどれもが、消したキーを渡していないことを確かめます。JSX 要素は、関数名を直接タグにして、spread の無い属性だけを書いていることが条件です。直接呼び出しは、関数に明示の戻り値型があり、object リテラルを 1 個だけ渡すときに限って数えます。JSX の呼び出し箇所は `impact_info` に残ります。JSX の型環境を差し替えているとき (`jsxFactory`・`jsxFragmentFactory`・`react` 以外の `jsxImportSource`・`react/jsx-runtime` の解決先を変え得る `paths` や `baseUrl`・ディレクトリの外か `node_modules` を指す `paths` や `baseUrl`・ディレクトリの外を指す `package.json` の入口・ディレクトリの外へ出る import の指定子・`react` や `@types/react` の augmentation・`JSX` という名前を作る宣言や公開・大文字小文字を問わない `@jsx` の pragma) は、従来の判定を維持します。自動の JSX runtime (`jsx: react-jsx` / `react-jsxdev`) の import はソースに現れないので、`react` と `@types/react` が `npm:` の別名でない registry の依存であることも求めます。registry でない `@types/*` があるとき、git・URL・ディレクトリの外のパスから中身を入れる依存があるとき、`compilerOptions.types` や `/// <reference types>` が registry の依存でないパッケージを指すときも、証明しません。別名・再 export・動的なアクセスがあるときや、ソースを読み切れないときも同じです。残りの契約が相対パスで import した型を参照するときは、証明しません。registry の依存から import した型と、リポジトリで宣言していない大域の型 (lib や `@types` のもの) は、diff がほかのファイルを変えていない場合だけ受け入れます。この分類はリポジトリ内の証拠に基づくので、リポジトリの外に消したキーを渡す利用者がいれば、その利用者には破壊的な変更になります。
-
-省略可能な props の削除の証明は、同じファイルの root 直下にある、一意で非公開の単純な `type` エイリアスにも対応します。値は通常の object 型とし、識別子の出現が宣言名とこの関数の props 注釈だけであることを求めます。公開・共有された別名、型レベルでのキーの利用、別名の連鎖、interface、交差型、ジェネリック型、import した別名は未証明です。削除した属性の指定・spread・変更された呼び出し・staged の扱いも含む条件は、[詳しい説明](docs/diff-analysis.ja.md)を参照してください。
-
-React の `memo()` で包んだ関数部品 (`export const Tag = memo(function Tag({ … }: { … }) { … })` や arrow 関数) の props に省略可能なプロパティを足した変更も、包まない関数部品と同じく、`review --hook` が `mod_compat` の理由 `optional_object_props` として報告します。条件は、包み方が変わらず、`react` から名前で import した `memo` に関数を 1 つだけ渡していることです。比較関数・型引数・`React.memo`・ほかの wrapper は、従来の判定を維持します。`react` が部品のディレクトリの祖先の `package.json` (ルートやワークスペースのパッケージのもの) の registry の依存で、解析するディレクトリの設定・依存・ソースのどれも React の型を差し替えていないことも求めます。diff が設定・`package.json`・ロックファイルを変えず、変えたソースの変更前の中身も同じ監査を通ることが必要です。条件の一覧は [docs/diff-analysis.ja.md](docs/diff-analysis.ja.md) にあります。
-
-公開 API の Rust の構造体は、`api_changes` が公開の形 (`pub` のフィールドとその型、クレートの外から構築できるか、`#[repr]`・`#[non_exhaustive]`・型の引数・`where`) を Cargo の SemVer の手引きに沿って比べます。名前付きの `pub` のフィールドは名前と `#[cfg]` の組で対応させ、`#[cfg]` で分けた同じ名前のフィールドはそれぞれを比べます。`pub` のフィールドの順は、`repr(C)` の構造体で、構造体が有り `repr(C)` が効く設定でだけ契約とし、`align`・`packed`・`transparent` だけでは契約にしません。`pub` のフィールドの削除・改名・型の変更・制限・位置の移動、外から構築できる構造体への `pub` のフィールドの追加、クレートの外から構築できなくする変更、型の引数の制約を強める変更、寿命の境界の付け外しは、同じ diff でリポジトリの中の利用を直しても、blocking な `api.mod` にします。クレートの外の利用は直らないためです。構築の制限を緩める・境界を緩める・既定値の付いた型の引数を足すなど、今の利用を壊さない変更は `mod_compat` の理由 `rust_struct_shape_compatible` とし、型の引数の改名や、すでにクレートの外から構築できない構造体の `pub` でないフィールドの変更は報告しません。
-
-公開 API の Rust の enum も同じく比べます。variant の削除・改名・形の変更、variant のフィールドの変更、`#[non_exhaustive]` の無い enum への variant の追加、`#[non_exhaustive]` の追加、クレートの外から観測できる discriminant の値 (`as` か `repr(C)`・`repr(<int>)` のレイアウト) の変更は blocking な `api.mod` にし、`#[non_exhaustive]` の enum への variant の追加など今の利用を壊さない変更は `mod_compat` の理由 `rust_enum_shape_compatible` にします。
-
-Rust の `union` は種類 `union` のシンボルで、公開 API の union も公開の形で比べます。`pub` のフィールドの削除・改名・型の変更・制限、`#[repr]` の変更、全てのフィールドが `pub` の `#[repr]` の union へのフィールドの追加、クレートの外から作れる union への型の引数の追加 (値は 1 つのフィールドで作るので、新しい引数を推論できないことがある) は blocking な `api.mod` にします。union の値は 1 つのフィールドで作るので、`pub` のフィールドの追加は `mod_compat` の理由 `rust_union_shape_compatible` とし、フィールドの並べ替えや `pub` でないフィールドの変更は報告しません。
-
-公開の Rust の型の inherent `impl` のメソッドと関連定数は、impl の見出しが成り立つ型でだけ使えるので、見出しも契約に含めます (#307)。impl の型の引数に境界や `where` を足す (`impl<T> S<T>` から `impl<T: Copy> S<T>`)・対象の型を狭める (`impl S<u8>`)・読めない見出しにする変更は、見出しを添えた signature の blocking な `api.mod` に、境界を緩めるだけの変更は `mod_compat` の理由 `rust_impl_header_compatible` にします。型の引数の改名・`where` への書き換え・整形は報告しません。`impl Trait for Type` のメソッドは別の API 項目にしません。
-
-Rust の公開の項目に `#[cfg]` を足したり条件を狭めたりすると、signature は変わらないまま、一部の設定から項目が消えます。`api_changes` は、項目がどの設定に有るか (項目自身の `#[cfg]`・`#[cfg_attr]` の `cfg` の部分・同じファイルの囲む項目の条件を、`#[cfg]` の分岐ごとにまとめたもの) を、条件の原子の真偽の全ての組み合わせで比べます (Unix 系の `target_os` は `unix` を含むものとします)。一部の設定から消えた項目は削除と同じく (参照が残れば `removed`、残らなければ `removed_dead`)、新しい設定に増えた項目は追加と同じく報告し、`cfg_availability` (hook の出力では `cfg`) に旧新の条件を添えます。同値な書き換えと、条件を変えない移動は報告せず、条件を狭める移動は削除としても報告します。`mod` の宣言の条件や `path` を変えたとき (`#[cfg(feature = "x")] pub mod api;`) も、その module の公開の項目を、差分で変えていないファイルのものも含めて同じく比べます。比べ切れなければ `truncations` に `rust_module_availability_incomplete` を出し、hook は `api.rust_module_availability_incomplete` で止まります。`pub use` と glob が作る名前も、cfg の原子の組み合わせごとに rustc と同じく解いて比べ、再公開に `#[cfg]` を足すと削除と同じく、消すか `pub(crate) use` に狭めるか、glob の持ち込む名前を非公開の項目で隠すとふつうの削除として報告します。名前を列挙し切れなければ `truncations` に `rust_reexports_incomplete` を出し、hook は `api.rust_reexports_incomplete` で止まります。
-
-Rust の 1 つのファイルの別々の inline module にある同じ名前の項目 (`pub mod a { pub fn run() }` と `pub mod b { pub fn run() }`) は、宣言ごとに比べます。`api_changes` は宣言を囲む inline module の経路で組にし、出力ではその経路を `inline_module` (hook の出力では `m`) に添えます。`name` は裸の名前のままです。組にできない同じ場所の宣言 (`#[cfg]` の分岐など) の変更は blocking な `api.mod` に残します。
-
-Rust のシグネチャが別名 (`use … as Text;` や非公開の `type Text = …;`) を通して型を名指すときは、`api_changes` は別名の指す先も比べます。シグネチャの字面が同じまま指す先が変われば、`unverified.reason` が `rust_signature_dependency_changed` の blocking な `api.mod` にします。lib crate のほかのファイルの束縛を差分で変えたときは、ほかのファイルもたどり、差分で変えていないファイルの公開の宣言も、変わった束縛を名指していれば比べます。
-
-Rust の項目を別のファイルへ移し、元の場所から `pub use` で再公開するときは、`api_changes` が再公開の先の宣言を解き、その場で変えた場合と同じく比べます。壊す変更は blocking な `api.mod` にし、変えずに移した項目は `moved` にします。解けない再公開 (外部 crate・glob・`#[cfg]`・`as` の改名) は blocking な `api.mod` に残します。
-
-TypeScript のクラス・enum・オーバーロードのある関数は、宣言ファイルに出る形で比べます。クラスはコンストラクタと、公開のフィールド (パラメータプロパティを含む)・アクセサ・index signature・実装の無いメソッドの宣言、enum はメンバーと値、オーバーロードのある関数・メソッドはオーバーロードの宣言です。これらの変更は、クラス・enum・関数・メソッドの blocking な `api.mod` になります (クラスに optional のフィールドを足しただけなら `mod_compat`)。
-
-ファイルをコンパイルする TypeScript の設定が `stripInternal` を有効にすると、`api_changes` は出力する宣言ファイルを使う利用者から見た API として比べます。export やメンバーへの `@internal` の付け足しは、その削除と同じ区分になります (export は `api.rm` / `api.rm_dead`、インタフェースや object 型のメンバーは、それを含む型や関数の変更)。設定の入力が import で取り込むファイルにも当てます。取り込みは TypeScript のモジュールの解決 (`paths`・`baseUrl` も) で辿り、その設定がコンパイルすると示せたファイルだけを消えるものとして扱います。示せないときも、どちらの判定でも壊れ得るソースの変化は出します。旧版のソースは base の版の設定と取り込みで判定し、設定だけの変更 (`stripInternal` を有効にする、継ぐ設定を変える) や取り込みの変更でも、その設定が当たる変えていない TypeScript のソースを比べ直します。
-
-呼び出し側を同じ diff で変更した場合も、inline object 型の引数から消したキーを渡していないことを確かめてから `mod_closed` にします。削除キーを含む JSX 属性・object リテラルや、spread・計算キー・引用符付きキー・変数の引数・暗黙の JSX children などキーを確定できない形は `api.mod` と hook の `impacts` に残ります。interface / object 型の type alias のプロパティ削除も、値の構築と利用の証明に失敗した参照を変更行だけで解決済みにはしません。
-
-どちらの削除の証明も、同じ信頼の境界を使います。利用の一覧 (消した引数やキーを渡していないかを調べる呼び出しと JSX 要素) は、`.gitignore`・global ignore・隠しファイルの除外に従う走査のソースを全部解析します。この走査にほかの言語のソースや解析できない形式 (`.vue` など) があれば、どちらの証明もしません。
-
-走査から外れたファイル (ignore したファイルと隠しファイル。`node_modules` と `.git` の中は除く) は、TS / JS 系のファイルと埋め込みのソース (`.vue`・`.svelte`・`.astro`・`.mdx`) だけを読みます。1 回の検出で 1 度だけ、変えた全ての関数についてまとめて読みます。
-
-- 変えた関数の名前が識別子の単語として現れるファイルは、一覧に加えて同じ規則で証明します。Unicode の escape で書いた名前も、現れたものとして数えます。埋め込みのソースに現れるときは証明しません
-- TS 系のファイル (`.d.ts` を含む) は、宣言のファイルに依存するときも一覧に加えます。`import`・`export … from`・`import()` (型の位置を含む)・`require()`・`import x = require()`・`declare module`・`/// <reference>` を、相対パス・ディレクトリの index・`paths` / `baseUrl`・リポジトリの package で解きます。宣言のファイルに解決するものと、解決できず registry の依存とも決められないものを、依存として数えます。package.json のあるディレクトリ (types・main・exports で何でも指せる) と、何も無いパスに当たる相対の指定子は、解決できないものとして扱います。ディレクトリの外へ一度出て戻る相対パス (`app` の中からの `../../app/src/ui` など) は、最後に指す位置で決めます
-- 宣言でない TS 系のファイル (`.d.ts` 以外) では、宣言のファイルの名前 (`panel.tsx` なら `panel`、`index.tsx` ならディレクトリの名前) も、現れたものとして数えます。JS 系のファイルは関数名だけで選ぶので、ignore した JS (`checkJs` で型検査するもの) が関数名を書かずに namespace import を計算したキーで使うときは、拾えません
-- どれにも当たらないファイルは一覧に入れません。ほかの言語のファイル (shell の hook・Python・Rust など) は読みません
-- 一覧は、加えたファイルを含めて 512 ファイル・8 MiB・100,000 ノードに収まる必要があります。外のファイルは、1 回の検出で読む量 1 GiB・解析する量 64 MiB までで、ファイルの数には上限を掛けません。読めないファイルがあるときや、上限を超えるときは証明しません
-
-監査は、ignore に関係なく、`node_modules` と `.git` を除く全てのファイルを対象にします。対象はソース・`.d.ts`・`tsconfig*.json` / `jsconfig*.json`・`package.json` です。走査から外れたファイルは、`JSX`・`declare`・`@jsx`・`<reference` か、ASCII の識別子の文字を表す Unicode の escape を含む TS / JS 系のファイルと、依存を調べる TS 系のファイルだけを解析します。解析は 1 ファイル 8 MiB までで、上の解析する量に数えます。registry から入れた依存のパッケージ (`node_modules` の中身) は、リポジトリのソースに依存せず、React が定める標準の JSX の契約を変えないものとして信頼します。どちらとも決められないものは、従来の判定を維持します。次のものがあるときは監査を作らず、props の証明はしません。末尾の引数の証明は、解決できない import を 1 つも受け入れません。
-
-- ディレクトリの symlink (Linux の `.venv` の `lib64 -> lib` も含みます) と、ソースや設定の symlink
-- ディレクトリの外か `node_modules` を取り込む、tsconfig の `files`・`include`・`typeRoots` と `/// <reference path>`
-- 読めない設定と `package.json`、上限の中で読めないか解析できない監査の対象のファイル
-- 解釈できない overrides のキー
-- どの依存も書き換えられる pnpmfile (`.pnpmfile.cjs`・`.pnpmfile.mjs`・`pnpmfile.js` と、ディレクトリの中と祖先の `.npmrc` の `pnpmfile`・`global-pnpmfile`)、読めない YAML と `.npmrc`
-- import の解決先を変える tsconfig の `moduleSuffixes` (`[""]` 以外) と、2 つ以上の項目がある `rootDirs`
-
-権限が無くて開けないディレクトリは、走査から外します。同じ利用者が動かす型検査も、そのディレクトリを読めないためです。
-
-リポジトリ内で指定子を解決できない import は、通常の named import で、パッケージが registry の依存のときだけ受け入れます。named import の条件は、import する名前と束縛する名前が、どれも変えた関数と違うことです (`import { useState } from "react"` など)。registry の依存と見なすのは、同じ名前の `package.json` がリポジトリに無く、`paths` や `baseUrl` で解決先を差し替えられないパッケージです。ディレクトリの中と祖先のどの `package.json` も、`file:`・`link:`・`workspace:`・`portal:`・`patch:`・パス・git や URL の指定で、依存・overrides・パッチに入れていないことも条件です。npm の overrides の `$名前` は参照先の依存の指定で判定し、参照先が無ければ registry の依存とは決めません。ディレクトリの中と祖先の `pnpm-workspace.yaml` (`overrides`・`packageExtensions`・`patchedDependencies`・`catalog`・`catalogs`) と `.yarnrc.yml` (`packageExtensions`) も同じ規則で判定し、`catalog:` の参照はそこで解きます。overrides のキーは、npm・pnpm・yarn の文法で読みます。キーに現れるパッケージ名は、pnpm で親子を選ぶ `親>子` の親も含めて、すべて判定に使います。`bridge@>=1.0.0` のような版の範囲にある `>` は、区切りとして扱いません。巻き上げで、別のパッケージが入れた依存もどこからでも解決され得るためです。default・namespace・`default as`・文字列の名前・同じ名前の import、再 export、`import()`、`require()`、副作用だけの import は、従来どおり指定子を解決できる必要があります。
-
-TS/TSX では、固定インターフェース型を受け取ってそのまま返すローカル関数に、単一メソッドのオブジェクトを直接登録して default export する形を限定的に証明します。契約に既存の引数をメソッド実装が受け取り始めても、契約・登録経路が不変で、直接呼び出しの引数数を確認できれば、`mod_compat` の理由 `fixed_callback_contract` として残します。`impact` とレビュー用 hook は停止せず、`context` の参照情報は保持します。
-
-対象は単純な必須引数と `void` 戻り値で、対象の default import に結び付く直接呼び出しを要求します。オブジェクトの受け渡し・別名・再 export・動的アクセス・解析失敗がある場合や、ソースが 512 ファイル・8 MiB・100,000 ノードの上限を超える場合は、従来の判定を維持します。現状の証明範囲は JS/TS のみで、リポジトリ全体に外部 import・計算アクセス・エスケープ付き文字列が無い場合に限られます。実装の引数と本体以外は旧新の byte 一致を要求し、動作の同値性や外部の利用者まで保証するものではありません。
-
-Python の関数・メソッドで戻り値の注釈だけを変えた変更では、`result = entry()` のように呼び出しを変えていなくても、その後の `result` の利用をすべて新しい型のリテラルとの比較 (`-> int` なら `assert result == 0`) に書き換えていれば、追随済みの呼び出しに数えます。旧版から持ち越した比較、変数や別の型との比較、別の名前や呼び出しへ結果を渡す形は blocking に残ります。詳しくは [Python の戻り値の注釈だけの変更](docs/diff-analysis.ja.md#python-の戻り値の注釈だけの変更) を参照してください。
-
-TypeScript の interface か object 型の type alias へ必須プロパティを足した変更は、`api.mod_closed` に分かれることがあります。条件は、その型を返す関数、`const x: T` と `satisfies T` の値、その型を引数に取るファイル直下の関数の呼び出し元を、同じ差分ですべて直していることです。足したプロパティには、新しいメンバーの型に合う値が要ります。generic や `extends` のある宣言、必須メソッドの追加、対応していない位置 (`T[]` など) の参照は、参照の行が変わっていても blocking に残ります。詳しくは [TypeScript の型への必須プロパティ追加](docs/diff-analysis.ja.md#typescript-の型への必須プロパティ追加) を参照してください。
-
-詳しい説明は話題ごとに分けています。
-
-- 全コマンドのオプション、バッチ処理、`session`、MCP サーバー: [docs/usage.ja.md](docs/usage.ja.md)
-- `context`・`impact`・`review`・`dead-code`・`cochange` の詳細: [docs/diff-analysis.ja.md](docs/diff-analysis.ja.md)
-- 短縮キー、TOON、`--format auto`: [docs/output-format.ja.md](docs/output-format.ja.md)
+| 詳しく知りたいこと | ガイド |
+| --- | --- |
+| 各コマンド・依存解決の範囲・基準比較・循環経路の根拠 | [使い方](docs/usage.ja.md) |
+| 差分判定・言語別の互換性判定・デッドコード・共変更 | [差分解析](docs/diff-analysis.ja.md) |
+| JSON・TOON・表示件数とトークン予算 | [出力形式](docs/output-format.ja.md) |
 
 ## 設定
 
@@ -316,23 +219,7 @@ make setup   # ツールチェーン (mise) と依存を取得する
 make ci      # CI と同じ検査 (書き換えない)
 ```
 
-| コマンド | 説明 |
-|---|---|
-| `make setup` | ツールチェーン (mise) と依存を取得する |
-| `make build` | デバッグ版をビルドする |
-| `make release` | リリース版をビルドする |
-| `make run` | デバッグ版を実行する (引数は ARGS="...") |
-| `make test` | テストを実行する |
-| `make lint` | clippy を警告ゼロで通す |
-| `make fmt` | コードを整形する (書き換える) |
-| `make fmt-check` | 整形済みかを確かめる (書き換えない) |
-| `make check` | 整形と静的検査 (書き換えない) |
-| `make ci` | CI と同じ検査 (書き換えない) |
-| `make install` | リリース版を INSTALL_PATH (既定 /usr/local/bin) に入れる |
-| `make uninstall` | INSTALL_PATH から取り除く |
-| `make clean` | ビルド成果物を消す |
-
-`make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
+`make help` で全コマンドを確認できます。
 <!-- standard:dev:end -->
 
 mise のほかに、tree-sitter のパーサをビルドする C コンパイラと、テストが呼ぶ `git` が要ります。テストは [cargo-nextest](https://nexte.st/) で走らせ、`make setup` が `mise.toml` の版を入れます。mise を使わないときは `SYSTEM_TOOLS=1` を付けると、PATH 上のツールで動きます（`make test` には PATH 上の `cargo-nextest` も要ります）。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まります。そのときは `make ci CARGO_FLAGS=` で外してください。

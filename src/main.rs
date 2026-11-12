@@ -319,6 +319,7 @@ fn dispatch_command(
             glob,
             component,
             component_depth,
+            base,
         } => {
             let result =
                 service.analyze_metrics(&astro_sight::models::metrics::MetricsOptions {
@@ -327,6 +328,7 @@ fn dispatch_command(
                     component,
                     component_depth,
                     include_generated,
+                    base,
                 })?;
             print!("{}", commands::serialize_cli_document(&result, output)?);
             Ok(())
