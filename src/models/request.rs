@@ -39,6 +39,10 @@ pub struct AstgenRequest {
     /// glob パターンフィルタ（refs コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
+    #[serde(default)]
+    pub component: crate::models::metrics::ComponentUnit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_depth: Option<usize>,
     /// generated 判定されたファイルも refs の走査対象に含める。
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_generated: bool,
@@ -80,6 +84,7 @@ pub struct AstgenRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Command {
+    Metrics,
     Ast,
     Symbols,
     Doctor,

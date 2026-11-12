@@ -45,6 +45,8 @@ TypeScript review follows same-file private types used in exported signatures, s
 
 ## Features
 
+- **Complexity and architecture metrics**: `metrics` measures function complexity, static local dependencies, cycles, CCD, ACD and propagation cost; select file or directory components and their depth. See [usage and coverage limits](docs/usage.md#metrics-complexity-and-dependency-metrics).
+
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass
 - **Diff impact**: `context` maps a unified diff to changed symbols, signature changes, and callers, and `impact` exits 1 while callers outside the diff are left unresolved (made for Stop hooks)
 - **Rust type aliases**: a transparent public alias introduced in the same file can turn an equivalent function signature change into an informational result when the old and new syntax trees prove the underlying type is unchanged

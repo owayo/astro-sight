@@ -221,6 +221,17 @@ impl Default for AstroSightServer {
 
 #[tool_router]
 impl AstroSightServer {
+    #[tool(
+        name = "metrics_analyze",
+        description = "Measure cyclomatic complexity, static local file dependencies, cycles, CCD, ACD and propagation cost. Unresolved imports and diagnostics limit coverage."
+    )]
+    async fn metrics_analyze(
+        &self,
+        params: Parameters<crate::models::metrics::MetricsOptions>,
+    ) -> Result<CallToolResult, McpError> {
+        self.to_tool_result(self.service.analyze_metrics(&params.0))
+    }
+
     pub fn new(output: OutputOptions) -> Self {
         // cwd 取得またはサンドボックス生成に失敗した場合は制限なしにフォールバックせず即座にパニック（fail-closed）
         let cwd = std::env::current_dir().expect("MCP server requires a valid current directory");

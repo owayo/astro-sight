@@ -50,6 +50,21 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Measure complexity, file dependencies, cycles, ACD and propagation cost
+    Metrics {
+        /// Directory whose source files form the component graph
+        #[arg(short, long, default_value = ".")]
+        dir: String,
+        /// Restrict the component graph to matching files (dependencies outside it are unresolved)
+        #[arg(short, long)]
+        glob: Option<String>,
+        /// Component granularity for dependency metrics
+        #[arg(long, value_enum, default_value = "file")]
+        component: crate::models::metrics::ComponentUnit,
+        /// Directory component depth relative to --dir (positive, default 1)
+        #[arg(long, default_value = "1")]
+        component_depth: usize,
+    },
     /// Extract AST fragment at a given position or range
     Ast {
         /// Path to the source file (single mode)

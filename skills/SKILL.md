@@ -4,7 +4,8 @@ description: >-
   Analyze source code with the astro-sight AST CLI. Use refs instead of grep/rg
   for code identifiers, including definitions and callers; review for diffs and
   PRs; context/impact during and after edits; and ast for syntax boundaries or
-  parse errors. Use symbols, calls, imports, sequence, cochange, dead-code, lint,
+  parse errors. Use metrics for complexity, dependency cycles, ACD and propagation
+  cost; symbols, calls, imports, sequence, cochange, dead-code, lint,
   and session for related structural analysis.
 allowed-tools: Bash(astro-sight:*)
 ---
@@ -34,6 +35,8 @@ TODO comments, and filename discovery.
 | Unresolved caller impacts after editing | `astro-sight impact --dir . --git` |
 | Exported symbols with no observed uses | `astro-sight dead-code --dir . --git` |
 | Definitions and complexity | `astro-sight symbols --path <file>` |
+| Complexity, dependency cycles, CCD, ACD and propagation cost | `astro-sight metrics --dir .` |
+| Architecture metrics grouped by directory | `astro-sight metrics --dir . --component directory --component-depth 2` |
 | Directory inventory | `astro-sight symbols --dir <dir>` |
 | Calls made by a function | `astro-sight calls --path <file> --function <name>` |
 | Imports and exports | `astro-sight imports --path <file>` |
@@ -205,6 +208,18 @@ smoothed scores rank candidates and are not probabilities of a missing edit.
 
 ## Structural queries and sessions
 
+`metrics` defaults to file components; `--component directory` groups by up to
+`--component-depth` parent segments relative to `--dir` (positive, default 1).
+Internal edges are removed and coupling/cycles recalculated after grouping.
+`files` / `file_edges` preserve file detail. CD includes self, CCD sums CD,
+ACD = CCD/N, and propagation cost = CCD/N² (all 0 for empty input).
+Dependencies are static local imports with bounded language/resolution coverage,
+not compiler-verified bindings. Read `unresolved_dependencies`, `diagnostics`,
+`truncations`, `skipped`, and `limitations`; an empty `cycles` does not prove the
+project acyclic. `--glob` narrows the graph inventory. Session accepts
+`{"command":"metrics","dir":".","component":"directory","component_depth":2}`;
+MCP exposes `metrics_analyze` with the same options.
+
 For multiple queries, send one JSON request per line to `session`. Each response
 is a JSON line, possibly containing an error; inspect every response, not just
 the process exit code. The examples use an existing source path; substitute paths
@@ -229,7 +244,7 @@ PowerShell:
 ```
 
 Session commands: `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`,
-`imports`, `lint`, `sequence`, `cochange`. `review`, `impact`, and `dead-code`
+`imports`, `lint`, `sequence`, `cochange`, `metrics`. `review`, `impact`, and `dead-code`
 are CLI-only. Session fields are not CLI flags: use `column` rather than `col`,
 `context_lines` rather than `context`, and arrays for `names` / `source_files`.
 Session `symbols` needs a file `path`; it does not provide CLI `symbols --dir`.

@@ -314,6 +314,23 @@ fn dispatch_command(
     swift_protocols: &astro_sight::config::SwiftProtocolMethods,
 ) -> Result<()> {
     match command {
+        Commands::Metrics {
+            dir,
+            glob,
+            component,
+            component_depth,
+        } => {
+            let result =
+                service.analyze_metrics(&astro_sight::models::metrics::MetricsOptions {
+                    dir,
+                    glob,
+                    component,
+                    component_depth,
+                    include_generated,
+                })?;
+            print!("{}", commands::serialize_cli_document(&result, output)?);
+            Ok(())
+        }
         Commands::Ast {
             path,
             paths,
