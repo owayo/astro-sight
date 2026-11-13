@@ -13,6 +13,7 @@
 
 use super::crates::{CrateVersion, Located, crate_package};
 use super::resolver::absolute_place;
+use super::test_scopes::TestScopes;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -318,11 +319,7 @@ pub(super) fn analyze(
     }
     // テストの module (`#[cfg(test)]`) の中身の変化は、公開の契約 (テストでない build) に関わらない。
     // `mod tests` の中の変化で、`tests` やその中の名前を書いた全てのファイルを探さない。
-    let tests = TestScopes {
-        old,
-        new,
-        known: std::cell::RefCell::new(HashMap::new()),
-    };
+    let tests = TestScopes::new(old, new);
     collect_scope_changes(&old_scopes, &new_scopes, &tests, &mut changes);
     let moves = collect_moves(old, new, &old_scopes, &new_scopes, &changes);
 
@@ -573,62 +570,6 @@ pub(super) fn analyze(
         incomplete,
         multi_placed,
     }
-}
-
-/// 旧新の両方でテストの module (`#[cfg(test)]` の付いた宣言の module か、その中) のスコープ。
-struct TestScopes<'v, 'a> {
-    old: &'v CrateVersion<'a>,
-    new: &'v CrateVersion<'a>,
-    known: std::cell::RefCell<HashMap<Vec<String>, bool>>,
-}
-
-impl TestScopes<'_, '_> {
-    /// スコープ `scope` (crate root からの経路) が、旧新の両方でテストの module の中か。
-    fn contains(&self, scope: &[String]) -> bool {
-        if let Some(&known) = self.known.borrow().get(scope) {
-            return known;
-        }
-        // 旧新のどちらかでテストの module で、もう一方でもテストの module か、無い。
-        let (old, new) = (test_module(self.old, scope), test_module(self.new, scope));
-        let found = old != TestModule::Other
-            && new != TestModule::Other
-            && (old == TestModule::Test || new == TestModule::Test);
-        self.known.borrow_mut().insert(scope.to_vec(), found);
-        found
-    }
-}
-
-/// その版での module の様子。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TestModule {
-    /// `#[cfg(test)]` の付いた宣言の module か、その中。
-    Test,
-    /// その経路の module が無い。
-    Absent,
-    /// それ以外 (決められないときも)。
-    Other,
-}
-
-/// module `module` (crate root からの経路) の、その版での様子。祖先のどれかが `#[cfg(test)]` の付いた
-/// 宣言の module なら Test。
-fn test_module(version: &CrateVersion<'_>, module: &[String]) -> TestModule {
-    for depth in 1..=module.len() {
-        let (parent, name) = (&module[..depth - 1], &module[depth - 1]);
-        let Located::Found(file, scope) = version.locate_scope(parent) else {
-            return TestModule::Other;
-        };
-        let declarations = file.module_declarations(&scope, name);
-        if declarations.is_empty() {
-            return TestModule::Absent;
-        }
-        if declarations
-            .iter()
-            .all(|declaration| declaration.only_in_tests())
-        {
-            return TestModule::Test;
-        }
-    }
-    TestModule::Other
 }
 
 /// スコープごとの指紋を旧新で比べ、束縛の変わった名前と、中身の変わった module を集める。テストの

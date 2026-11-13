@@ -39,6 +39,7 @@ pub(crate) mod dependents;
 pub(crate) mod exports;
 pub(crate) mod placements;
 mod resolver;
+pub(crate) mod test_scopes;
 pub(crate) mod use_scan;
 
 pub(crate) use crates::RustCrates;
