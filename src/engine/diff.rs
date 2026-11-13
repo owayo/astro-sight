@@ -1167,6 +1167,10 @@ impl BlockBuilder {
     fn finish(self) -> (DiffBlock, bool) {
         let added = self.added.is_some();
         let deleted = self.deleted.is_some();
+        // `diff --git` の見出しは、追加・削除でも無い側に同じパスを書く。無い側は mode の行か
+        // `--- /dev/null`・`+++ /dev/null` で分かる (手で書いた diff は mode の行を省く)。
+        let old_absent = added || matches!(self.old_header, Some(HeaderSide::DevNull));
+        let new_absent = deleted || matches!(self.new_header, Some(HeaderSide::DevNull));
         let index_changed = self.index.as_ref().map(|(old, new, _)| old != new);
         let explained = self.hunks
             || self.binary
@@ -1184,7 +1188,7 @@ impl BlockBuilder {
                         || self.new_mode.is_some())
             };
         let well_formed = !self.malformed
-            && !(added && deleted)
+            && !(old_absent && new_absent)
             && !(added && self.old_mode.is_some())
             && !(deleted && self.new_mode.is_some())
             && self.old_header.is_some() == self.new_header.is_some()
@@ -1232,13 +1236,13 @@ impl BlockBuilder {
             header.as_ref().map(|(old, _)| old),
             &self.from,
             &self.old_header,
-            added,
+            old_absent,
         );
         let new_path = side(
             header.as_ref().map(|(_, new)| new),
             &self.to,
             &self.new_header,
-            deleted,
+            new_absent,
         );
         let index_mode = self.index.as_ref().map(|(_, _, mode)| *mode);
         let mode = |line: Option<Option<u32>>, file: Option<Option<u32>>, absent: bool| {
@@ -1251,8 +1255,8 @@ impl BlockBuilder {
             }
         };
         let block = DiffBlock {
-            old_mode: mode(self.old_mode, self.deleted, added),
-            new_mode: mode(self.new_mode, self.added, deleted),
+            old_mode: mode(self.old_mode, self.deleted, old_absent),
+            new_mode: mode(self.new_mode, self.added, new_absent),
             old_path,
             new_path,
             content: if self.binary {
