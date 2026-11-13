@@ -108,6 +108,297 @@ fn impact_rust_cargo_reachability_checks_macro_arguments_and_glob_aliases() {
     }
 }
 
+/// Issue #373 の最小再現。bin だけの app の中で `Page` を workspace.rs から state.rs へ移し、
+/// 変更元 state.rs の呼び出し元の path を (impacted, 他のバケット) で返す。`app_targets` は
+/// app の manifest の target の節。fetch-lib は core-lib だけに依存し、core-lib の enum の同名の
+/// variant (`PagesSpec::Page`・`Placeholder::Page`) を使う。
+fn moved_page_in_binary_package(app_targets: &str) -> (Vec<String>, Vec<String>, String) {
+    let repo = TestRepo::new();
+    for directory in [
+        "crates/core-lib/src",
+        "crates/fetch-lib/src",
+        "crates/app/src",
+    ] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/core-lib\", \"crates/fetch-lib\", \"crates/app\"]\nresolver = \"3\"\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace.dependencies]\ncore-lib = { path = \"crates/core-lib\" }\nfetch-lib = { path = \"crates/fetch-lib\" }\n",
+    );
+    repo.write(
+        "crates/core-lib/Cargo.toml",
+        "[package]\nname = \"core-lib\"\nversion.workspace = true\nedition.workspace = true\n",
+    );
+    repo.write("crates/core-lib/src/lib.rs", "pub mod source;\n");
+    repo.write(
+        "crates/core-lib/src/source.rs",
+        "pub struct PageNumbers {\n    pub max_pages: u32,\n}\n\npub enum PagesSpec {\n    Page(PageNumbers),\n    NextLink,\n}\n\nimpl PagesSpec {\n    pub fn max_pages(&self) -> u32 {\n        match self {\n            PagesSpec::Page(pages) => pages.max_pages,\n            PagesSpec::NextLink => 1,\n        }\n    }\n}\n\npub enum Placeholder {\n    Var(String),\n    Page,\n}\n",
+    );
+    repo.write(
+        "crates/fetch-lib/Cargo.toml",
+        "[package]\nname = \"fetch-lib\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\ncore-lib.workspace = true\n",
+    );
+    repo.write(
+        "crates/fetch-lib/src/lib.rs",
+        "pub mod engine;\nmod template;\n",
+    );
+    repo.write(
+        "crates/fetch-lib/src/engine.rs",
+        "use core_lib::source::PagesSpec;\n\nstruct Page {\n    items: Vec<u32>,\n}\n\npub fn has_next(spec: Option<&PagesSpec>) -> bool {\n    matches!(spec, Some(PagesSpec::Page(_)))\n}\n\npub fn count() -> usize {\n    read_page().map(|page| page.items.len()).unwrap_or(0)\n}\n\nfn read_page() -> Result<Page, String> {\n    Ok(Page { items: Vec::new() })\n}\n",
+    );
+    repo.write(
+        "crates/fetch-lib/src/template.rs",
+        "use core_lib::source::Placeholder;\n\npub fn name(placeholder: &Placeholder) -> String {\n    match placeholder {\n        Placeholder::Var(name) => name.clone(),\n        Placeholder::Page => \"page\".into(),\n    }\n}\n",
+    );
+    repo.write("crates/fetch-lib/src/tool.rs", "fn main() {}\n");
+    repo.write(
+        "crates/app/Cargo.toml",
+        format!("[package]\nname = \"app\"\nversion.workspace = true\nedition.workspace = true\n\n{app_targets}\n[dependencies]\ncore-lib.workspace = true\nfetch-lib.workspace = true\n"),
+    );
+    repo.write(
+        "crates/app/src/main.rs",
+        "mod state;\nmod workspace;\n\nfn main() {\n    let page = workspace::Page::News;\n    let state = state::State::default();\n    println!(\"{:?} {} {}\", page, state.count, fetch_lib::engine::count());\n}\n",
+    );
+    repo.write(
+        "crates/app/src/state.rs",
+        "use std::collections::HashMap;\n\n#[derive(Default)]\npub struct State {\n    pub count: usize,\n    pub names: HashMap<u32, String>,\n}\n",
+    );
+    repo.write(
+        "crates/app/src/workspace.rs",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Page {\n    News,\n    Settings,\n}\n\npub fn is_news(page: Page) -> bool {\n    page == Page::News\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "crates/app/src/state.rs",
+        "use std::collections::{HashMap, HashSet};\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Page {\n    News,\n    Settings,\n}\n\n#[derive(Default)]\npub struct State {\n    pub count: usize,\n    pub names: HashMap<u32, String>,\n    pub seen: HashSet<u32>,\n}\n",
+    );
+    repo.write(
+        "crates/app/src/workspace.rs",
+        "pub use crate::state::Page;\n\npub fn is_news(page: Page) -> bool {\n    page == Page::News\n}\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "crates/app/src/state.rs")
+        .unwrap_or_else(|| panic!("{context}"));
+    let paths = |keys: &[&str]| {
+        let mut paths: Vec<String> = keys
+            .iter()
+            .filter_map(|key| change[*key].as_array())
+            .flatten()
+            .map(|caller| caller["path"].as_str().unwrap().to_owned())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    };
+    (
+        paths(&["impacted_callers"]),
+        paths(&["informational_callers", "low_confidence_callers"]),
+        context.to_string(),
+    )
+}
+
+#[test]
+fn impact_rust_cargo_reachability_accepts_target_paths_inside_the_package() {
+    // bin だけの app の `path = "src/main.rs"` で証明を止めず、app に依存しない fetch-lib の
+    // 同名の variant を出さない。再公開を通した main.rs の参照は残す (Issue #373)。
+    let (impacted, others, context) =
+        moved_page_in_binary_package("[[bin]]\nname = \"app-bin\"\npath = \"src/main.rs\"\n");
+    assert_eq!(impacted, ["crates/app/src/main.rs"], "{context}");
+    assert!(
+        others.iter().all(|path| path.starts_with("crates/app/")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_for_target_paths_outside_the_package() {
+    // app の target が fetch-lib のソースをコンパイルするなら、fetch-lib のファイルも app の依存の
+    // 名前で解決されうるので、到達性で外さない。
+    let (impacted, _, context) = moved_page_in_binary_package(
+        "[[bin]]\nname = \"app-bin\"\npath = \"src/main.rs\"\n\n[[bin]]\nname = \"fetch-tool\"\npath = \"../fetch-lib/src/tool.rs\"\n",
+    );
+    assert_eq!(
+        impacted,
+        [
+            "crates/app/src/main.rs",
+            "crates/fetch-lib/src/engine.rs",
+            "crates/fetch-lib/src/template.rs"
+        ],
+        "{context}"
+    );
+}
+
+/// a の `run` に引数を足し、同時に `rename` を `git mv` (内容は変えない) したときの、a の
+/// 呼び出し元の path。b だけが a に依存し、`b/src/bin/probe.rs` が `a::run(1)` を呼ぶ。c は a に
+/// 依存せず、外部の `other` から import した同名の `run` を呼ぶ (到達性だけが外せる)。
+fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, String) {
+    let repo = TestRepo::new();
+    for directory in ["a/src", "b/src/bin", "c/src", "notes"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    let package = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
+        )
+    };
+    repo.write("a/Cargo.toml", package("a", ""));
+    repo.write(
+        "b/Cargo.toml",
+        package("b", "[dependencies]\na = { path = \"../a\" }\n"),
+    );
+    repo.write(
+        "c/Cargo.toml",
+        package("c", "[dependencies]\nother = \"1\"\n"),
+    );
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write("b/src/lib.rs", "");
+    repo.write("b/src/bin/probe.rs", "fn main() {\n    a::run(1);\n}\n");
+    repo.write(
+        "c/src/lib.rs",
+        "use other::run;\n\npub fn caller() -> u8 {\n    run(1)\n}\n",
+    );
+    repo.write("notes/a.md", "note\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    if let Some((from, to)) = rename {
+        repo.create_dir_all(std::path::Path::new(to).parent().unwrap());
+        repo.git(["mv", from, to]);
+    }
+    let context = repo.run_json("context", &["--git"]);
+    let mut impacted: Vec<String> = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["path"] == "a/src/lib.rs")
+        .filter_map(|change| change["impacted_callers"].as_array())
+        .flatten()
+        .map(|caller| caller["path"].as_str().unwrap().to_owned())
+        .collect();
+    impacted.sort();
+    impacted.dedup();
+    (impacted, context.to_string())
+}
+
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_moved_by_hunkless_rename() {
+    // 対照: rename が無い・Rust でないファイルの rename なら、到達性で c の同名の参照を外す。
+    for rename in [None, Some(("notes/a.md", "notes/b.md"))] {
+        let (impacted, context) = callers_with_hunkless_rename(rename);
+        assert_eq!(impacted, ["b/src/bin/probe.rs"], "{rename:?}: {context}");
+    }
+    // 内容が同じまま c へ移した、変更前に b から a を呼んでいたコードは残す (Issue #374)。
+    // Rust のソースの置き場所が変わったので、作業ツリーの依存のグラフで外さない。
+    let (impacted, context) =
+        callers_with_hunkless_rename(Some(("b/src/bin/probe.rs", "c/src/bin/probe.rs")));
+    assert_eq!(
+        impacted,
+        ["c/src/bin/probe.rs", "c/src/lib.rs"],
+        "{context}"
+    );
+}
+
+/// `target` を指す symlink (mode 120000) を、作業ツリーに作らずに index へ入れる。
+fn add_symlink_to_index(repo: &TestRepo, path: &str, target: &str) {
+    let mut child = std::process::Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo.root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run git hash-object");
+    std::io::Write::write_all(
+        &mut child.stdin.take().expect("missing git stdin"),
+        target.as_bytes(),
+    )
+    .expect("failed to write symlink target");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for git hash-object");
+    assert!(output.status.success(), "git hash-object failed");
+    let blob = String::from_utf8(output.stdout).unwrap();
+    repo.git([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{},{path}", blob.trim()),
+    ]);
+}
+
+#[test]
+fn impact_rust_cargo_reachability_is_not_used_inside_the_staged_snapshot() {
+    // b の src/shared.rs は c の src/shared.rs への symlink で、c のファイルは b の module として
+    // b の依存 a を呼ぶ。staged の snapshot は symlink を書き出さないので、c が a に依存しない
+    // ことで外さない。review --staged を context --staged とそろえる (Issue #375)。
+    let repo = TestRepo::new();
+    for directory in ["a/src", "b/src", "c/src"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n",
+    );
+    repo.write(
+        "c/Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write("b/src/lib.rs", "mod shared;\n\npub use shared::call;\n");
+    repo.write("c/src/lib.rs", "pub fn unrelated() {}\n");
+    repo.write(
+        "c/src/shared.rs",
+        "pub fn call() -> u8 {\n    a::run(1)\n}\n",
+    );
+    repo.init_git();
+    repo.stage_all();
+    add_symlink_to_index(&repo, "b/src/shared.rs", "../../c/src/shared.rs");
+    repo.git(["commit", "-q", "-m", "initial"]);
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    repo.git(["add", "a/src/lib.rs"]);
+    let lists_shared = |changes: &serde_json::Value| {
+        changes.as_array().is_some_and(|changes| {
+            changes.iter().any(|change| {
+                change["path"] == "a/src/lib.rs"
+                    && change["impacted_callers"]
+                        .as_array()
+                        .is_some_and(|callers| {
+                            callers
+                                .iter()
+                                .any(|caller| caller["path"] == "c/src/shared.rs")
+                        })
+            })
+        })
+    };
+    // 対照: context --staged は index の側を読み、到達性を使わない。
+    let context = repo.run_json("context", &["--git", "--staged"]);
+    assert!(lists_shared(&context["changes"]), "{context}");
+    let review = repo.run_json("review", &["--git", "--staged"]);
+    assert!(lists_shared(&review["impact"]["changes"]), "{review}");
+}
+
 #[test]
 fn impact_rust_cargo_reachability_rejects_replaced_sysroot_in_legacy_tables() {
     let source = "use std::println;\nuse anyhow::Result;\npub fn unrelated() -> Result<()> { println!(\"x\"); Ok(()) }\n";
