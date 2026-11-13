@@ -151,6 +151,9 @@ pub(crate) struct SnapshotOmissions {
     entries: Vec<(std::path::PathBuf, OmittedKind)>,
     /// 書き出さなかった symlink の親ディレクトリの実体。
     symlink_parents: std::collections::HashSet<EntryId>,
+    /// 書き出さなかった symlink のうち、先が通常のファイルと分かっていないもの (ディレクトリとして
+    /// 辿りうるもの) の親ディレクトリの実体。
+    traversable_symlink_parents: std::collections::HashSet<EntryId>,
     /// gitlink の空ディレクトリの実体。
     gitlinks: std::collections::HashSet<EntryId>,
     cache: HidesCache,
@@ -240,8 +243,10 @@ impl SnapshotOmissions {
     /// - 開けた要素は、実際の checkout でも同じ index の要素になる。gitlink の空ディレクトリかその下
     ///   なら、中身を確かめられないので真。
     /// - 開けない名前は、そのディレクトリの書き出さなかった symlink の別名 (大文字小文字・正規化・
-    ///   8.3 の短い名前など) でありうるので、書き出さなかった symlink の親ディレクトリなら真。ほかの
-    ///   ディレクトリやファイルの下なら、実際の checkout でも開けない。
+    ///   8.3 の短い名前など) でありうるので、書き出さなかった symlink の親ディレクトリなら真。ただし
+    ///   開けない名前が途中の要素なら、先が通常のファイルと分かっている symlink は辿れないので、それ
+    ///   以外の symlink の親ディレクトリのときだけ真。ほかのディレクトリやファイルの下なら、実際の
+    ///   checkout でも開けない。
     /// - `..` や絶対パスは、途中に symlink があると OS によって辿り方が違うので真。
     fn hides(&self, relative: &std::path::Path) -> bool {
         if self.symlink_parents.is_empty() && self.gitlinks.is_empty() {
@@ -269,7 +274,8 @@ impl SnapshotOmissions {
     /// ディレクトリで、gitlink の空ディレクトリの下には何も無い。
     fn resolve(&self, names: &std::path::Path) -> bool {
         let mut opened = names;
-        let mut missing = false;
+        // 開けなかった要素の数。1 なら最後の要素だけが開けない。
+        let mut missing = 0usize;
         loop {
             let path = self.dir.join(opened);
             match std::fs::symlink_metadata(&path) {
@@ -277,11 +283,16 @@ impl SnapshotOmissions {
                 // 開けたファイル (やその下) は、実際の checkout でも同じ要素 (の下) になる。
                 Ok(metadata) if !metadata.is_dir() => return false,
                 Ok(metadata) => {
+                    let aliases = match missing {
+                        0 => None,
+                        1 => Some(&self.symlink_parents),
+                        _ => Some(&self.traversable_symlink_parents),
+                    };
                     return self
                         .directory_id(opened, &path, &metadata)
                         .is_none_or(|id| {
                             self.gitlinks.contains(&id)
-                                || (missing && self.symlink_parents.contains(&id))
+                                || aliases.is_some_and(|parents| parents.contains(&id))
                         });
                 }
                 Err(error)
@@ -290,7 +301,7 @@ impl SnapshotOmissions {
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) =>
                 {
-                    missing = true;
+                    missing += 1;
                     let Some(parent) = opened.parent() else {
                         return true;
                     };
@@ -402,6 +413,7 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
             dir_id: open_entry_id(dir)?,
             entries: Vec::new(),
             symlink_parents: std::collections::HashSet::new(),
+            traversable_symlink_parents: std::collections::HashSet::new(),
             gitlinks: std::collections::HashSet::new(),
             cache: HidesCache::default(),
         };
@@ -451,15 +463,18 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
                     }
                     omissions.gitlinks.insert(id);
                 }
-                OmittedKind::Symlink(_) => {
+                OmittedKind::Symlink(target) => {
                     // 書き出さなかった symlink の名前で開ける要素があれば、実際の checkout でどちらが
                     // 残るか分からない。
                     match std::fs::symlink_metadata(root.join(&path)) {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         _ => return None,
                     }
-                    let parent = path.parent().unwrap_or(std::path::Path::new(""));
-                    omissions.symlink_parents.insert(id_of(parent)?);
+                    let parent = id_of(path.parent().unwrap_or(std::path::Path::new("")))?;
+                    if target != LinkTarget::RegularFile {
+                        omissions.traversable_symlink_parents.insert(parent.clone());
+                    }
+                    omissions.symlink_parents.insert(parent);
                 }
             }
             // `dir` からの相対パスは、要素の祖先のディレクトリのうち `dir` と同じ実体のものから先。
@@ -638,6 +653,10 @@ mod tests {
         format!("{{\"path\":\"{path}\",\"kind\":\"symlink\",\"target\":\"regular_file\"}}")
     }
 
+    fn directory_symlink(path: &str) -> String {
+        format!("{{\"path\":\"{path}\",\"kind\":\"symlink\",\"target\":\"directory\"}}")
+    }
+
     fn gitlink(path: &str) -> String {
         format!("{{\"path\":\"{path}\",\"kind\":\"gitlink\"}}")
     }
@@ -766,9 +785,10 @@ mod tests {
                 tree,
                 true,
                 &format!(
-                    "{},{}",
+                    "{},{},{}",
                     symlink("app/src/bootstrap-link.rs"),
-                    gitlink("lib/sub")
+                    gitlink("lib/sub"),
+                    directory_symlink("docs/linked")
                 ),
             )),
         );
@@ -779,10 +799,12 @@ mod tests {
             // NTFS では symlink の短い名前 (8.3) を `main.rs` にでき、名前を比べても見つからない。
             "app/src/main.rs",
             "app/src/bootstrap-link.rs",
-            "app/src/missing/mod.rs",
             "./app/src/main.rs",
             "lib/sub",
             "lib/sub/Cargo.toml",
+            // 先がディレクトリの symlink は、途中の要素としても辿れる。
+            "docs/other.md",
+            "docs/missing/mod.rs",
             // `..` は、途中に symlink があると OS によって辿り方が違う。
             "app/src/nested/../lib.rs",
         ] {
@@ -790,9 +812,10 @@ mod tests {
         }
         assert!(view.hides(&snapshot.path().join("app/src/lib.rs")));
         // 対照: 開けるファイル・ディレクトリ、ファイルの下、書き出さなかった symlink の無いディレクトリで
-        // 開けない名前。
+        // 開けない名前、先が通常のファイルの symlink しか無いディレクトリで開けない途中の要素。
         for path in [
             "",
+            "app/src/missing/mod.rs",
             "app/src/lib.rs",
             "app/src/nested",
             "app/src/nested/mod.rs",
