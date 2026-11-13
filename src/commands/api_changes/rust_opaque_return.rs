@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::ControlFlow;
 
+use super::rust_dependencies::crates::CrateVersion;
+use super::rust_dependencies::test_scopes::TestScopes;
 use super::*;
 use crate::engine::rust_use_tree::{RustPubUseEdge, expand_rust_use_tree_edges_ast};
 use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
@@ -48,6 +50,37 @@ struct Declaration {
 #[derive(Default)]
 struct Snapshot {
     declarations: BTreeMap<Key, Vec<Declaration>>,
+}
+
+/// ファイルの中のテストの module の判定 (Issue #382)。公開の契約はテストでない build のものなので、旧新の
+/// 両方でテストの module のスコープにある宣言は、依存の変化の起点にも伝播の中継にも入れない
+/// (`rust_dependencies/dependents.rs` と同じ約束)。
+struct TestFilter<'t, 'v, 'a> {
+    /// ファイルを置いた module の経路 (crate root から)。
+    module: Vec<String>,
+    scopes: &'t TestScopes<'v, 'a>,
+}
+
+impl<'t, 'v, 'a> TestFilter<'t, 'v, 'a> {
+    /// 版 `version` でファイル `path` を置いた module が一意に決まれば、そのファイルの判定。`#[path]` も
+    /// たどった木で引き、複数の module に置くファイルか、木をたどれなければ None (今までどおり比べる)。
+    fn of(scopes: &'t TestScopes<'v, 'a>, version: &CrateVersion<'_>, path: &str) -> Option<Self> {
+        let modules = version.tree_modules(path)?;
+        let [module] = modules.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            module: module.clone(),
+            scopes,
+        })
+    }
+
+    /// ファイルの中の inline module の経路 `inline` のスコープが、テストの module の中か。
+    fn excludes(&self, inline: &[String]) -> bool {
+        let mut module = self.module.clone();
+        module.extend_from_slice(inline);
+        self.scopes.contains(&module)
+    }
 }
 
 fn public_functions(declarations: &[Declaration]) -> Vec<&PublicFunction> {
@@ -245,12 +278,18 @@ fn opaque_function(node: tree_sitter::Node<'_>) -> bool {
 }
 
 impl Snapshot {
+    /// ファイル `path` の宣言を足す。`tests` があれば、テストの module のスコープにある宣言を足さない。
     fn add(
         &mut self,
         path: &str,
         source: &[u8],
         strip: &ts_strip_internal::StripInternal,
+        tests: Option<&TestFilter<'_, '_, '_>>,
     ) -> Option<()> {
+        // ファイルを置いた module がテストの module なら、中の宣言を比べない。
+        if tests.is_some_and(|tests| tests.excludes(&[])) {
+            return Some(());
+        }
         let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
         let root = tree.root_node();
         if root.has_error() {
@@ -306,6 +345,23 @@ impl Snapshot {
                 }
             }
             let kind = node.kind();
+            // テストの module は、宣言ごと中身も比べない。確かめるのは `test` を書いた属性の付く宣言だけ
+            // (囲むテストの module は、その宣言で飛ばしている。片方の版だけ確かめても、比べる宣言が増えて
+            // 変化が多く出るだけで、見落としにはならない)。
+            if kind == "mod_item"
+                && let Some(tests) = tests
+                && super::rust_declarations::preceding_conditions(node, source)
+                    .iter()
+                    .any(|token| matches!(token.as_str(), "identifier:test" | "identifier:r#test"))
+            {
+                let inline: Vec<String> = scopes
+                    .iter()
+                    .filter_map(|scope| scope.name.strip_prefix("mod_item:").map(str::to_owned))
+                    .collect();
+                if tests.excludes(&inline) {
+                    return ControlFlow::Continue(Walk::Skip);
+                }
+            }
             let declaration = matches!(
                 kind,
                 "function_item"
@@ -577,6 +633,8 @@ pub(super) fn record(
     let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
     let mut undetermined = Vec::new();
     let mut snapshots: BTreeMap<String, (Snapshot, Snapshot)> = BTreeMap::new();
+    // package ごとのテストの module の判定 (旧新の lib crate を開ける package だけ。Issue #382)。
+    let mut test_scopes: BTreeMap<String, TestScopes<'_, '_>> = BTreeMap::new();
     let mut files = 0usize;
     let mut bytes = 0usize;
     for path in paths {
@@ -622,13 +680,33 @@ pub(super) fn record(
             incomplete(state, Some(&package), "more than 64 MiB of source text");
             break;
         }
+        // 旧新の版でファイルを置いた module が一意に決まれば、テストの module の宣言を比べない。
+        let library = inputs.rust_crates.library_versions(&path);
+        let scopes = library.map(|library| {
+            &*test_scopes
+                .entry(package.clone())
+                .or_insert_with(|| TestScopes::new(&library.old, &library.new))
+        });
+        let filter = |version: &CrateVersion<'_>| {
+            scopes.and_then(|scopes| TestFilter::of(scopes, version, &path))
+        };
+        let filters = [
+            library.and_then(|library| filter(&library.old)),
+            library.and_then(|library| filter(&library.new)),
+        ];
         let pair = snapshots.entry(package).or_default();
-        for (snapshot, source) in [(&mut pair.0, old.as_deref()), (&mut pair.1, new.as_deref())] {
+        for ((snapshot, source), tests) in
+            [(&mut pair.0, old.as_deref()), (&mut pair.1, new.as_deref())]
+                .into_iter()
+                .zip(&filters)
+        {
             let Some(source) = source else {
                 continue;
             };
             if source.len() > MAX_FILE_BYTES
-                || snapshot.add(&path, source, inputs.strip_internal).is_none()
+                || snapshot
+                    .add(&path, source, inputs.strip_internal, tests.as_ref())
+                    .is_none()
             {
                 incomplete(
                     state,
@@ -756,7 +834,10 @@ mod tests {
             .collect();
         git_commit_files(repo, &files, "base");
         for (path, source) in new {
-            std::fs::write(repo.join(path), source).unwrap();
+            let path = repo.join(path);
+            // 新しいファイルは、無いディレクトリにも置く (`src/other/tests.rs` など)
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
         }
         detect_api_changes_from_worktree(repo)
     }
@@ -843,8 +924,10 @@ mod tests {
         let strip = ts_strip_internal::StripInternal::disabled();
         let mut old = Snapshot::default();
         let mut new = Snapshot::default();
-        old.add("src/lib.rs", source.as_bytes(), &strip).unwrap();
-        new.add("src/lib.rs", after.as_bytes(), &strip).unwrap();
+        old.add("src/lib.rs", source.as_bytes(), &strip, None)
+            .unwrap();
+        new.add("src/lib.rs", after.as_bytes(), &strip, None)
+            .unwrap();
         let changed = changed_names(&old, &new);
         assert!(changed.contains_key("A0000"));
         assert!(changed.contains_key("produce"));
@@ -865,8 +948,10 @@ mod tests {
         let strip = ts_strip_internal::StripInternal::disabled();
         let mut old = Snapshot::default();
         let mut new = Snapshot::default();
-        old.add("src/lib.rs", source.as_bytes(), &strip).unwrap();
-        new.add("src/lib.rs", after.as_bytes(), &strip).unwrap();
+        old.add("src/lib.rs", source.as_bytes(), &strip, None)
+            .unwrap();
+        new.add("src/lib.rs", after.as_bytes(), &strip, None)
+            .unwrap();
         let changed = changed_names(&old, &new);
         assert!(changed.contains_key("produce"));
         assert!(!changed.contains_key("m0000"));
@@ -912,6 +997,186 @@ mod tests {
         let after = before.replace("cfg(feature = \"wide\")", "cfg(all(feature = \"wide\"))");
         let api = changes(&[("src/lib.rs", before)], &[("src/lib.rs", &after)]);
         assert!(!modified(&api, "produce"), "{api:?}");
+    }
+
+    /// Issue #382 のテストの root。不透明な戻り値の公開の関数 ([`TEST_MODULE_OPAQUE`]) と、テストの module
+    /// を置く `other`。
+    const TEST_MODULE_ROOT: &str = "pub mod other;\npub fn opaque() -> impl Copy { 0u8 }\npub async fn future() {}\npub fn items(values: &[u8]) -> impl Iterator<Item = &u8> { values.iter() }\npub struct Client;\nimpl Client {\n    pub async fn get(&self) -> u8 { 0 }\n}\n";
+    const TEST_MODULE_OTHER: &str = "pub fn helper() -> u8 { 1 }\n";
+    const GLOB_TESTS: &str =
+        "use super::*;\n\n#[test]\nfn helper_is_one() {\n    assert_eq!(helper(), 1);\n}\n";
+    const TEST_MODULE_OPAQUE: [&str; 4] = ["opaque", "future", "items", "Client.get"];
+
+    /// `src/other.rs` の末尾に `extra` を足したソース。
+    fn other_with(extra: &str) -> String {
+        format!("{TEST_MODULE_OTHER}{extra}")
+    }
+
+    /// `old` をコミットし、`new` に書き換えたとき、[`TEST_MODULE_OPAQUE`] のうち modified に出たものと、
+    /// 解析の打ち切り。
+    fn opaque_reported(
+        old: &[(&str, &str)],
+        new: &[(&str, String)],
+    ) -> (Vec<&'static str>, Vec<TruncationInfo>) {
+        let new: Vec<_> = new
+            .iter()
+            .map(|(path, source)| (*path, source.as_str()))
+            .collect();
+        let api = changes(old, &new);
+        let reported = TEST_MODULE_OPAQUE
+            .into_iter()
+            .filter(|name| modified(&api, name))
+            .collect();
+        (reported, api.parse_truncations)
+    }
+
+    /// テストでない build の `Hidden = outside` を返す `produce` と、テストの module の中の同じ名前の型
+    /// `Hidden = inside` を持つ root。
+    fn hidden_root(outside: &str, inside: &str) -> String {
+        format!(
+            "{TEST_MODULE_ROOT}type Hidden = {outside};\npub fn produce() -> impl Copy {{ Hidden::default() }}\n#[cfg(test)]\nmod tests {{\n    type Hidden = {inside};\n}}\n"
+        )
+    }
+
+    /// Issue #382: テストの module (旧新の両方で `#[cfg(test)]` の付いた宣言の module か、その中) の変化は、
+    /// テストでない build の公開の契約に関わらないので、依存の変化の起点にも伝播の中継にもしない
+    /// (`rust_dependencies/dependents.rs` と同じ約束)。
+    #[test]
+    fn opaque_returns_ignore_test_module_changes() {
+        let base = [
+            ("src/lib.rs", TEST_MODULE_ROOT),
+            ("src/other.rs", TEST_MODULE_OTHER),
+        ];
+        let existing = [
+            ("src/lib.rs", TEST_MODULE_ROOT.to_owned()),
+            ("src/other.rs", other_with("#[cfg(test)]\nmod tests;\n")),
+            (
+                "src/other/tests.rs",
+                GLOB_TESTS.replace("use super::*;", "use super::helper;"),
+            ),
+        ];
+        let existing: Vec<_> = existing
+            .iter()
+            .map(|(path, source)| (*path, source.as_str()))
+            .collect();
+        for (case, old, new) in [
+            // 誤検出の再現: 別ファイルのテストの module を、glob の import ごと足す
+            (
+                "test module file with a glob",
+                &base[..],
+                vec![
+                    ("src/other.rs", other_with("#[cfg(test)]\nmod tests;\n")),
+                    ("src/other/tests.rs", GLOB_TESTS.to_owned()),
+                ],
+            ),
+            // インラインのテストの module
+            (
+                "inline test module with a glob",
+                &base[..],
+                vec![(
+                    "src/other.rs",
+                    other_with(
+                        "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn t() {\n        assert_eq!(helper(), 1);\n    }\n}\n",
+                    ),
+                )],
+            ),
+            // 既にあるテストの module の import を glob に変える
+            (
+                "existing test module gains a glob",
+                &existing[..],
+                vec![("src/other/tests.rs", GLOB_TESTS.to_owned())],
+            ),
+            // `#[path]` で置いたテストの module (ファイルの名前によらない)
+            (
+                "test module placed with #[path]",
+                &base[..],
+                vec![
+                    (
+                        "src/lib.rs",
+                        format!(
+                            "{TEST_MODULE_ROOT}#[cfg(test)]\n#[path = \"testing/support.rs\"]\nmod tests;\n"
+                        ),
+                    ),
+                    ("src/testing/support.rs", "use super::*;\n".to_owned()),
+                ],
+            ),
+        ] {
+            let (reported, truncations) = opaque_reported(old, &new);
+            assert!(reported.is_empty(), "{case}: {reported:?}");
+            assert!(truncations.is_empty(), "{case}: {truncations:?}");
+        }
+        // テストの module の中の同じ名前の型の変化を、テストでない build の宣言へ伝えない
+        let api = changes(
+            &[
+                ("src/lib.rs", &hidden_root("()", "()")),
+                ("src/other.rs", TEST_MODULE_OTHER),
+            ],
+            &[("src/lib.rs", &hidden_root("()", "std::rc::Rc<()>"))],
+        );
+        assert!(!modified(&api, "produce"), "{api:?}");
+    }
+
+    /// Issue #382 の対照: テストでない module と、置き場を一意に決められないファイルは、今までどおり比べる。
+    #[test]
+    fn opaque_returns_keep_comparing_non_test_and_ambiguous_modules() {
+        let base = [
+            ("src/lib.rs", TEST_MODULE_ROOT),
+            ("src/other.rs", TEST_MODULE_OTHER),
+        ];
+        for (case, new) in [
+            // `#[cfg(test)]` の無い module は、テストの module ではない
+            (
+                "module without cfg(test)",
+                vec![
+                    ("src/other.rs", other_with("mod tests;\n")),
+                    ("src/other/tests.rs", GLOB_TESTS.to_owned()),
+                ],
+            ),
+            // `cfg_attr` の中の `cfg(test)` は、テストでない build にも module を残し得る (Issue #380)
+            (
+                "cfg(test) inside cfg_attr",
+                vec![
+                    (
+                        "src/other.rs",
+                        other_with("#[cfg_attr(feature = \"wide\", cfg(test))]\nmod tests;\n"),
+                    ),
+                    ("src/other/tests.rs", GLOB_TESTS.to_owned()),
+                ],
+            ),
+            // 同じファイルをテストの module とテストでない module の両方に置く
+            (
+                "file placed in a test module and another module",
+                vec![
+                    (
+                        "src/lib.rs",
+                        format!(
+                            "{TEST_MODULE_ROOT}#[cfg(test)]\nmod tests;\n#[path = \"tests.rs\"]\nmod also;\n"
+                        ),
+                    ),
+                    ("src/tests.rs", "use super::*;\n".to_owned()),
+                ],
+            ),
+            // テストでない module の private な glob は、今までどおり package 全体 (Issue #381)
+            (
+                "private glob outside test modules",
+                vec![(
+                    "src/other.rs",
+                    other_with("mod inner {\n    #[allow(unused_imports)]\n    use super::*;\n}\n"),
+                )],
+            ),
+        ] {
+            let (reported, _) = opaque_reported(&base, &new);
+            assert_eq!(reported, TEST_MODULE_OPAQUE, "{case}");
+        }
+        // テストでない build の同じ名前の型を変えれば、今までどおり変化
+        let api = changes(
+            &[
+                ("src/lib.rs", &hidden_root("()", "()")),
+                ("src/other.rs", TEST_MODULE_OTHER),
+            ],
+            &[("src/lib.rs", &hidden_root("std::rc::Rc<()>", "()"))],
+        );
+        assert!(modified(&api, "produce"), "{api:?}");
     }
 
     #[test]
