@@ -3213,6 +3213,19 @@ mod tests {
             super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
             None
         );
+        // 大文字小文字を区別しないファイルシステムでは、`src/MAIN.rs` の symlink は `src/main.rs` と
+        // して開ける。名前の大文字小文字だけが違う問い合わせも有無を決めない。
+        let root = snapshot_project(
+            "{\"path\":\"src/MAIN.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
+        );
+        assert_eq!(
+            super::checked_is_file(root.path(), std::path::Path::new("src/main.rs")),
+            None
+        );
+        assert_eq!(
+            super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
+            None
+        );
     }
 
     /// プロジェクト単位の証明は Rust ソースを全部読む。100MB の入力上限を超えるファイル
