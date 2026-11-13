@@ -558,6 +558,64 @@ fn impact_rust_cargo_reachability_is_not_used_inside_the_staged_snapshot() {
     assert!(lists_shared(&review["impact"]["changes"]), "{review}");
 }
 
+/// `left::run` に引数を足して stage したときの、review --staged の impacted_callers の path。
+/// `src/left/shared.rs` は `symlink` なら `../right/shared.rs` への symlink (index だけに入れる)、
+/// そうでなければ同じ中身の通常のファイル。`right/shared.rs` の `super::run(1)` は、symlink の
+/// 版では `left::shared` としてもコンパイルされ、`left::run` を呼ぶ。
+fn staged_callers_of_left_run(symlink: bool) -> (Vec<String>, String) {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/right");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod left;\npub mod right;\n");
+    let module = "pub fn run(x: u8) -> u8 {\n    x\n}\n\npub mod shared;\n";
+    repo.write("src/left.rs", module);
+    repo.write("src/right.rs", module);
+    let shared = "pub fn call() -> u8 {\n    super::run(1)\n}\n";
+    repo.write("src/right/shared.rs", shared);
+    if !symlink {
+        repo.create_dir_all("src/left");
+        repo.write("src/left/shared.rs", shared);
+    }
+    repo.init_git();
+    repo.stage_all();
+    if symlink {
+        add_symlink_to_index(&repo, "src/left/shared.rs", "../right/shared.rs");
+    }
+    repo.git(["commit", "-q", "-m", "initial"]);
+    repo.write(
+        "src/left.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n\npub mod shared;\n",
+    );
+    repo.git(["add", "src/left.rs"]);
+    let review = repo.run_json("review", &["--git", "--staged"]);
+    let mut impacted: Vec<String> = review["impact"]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["path"] == "src/left.rs")
+        .filter_map(|change| change["impacted_callers"].as_array())
+        .flatten()
+        .map(|caller| caller["path"].as_str().unwrap().to_owned())
+        .collect();
+    impacted.sort();
+    impacted.dedup();
+    (impacted, review.to_string())
+}
+
+#[test]
+fn impact_rust_module_owner_keeps_callers_through_symlinks_omitted_by_the_staged_snapshot() {
+    // 対照: 通常のファイルなら、right の module の `super::run` は right::run なので外す。
+    let (impacted, review) = staged_callers_of_left_run(false);
+    assert_eq!(impacted, ["src/left/shared.rs"], "{review}");
+    // snapshot は symlink を書き出さないが、書き出さなかった要素の記録から、実際の checkout と
+    // 同じく module の所有元を決め切らない (Issue #376)。
+    let (impacted, review) = staged_callers_of_left_run(true);
+    assert_eq!(impacted, ["src/right/shared.rs"], "{review}");
+}
+
 #[test]
 fn impact_rust_cargo_reachability_rejects_replaced_sysroot_in_legacy_tables() {
     let source = "use std::println;\nuse anyhow::Result;\npub fn unrelated() -> Result<()> { println!(\"x\"); Ok(()) }\n";
