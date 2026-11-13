@@ -390,11 +390,35 @@ impl ModuleDeclaration {
         )
     }
 
-    /// 宣言に `#[cfg(test)]` が付いているか (テストの build にだけある module)。
+    /// 宣言か囲む inline module に、無条件の `#[cfg(test)]` が付いているか (テストの build にだけある
+    /// module)。属性の先頭 (`#[`、内側の属性は `#![`) の直後がちょうど `cfg(test)` の属性だけを数える。
+    /// `cfg_attr(述語, cfg(test))` の中の `cfg(test)` は、述語が成り立たない設定ではテストでない build
+    /// にも module を残すので数えない (Issue #380)。
     pub(crate) fn only_in_tests(&self) -> bool {
-        self.conditions
-            .windows(4)
-            .any(|window| window == ["identifier:cfg", "(", "identifier:test", ")"])
+        // `r#cfg`・`r#test` も同じ名前 (raw identifier の `r#` は名前に含まれない)。
+        let named = |token: &String, name: &str| {
+            token
+                .strip_prefix("identifier:")
+                .is_some_and(|text| text.strip_prefix("r#").unwrap_or(text) == name)
+        };
+        let tokens = &self.conditions;
+        tokens.iter().enumerate().any(|(start, token)| {
+            if token != "#" {
+                return false;
+            }
+            let at =
+                start + 1 + usize::from(tokens.get(start + 1).is_some_and(|token| token == "!"));
+            matches!(
+                tokens.get(at..at + 6),
+                Some([open, cfg, left, test, right, close])
+                    if open == "["
+                        && named(cfg, "cfg")
+                        && left == "("
+                        && named(test, "test")
+                        && right == ")"
+                        && close == "]"
+            )
+        })
     }
 }
 
