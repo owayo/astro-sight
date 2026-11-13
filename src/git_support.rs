@@ -52,6 +52,202 @@ pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::proc
     }
 }
 
+/// snapshot が書き出さなかった symlink と gitlink の記録 (snapshot の `.git` の下、JSON)。
+pub(crate) const SNAPSHOT_OMISSIONS: &str = "astro-sight-snapshot-omissions.json";
+pub(crate) const SNAPSHOT_OMISSIONS_VERSION: u32 = 1;
+
+/// symlink の先。snapshot と同じ tree の中で、要素を 1 つずつ辿って決める。途中に symlink・gitlink・
+/// ファイルがある、tree の外へ出る、tree に無いなら `Unknown`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LinkTarget {
+    RegularFile,
+    Directory,
+    Unknown,
+}
+
+/// snapshot が書き出さなかった要素の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OmittedKind {
+    Symlink(LinkTarget),
+    Gitlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmittedEntryKind {
+    Symlink,
+    Gitlink,
+}
+
+/// 記録の 1 件。`path` は snapshot のリポジトリの root からの `/` 区切りのパス。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OmittedEntry {
+    path: String,
+    kind: OmittedEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<LinkTarget>,
+}
+
+impl OmittedEntry {
+    pub(crate) fn symlink(path: String, target: LinkTarget) -> Self {
+        Self {
+            path,
+            kind: OmittedEntryKind::Symlink,
+            target: Some(target),
+        }
+    }
+
+    pub(crate) fn gitlink(path: String) -> Self {
+        Self {
+            path,
+            kind: OmittedEntryKind::Gitlink,
+            target: None,
+        }
+    }
+}
+
+/// [`SNAPSHOT_OMISSIONS`] の中身。`complete` が偽 (書けない名前があった) なら、読む側は使わない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OmissionRecord {
+    pub(crate) version: u32,
+    /// snapshot の marker と同じ tree の OID。
+    pub(crate) tree: String,
+    pub(crate) complete: bool,
+    pub(crate) entries: Vec<OmittedEntry>,
+}
+
+/// `dir` の作業ツリーが、実際の checkout と同じに見えるか (Issue #376)。
+///
+/// staged の解析用に index を展開した snapshot は symlink を書き出さず、gitlink を空のディレクトリに
+/// する。ディレクトリを走査して symlink を障壁にする証明や、ファイルの有無で候補を選ぶ証明は、
+/// 書き出さなかった要素を実際の checkout の symlink・gitlink と同じに扱う必要がある。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TreeView {
+    /// snapshot の中ではない。
+    Checkout,
+    /// snapshot で、書き出さなかった要素の記録を読めた。パスは `dir` からの相対。
+    Snapshot(Vec<(std::path::PathBuf, OmittedKind)>),
+    /// snapshot だが、記録が無い・読めない・tree が合わない・不完全か、`dir` 自身が書き出さなかった
+    /// 要素の下にある。
+    Unusable,
+}
+
+impl TreeView {
+    /// `dir` の下の、書き出さなかった要素。通常の checkout なら空、記録を使えなければ None。
+    pub(crate) fn omitted(&self) -> Option<&[(std::path::PathBuf, OmittedKind)]> {
+        match self {
+            Self::Checkout => Some(&[]),
+            Self::Snapshot(entries) => Some(entries),
+            Self::Unusable => None,
+        }
+    }
+
+    /// `relative` (`dir` からの相対) か、その途中のディレクトリが書き出さなかった要素で、有無や種類が
+    /// 実際の checkout と違いうるか。記録を使えなければ常に真。
+    pub(crate) fn hides(&self, relative: &std::path::Path) -> bool {
+        self.omitted()
+            .is_none_or(|entries| entries.iter().any(|(path, _)| relative.starts_with(path)))
+    }
+}
+
+type TreeViewCache =
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<TreeView>>>;
+
+fn tree_view_cache() -> &'static TreeViewCache {
+    static CACHE: std::sync::OnceLock<TreeViewCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `dir` の [`TreeView`]。同じ `dir` は、次に snapshot を作るか捨てるまで ([`forget_tree_views`])
+/// 1 度だけ求める。
+pub(crate) fn tree_view(dir: &std::path::Path) -> std::sync::Arc<TreeView> {
+    if let Some(view) = tree_view_cache()
+        .lock()
+        .expect("tree view cache mutex poisoned")
+        .get(dir)
+    {
+        return view.clone();
+    }
+    let view = std::sync::Arc::new(read_tree_view(dir));
+    tree_view_cache()
+        .lock()
+        .expect("tree view cache mutex poisoned")
+        .insert(dir.to_owned(), view.clone());
+    view
+}
+
+/// [`tree_view`] の結果を忘れる。snapshot を作る・捨てるたびに呼び、同じパスに作り直した snapshot や、
+/// 前に通常のディレクトリとして見たパスで、古い見え方を引かない。
+pub(crate) fn forget_tree_views() {
+    tree_view_cache()
+        .lock()
+        .expect("tree view cache mutex poisoned")
+        .clear();
+}
+
+fn read_tree_view(dir: &std::path::Path) -> TreeView {
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return if is_inside_index_snapshot(dir) {
+            TreeView::Unusable
+        } else {
+            TreeView::Checkout
+        };
+    };
+    let Some(root) = canonical
+        .ancestors()
+        .find(|parent| parent.join(".git").join(INDEX_SNAPSHOT_MARKER).is_file())
+    else {
+        return TreeView::Checkout;
+    };
+    (|| {
+        let tree = index_snapshot_tree(root)?;
+        let path = root.join(".git").join(SNAPSHOT_OMISSIONS);
+        if std::fs::metadata(&path).ok()?.len() > 64 * 1024 * 1024 {
+            return None;
+        }
+        let record: OmissionRecord =
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        if record.version != SNAPSHOT_OMISSIONS_VERSION || record.tree != tree || !record.complete {
+            return None;
+        }
+        let prefix = canonical.strip_prefix(root).ok()?;
+        let mut entries = Vec::new();
+        for entry in record.entries {
+            // Windows では `\` も区切りになり、`C:` は prefix になる。記録の writer は書かない形。
+            let parts: Vec<&str> = entry.path.split('/').collect();
+            if entry.path.contains(['\\', ':'])
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || matches!(*part, "." | ".."))
+            {
+                return None;
+            }
+            let path: std::path::PathBuf = parts.iter().collect();
+            if !path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return None;
+            }
+            // 解析の root 自身が、書き出さなかった要素 (の下) なら中身を確かめられない。
+            if prefix.starts_with(&path) {
+                return None;
+            }
+            let kind = match (entry.kind, entry.target) {
+                (OmittedEntryKind::Symlink, Some(target)) => OmittedKind::Symlink(target),
+                (OmittedEntryKind::Gitlink, None) => OmittedKind::Gitlink,
+                _ => return None,
+            };
+            if let Ok(relative) = path.strip_prefix(prefix) {
+                entries.push((relative.to_owned(), kind));
+            }
+        }
+        Some(TreeView::Snapshot(entries))
+    })()
+    .unwrap_or(TreeView::Unusable)
+}
+
 /// `--base` を省略したときの既定 base。context / impact / review / dead-code / cochange で
 /// 共通に「未コミットの作業ツリー変更」を既定の解析対象にする。
 ///
@@ -146,6 +342,138 @@ pub(crate) fn normalize_workspace_separators(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// marker と記録を置いた、snapshot の形の一時ディレクトリ。`record` が None なら記録を置かない。
+    fn fake_snapshot(tree: &str, record: Option<&str>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::create_dir_all(root.path().join("app/src")).unwrap();
+        std::fs::write(root.path().join(".git").join(INDEX_SNAPSHOT_MARKER), tree).unwrap();
+        if let Some(record) = record {
+            std::fs::write(root.path().join(".git").join(SNAPSHOT_OMISSIONS), record).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn tree_view_reads_complete_records_and_rejects_the_rest() {
+        let tree = "0123456789012345678901234567890123456789";
+        let record = |tree: &str, complete: bool, entries: &str| {
+            format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":{complete},\"entries\":[{entries}]}}"
+            )
+        };
+        let entries = "{\"path\":\"app/src/link.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"},{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}";
+        // 対照: snapshot でないディレクトリは、実際の checkout。
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(*tree_view(plain.path()), TreeView::Checkout);
+        assert!(!tree_view(plain.path()).hides(Path::new("anything")));
+
+        let snapshot = fake_snapshot(tree, Some(&record(tree, true, entries)));
+        let view = tree_view(snapshot.path());
+        assert_eq!(
+            *view,
+            TreeView::Snapshot(vec![
+                (
+                    PathBuf::from("app/src/link.rs"),
+                    OmittedKind::Symlink(LinkTarget::RegularFile)
+                ),
+                (PathBuf::from("vendor/sub"), OmittedKind::Gitlink),
+            ])
+        );
+        assert!(view.hides(Path::new("app/src/link.rs")));
+        assert!(view.hides(Path::new("vendor/sub/Cargo.toml")));
+        assert!(!view.hides(Path::new("app/src/lib.rs")));
+        // 解析の root からの相対パスにする。
+        assert_eq!(
+            *tree_view(&snapshot.path().join("app")),
+            TreeView::Snapshot(vec![(
+                PathBuf::from("src/link.rs"),
+                OmittedKind::Symlink(LinkTarget::RegularFile)
+            )])
+        );
+
+        // 記録が無い・tree が違う・不完全・壊れている・版が違う、root が書き出さなかった要素の下。
+        for snapshot in [
+            fake_snapshot(tree, None),
+            fake_snapshot(tree, Some(&record("f".repeat(40).as_str(), true, entries))),
+            fake_snapshot(tree, Some(&record(tree, false, entries))),
+            fake_snapshot(tree, Some("{")),
+            fake_snapshot(
+                tree,
+                Some(&record(tree, true, entries).replace("\"version\":1", "\"version\":2")),
+            ),
+            fake_snapshot(
+                tree,
+                Some(&record(
+                    tree,
+                    true,
+                    "{\"path\":\"app/../x\",\"kind\":\"gitlink\"}",
+                )),
+            ),
+            // Windows では `\` も区切りで、`C:` は prefix になる。
+            fake_snapshot(
+                tree,
+                Some(&record(
+                    tree,
+                    true,
+                    "{\"path\":\"app\\\\..\\\\src\\\\link.rs\",\"kind\":\"gitlink\"}",
+                )),
+            ),
+            fake_snapshot(
+                tree,
+                Some(&record(
+                    tree,
+                    true,
+                    "{\"path\":\"C:/x\",\"kind\":\"gitlink\"}",
+                )),
+            ),
+        ] {
+            let view = tree_view(snapshot.path());
+            assert_eq!(*view, TreeView::Unusable);
+            assert!(view.hides(Path::new("app/src/lib.rs")));
+        }
+        let nested = fake_snapshot(
+            tree,
+            Some(&record(
+                tree,
+                true,
+                "{\"path\":\"app\",\"kind\":\"gitlink\"}",
+            )),
+        );
+        assert_eq!(*tree_view(&nested.path().join("app")), TreeView::Unusable);
+    }
+
+    #[test]
+    fn forgetting_tree_views_rereads_a_snapshot_at_the_same_path() {
+        let tree = "0123456789012345678901234567890123456789";
+        let record = |entries: &str| {
+            format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{entries}]}}"
+            )
+        };
+        let snapshot = fake_snapshot(tree, Some(&record("")));
+        assert_eq!(*tree_view(snapshot.path()), TreeView::Snapshot(Vec::new()));
+        // 同じパスに、書き出さなかった要素のある snapshot を作り直す。
+        std::fs::write(
+            snapshot.path().join(".git").join(SNAPSHOT_OMISSIONS),
+            record("{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}"),
+        )
+        .unwrap();
+        forget_tree_views();
+        assert_eq!(
+            *tree_view(snapshot.path()),
+            TreeView::Snapshot(vec![(PathBuf::from("vendor/sub"), OmittedKind::Gitlink)])
+        );
+        // snapshot でなかったパスが、後で snapshot になる場合も同じ。
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(*tree_view(plain.path()), TreeView::Checkout);
+        std::fs::create_dir_all(plain.path().join(".git")).unwrap();
+        std::fs::write(plain.path().join(".git").join(INDEX_SNAPSHOT_MARKER), tree).unwrap();
+        forget_tree_views();
+        assert_eq!(*tree_view(plain.path()), TreeView::Unusable);
+    }
 
     #[test]
     fn accepts_normal_revisions() {
