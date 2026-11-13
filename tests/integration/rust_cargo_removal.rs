@@ -35,6 +35,9 @@ fn remove_old_app_with_files(
     repo.write("engine/Cargo.toml", engine_manifest);
     repo.write("engine/src/lib.rs", engine_source);
     for (path, source) in files {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            repo.create_dir_all(parent);
+        }
         repo.write(path, source);
     }
     repo.init_git();
@@ -100,6 +103,36 @@ fn rust_cargo_removal_hook_ignores_same_named_function_in_unrelated_crate() {
             }
         );
     }
+}
+
+#[test]
+fn rust_cargo_removal_hook_accepts_target_paths_inside_the_package() {
+    let inside = package(
+        "engine",
+        "build = \"build.rs\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[[bin]]\nname = \"engine-cli\"\npath = \"src/main.rs\"\n",
+    );
+    let outside = package(
+        "engine",
+        "[[bin]]\nname = \"engine-cli\"\npath = \"../tools/main.rs\"\n",
+    );
+    let files = [
+        ("engine/build.rs", "fn main() {}\n"),
+        ("engine/src/main.rs", "fn main() {}\n"),
+        ("tools/main.rs", "fn main() {}\n"),
+    ];
+    // 変更前のツリーだけ、または変更後のツリーだけで package の外を指すなら証明しない。
+    for (before, after) in [(&outside, &inside), (&inside, &outside)] {
+        let repo = remove_old_app_with_files(before, ENGINE_IMPORT_RUN, &files);
+        repo.write("engine/Cargo.toml", after);
+        assert_eq!(
+            review_hook(&repo, &[]),
+            (Some(1), "rm".to_owned()),
+            "{before} -> {after}"
+        );
+    }
+    // どちらのツリーでも package の中を指すだけなら、証明を止めない (Issue #373)。
+    let repo = remove_old_app_with_files(&inside, ENGINE_IMPORT_RUN, &files);
+    assert_eq!(review_hook(&repo, &[]), (Some(0), "rm_dead".to_owned()));
 }
 
 #[test]
