@@ -1264,18 +1264,58 @@ mod tests {
         ));
     }
 
+    /// b の manifest に `manifest` を追記し、b の下に `files` (パスと中身) を置いたワークスペースで、
+    /// a に依存しない b の参照を外せるか。作業ツリーの走査と、git の tree と同じく字面で解決する
+    /// 列挙したツリーの走査で、結果が同じことも確かめる。
+    fn proves_with_b_files(manifest: &str, files: &[(&str, &str)]) -> bool {
+        let directory = workspace("", manifest, "", "pub fn unrelated() {}\n");
+        for (file, content) in files {
+            let path = directory.path().join("b").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let proves = RustCargoReachability::new(directory.path(), true)
+            .proves_unreachable("b/src/lib.rs", "a/src/lib.rs");
+        let package = |name: &str, extra: &str| {
+            format!(
+                "[package]\nname = \"sample-{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            )
+        };
+        let mut listed = vec![
+            (
+                "Cargo.toml".to_owned(),
+                "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\n".to_owned(),
+            ),
+            ("a/Cargo.toml".to_owned(), package("a", "")),
+            ("b/Cargo.toml".to_owned(), package("b", manifest)),
+            ("c/Cargo.toml".to_owned(), package("c", "")),
+            ("a/src/lib.rs".to_owned(), "pub struct Result;\n".to_owned()),
+            (
+                "b/src/lib.rs".to_owned(),
+                "pub fn unrelated() {}\n".to_owned(),
+            ),
+            ("c/src/lib.rs".to_owned(), "pub struct Result;\n".to_owned()),
+        ];
+        listed.extend(
+            files
+                .iter()
+                .map(|(file, content)| (format!("b/{file}"), (*content).to_owned())),
+        );
+        let listed: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        let listed_proves = scan_listed(&listed).is_some_and(|index| {
+            let b = index.owner("b/src/lib.rs").unwrap();
+            !index.may_reach(b, index.owner("a/src/lib.rs").unwrap())
+        });
+        assert_eq!(proves, listed_proves, "{manifest}");
+        proves
+    }
+
     #[test]
     fn target_paths_must_name_sources_inside_the_package() {
-        let proves = |manifest: &str, files: &[&str]| {
-            let directory = workspace("", manifest, "", "pub fn unrelated() {}\n");
-            for file in files {
-                let path = directory.path().join("b").join(file);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, "fn main() {}\n").unwrap();
-            }
-            RustCargoReachability::new(directory.path(), true)
-                .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
-        };
+        let main = ("src/main.rs", "fn main() {}\n");
         // 外・`..`・走査していない・Rust のソースでない・文字列でないパスは証明しない。
         for (manifest, files) in [
             ("[lib]\npath = \"../a/src/lib.rs\"\n", &[][..]),
@@ -1290,15 +1330,37 @@ mod tests {
             ("[[bin]]\nname = \"tool\"\npath = \"src/missing.rs\"\n", &[]),
             (
                 "[[bin]]\nname = \"tool\"\npath = \"src/main\"\n",
-                &["src/main"],
+                &[("src/main", "fn main() {}\n")],
             ),
             ("[[bin]]\nname = \"tool\"\npath = \"\"\n", &[]),
             ("[[bin]]\nname = \"tool\"\npath = 1\n", &[]),
             ("[[test]]\nname = \"it\"\npath = \"/tests/it.rs\"\n", &[]),
             ("[[test]]\nname = \"it\"\npath = \"C:/tests/it.rs\"\n", &[]),
-            ("build = [\"build.rs\"]\n", &["build.rs"]),
+            (
+                "build = [\"build.rs\"]\n",
+                &[("build.rs", "fn main() {}\n")],
+            ),
+            // 1 つの target だけが外を指しても、全てのエントリを確かめる。
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n\n[[bin]]\nname = \"other\"\npath = \"../a/src/lib.rs\"\n",
+                &[main],
+            ),
         ] {
-            assert!(!proves(manifest, files), "{manifest}");
+            assert!(!proves_with_b_files(manifest, files), "{manifest}");
+        }
+        // 中を指す target の根も、ソースの取り込みや標準でない属性の検査は今までどおり受ける。
+        for source in [
+            "include!(\"../../a/src/lib.rs\");\nfn main() {}\n",
+            "#[path = \"../../a/src/lib.rs\"]\nmod shared;\nfn main() {}\n",
+            "#[custom::attribute]\nfn main() {}\n",
+        ] {
+            assert!(
+                !proves_with_b_files(
+                    "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+                    &[("tools/tool.rs", source)],
+                ),
+                "{source}"
+            );
         }
         // 変えた側の target が b のソースをコンパイルすると、b のファイルから a の名前が見える。
         let directory = workspace("", "", "", "pub fn unrelated() {}\n");
@@ -1318,20 +1380,23 @@ mod tests {
             ("[lib]\npath = \"./src/lib.rs\"\n", &[]),
             (
                 "[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
-                &["src/main.rs"],
+                &[main],
             ),
             (
                 "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
-                &["tools/tool.rs"],
+                &[("tools/tool.rs", "fn main() {}\n")],
             ),
             (
                 "[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\n",
-                &["examples/demo.rs"],
+                &[("examples/demo.rs", "fn main() {}\n")],
             ),
-            ("build = \"build.rs\"\n", &["build.rs"]),
-            ("build = \"scripts/build.rs\"\n", &["scripts/build.rs"]),
+            ("build = \"build.rs\"\n", &[("build.rs", "fn main() {}\n")]),
+            (
+                "build = \"scripts/build.rs\"\n",
+                &[("scripts/build.rs", "fn main() {}\n")],
+            ),
         ] {
-            assert!(proves(manifest, files), "{manifest}");
+            assert!(proves_with_b_files(manifest, files), "{manifest}");
         }
     }
 
@@ -1456,11 +1521,11 @@ mod tests {
     }
 
     /// 呼び出し側が列挙したツリー。git の tree と同じく symlink を辿らずに解決する。
-    struct ListedTree(HashMap<PathBuf, &'static str>);
+    struct ListedTree(HashMap<PathBuf, Vec<u8>>);
 
     impl WorkspaceTree for ListedTree {
         fn read(&self, path: &Path) -> Option<Vec<u8>> {
-            self.0.get(path).map(|content| content.as_bytes().to_vec())
+            self.0.get(path).cloned()
         }
 
         fn resolve(&self, base: &Path, relative: &str) -> Option<PathBuf> {
@@ -1468,15 +1533,12 @@ mod tests {
         }
     }
 
-    fn scan_listed(files: &[(&str, &'static str)]) -> Option<CargoIndex> {
+    fn scan_listed(files: &[(&str, &str)]) -> Option<CargoIndex> {
         scan_listed_with_symlinks(files, &[])
     }
 
     /// `symlinks` はファイルを指す symlink の要素 (git の tree の mode 120000) として足す。
-    fn scan_listed_with_symlinks(
-        files: &[(&str, &'static str)],
-        symlinks: &[&str],
-    ) -> Option<CargoIndex> {
+    fn scan_listed_with_symlinks(files: &[(&str, &str)], symlinks: &[&str]) -> Option<CargoIndex> {
         let paths: Vec<PathBuf> = files
             .iter()
             .map(|(path, _)| Path::new(path).components().collect())
@@ -1485,7 +1547,7 @@ mod tests {
             paths
                 .iter()
                 .cloned()
-                .zip(files.iter().map(|(_, content)| *content))
+                .zip(files.iter().map(|(_, content)| content.as_bytes().to_vec()))
                 .collect(),
         );
         CargoIndex::scan(
