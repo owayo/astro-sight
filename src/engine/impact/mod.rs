@@ -1026,18 +1026,20 @@ mod tests {
             "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
             "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
             "--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1 @@\n+a\n",
+            "diff --git a/notes/new.md b/notes/new.md\n--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1 @@\n+a\n",
+            "diff --git a/notes/old.md b/notes/old.md\n--- a/notes/old.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
             // astro-sight が未追跡のファイルに合成する追加の diff。
             "diff --git a/notes/new.md b/notes/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1 @@\n+a\n",
         ] {
             assert_eq!(cargo_inputs_unchanged(diff), (true, true), "{diff}");
         }
-        // Rust のソースの追加は、reexport の側だけ許す (今までどおり)。
-        assert_eq!(
-            cargo_inputs_unchanged(
-                "diff --git a/src/new.rs b/src/new.rs\nnew file mode 100644\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+a\n"
-            ),
-            (false, true)
-        );
+        // Rust のソースの追加は、reexport の側だけ許す (今までどおり。mode の行を省いた手書きも)。
+        for diff in [
+            "diff --git a/src/new.rs b/src/new.rs\nnew file mode 100644\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+a\n",
+            "diff --git a/src/new.rs b/src/new.rs\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+a\n",
+        ] {
+            assert_eq!(cargo_inputs_unchanged(diff), (false, true), "{diff}");
+        }
         // 構成を変えたとみなす形 (Issue #374・#377)。
         for diff in [
             // binary と扱われる manifest の変更。
@@ -1045,6 +1047,8 @@ mod tests {
             // gitlink の更新と追加。
             "diff --git a/b b/b\nindex aaa..bbb 160000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb\n",
             "diff --git a/b b/b\nnew file mode 160000\nindex 0000000..bbb\n--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+Subproject commit bbb\n",
+            "diff --git a/b b/b\ndeleted file mode 160000\nindex aaa..0000000\n--- a/b\n+++ /dev/null\n@@ -1 +0,0 @@\n-Subproject commit aaa\n",
+            "diff --git a/b b/b\nindex aaa..bbb 160000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb-dirty\n",
             // 内容が同じ rename (mode が出ず、gitlink の rename と区別できない)。
             "diff --git a/a.md b/b.md\nsimilarity index 100%\nrename from a.md\nrename to b.md\n",
             "diff --git a/b/src/x.rs b/c/src/x.rs\nsimilarity index 100%\nrename from b/src/x.rs\nrename to c/src/x.rs\n",
