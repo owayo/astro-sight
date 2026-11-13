@@ -779,6 +779,9 @@ pub(crate) struct DiffBlock {
     pub(crate) old_mode: BlockMode,
     pub(crate) new_mode: BlockMode,
     pub(crate) content: BlockContent,
+    /// 追加・削除した行に `Subproject commit ` で始まる行がある (`--submodule=short` の gitlink の
+    /// 本文。中だけが dirty な gitlink は mode が出ないので、これでしか分からない)。
+    pub(crate) gitlink_body: bool,
 }
 
 /// [`scan_blocks`] の結果。
@@ -804,7 +807,7 @@ pub(crate) fn scan_blocks(input: &str) -> BlockScan {
     };
     let mut current: Option<BlockBuilder> = None;
     let mut lines = DiffLines::new(input);
-    let mut push = |scan: &mut BlockScan, block: BlockBuilder| {
+    let push = |scan: &mut BlockScan, block: BlockBuilder| {
         let (block, well_formed) = block.finish();
         scan.complete &= well_formed;
         scan.blocks.push(block);
@@ -812,8 +815,13 @@ pub(crate) fn scan_blocks(input: &str) -> BlockScan {
     while let Some(line) = lines.next() {
         let raw = raw_line(input, lines.line_start());
         match line {
-            DiffLine::Body(_) => match current.as_mut() {
-                Some(block) => block.hunks = true,
+            DiffLine::Body(body) => match current.as_mut() {
+                Some(block) => {
+                    block.hunks = true;
+                    if let HunkBodyLine::Added(text) | HunkBodyLine::Removed(text) = body {
+                        block.gitlink_body |= text.starts_with("Subproject commit ");
+                    }
+                }
                 None => scan.complete = false,
             },
             DiffLine::Hunk(_) => match current.as_mut() {
@@ -1072,6 +1080,7 @@ struct BlockBuilder {
     added: Option<Option<u32>>,
     deleted: Option<Option<u32>>,
     hunks: bool,
+    gitlink_body: bool,
     binary: bool,
     /// `GIT binary patch` の本体の途中。
     in_binary_patch: bool,
@@ -1253,6 +1262,7 @@ impl BlockBuilder {
             } else {
                 BlockContent::Unchanged
             },
+            gitlink_body: self.gitlink_body,
         };
         (block, well_formed)
     }
@@ -2177,6 +2187,7 @@ index e69de29..0000000
             old_mode: BlockMode::Known(0o100644),
             new_mode: BlockMode::Known(0o100644),
             content: BlockContent::Hunks,
+            gitlink_body: false,
         };
         assert_eq!(
             only_block(
@@ -2201,6 +2212,7 @@ index e69de29..0000000
                 old_mode: BlockMode::Absent,
                 new_mode: BlockMode::Known(0o100644),
                 content: BlockContent::Hunks,
+                gitlink_body: false,
             }
         );
         // 空のファイルの削除は本文が無い。
@@ -2212,6 +2224,7 @@ index e69de29..0000000
                 old_mode: BlockMode::Known(0o100755),
                 new_mode: BlockMode::Absent,
                 content: BlockContent::Unchanged,
+                gitlink_body: false,
             }
         );
         // 内容が同じ rename は mode が出ない (gitlink の rename と区別できない)。
@@ -2225,6 +2238,7 @@ index e69de29..0000000
                 old_mode: BlockMode::Unknown,
                 new_mode: BlockMode::Unknown,
                 content: BlockContent::Unchanged,
+                gitlink_body: false,
             }
         );
         assert_eq!(
@@ -2242,6 +2256,7 @@ index e69de29..0000000
                 old_mode: BlockMode::Known(0o100644),
                 new_mode: BlockMode::Known(0o100755),
                 content: BlockContent::Unchanged,
+                gitlink_body: false,
             }
         );
         assert_eq!(
@@ -2265,13 +2280,40 @@ index e69de29..0000000
             .new_mode,
             BlockMode::Known(0o160000)
         );
-        // 中だけが dirty な gitlink は旧新の OID が同じで、`index` 行も mode も出ない。
+        // 中だけが dirty な gitlink は旧新の OID が同じで、`index` 行も mode も出ない。本文で分かる。
+        let dirty = only_block(
+            "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n",
+        );
+        assert_eq!(
+            (dirty.new_mode, dirty.gitlink_body),
+            (BlockMode::Unknown, true)
+        );
+        // 空の context 行・CRLF・hunk を数え終えた後の改行なしの印は、正しい本文。
+        for diff in [
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n",
+            "diff --git a/x b/x\r\nindex aaa..bbb 100644\r\n--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n",
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n",
+        ] {
+            let block = only_block(diff);
+            assert_eq!(
+                (block.content, block.gitlink_body),
+                (BlockContent::Hunks, false),
+                "{diff}"
+            );
+        }
+        // astro-sight が未追跡のファイルに合成する追加の diff (`index` 行なし)。
         assert_eq!(
             only_block(
-                "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n"
-            )
-            .new_mode,
-            BlockMode::Unknown
+                "diff --git a/notes/new.md b/notes/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1,2 @@\n+a\n+b\n"
+            ),
+            DiffBlock {
+                old_path: BlockPath::Absent,
+                new_path: known("notes/new.md"),
+                old_mode: BlockMode::Absent,
+                new_mode: BlockMode::Known(0o100644),
+                content: BlockContent::Hunks,
+                gitlink_body: false,
+            }
         );
         // 安全な相対パスとして読めないパスは確定しない。
         assert_eq!(
@@ -2313,6 +2355,7 @@ index e69de29..0000000
                 old_mode: BlockMode::Unknown,
                 new_mode: BlockMode::Unknown,
                 content: BlockContent::Hunks,
+                gitlink_body: false,
             }
         );
         let empty = scan_blocks("");
