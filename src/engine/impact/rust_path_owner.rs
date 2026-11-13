@@ -355,7 +355,9 @@ impl RustPathOwnerProjectProof {
         } else {
             base.join("mod.rs")
         };
-        if self.root.join(alternative).exists() {
+        if crate::git_support::tree_view(&self.root).hides(&alternative)
+            || self.root.join(alternative).exists()
+        {
             return false;
         }
         let reference = Path::new(ref_path);
@@ -383,7 +385,13 @@ impl RustPathOwnerProjectProof {
         };
         let file = base.join(format!("{name}.rs"));
         let directory_file = base.join(name).join("mod.rs");
-        if self.root.join(&file).is_file() == self.root.join(&directory_file).is_file() {
+        let (Some(file_exists), Some(directory_file_exists)) = (
+            checked_is_file(&self.root, &file),
+            checked_is_file(&self.root, &directory_file),
+        ) else {
+            return false;
+        };
+        if file_exists == directory_file_exists {
             return false;
         }
         let Some(Some(old)) = self.reexport_old_sources.get(source) else {
@@ -1332,7 +1340,7 @@ impl RustPathOwnerIndex {
     ) -> Option<PathBuf> {
         let lib = src.join("lib.rs");
         let main = src.join("main.rs");
-        let root = match (dir.join(&lib).is_file(), dir.join(&main).is_file()) {
+        let root = match (checked_is_file(dir, &lib)?, checked_is_file(dir, &main)?) {
             (true, false) => lib,
             (false, true) => main,
             _ => return None,
@@ -1347,7 +1355,7 @@ impl RustPathOwnerIndex {
             let base = src.join(&prefix);
             let file = base.join(format!("{module}.rs"));
             let nested = base.join(module).join("mod.rs");
-            parent = match (dir.join(&file).is_file(), dir.join(&nested).is_file()) {
+            parent = match (checked_is_file(dir, &file)?, checked_is_file(dir, &nested)?) {
                 (true, false) => file,
                 (false, true) => nested,
                 _ => return None,
@@ -1679,6 +1687,34 @@ fn scan_reexport_sources(root: &Path) -> bool {
         })
 }
 
+/// `dir` の下の `path` が通常のファイル (symlink の先を含む) か。staged の snapshot が書き出さなかった
+/// 要素のために、実際の checkout と有無が違いうるなら None (Issue #376、[`crate::git_support::TreeView::hides`])。
+fn checked_is_file(dir: &Path, path: &Path) -> Option<bool> {
+    (!crate::git_support::tree_view(dir).hides(path)).then(|| dir.join(path).is_file())
+}
+
+/// root の直下の `.git`・`target` (かその下) のパスか。
+fn under_root_git_or_target(path: &Path) -> bool {
+    path.components()
+        .next()
+        .is_some_and(|first| matches!(first.as_os_str().to_str(), Some(".git" | "target")))
+}
+
+/// snapshot が書き出さなかった要素を、型を見てから root の直下の `.git`・`target` のディレクトリを
+/// 読み飛ばす走査 (`scan_project_sources`・`scan_no_source_inclusion`) と同じく障壁にする。symlink は
+/// 種類を問わず障壁で、gitlink は中を確かめられない (Issue #376)。
+fn omissions_allow_typed_scan(root: &Path) -> bool {
+    crate::git_support::tree_view(root)
+        .omitted()
+        .is_some_and(|omitted| {
+            omitted.iter().all(|(path, kind)| {
+                under_root_git_or_target(path)
+                    && (path.components().count() > 1
+                        || matches!(kind, crate::git_support::OmittedKind::Gitlink))
+            })
+        })
+}
+
 fn scan_sources<F>(root: &Path, mut source_is_uncertain: F) -> bool
 where
     F: FnMut(&[u8]) -> bool,
@@ -1686,6 +1722,18 @@ where
     let Ok(root) = root.canonicalize() else {
         return false;
     };
+    // root の直下の `.git`・`target` は名前で先に読み飛ばす。それ以外の、snapshot が書き出さなかった
+    // 要素は、実際の checkout の symlink と同じく障壁にする (Issue #376)。
+    if !crate::git_support::tree_view(&root)
+        .omitted()
+        .is_some_and(|omitted| {
+            omitted
+                .iter()
+                .all(|(path, _)| under_root_git_or_target(path))
+        })
+    {
+        return false;
+    }
     for ancestor in root.ancestors().skip(1) {
         if ancestor.join("Cargo.toml").exists() || ancestor.join(".git").exists() {
             return false;
@@ -2118,6 +2166,9 @@ fn scan_project_sources(
     let Ok(root) = root.canonicalize() else {
         return false;
     };
+    if !omissions_allow_typed_scan(&root) {
+        return false;
+    }
     for ancestor in root.ancestors().skip(1) {
         if ancestor.join("Cargo.toml").exists() || ancestor.join(".git").exists() {
             return false;
@@ -2188,6 +2239,9 @@ fn scan_no_source_inclusion(root: &Path) -> bool {
     let Ok(root) = root.canonicalize() else {
         return false;
     };
+    if !omissions_allow_typed_scan(&root) {
+        return false;
+    }
     for ancestor in root.ancestors().skip(1) {
         if ancestor.join("Cargo.toml").exists() || ancestor.join(".git").exists() {
             return false;
@@ -2663,9 +2717,15 @@ fn source_module_path_inner(
     ref_file: &Path,
     allow_nested_root_names: bool,
 ) -> Option<(PathBuf, PathBuf, Vec<String>)> {
-    let package = ref_file
-        .ancestors()
-        .find(|ancestor| dir.join(ancestor).join("Cargo.toml").is_file())?;
+    // 最も近い manifest を、snapshot が書き出さなかった要素で取り違えない (Issue #376)。
+    let mut package = None;
+    for ancestor in ref_file.ancestors() {
+        if checked_is_file(dir, &ancestor.join("Cargo.toml"))? {
+            package = Some(ancestor);
+            break;
+        }
+    }
+    let package = package?;
     let manifest = read_input_text_file(&dir.join(package).join("Cargo.toml"))?;
     let manifest_value = toml::from_str::<toml::Value>(&manifest).ok()?;
     let edition = manifest_value.get("package")?.get("edition")?.as_str()?;
@@ -2729,7 +2789,7 @@ fn private_module_file_from_roots(
 ) -> Option<PathBuf> {
     let mut resolved = None;
     for root in roots {
-        if !dir.join(&root).is_file() {
+        if !checked_is_file(dir, &root)? {
             continue;
         }
         let mut parent = root;
@@ -2771,7 +2831,7 @@ fn private_module_file_from_roots(
             let base = src.join(&prefix);
             let file = base.join(format!("{module}.rs"));
             let nested = base.join(module).join("mod.rs");
-            parent = match (dir.join(&file).is_file(), dir.join(&nested).is_file()) {
+            parent = match (checked_is_file(dir, &file)?, checked_is_file(dir, &nested)?) {
                 (true, false) => file,
                 (false, true) => nested,
                 _ => return None,
@@ -3069,6 +3129,113 @@ mod tests {
         ] {
             tree_sitter::Query::new(&language, query).unwrap();
         }
+    }
+
+    /// staged の snapshot (marker と記録だけを置いた形) の Cargo のプロジェクト。`entries` は記録の要素。
+    fn snapshot_project(entries: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        crate::git_support::fake_snapshot_record(root.path(), entries);
+        root
+    }
+
+    /// snapshot が書き出さなかった要素は、実際の checkout の symlink と同じく全体の走査を止め、その
+    /// パスのファイルの有無も決めない (Issue #376)。
+    #[test]
+    fn snapshot_omissions_block_scans_and_existence_checks() {
+        // 対照: 要素の無い記録と、root の直下の `target` の中だけの要素。
+        for entries in [
+            "",
+            "{\"path\":\"target/debug/link\",\"kind\":\"symlink\",\"target\":\"unknown\"}",
+        ] {
+            let root = snapshot_project(entries);
+            assert!(scan_ordinary_sources(root.path()), "{entries}");
+            assert!(super::scan_no_source_inclusion(root.path()), "{entries}");
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new("src/lib.rs")),
+                Some(true)
+            );
+        }
+        // 種類を問わない symlink と gitlink は、実際の checkout と同じく障壁。root の直下の `target`
+        // 自身が symlink なら、型を先に見る走査では障壁。
+        for entries in [
+            "{\"path\":\"CLAUDE.md\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
+            "{\"path\":\"src/main.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
+            "{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}",
+        ] {
+            let root = snapshot_project(entries);
+            assert!(!scan_ordinary_sources(root.path()), "{entries}");
+            assert!(!super::scan_no_source_inclusion(root.path()), "{entries}");
+        }
+        let root =
+            snapshot_project("{\"path\":\"target\",\"kind\":\"symlink\",\"target\":\"directory\"}");
+        assert!(scan_ordinary_sources(root.path()));
+        assert!(!super::scan_no_source_inclusion(root.path()));
+        // 書き出さなかった第 2 の crate root と、gitlink の下のファイルの有無は決めない。書き出さなかった
+        // symlink のディレクトリで開けない名前 (`src/other.rs`) も、その別名でありうるので決めない。
+        let root = snapshot_project(
+            "{\"path\":\"src/main.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"},{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}",
+        );
+        for path in ["src/main.rs", "src/other.rs", "vendor/sub/Cargo.toml"] {
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new(path)),
+                None,
+                "{path}"
+            );
+        }
+        // 対照: 開けるファイルと、書き出さなかった symlink の無いディレクトリで開けない名前。
+        for (path, exists) in [
+            ("Cargo.toml", true),
+            ("src/lib.rs", true),
+            ("vendor/other.rs", false),
+            ("src/lib.rs/x.rs", false),
+        ] {
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new(path)),
+                Some(exists),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
+            None
+        );
+        // `src/main.rs` として開けうる別名の symlink: 大文字小文字だけが違う名前と、NTFS で短い名前 (8.3)
+        // を `main.rs` にできる名前。
+        for link in ["src/MAIN.rs", "src/bootstrap-link.rs"] {
+            let root = snapshot_project(&format!(
+                "{{\"path\":\"{link}\",\"kind\":\"symlink\",\"target\":\"regular_file\"}}"
+            ));
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new("src/main.rs")),
+                None,
+                "{link}"
+            );
+            assert_eq!(
+                super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
+                None,
+                "{link}"
+            );
+        }
+        // 対照: 文書の symlink だけなら、`src` の crate root を決められる。
+        let root = snapshot_project(
+            "{\"path\":\"CLAUDE.md\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
+        );
+        assert_eq!(
+            super::checked_is_file(root.path(), std::path::Path::new("src/main.rs")),
+            Some(false)
+        );
+        assert_eq!(
+            super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
+            Some(std::path::PathBuf::from("src/lib.rs"))
+        );
     }
 
     /// プロジェクト単位の証明は Rust ソースを全部読む。100MB の入力上限を超えるファイル

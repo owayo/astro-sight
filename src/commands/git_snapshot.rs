@@ -146,7 +146,135 @@ fn read_manifest(listing: &[u8]) -> Result<TreeManifest> {
     Ok(manifest)
 }
 
-/// 親ディレクトリと gitlink の空ディレクトリを、浅い順に 1 つずつ作る。
+/// symlink の先を、同じ tree の中で要素を 1 つずつ辿って分類する。`..` を先に畳まない (途中の
+/// 要素が symlink なら、実際に開くのは別の場所)。途中に symlink・gitlink・ファイルがある、tree の外へ
+/// 出る、tree に無い、読めない名前なら不明。
+fn classify_link(
+    link: &str,
+    target: &[u8],
+    files: &BTreeSet<String>,
+    directories: &BTreeSet<String>,
+    links: &BTreeSet<String>,
+) -> crate::git_support::LinkTarget {
+    use crate::git_support::LinkTarget;
+    let Ok(target) = std::str::from_utf8(target) else {
+        return LinkTarget::Unknown;
+    };
+    if target.is_empty() || target.starts_with('/') || target.contains(['\\', ':', '\0']) {
+        return LinkTarget::Unknown;
+    }
+    let mut current: Vec<&str> = link.split('/').collect();
+    current.pop();
+    let mut at_file = false;
+    for part in target.split('/') {
+        if at_file {
+            // ファイルの下の要素 (`file/..`・`file/x`・`file/`) は開けない。
+            return LinkTarget::Unknown;
+        }
+        match part {
+            "" | "." => {}
+            ".." => {
+                if current.pop().is_none() {
+                    return LinkTarget::Unknown;
+                }
+            }
+            name => {
+                current.push(name);
+                let path = current.join("/");
+                if links.contains(&path) {
+                    return LinkTarget::Unknown;
+                }
+                if files.contains(&path) {
+                    at_file = true;
+                } else if !directories.contains(&path) {
+                    return LinkTarget::Unknown;
+                }
+            }
+        }
+    }
+    if at_file {
+        LinkTarget::RegularFile
+    } else {
+        LinkTarget::Directory
+    }
+}
+
+/// 書き出さなかった symlink と gitlink の記録 (Issue #376)。symlink の先は tree の blob から読む。
+/// UTF-8 でない名前があれば、分類も記録も確かめられないので `complete` を偽にする。
+fn omission_record(
+    root: &Path,
+    tree: &str,
+    manifest: &TreeManifest,
+) -> crate::git_support::OmissionRecord {
+    use crate::git_support::{
+        LinkTarget, OmissionRecord, OmittedEntry, SNAPSHOT_OMISSIONS_VERSION,
+    };
+    let mut complete = true;
+    let mut names = |paths: &[PathBuf]| -> BTreeSet<String> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                let name = path.to_str().map(str::to_owned);
+                complete &= name.is_some();
+                name
+            })
+            .collect()
+    };
+    let symlinks = names(&manifest.symlinks);
+    let gitlinks = names(&manifest.gitlinks);
+    let mut entries = Vec::new();
+    if !symlinks.is_empty() {
+        // symlink の先の分類にだけ、tree の全ての名前が要る。
+        let files = names(&manifest.files);
+        // tree のディレクトリは、その下に要素があるものだけ。gitlink の中は辿れない。
+        let mut directories = BTreeSet::new();
+        for path in files.iter().chain(&symlinks).chain(&gitlinks) {
+            let mut parts: Vec<&str> = path.split('/').collect();
+            parts.pop();
+            while !parts.is_empty() {
+                directories.insert(parts.join("/"));
+                parts.pop();
+            }
+        }
+        let links: BTreeSet<String> = symlinks.union(&gitlinks).cloned().collect();
+        let blobs = root
+            .to_str()
+            .map(|root| crate::commands::git_input::GitBlobBatch::new(root, tree));
+        complete &= blobs.is_some();
+        for link in &symlinks {
+            let target = blobs
+                .as_ref()
+                .and_then(|blobs| blobs.read_limited(link, 4096))
+                .map_or(LinkTarget::Unknown, |target| {
+                    classify_link(link, &target, &files, &directories, &links)
+                });
+            entries.push(OmittedEntry::symlink(link.clone(), target));
+        }
+    }
+    entries.extend(gitlinks.iter().cloned().map(OmittedEntry::gitlink));
+    OmissionRecord {
+        version: SNAPSHOT_OMISSIONS_VERSION,
+        tree: tree.to_owned(),
+        complete,
+        entries,
+    }
+}
+
+/// [`omission_record`] を snapshot の `.git` の下に書く。書けなければ記録が無いままで、読む側は
+/// snapshot を実際の checkout と同じとはみなさない。
+fn write_omission_record(root: &Path, tree: &str, manifest: &TreeManifest) {
+    let record = omission_record(root, tree, manifest);
+    if let Ok(bytes) = serde_json::to_vec(&record) {
+        let _ = fs::write(
+            root.join(".git")
+                .join(crate::git_support::SNAPSHOT_OMISSIONS),
+            bytes,
+        );
+    }
+}
+
+/// 親ディレクトリと gitlink の空ディレクトリを、浅い順に 1 つずつ作る。symlink は書き出さないが、
+/// その親のディレクトリは作り、実際の checkout と同じディレクトリが見えるようにする。
 ///
 /// 同じ論理パスは 1 度しか作らないので、既にあれば別の論理パスが FS 上で同じ実体になった
 /// (大文字小文字や Unicode 正規化の別名) ことになる。同じディレクトリへ黙って混ぜると、
@@ -154,7 +282,11 @@ fn read_manifest(listing: &[u8]) -> Result<TreeManifest> {
 /// ディレクトリの衝突は、上書きしない checkout-index が非 0 で終わることで検出する。
 fn create_directories(root: &Path, manifest: &TreeManifest) -> Result<()> {
     let mut directories = BTreeSet::new();
-    let parents = manifest.files.iter().filter_map(|path| path.parent());
+    let parents = manifest
+        .files
+        .iter()
+        .chain(&manifest.symlinks)
+        .filter_map(|path| path.parent());
     for directory in parents.chain(manifest.gitlinks.iter().map(PathBuf::as_path)) {
         for ancestor in directory.ancestors() {
             if ancestor.as_os_str().is_empty() {
@@ -282,6 +414,13 @@ pub(in crate::commands) struct IndexSnapshot {
     /// 生成物の判定の属性を、スナップショットの `.gitattributes` (index の内容) と元のリポジトリの
     /// info・利用者の属性ファイルから引くための登録 (一時リポジトリの info は書き出し用の属性)。
     _attributes: crate::engine::gitattributes::SnapshotRegistration,
+}
+
+impl Drop for IndexSnapshot {
+    /// 一時ディレクトリを消す前に、その中の見え方 ([`crate::git_support::tree_view`]) を忘れる。
+    fn drop(&mut self) {
+        crate::git_support::forget_tree_views();
+    }
 }
 
 /// スナップショットの作成に要る、元のリポジトリの値。
@@ -490,6 +629,8 @@ impl IndexSnapshot {
         }
         create_directories(root, &manifest)?;
         checkout_files(root, &manifest.files)?;
+        write_omission_record(root, &tree, &manifest);
+        crate::git_support::forget_tree_views();
         let analysis_dir = root.join(prefix);
         fs::create_dir_all(&analysis_dir)?;
         let analysis_text = analysis_dir
@@ -648,6 +789,8 @@ fn prepare_commit_snapshot_with_budget(
     omissions.sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
     create_directories(root, &manifest)?;
     checkout_files(root, &manifest.files)?;
+    write_omission_record(root, &tree, &manifest);
+    crate::git_support::forget_tree_views();
     let analysis_dir = root.join(repository.prefix);
     fs::create_dir_all(&analysis_dir)?;
     let attributes = crate::engine::gitattributes::register_snapshot(root, original);
@@ -766,6 +909,119 @@ mod tests {
             PreparedSnapshot::Ready(snapshot) => snapshot,
             PreparedSnapshot::OverBudget(_) => panic!("small staged tree must be materialized"),
         }
+    }
+
+    /// snapshot は書き出さなかった symlink と gitlink を、先の分類つきで記録し、`tree_view` で読める。
+    /// symlink だけを含むディレクトリも作る (Issue #376)。
+    #[test]
+    fn omitted_links_are_recorded_with_their_targets() {
+        use crate::git_support::{LinkTarget, OmittedKind, TreeView};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        write(repo, "AGENTS.md", b"agents\n");
+        write(repo, "src/lib.rs", b"pub mod right;\n");
+        write(repo, "src/right/shared.rs", b"pub fn call() {}\n");
+        commit_all(repo, "base");
+        let targets = tempfile::tempdir().expect("tempdir");
+        let link = |path: &str, target: &str| {
+            let file = targets.path().join("target");
+            fs::write(&file, target).expect("write");
+            let blob = String::from_utf8(git(
+                repo,
+                &["hash-object", "-w", file.to_str().expect("utf-8")],
+            ))
+            .expect("utf-8");
+            git(
+                repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("120000,{},{path}", blob.trim()),
+                ],
+            );
+        };
+        link("CLAUDE.md", "AGENTS.md");
+        link("src/left/shared.rs", "../right/shared.rs");
+        link("docs", "src");
+        link("dangling.rs", "missing.rs");
+        link("through.rs", "docs/lib.rs");
+        link("escape.rs", "../outside.rs");
+        link("under_file.rs", "AGENTS.md/x");
+        // `..` を先に畳まない: 途中の symlink・gitlink・ファイルの下へ出入りする先は不明。
+        link("via_link.rs", "docs/../AGENTS.md");
+        link("via_gitlink.rs", "vendor/sub/../../AGENTS.md");
+        link("via_file.rs", "AGENTS.md/../AGENTS.md");
+        link("trailing.rs", "AGENTS.md/");
+        // 対照: 実在するディレクトリを通る `..` は辿る。
+        link("parent.md", "src/../AGENTS.md");
+        git(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},vendor/sub", head(repo)),
+            ],
+        );
+        let snapshot = ready(prepare_staged(repo, SnapshotBudget::DEFAULT));
+        let analysis = Path::new(snapshot.dir().expect("utf-8"));
+        assert!(analysis.join("src/left").is_dir());
+        assert!(!analysis.join("src/left/shared.rs").exists());
+        let link = |target| OmittedKind::Symlink(target);
+        let view = crate::git_support::tree_view(analysis);
+        assert!(matches!(*view, TreeView::Snapshot(_)));
+        assert_eq!(
+            view.omitted().map(<[_]>::to_vec),
+            Some(vec![
+                (PathBuf::from("CLAUDE.md"), link(LinkTarget::RegularFile)),
+                (PathBuf::from("dangling.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("docs"), link(LinkTarget::Directory)),
+                (PathBuf::from("escape.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("parent.md"), link(LinkTarget::RegularFile)),
+                (
+                    PathBuf::from("src/left/shared.rs"),
+                    link(LinkTarget::RegularFile)
+                ),
+                (PathBuf::from("through.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("trailing.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("under_file.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("via_file.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("via_gitlink.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("via_link.rs"), link(LinkTarget::Unknown)),
+                (PathBuf::from("vendor/sub"), OmittedKind::Gitlink),
+            ])
+        );
+    }
+
+    /// snapshot を作る・捨てるたびに `tree_view` の結果を忘れ、同じパスで作り直した snapshot の記録を
+    /// 読み直す (Issue #376)。別の snapshot の形のディレクトリで、記録を書き換えて確かめる。
+    #[test]
+    fn creating_and_dropping_snapshots_forgets_tree_views() {
+        use crate::git_support::{OmittedKind, fake_snapshot_record, tree_view};
+        let observed = tempfile::tempdir().expect("tempdir");
+        let omitted = || tree_view(observed.path()).omitted().map(<[_]>::to_vec);
+        fake_snapshot_record(observed.path(), "");
+        assert_eq!(omitted(), Some(Vec::new()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_git_repo_for_test(repo.path());
+        write(repo.path(), "a.rs", b"pub fn a() {}\n");
+        commit_all(repo.path(), "base");
+        write(repo.path(), "a.rs", b"pub fn b() {}\n");
+        git(repo.path(), &["add", "a.rs"]);
+        fake_snapshot_record(
+            observed.path(),
+            "{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}",
+        );
+        let snapshot = ready(prepare_staged(repo.path(), SnapshotBudget::DEFAULT));
+        assert_eq!(
+            omitted(),
+            Some(vec![(PathBuf::from("vendor/sub"), OmittedKind::Gitlink)])
+        );
+        fake_snapshot_record(observed.path(), "");
+        drop(snapshot);
+        assert_eq!(omitted(), Some(Vec::new()));
     }
 
     #[test]

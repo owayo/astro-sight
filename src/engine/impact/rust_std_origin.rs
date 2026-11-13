@@ -481,6 +481,37 @@ impl RustStdProjectProof {
 }
 
 fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
+    // snapshot が書き出さなかった要素も、下の走査が実際の checkout の symlink に当てる規則で扱う。
+    // `.git`・`target` という名前の要素はどの深さでも読み飛ばす。gitlink の中と、先がディレクトリか
+    // 分からない symlink は確かめられない (Issue #376)。
+    let omitted_allowed = |path: &Path, kind: &crate::git_support::OmittedKind| {
+        if path
+            .components()
+            .any(|part| matches!(part.as_os_str().to_str(), Some(".git" | "target")))
+        {
+            return true;
+        }
+        matches!(
+            kind,
+            crate::git_support::OmittedKind::Symlink(crate::git_support::LinkTarget::RegularFile)
+        ) && !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("rs" | "toml")
+        ) && !matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("config" | "build.rs")
+        )
+    };
+    if !crate::git_support::tree_view(root)
+        .omitted()
+        .is_some_and(|omitted| {
+            omitted
+                .iter()
+                .all(|(path, kind)| omitted_allowed(path, kind))
+        })
+    {
+        return None;
+    }
     let mut pending = vec![root.to_owned()];
     let mut raw_manifests = Vec::new();
     let mut rust_files = Vec::new();
@@ -535,9 +566,15 @@ fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
             })
         })
         .collect::<Option<_>>()?;
+    let view = crate::git_support::tree_view(root);
     for manifest in &manifests {
         for name in ["config", "config.toml"] {
             let path = manifest.directory.join(".cargo").join(name);
+            // snapshot が書き出さなかった symlink (`.cargo/CONFIG` など) のために、実際の checkout と
+            // 有無が違いうる設定は確かめられない (Issue #376)。
+            if view.hides(path.strip_prefix(root).ok()?) {
+                return None;
+            }
             if path.exists() && read_input_file(&path)?.windows(8).any(|w| w == b"--extern") {
                 return None;
             }
@@ -697,6 +734,66 @@ fn target_path_escapes(value: &toml::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// staged の snapshot (marker と記録だけを置いた形) の Cargo のプロジェクトで、書き出さなかった要素に
+    /// 実際の checkout の symlink と同じ規則を当てる (Issue #376)。
+    #[test]
+    fn project_scan_applies_checkout_symlink_rules_to_snapshot_omissions() {
+        let project = |entries: &str| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            std::fs::create_dir_all(root.path().join(".git")).unwrap();
+            std::fs::write(
+                root.path().join("Cargo.toml"),
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+            crate::git_support::fake_snapshot_record(root.path(), entries);
+            root
+        };
+        let symlink = |path: &str, target: &str| {
+            format!("{{\"path\":\"{path}\",\"kind\":\"symlink\",\"target\":\"{target}\"}}")
+        };
+        // 対照: 通常のファイルを指す文書の symlink と、`target` という名前の要素の下は許す。
+        for entries in [
+            String::new(),
+            symlink("CLAUDE.md", "regular_file"),
+            symlink("crates/x/target/link", "unknown"),
+        ] {
+            assert!(
+                scan_project(project(&entries).path()).is_some(),
+                "{entries}"
+            );
+        }
+        for entries in [
+            symlink("src/x.rs", "regular_file"),
+            symlink("Cargo.toml", "regular_file"),
+            symlink("build.rs", "regular_file"),
+            symlink("config", "regular_file"),
+            symlink("docs", "directory"),
+            symlink("notes.md", "unknown"),
+            "{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}".to_owned(),
+            // 実際の checkout では、大文字小文字を区別しないファイルシステムで `.cargo/config` として
+            // 開けうる。書き出さなかったので `--extern` の有無を確かめられない。
+            symlink(".cargo/CONFIG", "regular_file"),
+        ] {
+            assert!(
+                scan_project(project(&entries).path()).is_none(),
+                "{entries}"
+            );
+        }
+        // 対照: 書き出した設定は読み、`--extern` が無ければ通し、あれば止める。
+        for (config, allowed) in [
+            ("[build]\njobs = 1\n", true),
+            ("[build]\nrustflags = [\"--extern\", \"std=x\"]\n", false),
+        ] {
+            let root = project("");
+            std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+            std::fs::write(root.path().join(".cargo/config"), config).unwrap();
+            assert_eq!(scan_project(root.path()).is_some(), allowed, "{config}");
+        }
+    }
 
     #[test]
     fn std_use_and_qualified_type_have_structural_origin() {

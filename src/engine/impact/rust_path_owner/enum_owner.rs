@@ -15,6 +15,37 @@ pub(super) fn static_layout(
     {
         return None;
     }
+    // snapshot が書き出さなかった要素も、下の走査が実際の checkout の symlink に当てる規則で扱う
+    // (通常のファイルを指し、`.rs` でも `Cargo.toml` でもない symlink だけを許す)。root の直下の
+    // `.git`・`target` のディレクトリの中は読まない (Issue #376)。
+    let omitted_allowed = |path: &Path, kind: &crate::git_support::OmittedKind| {
+        if super::under_root_git_or_target(path)
+            && (path.components().count() > 1
+                || matches!(kind, crate::git_support::OmittedKind::Gitlink))
+        {
+            return true;
+        }
+        matches!(
+            kind,
+            crate::git_support::OmittedKind::Symlink(crate::git_support::LinkTarget::RegularFile)
+        ) && !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
+    };
+    if !crate::git_support::tree_view(&root)
+        .omitted()
+        .is_some_and(|omitted| {
+            omitted
+                .iter()
+                .all(|(path, kind)| omitted_allowed(path, kind))
+        })
+    {
+        return None;
+    }
     let mut pending = vec![root.clone()];
     let mut relocated = Vec::new();
     let mut candidates = Vec::new();
@@ -291,6 +322,11 @@ impl EnumFile {
 }
 
 fn ordinary_file(dir: &Path, path: &Path) -> Option<bool> {
+    // snapshot が書き出さなかった要素のために実際の checkout と有無が違いうるなら、決めない
+    // (Issue #376)。
+    if crate::git_support::tree_view(dir).hides(path) {
+        return None;
+    }
     match std::fs::symlink_metadata(dir.join(path)) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => dir
             .join(path)
