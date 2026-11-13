@@ -1283,6 +1283,43 @@ fn single_name_uses_and_test_modules() {
     assert!(api.parse_truncations.is_empty(), "{api:?}");
 }
 
+/// Issue #380: テストの module とみなすのは、無条件の `#[cfg(test)]` を付けた module だけ。`cfg_attr` の
+/// 中の `cfg(test)` は、述語が成り立たない設定ではテストでない build にも module を残すので、中の型の
+/// 変化は今までどおりシグネチャの依存の変化にする。
+#[test]
+fn cfg_attr_test_conditions_do_not_make_test_modules() {
+    let changed = Some(Reason::RustSignatureDependencyChanged);
+    for (attributes, expected) in [
+        // 対照: 属性が無い module と、テストでない build にだけ有る module は比べる
+        ("", changed),
+        ("#[cfg(not(test))]\n", changed),
+        // 対照: 無条件の `#[cfg(test)]` の module は、ほかの属性と並んでいてもテストの module
+        ("#[cfg(test)]\n", None),
+        (
+            "#[cfg_attr(feature = \"wide\", allow(dead_code))]\n#[cfg(test)]\n",
+            None,
+        ),
+        // Issue の再現: `wide` を有効にしない設定では、テストでない build にも `m` がある
+        ("#[cfg_attr(feature = \"wide\", cfg(test))]\n", changed),
+    ] {
+        let root = format!(
+            "{attributes}pub mod m;\n\npub fn take(value: m::Value) -> u8 {{\n    let _ = value;\n    0\n}}\n"
+        );
+        let api = api_changes_of_files(
+            &[
+                ("src/lib.rs", &root),
+                ("src/m.rs", "pub type Value = u8;\n"),
+            ],
+            &[("src/m.rs", "pub type Value = u16;\n")],
+        );
+        assert_eq!(
+            dependency_reason(&api, "take"),
+            expected,
+            "{attributes}: {api:?}"
+        );
+    }
+}
+
 /// Issue #312: 宣言の有る条件と両立しない cfg の枝だけを変えても、契約の束縛の変化にしない。両立する
 /// 枝の変化と、両立するか決められない枝は今までどおり比べる。
 #[test]
