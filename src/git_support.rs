@@ -148,31 +148,51 @@ impl TreeView {
     /// 違う名前も、それを区別しないファイルシステムでは同じ要素なので、同じとみなす。
     pub(crate) fn hides(&self, relative: &std::path::Path) -> bool {
         self.omitted().is_none_or(|entries| {
-            entries.iter().any(|(path, _)| {
-                let mut query = relative.components();
-                path.components().all(|part| {
-                    query
-                        .next()
-                        .is_some_and(|other| same_entry_name(part.as_os_str(), other.as_os_str()))
-                })
-            })
+            entries
+                .iter()
+                .any(|(path, _)| strip_entry_prefix(relative, path).is_some())
         })
     }
 }
 
-/// 大文字小文字と Unicode の正規化を区別しないファイルシステムで、同じ名前になりうるか。区別する
-/// ファイルシステムでも同じとみなす (証明をやめる側)。
+/// `path` が要素ごとに `prefix` で始まるなら、残りの要素。名前は [`same_entry_name`] で比べる。
+fn strip_entry_prefix(
+    path: &std::path::Path,
+    prefix: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut parts = path.components();
+    for part in prefix.components() {
+        if !same_entry_name(part.as_os_str(), parts.next()?.as_os_str()) {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
+/// 大文字小文字と Unicode の正規化を区別しないファイルシステムで、同じ名前になりうるか。HFS+ は
+/// 名前を分解して保存し、比べるときに一部の書式の文字 (U+200C-200F・U+202A-202E・U+206A-206F・
+/// U+FEFF) を無視する。Windows は大文字の表で比べる。どれかで同じになりうれば同じとみなす (区別する
+/// ファイルシステムでも同じとみなし、証明をやめる側に倒す)。
 fn same_entry_name(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
     use unicode_normalization::UnicodeNormalization;
-    let fold = |name: &str| -> String {
-        name.nfc()
-            .collect::<String>()
-            .to_lowercase()
-            .nfc()
+    let decompose = |name: &str| -> String {
+        name.nfd()
+            .filter(|ch| {
+                !matches!(
+                    u32::from(*ch),
+                    0x200C..=0x200F | 0x202A..=0x202E | 0x206A..=0x206F | 0xFEFF
+                )
+            })
             .collect()
     };
     match (left.to_str(), right.to_str()) {
-        (Some(left), Some(right)) => fold(left) == fold(right),
+        (Some(left), Some(right)) => {
+            let (left, right) = (decompose(left), decompose(right));
+            let fold =
+                |name: &str, case: fn(&str) -> String| -> String { case(name).nfd().collect() };
+            fold(&left, str::to_uppercase) == fold(&right, str::to_uppercase)
+                || fold(&left, str::to_lowercase) == fold(&right, str::to_lowercase)
+        }
         _ => left == right,
     }
 }
@@ -262,8 +282,10 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
             {
                 return None;
             }
-            // 解析の root 自身が、書き出さなかった要素 (の下) なら中身を確かめられない。
-            if prefix.starts_with(&path) {
+            // 解析の root 自身が、書き出さなかった要素 (の下) なら中身を確かめられない。root は
+            // canonicalize した名前 (HFS+ では分解した形) で、記録は index の名前なので、要素の
+            // 名前は [`same_entry_name`] で比べる。
+            if strip_entry_prefix(prefix, &path).is_some() {
                 return None;
             }
             let kind = match (entry.kind, entry.target) {
@@ -271,8 +293,8 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
                 (OmittedEntryKind::Gitlink, None) => OmittedKind::Gitlink,
                 _ => return None,
             };
-            if let Ok(relative) = path.strip_prefix(prefix) {
-                entries.push((relative.to_owned(), kind));
+            if let Some(relative) = strip_entry_prefix(&path, prefix) {
+                entries.push((relative, kind));
             }
         }
         Some(TreeView::Snapshot(entries))
@@ -492,6 +514,9 @@ mod tests {
             "app/src/main.rs",
             "APP/Src/Main.RS",
             "app/cafe\u{301}/Cargo.toml",
+            // HFS+ は比べるときに書式の文字を無視する。
+            "app/src/ma\u{200c}in.rs",
+            "app/caf\u{e9}\u{feff}/Cargo.toml",
         ] {
             assert!(view.hides(Path::new(path)), "{path}");
         }
@@ -499,6 +524,49 @@ mod tests {
         for path in ["app/src/lib.rs", "app/src/main.rs.bak", "app/cafe"] {
             assert!(!view.hides(Path::new(path)), "{path}");
         }
+        // Windows の大文字の表では、語末のシグマも同じ名前になる。
+        let sigma = fake_snapshot(
+            tree,
+            Some(&format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{{\"path\":\"a\u{3c3}\",\"kind\":\"gitlink\"}}]}}"
+            )),
+        );
+        for path in ["a\u{3a3}", "a\u{3c2}", "A\u{3a3}/x.rs"] {
+            assert!(tree_view(sigma.path()).hides(Path::new(path)), "{path}");
+        }
+    }
+
+    /// 解析の root は canonicalize した名前 (HFS+ では分解した形) で、記録は index の名前 (合成した形)。
+    /// 正規化だけが違っても、記録の要素を落とさない。
+    #[test]
+    fn tree_view_relates_records_to_roots_with_another_normalization() {
+        let tree = "0123456789012345678901234567890123456789";
+        let snapshot = fake_snapshot(
+            tree,
+            Some(&format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{{\"path\":\"caf\u{e9}/src/main.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"}}]}}"
+            )),
+        );
+        let decomposed = snapshot.path().join("cafe\u{301}");
+        std::fs::create_dir_all(decomposed.join("src")).unwrap();
+        assert_eq!(
+            *tree_view(&decomposed),
+            TreeView::Snapshot(vec![(
+                PathBuf::from("src/main.rs"),
+                OmittedKind::Symlink(LinkTarget::RegularFile)
+            )])
+        );
+        assert!(tree_view(&decomposed).hides(Path::new("src/main.rs")));
+        // root が、正規化だけが違う書き出さなかった要素の下なら使えない。
+        let nested = fake_snapshot(
+            tree,
+            Some(&format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{{\"path\":\"caf\u{e9}\",\"kind\":\"gitlink\"}}]}}"
+            )),
+        );
+        let decomposed = nested.path().join("cafe\u{301}");
+        std::fs::create_dir_all(&decomposed).unwrap();
+        assert_eq!(*tree_view(&decomposed), TreeView::Unusable);
     }
 
     #[test]
