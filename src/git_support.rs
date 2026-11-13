@@ -153,7 +153,35 @@ pub(crate) struct SnapshotOmissions {
     symlink_parents: std::collections::HashSet<EntryId>,
     /// gitlink の空ディレクトリの実体。
     gitlinks: std::collections::HashSet<EntryId>,
+    cache: HidesCache,
 }
+
+/// [`SnapshotOmissions::hides`] が求めた値。snapshot は消すまで変わらないので、問い合わせの結果と
+/// 開いたディレクトリの実体 (Windows では canonicalize が重い) を覚える。中身は比べない。
+#[derive(Debug, Default)]
+struct HidesCache(std::sync::Mutex<HidesCacheMaps>);
+
+#[derive(Debug, Default)]
+struct HidesCacheMaps {
+    /// 問い合わせ (`dir` からの、通常の名前だけの相対パス) ごとの結果。
+    results: std::collections::HashMap<std::path::PathBuf, bool>,
+    /// 開けたディレクトリ (`dir` からの相対パス) の実体。
+    ids: std::collections::HashMap<std::path::PathBuf, Option<EntryId>>,
+}
+
+impl HidesCache {
+    fn maps(&self) -> std::sync::MutexGuard<'_, HidesCacheMaps> {
+        self.0.lock().expect("hides cache mutex poisoned")
+    }
+}
+
+impl PartialEq for HidesCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HidesCache {}
 
 /// ディレクトリの実体を表す鍵。Linux の `realpath` は、大文字小文字を区別しないディレクトリ (ext4 の
 /// casefold など) でも入力の綴りを返し、同じディレクトリが別の文字列になりうるので、Unix ではデバイスと
@@ -207,7 +235,7 @@ impl TreeView {
 }
 
 impl SnapshotOmissions {
-    /// `relative` を `dir` から snapshot のファイルシステムで 1 要素ずつ開いて決める。
+    /// `relative` を `dir` から snapshot のファイルシステムで開いて決める。
     ///
     /// - 開けた要素は、実際の checkout でも同じ index の要素になる。gitlink の空ディレクトリかその下
     ///   なら、中身を確かめられないので真。
@@ -219,7 +247,7 @@ impl SnapshotOmissions {
         if self.symlink_parents.is_empty() && self.gitlinks.is_empty() {
             return false;
         }
-        let mut names = Vec::new();
+        let mut names = std::path::PathBuf::new();
         for component in relative.components() {
             match component {
                 std::path::Component::CurDir => {}
@@ -227,36 +255,71 @@ impl SnapshotOmissions {
                 _ => return true,
             }
         }
-        let mut opened = self.dir.clone();
-        // `opened` の metadata。None なら `dir` 自身。
-        let mut opened_metadata = None;
-        for name in names {
-            let next = opened.join(name);
-            match std::fs::symlink_metadata(&next) {
-                // snapshot は symlink を書き出さない。
+        if let Some(&hidden) = self.cache.maps().results.get(&names) {
+            return hidden;
+        }
+        let hidden = self.resolve(&names);
+        self.cache.maps().results.insert(names, hidden);
+        hidden
+    }
+
+    /// [`Self::hides`] の本体。`names` は通常の名前だけの、`dir` からの相対パス。
+    ///
+    /// 開ける最も深い要素を深い方から探す。snapshot は symlink を書き出さないので、途中の要素は
+    /// ディレクトリで、gitlink の空ディレクトリの下には何も無い。
+    fn resolve(&self, names: &std::path::Path) -> bool {
+        let mut opened = names;
+        let mut missing = false;
+        loop {
+            let path = self.dir.join(opened);
+            match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => return true,
-                // ファイルの下は、実際の checkout でも開けない。
+                // 開けたファイル (やその下) は、実際の checkout でも同じ要素 (の下) になる。
                 Ok(metadata) if !metadata.is_dir() => return false,
                 Ok(metadata) => {
-                    if !self.gitlinks.is_empty()
-                        && entry_id(&next, &metadata).is_none_or(|id| self.gitlinks.contains(&id))
-                    {
-                        return true;
-                    }
-                    opened = next;
-                    opened_metadata = Some(metadata);
+                    return self
+                        .directory_id(opened, &path, &metadata)
+                        .is_none_or(|id| {
+                            self.gitlinks.contains(&id)
+                                || (missing && self.symlink_parents.contains(&id))
+                        });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return match &opened_metadata {
-                        None => self.symlink_parents.contains(&self.dir_id),
-                        Some(metadata) => entry_id(&opened, metadata)
-                            .is_none_or(|id| self.symlink_parents.contains(&id)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    missing = true;
+                    let Some(parent) = opened.parent() else {
+                        return true;
                     };
+                    opened = parent;
                 }
                 Err(_) => return true,
             }
         }
-        false
+    }
+
+    /// 開けたディレクトリ `path` (`dir` からの相対は `relative`) の実体。
+    fn directory_id(
+        &self,
+        relative: &std::path::Path,
+        path: &std::path::Path,
+        metadata: &std::fs::Metadata,
+    ) -> Option<EntryId> {
+        if relative.as_os_str().is_empty() {
+            return Some(self.dir_id.clone());
+        }
+        if let Some(id) = self.cache.maps().ids.get(relative) {
+            return id.clone();
+        }
+        let id = entry_id(path, metadata);
+        self.cache
+            .maps()
+            .ids
+            .insert(relative.to_owned(), id.clone());
+        id
     }
 }
 
@@ -340,6 +403,7 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
             entries: Vec::new(),
             symlink_parents: std::collections::HashSet::new(),
             gitlinks: std::collections::HashSet::new(),
+            cache: HidesCache::default(),
         };
         // snapshot の root からの相対パスで指すディレクトリの実体。同じディレクトリは 1 度だけ開く。
         let mut ids = std::collections::HashMap::<std::path::PathBuf, EntryId>::new();
