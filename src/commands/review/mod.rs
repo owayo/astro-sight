@@ -1114,6 +1114,51 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn working_tree_matches_index_counts_submodules_hidden_by_ignore_settings() {
+        let upstream = tempfile::tempdir().expect("tempdir");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let git = |repo: &std::path::Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        for repo in [upstream.path(), parent.path()] {
+            git(repo, &["init", "-q"]);
+            git(repo, &["config", "user.name", "test"]);
+            git(repo, &["config", "user.email", "test@example.com"]);
+        }
+        fs::write(upstream.path().join("lib.rs"), "pub fn a() {}\n").expect("write");
+        git(upstream.path(), &["add", "-A"]);
+        git(upstream.path(), &["commit", "-qm", "sub"]);
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.path().to_str().expect("utf-8"),
+                "sub",
+            ],
+        );
+        git(parent.path(), &["commit", "-qm", "initial"]);
+        git(parent.path(), &["config", "diff.ignoreSubmodules", "all"]);
+        let dir = parent.path().to_str().expect("utf-8");
+        // 対照: submodule の中も変えていなければ一致する。
+        assert!(working_tree_matches_index(dir));
+        // submodule の中だけの変更は、利用者の ignore の設定で隠さない (Issue #377)。
+        fs::write(parent.path().join("sub/lib.rs"), "pub fn b() {}\n").expect("write");
+        assert!(!working_tree_matches_index(dir));
+    }
+
+    #[test]
     fn reference_evidence_staged_fallback_clears_worktree_facts_without_changing_blocking() {
         use std::process::Command;
         let temp = tempfile::tempdir().unwrap();

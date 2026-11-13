@@ -414,10 +414,17 @@ fn impact_rust_cargo_reachability_keeps_callers_for_binary_manifest_changes() {
 
 #[test]
 fn impact_rust_cargo_reachability_keeps_callers_for_submodule_manifest_changes() {
-    // b は submodule。submodule の中で b の manifest から a への依存を消し、親で gitlink を
-    // 更新しても、変更前の b は a を呼べたので外さない。利用者の `diff.ignoreSubmodules` で
-    // gitlink の更新を隠さない (Issue #377)。
-    for ignore in [false, true] {
+    // b は submodule。submodule の中で b の manifest から a への依存を消しても、変更前の b は a を
+    // 呼べたので外さない。gitlink を更新した場合 (index の mode が出る) と、コミットせず中だけが
+    // dirty な場合 (mode が出ず、本文の `Subproject commit` で分かる) の両方で、利用者の
+    // `diff.ignoreSubmodules` や `.gitmodules` の `ignore` で変更を隠さない (Issue #377)。
+    for (commit, ignore) in [
+        (true, None),
+        (true, Some("config")),
+        (false, None),
+        (false, Some("config")),
+        (false, Some("gitmodules")),
+    ] {
         let upstream = TestRepo::new();
         upstream.create_dir_all("src");
         upstream.write("Cargo.toml", B_DEPENDS_ON_A);
@@ -436,22 +443,28 @@ fn impact_rust_cargo_reachability_keeps_callers_for_submodule_manifest_changes()
                     &upstream_path,
                     "b",
                 ]);
-                if ignore {
-                    repo.git(["config", "diff.ignoreSubmodules", "all"]);
+                match ignore {
+                    Some("config") => repo.git(["config", "diff.ignoreSubmodules", "all"]),
+                    Some(_) => {
+                        repo.git(["config", "-f", ".gitmodules", "submodule.b.ignore", "all"])
+                    }
+                    None => {}
                 }
             },
             |repo| {
                 repo.write("b/Cargo.toml", B_WITHOUT_A);
-                repo.git(["-C", "b", "config", "user.email", "astro-sight@example.com"]);
-                repo.git(["-C", "b", "config", "user.name", "astro-sight"]);
-                repo.git(["-C", "b", "commit", "-q", "-am", "drop a"]);
-                repo.git(["add", "b"]);
+                if commit {
+                    repo.git(["-C", "b", "config", "user.email", "astro-sight@example.com"]);
+                    repo.git(["-C", "b", "config", "user.name", "astro-sight"]);
+                    repo.git(["-C", "b", "commit", "-q", "-am", "drop a"]);
+                    repo.git(["add", "b"]);
+                }
             },
         );
         assert_eq!(
             impacted,
             ["b/src/lib.rs", "c/src/lib.rs"],
-            "ignore={ignore}: {context}"
+            "commit={commit} ignore={ignore:?}: {context}"
         );
     }
 }

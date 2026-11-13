@@ -49,10 +49,10 @@ use test_context::is_in_test_context;
 /// 差分が Cargo の入力 (manifest と Rust のソースの置き場所) を変えないと確かめられるか。
 ///
 /// diff の全てのブロック ([`diff::scan_blocks`]) を見る。読み切れない入力、パスを確定できない
-/// ブロック、gitlink・symlink、mode の出ないブロック (内容が同じ rename・copy や中だけが dirty な
-/// gitlink。gitlink でないと確かめられない)、旧新を比べられない Rust のソース (binary や、
-/// `parse_unified_diff` が読まないクォートした見出し。module の配線の比較から漏れる) は変えたと
-/// みなす (Issue #374・#377)。
+/// ブロック、gitlink・symlink (中だけが dirty な gitlink は本文で見分ける)、mode の出ない内容が
+/// 同じ rename・copy (gitlink の rename と区別できない)、旧新を比べられない Rust のソース (binary
+/// や、`parse_unified_diff` が読まないクォートした見出し。module の配線の比較から漏れる) は
+/// 変えたとみなす (Issue #374・#377)。
 fn rust_cargo_inputs_unchanged(
     scan: &diff::BlockScan,
     diff_files: &[DiffFile],
@@ -83,16 +83,23 @@ fn block_keeps_rust_cargo_inputs(
     let (Some(old_path), Some(new_path)) = (side(&block.old_path), side(&block.new_path)) else {
         return false;
     };
-    // mode が出ないブロック (内容が同じ rename・copy、中だけが dirty な gitlink、git 以外の
-    // unified diff) は gitlink でないと確かめられない。symlink は置き場所を変えうる (通常の
-    // ファイルとの型の変更も、削除と追加の組として現れる)。
+    // gitlink と symlink は置き場所を変えうる (通常のファイルとの型の変更も、削除と追加の組として
+    // 現れる)。中だけが dirty な gitlink は mode が出ず、本文の `Subproject commit` で分かる。
     let modes = [block.old_mode, block.new_mode];
-    if modes.iter().any(|mode| {
-        matches!(
-            mode,
-            BlockMode::Unknown | BlockMode::Known(GITLINK) | BlockMode::Known(SYMLINK)
-        )
-    }) {
+    if block.gitlink_body
+        || modes
+            .iter()
+            .any(|mode| matches!(mode, BlockMode::Known(GITLINK) | BlockMode::Known(SYMLINK)))
+    {
+        return false;
+    }
+    // git は内容の変更に必ず mode 付きの `index` 行を出すので、mode が出ないのは内容が同じ
+    // rename・copy (gitlink の rename と区別できない) か、手で書いた diff。本文のある同じパスの
+    // ブロックと追加・削除だけを、通常のファイルとして読む。
+    let both_present = old_path != "/dev/null" && new_path != "/dev/null";
+    if modes.contains(&BlockMode::Unknown)
+        && (block.content != BlockContent::Hunks || both_present && old_path != new_path)
+    {
         return false;
     }
     let rust_source = [old_path, new_path]
@@ -1014,6 +1021,13 @@ mod tests {
             "diff --git a/a.md b/b.md\nsimilarity index 80%\nrename from a.md\nrename to b.md\nindex aaa..bbb 100644\n--- a/a.md\n+++ b/b.md\n@@ -1 +1 @@\n-a\n+b\n",
             "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
             "",
+            // 手で書いた diff (`index` 行の無い `diff --git` と git 以外の unified diff) の、本文の
+            // ある同じパスの変更と追加は通常のファイルとして読む。
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1 @@\n+a\n",
+            // astro-sight が未追跡のファイルに合成する追加の diff。
+            "diff --git a/notes/new.md b/notes/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1 @@\n+a\n",
         ] {
             assert_eq!(cargo_inputs_unchanged(diff), (true, true), "{diff}");
         }
@@ -1041,9 +1055,9 @@ mod tests {
             "diff --git \"a/x\\ty/Cargo.toml\" \"b/x\\ty/Cargo.toml\"\nindex aaa..bbb 100644\n--- \"a/x\\ty/Cargo.toml\"\n+++ \"b/x\\ty/Cargo.toml\"\n@@ -1 +1 @@\n-a\n+b\n",
             // 読み切れない入力。
             "diff --cc src/lib.rs\nindex aaa,bbb..ccc\n",
-            // mode が出ない: 中だけが dirty な gitlink と、git 以外の unified diff。
+            // mode が出ない: 中だけが dirty な gitlink (本文で分かる) と、手で書いた rename。
             "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n",
-            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "--- a/notes/a.md\n+++ b/notes/b.md\n@@ -1 +1 @@\n-a\n+b\n",
             // symlink の付け替えと、通常のファイルから symlink への型の変更 (削除と追加の組)。
             "diff --git a/crates/b b/crates/b\nindex aaa..bbb 120000\n--- a/crates/b\n+++ b/crates/b\n@@ -1 +1 @@\n-../x\n+../y\n",
             "diff --git a/src/x.rs b/src/x.rs\ndeleted file mode 100644\nindex aaa..0000000\n--- a/src/x.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\ndiff --git a/src/x.rs b/src/x.rs\nnew file mode 120000\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+y.rs\n\\ No newline at end of file\n",
