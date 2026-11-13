@@ -33,7 +33,13 @@ pub(crate) struct CargoIndex {
 
 impl CargoIndex {
     /// 作業ツリーを走査する。package が `minimum_packages` 個に満たなければソースを読まずに諦める。
+    /// staged の解析用に index を展開したディレクトリは symlink を書き出さず、gitlink を空の
+    /// ディレクトリにするので、走査では package をまたぐ取り込みを確かめられない (Issue #375)。
+    /// index の tree を読む呼び出し側 (`removed_cargo.rs`) は別の経路で走査する。
     pub(crate) fn scan_directory(root: &Path, minimum_packages: usize) -> Option<Self> {
+        if crate::git_support::is_inside_index_snapshot(root) {
+            return None;
+        }
         Self::scan(
             &DirectoryTree(root),
             || walk_directory(root),

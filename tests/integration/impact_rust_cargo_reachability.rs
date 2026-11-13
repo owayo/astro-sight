@@ -310,6 +310,95 @@ fn impact_rust_cargo_reachability_keeps_callers_moved_by_hunkless_rename() {
     );
 }
 
+/// `target` を指す symlink (mode 120000) を、作業ツリーに作らずに index へ入れる。
+fn add_symlink_to_index(repo: &TestRepo, path: &str, target: &str) {
+    let mut child = std::process::Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo.root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run git hash-object");
+    std::io::Write::write_all(
+        &mut child.stdin.take().expect("missing git stdin"),
+        target.as_bytes(),
+    )
+    .expect("failed to write symlink target");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for git hash-object");
+    assert!(output.status.success(), "git hash-object failed");
+    let blob = String::from_utf8(output.stdout).unwrap();
+    repo.git([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{},{path}", blob.trim()),
+    ]);
+}
+
+#[test]
+fn impact_rust_cargo_reachability_is_not_used_inside_the_staged_snapshot() {
+    // b の src/shared.rs は c の src/shared.rs への symlink で、c のファイルは b の module として
+    // b の依存 a を呼ぶ。staged の snapshot は symlink を書き出さないので、c が a に依存しない
+    // ことで外さない。review --staged を context --staged とそろえる (Issue #375)。
+    let repo = TestRepo::new();
+    for directory in ["a/src", "b/src", "c/src"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n",
+    );
+    repo.write(
+        "c/Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write("b/src/lib.rs", "mod shared;\n\npub use shared::call;\n");
+    repo.write("c/src/lib.rs", "pub fn unrelated() {}\n");
+    repo.write(
+        "c/src/shared.rs",
+        "pub fn call() -> u8 {\n    a::run(1)\n}\n",
+    );
+    repo.init_git();
+    repo.stage_all();
+    add_symlink_to_index(&repo, "b/src/shared.rs", "../../c/src/shared.rs");
+    repo.git(["commit", "-q", "-m", "initial"]);
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    repo.git(["add", "a/src/lib.rs"]);
+    let lists_shared = |changes: &serde_json::Value| {
+        changes.as_array().is_some_and(|changes| {
+            changes.iter().any(|change| {
+                change["path"] == "a/src/lib.rs"
+                    && change["impacted_callers"]
+                        .as_array()
+                        .is_some_and(|callers| {
+                            callers
+                                .iter()
+                                .any(|caller| caller["path"] == "c/src/shared.rs")
+                        })
+            })
+        })
+    };
+    // 対照: context --staged は index の側を読み、到達性を使わない。
+    let context = repo.run_json("context", &["--git", "--staged"]);
+    assert!(lists_shared(&context["changes"]), "{context}");
+    let review = repo.run_json("review", &["--git", "--staged"]);
+    assert!(lists_shared(&review["impact"]["changes"]), "{review}");
+}
+
 #[test]
 fn impact_rust_cargo_reachability_rejects_replaced_sysroot_in_legacy_tables() {
     let source = "use std::println;\nuse anyhow::Result;\npub fn unrelated() -> Result<()> { println!(\"x\"); Ok(()) }\n";
