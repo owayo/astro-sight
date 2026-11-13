@@ -1688,7 +1688,7 @@ fn scan_reexport_sources(root: &Path) -> bool {
 }
 
 /// `dir` の下の `path` が通常のファイル (symlink の先を含む) か。staged の snapshot が書き出さなかった
-/// 要素 (やその下) で、実際の checkout と有無が違いうるなら None (Issue #376)。
+/// 要素のために、実際の checkout と有無が違いうるなら None (Issue #376、[`crate::git_support::TreeView::hides`])。
 fn checked_is_file(dir: &Path, path: &Path) -> Option<bool> {
     (!crate::git_support::tree_view(dir).hides(path)).then(|| dir.join(path).is_file())
 }
@@ -3142,23 +3142,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        let tree = "0".repeat(40);
-        std::fs::write(
-            root.path()
-                .join(".git")
-                .join(crate::git_support::INDEX_SNAPSHOT_MARKER),
-            &tree,
-        )
-        .unwrap();
-        std::fs::write(
-            root.path()
-                .join(".git")
-                .join(crate::git_support::SNAPSHOT_OMISSIONS),
-            format!(
-                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{entries}]}}"
-            ),
-        )
-        .unwrap();
+        crate::git_support::fake_snapshot_record(root.path(), entries);
         root
     }
 
@@ -3194,37 +3178,63 @@ mod tests {
             snapshot_project("{\"path\":\"target\",\"kind\":\"symlink\",\"target\":\"directory\"}");
         assert!(scan_ordinary_sources(root.path()));
         assert!(!super::scan_no_source_inclusion(root.path()));
-        // 書き出さなかった第 2 の crate root と、gitlink の下のファイルの有無は決めない。
+        // 書き出さなかった第 2 の crate root と、gitlink の下のファイルの有無は決めない。書き出さなかった
+        // symlink のディレクトリで開けない名前 (`src/other.rs`) も、その別名でありうるので決めない。
         let root = snapshot_project(
             "{\"path\":\"src/main.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"},{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}",
         );
-        for path in ["src/main.rs", "vendor/sub/Cargo.toml"] {
+        for path in ["src/main.rs", "src/other.rs", "vendor/sub/Cargo.toml"] {
             assert_eq!(
                 super::checked_is_file(root.path(), std::path::Path::new(path)),
                 None,
                 "{path}"
             );
         }
-        assert_eq!(
-            super::checked_is_file(root.path(), std::path::Path::new("src/lib.rs")),
-            Some(true)
-        );
+        // 対照: 開けるファイルと、書き出さなかった symlink の無いディレクトリで開けない名前。
+        for (path, exists) in [
+            ("Cargo.toml", true),
+            ("src/lib.rs", true),
+            ("vendor/other.rs", false),
+            ("src/lib.rs/x.rs", false),
+        ] {
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new(path)),
+                Some(exists),
+                "{path}"
+            );
+        }
         assert_eq!(
             super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
             None
         );
-        // 大文字小文字を区別しないファイルシステムでは、`src/MAIN.rs` の symlink は `src/main.rs` と
-        // して開ける。名前の大文字小文字だけが違う問い合わせも有無を決めない。
+        // `src/main.rs` として開けうる別名の symlink: 大文字小文字だけが違う名前と、NTFS で短い名前 (8.3)
+        // を `main.rs` にできる名前。
+        for link in ["src/MAIN.rs", "src/bootstrap-link.rs"] {
+            let root = snapshot_project(&format!(
+                "{{\"path\":\"{link}\",\"kind\":\"symlink\",\"target\":\"regular_file\"}}"
+            ));
+            assert_eq!(
+                super::checked_is_file(root.path(), std::path::Path::new("src/main.rs")),
+                None,
+                "{link}"
+            );
+            assert_eq!(
+                super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
+                None,
+                "{link}"
+            );
+        }
+        // 対照: 文書の symlink だけなら、`src` の crate root を決められる。
         let root = snapshot_project(
-            "{\"path\":\"src/MAIN.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
+            "{\"path\":\"CLAUDE.md\",\"kind\":\"symlink\",\"target\":\"regular_file\"}",
         );
         assert_eq!(
             super::checked_is_file(root.path(), std::path::Path::new("src/main.rs")),
-            None
+            Some(false)
         );
         assert_eq!(
             super::private_module_file(root.path(), std::path::Path::new("src"), &[], false),
-            None
+            Some(std::path::PathBuf::from("src/lib.rs"))
         );
     }
 
