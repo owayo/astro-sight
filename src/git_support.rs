@@ -137,21 +137,52 @@ pub(crate) enum TreeView {
 /// snapshot の中の、書き出さなかった要素の位置。
 ///
 /// 名前の比べ方 (大文字小文字・Unicode の正規化・比べるときに無視する文字・8.3 の短い名前など) は
-/// ファイルシステムごとに違い、文字列では再現しきれない。位置は snapshot のファイルシステムで開いて
-/// (canonicalize して) 決め、問い合わせも同じファイルシステムで開いて照らす。snapshot はどの index の
-/// 要素も (symlink は親ディレクトリまで) 同じ名前で作るので、開けた名前は実際の checkout でも同じ要素に
-/// なる。
+/// ファイルシステムごとに違い、文字列では再現しきれない。位置は snapshot のファイルシステムで開いた
+/// ディレクトリの実体 ([`EntryId`]) で持ち、問い合わせも同じファイルシステムで開いて照らす。snapshot は
+/// どの index の要素も (symlink は親ディレクトリまで) 同じ名前で作るので、開けた名前は実際の checkout
+/// でも同じ要素になる。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotOmissions {
     /// [`tree_view`] に渡された `dir`。問い合わせはここから開く。
     dir: std::path::PathBuf,
-    /// `dir` の下の、書き出さなかった要素の `dir` からの相対パスと種類。親ディレクトリは snapshot での
-    /// 実際の名前。
+    /// `dir` の実体。
+    dir_id: EntryId,
+    /// `dir` の下の、書き出さなかった要素の `dir` からの相対パスと種類。
     entries: Vec<(std::path::PathBuf, OmittedKind)>,
-    /// 書き出さなかった symlink の親ディレクトリ (canonicalize したもの)。
-    symlink_parents: std::collections::BTreeSet<std::path::PathBuf>,
-    /// gitlink の空ディレクトリ (canonicalize したもの)。
-    gitlinks: Vec<std::path::PathBuf>,
+    /// 書き出さなかった symlink の親ディレクトリの実体。
+    symlink_parents: std::collections::HashSet<EntryId>,
+    /// gitlink の空ディレクトリの実体。
+    gitlinks: std::collections::HashSet<EntryId>,
+}
+
+/// ディレクトリの実体を表す鍵。Linux の `realpath` は、大文字小文字を区別しないディレクトリ (ext4 の
+/// casefold など) でも入力の綴りを返し、同じディレクトリが別の文字列になりうるので、Unix ではデバイスと
+/// inode で表す。Windows の `canonicalize` (GetFinalPathNameByHandleW) は、保存された綴りの長い名前を
+/// 返すので、そのパスで表す。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EntryId(
+    #[cfg(unix)] (u64, u64),
+    #[cfg(not(unix))] std::path::PathBuf,
+);
+
+/// `path` (`metadata` はその metadata) の [`EntryId`]。
+fn entry_id(path: &std::path::Path, metadata: &std::fs::Metadata) -> Option<EntryId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Some(EntryId((metadata.dev(), metadata.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        std::fs::canonicalize(path).ok().map(EntryId)
+    }
+}
+
+/// `path` を開いた [`EntryId`]。
+fn open_entry_id(path: &std::path::Path) -> Option<EntryId> {
+    entry_id(path, &std::fs::metadata(path).ok()?)
 }
 
 impl TreeView {
@@ -197,32 +228,35 @@ impl SnapshotOmissions {
             }
         }
         let mut opened = self.dir.clone();
-        let mut missing = false;
+        // `opened` の metadata。None なら `dir` 自身。
+        let mut opened_metadata = None;
         for name in names {
             let next = opened.join(name);
             match std::fs::symlink_metadata(&next) {
                 // snapshot は symlink を書き出さない。
                 Ok(metadata) if metadata.file_type().is_symlink() => return true,
+                // ファイルの下は、実際の checkout でも開けない。
+                Ok(metadata) if !metadata.is_dir() => return false,
                 Ok(metadata) => {
-                    opened = next;
-                    if !metadata.is_dir() {
-                        break;
+                    if !self.gitlinks.is_empty()
+                        && entry_id(&next, &metadata).is_none_or(|id| self.gitlinks.contains(&id))
+                    {
+                        return true;
                     }
+                    opened = next;
+                    opened_metadata = Some(metadata);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    missing = true;
-                    break;
+                    return match &opened_metadata {
+                        None => self.symlink_parents.contains(&self.dir_id),
+                        Some(metadata) => entry_id(&opened, metadata)
+                            .is_none_or(|id| self.symlink_parents.contains(&id)),
+                    };
                 }
                 Err(_) => return true,
             }
         }
-        let Ok(opened) = std::fs::canonicalize(&opened) else {
-            return true;
-        };
-        self.gitlinks
-            .iter()
-            .any(|gitlink| opened.starts_with(gitlink))
-            || (missing && self.symlink_parents.contains(&opened))
+        false
     }
 }
 
@@ -292,14 +326,31 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
         if record.version != SNAPSHOT_OMISSIONS_VERSION || record.tree != tree || !record.complete {
             return None;
         }
+        // `dir` と、snapshot の root までのその祖先の実体 (`dir` が gitlink の下かを確かめる)。
+        let mut dir_and_ancestors = std::collections::HashSet::new();
+        for ancestor in canonical.ancestors() {
+            dir_and_ancestors.insert(open_entry_id(ancestor)?);
+            if ancestor == root {
+                break;
+            }
+        }
         let mut omissions = SnapshotOmissions {
             dir: dir.to_owned(),
+            dir_id: open_entry_id(dir)?,
             entries: Vec::new(),
-            symlink_parents: std::collections::BTreeSet::new(),
-            gitlinks: Vec::new(),
+            symlink_parents: std::collections::HashSet::new(),
+            gitlinks: std::collections::HashSet::new(),
         };
-        // 同じ親ディレクトリは 1 度だけ開く。
-        let mut parents = std::collections::HashMap::new();
+        // snapshot の root からの相対パスで指すディレクトリの実体。同じディレクトリは 1 度だけ開く。
+        let mut ids = std::collections::HashMap::<std::path::PathBuf, EntryId>::new();
+        let mut id_of = |relative: &std::path::Path| -> Option<EntryId> {
+            if let Some(id) = ids.get(relative) {
+                return Some(id.clone());
+            }
+            let id = open_entry_id(&root.join(relative))?;
+            ids.insert(relative.to_owned(), id.clone());
+            Some(id)
+        };
         for entry in record.entries {
             // Windows では `\` も区切りになり、`C:` は prefix になる。記録の writer は書かない形。
             let parts: Vec<&str> = entry.path.split('/').collect();
@@ -322,16 +373,19 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
                 (OmittedEntryKind::Gitlink, None) => OmittedKind::Gitlink,
                 _ => return None,
             };
-            let location = match kind {
+            match kind {
                 OmittedKind::Gitlink => {
                     // snapshot は gitlink を空のディレクトリにする。
                     let metadata = std::fs::symlink_metadata(root.join(&path)).ok()?;
                     if !metadata.is_dir() || metadata.file_type().is_symlink() {
                         return None;
                     }
-                    let location = std::fs::canonicalize(root.join(&path)).ok()?;
-                    omissions.gitlinks.push(location.clone());
-                    location
+                    let id = entry_id(&root.join(&path), &metadata)?;
+                    // 解析の root 自身が gitlink (の下) なら、中身を確かめられない。
+                    if dir_and_ancestors.contains(&id) {
+                        return None;
+                    }
+                    omissions.gitlinks.insert(id);
                 }
                 OmittedKind::Symlink(_) => {
                     // 書き出さなかった symlink の名前で開ける要素があれば、実際の checkout でどちらが
@@ -341,34 +395,20 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
                         _ => return None,
                     }
                     let parent = path.parent().unwrap_or(std::path::Path::new(""));
-                    let opened = match parents.get(parent) {
-                        Some(opened) => std::path::PathBuf::clone(opened),
-                        None => {
-                            let opened = std::fs::canonicalize(root.join(parent)).ok()?;
-                            parents.insert(parent.to_owned(), opened.clone());
-                            opened
-                        }
-                    };
-                    omissions.symlink_parents.insert(opened.clone());
-                    opened.join(path.file_name()?)
+                    omissions.symlink_parents.insert(id_of(parent)?);
                 }
-            };
-            if !location.starts_with(root) {
-                return None;
             }
-            if let Ok(relative) = location.strip_prefix(&canonical)
-                && relative.components().next().is_some()
-            {
-                omissions.entries.push((relative.to_owned(), kind));
+            // `dir` からの相対パスは、要素の祖先のディレクトリのうち `dir` と同じ実体のものから先。
+            let mut prefix = std::path::PathBuf::new();
+            for (depth, part) in parts.iter().enumerate() {
+                if id_of(&prefix)? == omissions.dir_id {
+                    omissions
+                        .entries
+                        .push((parts[depth..].iter().collect(), kind));
+                    break;
+                }
+                prefix.push(part);
             }
-        }
-        // 解析の root 自身が gitlink (の下) なら、中身を確かめられない。
-        if omissions
-            .gitlinks
-            .iter()
-            .any(|gitlink| canonical.starts_with(gitlink))
-        {
-            return None;
         }
         Some(TreeView::Snapshot(omissions))
     })()
