@@ -281,9 +281,12 @@ where
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
     // Index 側の manifest、依存関係の変更、別 package への移動は
-    // 作業ツリーだけから旧側の到達性を証明できない。
+    // 作業ツリーだけから旧側の到達性を証明できない。内容が同じ rename は hunk が無く
+    // `diff_files` に現れないので、hunk の無い変更も確かめる (Issue #374)。
+    let hunkless_changes = diff::parse_hunkless_changes(diff_input);
     let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
-        && rust_cargo_inputs_unchanged(&diff_files, false);
+        && rust_cargo_inputs_unchanged(&diff_files, false)
+        && rust_cargo_inputs_unchanged(&hunkless_changes, false);
     let pass2_maps = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
@@ -300,7 +303,8 @@ where
                 && rust_path_owner::private_scope_wiring_unchanged(dir, &diff_files, diff_input),
             rust_reexport_cargo_enabled: options.new_side
                 == crate::models::impact::DiffNewSide::WorkingTree
-                && rust_cargo_inputs_unchanged(&diff_files, true),
+                && rust_cargo_inputs_unchanged(&diff_files, true)
+                && rust_cargo_inputs_unchanged(&hunkless_changes, true),
             rust_diff_files: &diff_files,
             rust_diff_input: diff_input,
         },
