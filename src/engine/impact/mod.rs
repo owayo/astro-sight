@@ -49,9 +49,10 @@ use test_context::is_in_test_context;
 /// 差分が Cargo の入力 (manifest と Rust のソースの置き場所) を変えないと確かめられるか。
 ///
 /// diff の全てのブロック ([`diff::scan_blocks`]) を見る。読み切れない入力、パスを確定できない
-/// ブロック、gitlink、mode の出ない内容が同じ rename・copy (gitlink の rename と区別できない)、
-/// 旧新を比べられない Rust のソース (binary や、`parse_unified_diff` が読まないクォートした見出し。
-/// module の配線の比較から漏れる) は変えたとみなす (Issue #374・#377)。
+/// ブロック、gitlink・symlink、mode の出ないブロック (内容が同じ rename・copy や中だけが dirty な
+/// gitlink。gitlink でないと確かめられない)、旧新を比べられない Rust のソース (binary や、
+/// `parse_unified_diff` が読まないクォートした見出し。module の配線の比較から漏れる) は変えたと
+/// みなす (Issue #374・#377)。
 fn rust_cargo_inputs_unchanged(
     scan: &diff::BlockScan,
     diff_files: &[DiffFile],
@@ -71,6 +72,7 @@ fn block_keeps_rust_cargo_inputs(
 ) -> bool {
     use diff::{BlockContent, BlockMode, BlockPath};
     const GITLINK: u32 = 0o160000;
+    const SYMLINK: u32 = 0o120000;
     fn side(path: &BlockPath) -> Option<&str> {
         match path {
             BlockPath::Known(path) => Some(path.as_str()),
@@ -81,15 +83,16 @@ fn block_keeps_rust_cargo_inputs(
     let (Some(old_path), Some(new_path)) = (side(&block.old_path), side(&block.new_path)) else {
         return false;
     };
+    // mode が出ないブロック (内容が同じ rename・copy、中だけが dirty な gitlink、git 以外の
+    // unified diff) は gitlink でないと確かめられない。symlink は置き場所を変えうる (通常の
+    // ファイルとの型の変更も、削除と追加の組として現れる)。
     let modes = [block.old_mode, block.new_mode];
-    if modes.contains(&BlockMode::Known(GITLINK)) {
-        return false;
-    }
-    if old_path != "/dev/null"
-        && new_path != "/dev/null"
-        && old_path != new_path
-        && modes.contains(&BlockMode::Unknown)
-    {
+    if modes.iter().any(|mode| {
+        matches!(
+            mode,
+            BlockMode::Unknown | BlockMode::Known(GITLINK) | BlockMode::Known(SYMLINK)
+        )
+    }) {
         return false;
     }
     let rust_source = [old_path, new_path]
@@ -1038,6 +1041,12 @@ mod tests {
             "diff --git \"a/x\\ty/Cargo.toml\" \"b/x\\ty/Cargo.toml\"\nindex aaa..bbb 100644\n--- \"a/x\\ty/Cargo.toml\"\n+++ \"b/x\\ty/Cargo.toml\"\n@@ -1 +1 @@\n-a\n+b\n",
             // 読み切れない入力。
             "diff --cc src/lib.rs\nindex aaa,bbb..ccc\n",
+            // mode が出ない: 中だけが dirty な gitlink と、git 以外の unified diff。
+            "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            // symlink の付け替えと、通常のファイルから symlink への型の変更 (削除と追加の組)。
+            "diff --git a/crates/b b/crates/b\nindex aaa..bbb 120000\n--- a/crates/b\n+++ b/crates/b\n@@ -1 +1 @@\n-../x\n+../y\n",
+            "diff --git a/src/x.rs b/src/x.rs\ndeleted file mode 100644\nindex aaa..0000000\n--- a/src/x.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\ndiff --git a/src/x.rs b/src/x.rs\nnew file mode 120000\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+y.rs\n\\ No newline at end of file\n",
         ] {
             assert_eq!(cargo_inputs_unchanged(diff), (false, false), "{diff}");
         }
