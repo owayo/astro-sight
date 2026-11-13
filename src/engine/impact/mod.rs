@@ -46,49 +46,118 @@ pub(crate) use rust_path_owner::scan_ordinary_sources as rust_import_path_enviro
 use signature::detect_signature_changes;
 use test_context::is_in_test_context;
 
-fn rust_cargo_inputs_unchanged(diff_files: &[DiffFile], allow_rs_add_remove: bool) -> bool {
-    !diff_files.iter().any(|file| {
-        if allow_rs_add_remove
-            && [&file.old_path, &file.new_path].iter().any(|path| {
-                Path::new(path)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs") && ext != "rs")
-            })
-        {
-            return true;
+/// 差分が Cargo の入力 (manifest と Rust のソースの置き場所) を変えないと確かめられるか。
+///
+/// diff の全てのブロック ([`diff::scan_blocks`]) を見る。読み切れない入力、パスを確定できない
+/// ブロック、gitlink、mode の出ない内容が同じ rename・copy (gitlink の rename と区別できない)、
+/// 旧新を比べられない Rust のソース (binary や、`parse_unified_diff` が読まないクォートした見出し。
+/// module の配線の比較から漏れる) は変えたとみなす (Issue #374・#377)。
+fn rust_cargo_inputs_unchanged(
+    scan: &diff::BlockScan,
+    diff_files: &[DiffFile],
+    allow_rs_add_remove: bool,
+) -> bool {
+    scan.complete
+        && scan
+            .blocks
+            .iter()
+            .all(|block| block_keeps_rust_cargo_inputs(block, diff_files, allow_rs_add_remove))
+}
+
+fn block_keeps_rust_cargo_inputs(
+    block: &diff::DiffBlock,
+    diff_files: &[DiffFile],
+    allow_rs_add_remove: bool,
+) -> bool {
+    use diff::{BlockContent, BlockMode, BlockPath};
+    const GITLINK: u32 = 0o160000;
+    fn side(path: &BlockPath) -> Option<&str> {
+        match path {
+            BlockPath::Known(path) => Some(path.as_str()),
+            BlockPath::Absent => Some("/dev/null"),
+            BlockPath::Unknown => None,
         }
-        let added_or_removed = file.old_path == "/dev/null" || file.new_path == "/dev/null";
-        let changed_rs_path = file.old_path != file.new_path
-            && !(allow_rs_add_remove && added_or_removed)
-            && [&file.old_path, &file.new_path].iter().any(|path| {
-                Path::new(path)
-                    .extension()
-                    .is_some_and(|ext| match ext.to_str() {
-                        Some(ext) => !ext.is_ascii() || ext.eq_ignore_ascii_case("rs"),
-                        None => true,
-                    })
-            });
-        let changed_cargo_path = [&file.old_path, &file.new_path].iter().any(|path| {
-            let path = Path::new(path);
-            path.extension()
-                .is_some_and(|ext| ext.to_str().is_none_or(|ext| !ext.is_ascii()))
-                || path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.eq_ignore_ascii_case("Cargo.toml")
-                            || name.eq_ignore_ascii_case("Cargo.lock")
-                    })
-                || path.components().any(|component| {
-                    component
-                        .as_os_str()
-                        .to_str()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
+    }
+    let (Some(old_path), Some(new_path)) = (side(&block.old_path), side(&block.new_path)) else {
+        return false;
+    };
+    let modes = [block.old_mode, block.new_mode];
+    if modes.contains(&BlockMode::Known(GITLINK)) {
+        return false;
+    }
+    if old_path != "/dev/null"
+        && new_path != "/dev/null"
+        && old_path != new_path
+        && modes.contains(&BlockMode::Unknown)
+    {
+        return false;
+    }
+    let rust_source = [old_path, new_path]
+        .iter()
+        .any(|path| may_be_rust_source(path));
+    let compared = match block.content {
+        BlockContent::Unchanged => true,
+        BlockContent::Binary => false,
+        BlockContent::Hunks => diff_files
+            .iter()
+            .any(|file| file.old_path == old_path && file.new_path == new_path),
+    };
+    if rust_source && !compared {
+        return false;
+    }
+    !paths_change_rust_cargo_inputs(old_path, new_path, allow_rs_add_remove)
+}
+
+/// 拡張子が `rs` (大文字小文字を問わない) か、ASCII でない (`.rs` に折り畳まれうる) パス。
+fn may_be_rust_source(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| match ext.to_str() {
+            Some(ext) => !ext.is_ascii() || ext.eq_ignore_ascii_case("rs"),
+            None => true,
+        })
+}
+
+/// 旧新のパス (追加・削除の側は `/dev/null`) が、Rust のソースの置き場所か Cargo の入力を変えるか。
+fn paths_change_rust_cargo_inputs(
+    old_path: &str,
+    new_path: &str,
+    allow_rs_add_remove: bool,
+) -> bool {
+    let paths = [old_path, new_path];
+    if allow_rs_add_remove
+        && paths.iter().any(|path| {
+            Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs") && ext != "rs")
+        })
+    {
+        return true;
+    }
+    let added_or_removed = old_path == "/dev/null" || new_path == "/dev/null";
+    let changed_rs_path = old_path != new_path
+        && !(allow_rs_add_remove && added_or_removed)
+        && paths.iter().any(|path| may_be_rust_source(path));
+    let changed_cargo_path = paths.iter().any(|path| {
+        let path = Path::new(path);
+        path.extension()
+            .is_some_and(|ext| ext.to_str().is_none_or(|ext| !ext.is_ascii()))
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("Cargo.toml")
+                        || name.eq_ignore_ascii_case("Cargo.lock")
                 })
-        });
-        changed_rs_path || changed_cargo_path
-    })
+            || path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
+            })
+    });
+    changed_rs_path || changed_cargo_path
 }
 
 struct FileContext {
@@ -281,12 +350,11 @@ where
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
     // Index 側の manifest、依存関係の変更、別 package への移動は
-    // 作業ツリーだけから旧側の到達性を証明できない。内容が同じ rename は hunk が無く
-    // `diff_files` に現れないので、hunk の無い変更も確かめる (Issue #374)。
-    let hunkless_changes = diff::parse_hunkless_changes(diff_input);
+    // 作業ツリーだけから旧側の到達性を証明できない。hunk の無い rename・binary・gitlink の
+    // ブロックも見落とさないよう、diff の全てのブロックで確かめる (Issue #374・#377)。
+    let diff_blocks = diff::scan_blocks(diff_input);
     let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
-        && rust_cargo_inputs_unchanged(&diff_files, false)
-        && rust_cargo_inputs_unchanged(&hunkless_changes, false);
+        && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, false);
     let pass2_maps = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
@@ -303,8 +371,7 @@ where
                 && rust_path_owner::private_scope_wiring_unchanged(dir, &diff_files, diff_input),
             rust_reexport_cargo_enabled: options.new_side
                 == crate::models::impact::DiffNewSide::WorkingTree
-                && rust_cargo_inputs_unchanged(&diff_files, true)
-                && rust_cargo_inputs_unchanged(&hunkless_changes, true),
+                && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, true),
             rust_diff_files: &diff_files,
             rust_diff_input: diff_input,
         },
@@ -922,6 +989,59 @@ fn lang_compat_group(lang: LangId) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `diff` が Cargo の入力を変えないか (変えないと確かめられるか) を、Rust のソースの追加・削除を
+    /// 許さない側と許す側 (reexport) の組で返す。
+    fn cargo_inputs_unchanged(diff: &str) -> (bool, bool) {
+        let scan = diff::scan_blocks(diff);
+        let files = diff::parse_unified_diff(diff);
+        (
+            rust_cargo_inputs_unchanged(&scan, &files, false),
+            rust_cargo_inputs_unchanged(&scan, &files, true),
+        )
+    }
+
+    #[test]
+    fn rust_cargo_inputs_unchanged_reads_every_diff_block() {
+        // 対照: Rust のソースや Rust でないファイルの内容・mode の変更、内容も変えた Rust でない
+        // ファイルの rename (mode が出る)、空の diff は構成を変えない。
+        for diff in [
+            "diff --git a/src/lib.rs b/src/lib.rs\nindex aaa..bbb 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/notes.bin b/notes.bin\nindex aaa..bbb 100644\nBinary files a/notes.bin and b/notes.bin differ\n",
+            "diff --git a/a.md b/b.md\nsimilarity index 80%\nrename from a.md\nrename to b.md\nindex aaa..bbb 100644\n--- a/a.md\n+++ b/b.md\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+            "",
+        ] {
+            assert_eq!(cargo_inputs_unchanged(diff), (true, true), "{diff}");
+        }
+        // Rust のソースの追加は、reexport の側だけ許す (今までどおり)。
+        assert_eq!(
+            cargo_inputs_unchanged(
+                "diff --git a/src/new.rs b/src/new.rs\nnew file mode 100644\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+a\n"
+            ),
+            (false, true)
+        );
+        // 構成を変えたとみなす形 (Issue #374・#377)。
+        for diff in [
+            // binary と扱われる manifest の変更。
+            "diff --git a/b/Cargo.toml b/b/Cargo.toml\nindex aaa..bbb 100644\nBinary files a/b/Cargo.toml and b/b/Cargo.toml differ\n",
+            // gitlink の更新と追加。
+            "diff --git a/b b/b\nindex aaa..bbb 160000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb\n",
+            "diff --git a/b b/b\nnew file mode 160000\nindex 0000000..bbb\n--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+Subproject commit bbb\n",
+            // 内容が同じ rename (mode が出ず、gitlink の rename と区別できない)。
+            "diff --git a/a.md b/b.md\nsimilarity index 100%\nrename from a.md\nrename to b.md\n",
+            "diff --git a/b/src/x.rs b/c/src/x.rs\nsimilarity index 100%\nrename from b/src/x.rs\nrename to c/src/x.rs\n",
+            // 旧新を比べられない Rust のソース (binary・`parse_unified_diff` が読まないクォート)。
+            "diff --git a/src/lib.rs b/src/lib.rs\nindex aaa..bbb 100644\nBinary files a/src/lib.rs and b/src/lib.rs differ\n",
+            "diff --git \"a/src/x\\ty.rs\" \"b/src/x\\ty.rs\"\nindex aaa..bbb 100644\n--- \"a/src/x\\ty.rs\"\n+++ \"b/src/x\\ty.rs\"\n@@ -1 +1 @@\n-a\n+b\n",
+            // クォートした見出しの manifest。
+            "diff --git \"a/x\\ty/Cargo.toml\" \"b/x\\ty/Cargo.toml\"\nindex aaa..bbb 100644\n--- \"a/x\\ty/Cargo.toml\"\n+++ \"b/x\\ty/Cargo.toml\"\n@@ -1 +1 @@\n-a\n+b\n",
+            // 読み切れない入力。
+            "diff --cc src/lib.rs\nindex aaa,bbb..ccc\n",
+        ] {
+            assert_eq!(cargo_inputs_unchanged(diff), (false, false), "{diff}");
+        }
+    }
 
     // SymbolKind → 文字列マッピングの検証
     #[test]

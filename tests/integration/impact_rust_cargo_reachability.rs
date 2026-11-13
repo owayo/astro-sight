@@ -233,10 +233,11 @@ fn impact_rust_cargo_reachability_keeps_callers_for_target_paths_outside_the_pac
     );
 }
 
-/// a の `run` に引数を足し、同時に `rename` を `git mv` (内容は変えない) したときの、a の
-/// 呼び出し元の path。b だけが a に依存し、`b/src/bin/probe.rs` が `a::run(1)` を呼ぶ。c は a に
-/// 依存せず、外部の `other` から import した同名の `run` を呼ぶ (到達性だけが外せる)。
-fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, String) {
+/// a の `run` に引数を足し、同時に `rename` を `git mv` したときの、a の呼び出し元の path。
+/// `edit` なら移した先の末尾に 1 行足す (内容も変えた rename)。b だけが a に依存し、
+/// `b/src/bin/probe.rs` が `a::run(1)` を呼ぶ。c は a に依存せず、外部の `other` から import した
+/// 同名の `run` を呼ぶ (到達性だけが外せる)。
+fn callers_with_hunkless_rename(rename: Option<(&str, &str)>, edit: bool) -> (Vec<String>, String) {
     let repo = TestRepo::new();
     for directory in ["a/src", "b/src/bin", "c/src", "notes"] {
         repo.create_dir_all(directory);
@@ -266,7 +267,7 @@ fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, S
         "c/src/lib.rs",
         "use other::run;\n\npub fn caller() -> u8 {\n    run(1)\n}\n",
     );
-    repo.write("notes/a.md", "note\n");
+    repo.write("notes/a.md", "line 1\nline 2\nline 3\nline 4\nline 5\n");
     repo.init_git();
     repo.commit_all("initial");
     repo.write(
@@ -276,6 +277,11 @@ fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, S
     if let Some((from, to)) = rename {
         repo.create_dir_all(std::path::Path::new(to).parent().unwrap());
         repo.git(["mv", from, to]);
+        if edit {
+            let mut content = std::fs::read(repo.path(to)).unwrap();
+            content.extend_from_slice(b"line 6\n");
+            repo.write(to, content);
+        }
     }
     let context = repo.run_json("context", &["--git"]);
     let mut impacted: Vec<String> = context["changes"]
@@ -294,20 +300,160 @@ fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, S
 
 #[test]
 fn impact_rust_cargo_reachability_keeps_callers_moved_by_hunkless_rename() {
-    // 対照: rename が無い・Rust でないファイルの rename なら、到達性で c の同名の参照を外す。
-    for rename in [None, Some(("notes/a.md", "notes/b.md"))] {
-        let (impacted, context) = callers_with_hunkless_rename(rename);
+    // 対照: rename が無い・Rust でないファイルを内容も変えて rename した (mode が diff に出る)
+    // なら、到達性で c の同名の参照を外す。
+    for (rename, edit) in [(None, false), (Some(("notes/a.md", "notes/b.md")), true)] {
+        let (impacted, context) = callers_with_hunkless_rename(rename, edit);
         assert_eq!(impacted, ["b/src/bin/probe.rs"], "{rename:?}: {context}");
     }
     // 内容が同じまま c へ移した、変更前に b から a を呼んでいたコードは残す (Issue #374)。
     // Rust のソースの置き場所が変わったので、作業ツリーの依存のグラフで外さない。
     let (impacted, context) =
-        callers_with_hunkless_rename(Some(("b/src/bin/probe.rs", "c/src/bin/probe.rs")));
+        callers_with_hunkless_rename(Some(("b/src/bin/probe.rs", "c/src/bin/probe.rs")), false);
     assert_eq!(
         impacted,
         ["c/src/bin/probe.rs", "c/src/lib.rs"],
         "{context}"
     );
+    // 内容が同じ rename は diff に mode が出ず、gitlink の rename と区別できないので、Rust で
+    // ないファイルでも到達性を使わない (Issue #377)。
+    let (impacted, context) =
+        callers_with_hunkless_rename(Some(("notes/a.md", "notes/b.md")), false);
+    assert_eq!(
+        impacted,
+        ["b/src/bin/probe.rs", "c/src/lib.rs"],
+        "{context}"
+    );
+}
+
+/// b だけが a に依存し、`b/src/lib.rs` が `a::run(1)` を呼ぶワークスペース (c は a に依存せず、
+/// 外部の `other` の同名の `run` を呼ぶ) で、a の `run` に引数を足したときの a の呼び出し元の path。
+/// `prepare` はコミットの前に、`change` は a を変えた後に呼ぶ。
+fn callers_of_changed_run(
+    prepare: impl FnOnce(&TestRepo),
+    change: impl FnOnce(&TestRepo),
+) -> (Vec<String>, String) {
+    let repo = TestRepo::new();
+    for directory in ["a/src", "c/src"] {
+        repo.create_dir_all(directory);
+    }
+    let package = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
+        )
+    };
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    repo.write("a/Cargo.toml", package("a", ""));
+    repo.write(
+        "c/Cargo.toml",
+        package("c", "[dependencies]\nother = \"1\"\n"),
+    );
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write(
+        "c/src/lib.rs",
+        "use other::run;\n\npub fn caller() -> u8 {\n    run(1)\n}\n",
+    );
+    repo.init_git();
+    prepare(&repo);
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    change(&repo);
+    let context = repo.run_json("context", &["--git"]);
+    let mut impacted: Vec<String> = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["path"] == "a/src/lib.rs")
+        .filter_map(|change| change["impacted_callers"].as_array())
+        .flatten()
+        .map(|caller| caller["path"].as_str().unwrap().to_owned())
+        .collect();
+    impacted.sort();
+    impacted.dedup();
+    (impacted, context.to_string())
+}
+
+const B_DEPENDS_ON_A: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n";
+const B_WITHOUT_A: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+const B_CALLER: &str = "pub fn caller() -> u8 {\n    a::run(1)\n}\n";
+
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_for_binary_manifest_changes() {
+    let package_b = |repo: &TestRepo| {
+        repo.create_dir_all("b/src");
+        repo.write("b/Cargo.toml", B_DEPENDS_ON_A);
+        repo.write("b/src/lib.rs", B_CALLER);
+    };
+    // 対照: Rust と Cargo に関係しない binary の変更では、到達性で c の同名の参照を外す。
+    let (impacted, context) = callers_of_changed_run(
+        |repo| {
+            package_b(repo);
+            repo.create_dir_all("assets");
+            repo.write("assets/logo.bin", b"\x00\x01\x02");
+        },
+        |repo| repo.write("assets/logo.bin", b"\x00\x01\x03"),
+    );
+    assert_eq!(impacted, ["b/src/lib.rs"], "{context}");
+    // `-diff` で binary になる manifest から a への依存を消しても、変更前の b は a を呼べた
+    // ので外さない (Issue #377)。
+    let (impacted, context) = callers_of_changed_run(
+        |repo| {
+            package_b(repo);
+            repo.write(".gitattributes", "b/Cargo.toml -diff\n");
+        },
+        |repo| repo.write("b/Cargo.toml", B_WITHOUT_A),
+    );
+    assert_eq!(impacted, ["b/src/lib.rs", "c/src/lib.rs"], "{context}");
+}
+
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_for_submodule_manifest_changes() {
+    // b は submodule。submodule の中で b の manifest から a への依存を消し、親で gitlink を
+    // 更新しても、変更前の b は a を呼べたので外さない。利用者の `diff.ignoreSubmodules` で
+    // gitlink の更新を隠さない (Issue #377)。
+    for ignore in [false, true] {
+        let upstream = TestRepo::new();
+        upstream.create_dir_all("src");
+        upstream.write("Cargo.toml", B_DEPENDS_ON_A);
+        upstream.write("src/lib.rs", B_CALLER);
+        upstream.init_git();
+        upstream.commit_all("b");
+        let upstream_path = upstream.root().to_str().unwrap().to_owned();
+        let (impacted, context) = callers_of_changed_run(
+            |repo| {
+                repo.git([
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    &upstream_path,
+                    "b",
+                ]);
+                if ignore {
+                    repo.git(["config", "diff.ignoreSubmodules", "all"]);
+                }
+            },
+            |repo| {
+                repo.write("b/Cargo.toml", B_WITHOUT_A);
+                repo.git(["-C", "b", "config", "user.email", "astro-sight@example.com"]);
+                repo.git(["-C", "b", "config", "user.name", "astro-sight"]);
+                repo.git(["-C", "b", "commit", "-q", "-am", "drop a"]);
+                repo.git(["add", "b"]);
+            },
+        );
+        assert_eq!(
+            impacted,
+            ["b/src/lib.rs", "c/src/lib.rs"],
+            "ignore={ignore}: {context}"
+        );
+    }
 }
 
 /// `target` を指す symlink (mode 120000) を、作業ツリーに作らずに index へ入れる。
