@@ -566,9 +566,15 @@ fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
             })
         })
         .collect::<Option<_>>()?;
+    let view = crate::git_support::tree_view(root);
     for manifest in &manifests {
         for name in ["config", "config.toml"] {
             let path = manifest.directory.join(".cargo").join(name);
+            // snapshot が書き出さなかった symlink (`.cargo/CONFIG` など) のために、実際の checkout と
+            // 有無が違いうる設定は確かめられない (Issue #376)。
+            if view.hides(path.strip_prefix(root).ok()?) {
+                return None;
+            }
             if path.exists() && read_input_file(&path)?.windows(8).any(|w| w == b"--extern") {
                 return None;
             }
@@ -768,11 +774,24 @@ mod tests {
             symlink("docs", "directory"),
             symlink("notes.md", "unknown"),
             "{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}".to_owned(),
+            // 実際の checkout では、大文字小文字を区別しないファイルシステムで `.cargo/config` として
+            // 開けうる。書き出さなかったので `--extern` の有無を確かめられない。
+            symlink(".cargo/CONFIG", "regular_file"),
         ] {
             assert!(
                 scan_project(project(&entries).path()).is_none(),
                 "{entries}"
             );
+        }
+        // 対照: 書き出した設定は読み、`--extern` が無ければ通し、あれば止める。
+        for (config, allowed) in [
+            ("[build]\njobs = 1\n", true),
+            ("[build]\nrustflags = [\"--extern\", \"std=x\"]\n", false),
+        ] {
+            let root = project("");
+            std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+            std::fs::write(root.path().join(".cargo/config"), config).unwrap();
+            assert_eq!(scan_project(root.path()).is_some(), allowed, "{config}");
         }
     }
 
