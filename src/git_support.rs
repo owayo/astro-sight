@@ -144,46 +144,78 @@ impl TreeView {
     }
 
     /// `relative` (`dir` からの相対) か、その途中のディレクトリが書き出さなかった要素で、有無や種類が
-    /// 実際の checkout と違いうるか。記録を使えなければ常に真。
+    /// 実際の checkout と違いうるか。記録を使えなければ常に真。大文字小文字と Unicode の正規化だけが
+    /// 違う名前も、それを区別しないファイルシステムでは同じ要素なので、同じとみなす。
     pub(crate) fn hides(&self, relative: &std::path::Path) -> bool {
-        self.omitted()
-            .is_none_or(|entries| entries.iter().any(|(path, _)| relative.starts_with(path)))
+        self.omitted().is_none_or(|entries| {
+            entries.iter().any(|(path, _)| {
+                let mut query = relative.components();
+                path.components().all(|part| {
+                    query
+                        .next()
+                        .is_some_and(|other| same_entry_name(part.as_os_str(), other.as_os_str()))
+                })
+            })
+        })
     }
 }
 
-type TreeViewCache =
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<TreeView>>>;
+/// 大文字小文字と Unicode の正規化を区別しないファイルシステムで、同じ名前になりうるか。区別する
+/// ファイルシステムでも同じとみなす (証明をやめる側)。
+fn same_entry_name(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let fold = |name: &str| -> String {
+        name.nfc()
+            .collect::<String>()
+            .to_lowercase()
+            .nfc()
+            .collect()
+    };
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => fold(left) == fold(right),
+        _ => left == right,
+    }
+}
 
-fn tree_view_cache() -> &'static TreeViewCache {
-    static CACHE: std::sync::OnceLock<TreeViewCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
+#[derive(Default)]
+struct TreeViewCache {
+    /// [`forget_tree_views`] のたびに増やす。読んでいる間に忘れた結果は登録しない。
+    generation: u64,
+    views: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<TreeView>>,
+}
+
+fn tree_view_cache() -> std::sync::MutexGuard<'static, TreeViewCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<TreeViewCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("tree view cache mutex poisoned")
 }
 
 /// `dir` の [`TreeView`]。同じ `dir` は、次に snapshot を作るか捨てるまで ([`forget_tree_views`])
 /// 1 度だけ求める。
 pub(crate) fn tree_view(dir: &std::path::Path) -> std::sync::Arc<TreeView> {
-    if let Some(view) = tree_view_cache()
-        .lock()
-        .expect("tree view cache mutex poisoned")
-        .get(dir)
-    {
-        return view.clone();
-    }
+    let generation = {
+        let cache = tree_view_cache();
+        if let Some(view) = cache.views.get(dir) {
+            return view.clone();
+        }
+        cache.generation
+    };
     let view = std::sync::Arc::new(read_tree_view(dir));
-    tree_view_cache()
-        .lock()
-        .expect("tree view cache mutex poisoned")
-        .insert(dir.to_owned(), view.clone());
+    let mut cache = tree_view_cache();
+    if cache.generation == generation {
+        cache.views.insert(dir.to_owned(), view.clone());
+    }
     view
 }
 
 /// [`tree_view`] の結果を忘れる。snapshot を作る・捨てるたびに呼び、同じパスに作り直した snapshot や、
 /// 前に通常のディレクトリとして見たパスで、古い見え方を引かない。
 pub(crate) fn forget_tree_views() {
-    tree_view_cache()
-        .lock()
-        .expect("tree view cache mutex poisoned")
-        .clear();
+    let mut cache = tree_view_cache();
+    cache.generation += 1;
+    cache.views.clear();
 }
 
 fn read_tree_view(dir: &std::path::Path) -> TreeView {
@@ -443,6 +475,30 @@ mod tests {
             )),
         );
         assert_eq!(*tree_view(&nested.path().join("app")), TreeView::Unusable);
+    }
+
+    #[test]
+    fn hides_names_that_differ_only_in_case_or_normalization() {
+        let tree = "0123456789012345678901234567890123456789";
+        let snapshot = fake_snapshot(
+            tree,
+            Some(&format!(
+                "{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{{\"path\":\"app/src/MAIN.rs\",\"kind\":\"symlink\",\"target\":\"regular_file\"}},{{\"path\":\"app/caf\u{e9}\",\"kind\":\"gitlink\"}}]}}"
+            )),
+        );
+        let view = tree_view(snapshot.path());
+        for path in [
+            "app/src/MAIN.rs",
+            "app/src/main.rs",
+            "APP/Src/Main.RS",
+            "app/cafe\u{301}/Cargo.toml",
+        ] {
+            assert!(view.hides(Path::new(path)), "{path}");
+        }
+        // 対照: 別の名前は隠さない。
+        for path in ["app/src/lib.rs", "app/src/main.rs.bak", "app/cafe"] {
+            assert!(!view.hides(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

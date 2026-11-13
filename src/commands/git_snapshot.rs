@@ -993,6 +993,50 @@ mod tests {
         );
     }
 
+    /// snapshot を作る・捨てるたびに `tree_view` の結果を忘れ、同じパスで作り直した snapshot の記録を
+    /// 読み直す (Issue #376)。別の snapshot の形のディレクトリで、記録を書き換えて確かめる。
+    #[test]
+    fn creating_and_dropping_snapshots_forgets_tree_views() {
+        use crate::git_support::{OmittedKind, TreeView};
+        let observed = tempfile::tempdir().expect("tempdir");
+        let tree = "0".repeat(40);
+        fs::create_dir_all(observed.path().join(".git")).expect("mkdir");
+        fs::write(
+            observed.path().join(".git").join(INDEX_SNAPSHOT_MARKER),
+            &tree,
+        )
+        .expect("write");
+        let record = |entries: &str| {
+            fs::write(
+                observed.path().join(".git").join(crate::git_support::SNAPSHOT_OMISSIONS),
+                format!("{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{entries}]}}"),
+            )
+            .expect("write");
+        };
+        let gitlink =
+            || TreeView::Snapshot(vec![(PathBuf::from("vendor/sub"), OmittedKind::Gitlink)]);
+        record("");
+        assert_eq!(
+            *crate::git_support::tree_view(observed.path()),
+            TreeView::Snapshot(Vec::new())
+        );
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_git_repo_for_test(repo.path());
+        write(repo.path(), "a.rs", b"pub fn a() {}\n");
+        commit_all(repo.path(), "base");
+        write(repo.path(), "a.rs", b"pub fn b() {}\n");
+        git(repo.path(), &["add", "a.rs"]);
+        record("{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}");
+        let snapshot = ready(prepare_staged(repo.path(), SnapshotBudget::DEFAULT));
+        assert_eq!(*crate::git_support::tree_view(observed.path()), gitlink());
+        record("");
+        drop(snapshot);
+        assert_eq!(
+            *crate::git_support::tree_view(observed.path()),
+            TreeView::Snapshot(Vec::new())
+        );
+    }
+
     #[test]
     fn metrics_commit_snapshot_budget_excess_is_an_error() {
         let repo = tempfile::tempdir().unwrap();
