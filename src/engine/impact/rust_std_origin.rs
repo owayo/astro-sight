@@ -743,19 +743,7 @@ mod tests {
             )
             .unwrap();
             std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-            let tree = "0".repeat(40);
-            std::fs::write(
-                root.path()
-                    .join(".git")
-                    .join(crate::git_support::INDEX_SNAPSHOT_MARKER),
-                &tree,
-            )
-            .unwrap();
-            std::fs::write(
-                root.path().join(".git").join(crate::git_support::SNAPSHOT_OMISSIONS),
-                format!("{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{entries}]}}"),
-            )
-            .unwrap();
+            crate::git_support::fake_snapshot_record(root.path(), entries);
             root
         };
         let symlink = |path: &str, target: &str| {

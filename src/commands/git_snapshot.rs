@@ -970,9 +970,11 @@ mod tests {
         assert!(analysis.join("src/left").is_dir());
         assert!(!analysis.join("src/left/shared.rs").exists());
         let link = |target| OmittedKind::Symlink(target);
+        let view = crate::git_support::tree_view(analysis);
+        assert!(matches!(*view, TreeView::Snapshot(_)));
         assert_eq!(
-            *crate::git_support::tree_view(analysis),
-            TreeView::Snapshot(vec![
+            view.omitted().map(<[_]>::to_vec),
+            Some(vec![
                 (PathBuf::from("CLAUDE.md"), link(LinkTarget::RegularFile)),
                 (PathBuf::from("dangling.rs"), link(LinkTarget::Unknown)),
                 (PathBuf::from("docs"), link(LinkTarget::Directory)),
@@ -997,44 +999,29 @@ mod tests {
     /// 読み直す (Issue #376)。別の snapshot の形のディレクトリで、記録を書き換えて確かめる。
     #[test]
     fn creating_and_dropping_snapshots_forgets_tree_views() {
-        use crate::git_support::{OmittedKind, TreeView};
+        use crate::git_support::{OmittedKind, fake_snapshot_record, tree_view};
         let observed = tempfile::tempdir().expect("tempdir");
-        let tree = "0".repeat(40);
-        fs::create_dir_all(observed.path().join(".git")).expect("mkdir");
-        fs::write(
-            observed.path().join(".git").join(INDEX_SNAPSHOT_MARKER),
-            &tree,
-        )
-        .expect("write");
-        let record = |entries: &str| {
-            fs::write(
-                observed.path().join(".git").join(crate::git_support::SNAPSHOT_OMISSIONS),
-                format!("{{\"version\":1,\"tree\":\"{tree}\",\"complete\":true,\"entries\":[{entries}]}}"),
-            )
-            .expect("write");
-        };
-        let gitlink =
-            || TreeView::Snapshot(vec![(PathBuf::from("vendor/sub"), OmittedKind::Gitlink)]);
-        record("");
-        assert_eq!(
-            *crate::git_support::tree_view(observed.path()),
-            TreeView::Snapshot(Vec::new())
-        );
+        let omitted = || tree_view(observed.path()).omitted().map(<[_]>::to_vec);
+        fake_snapshot_record(observed.path(), "");
+        assert_eq!(omitted(), Some(Vec::new()));
         let repo = tempfile::tempdir().expect("tempdir");
         init_git_repo_for_test(repo.path());
         write(repo.path(), "a.rs", b"pub fn a() {}\n");
         commit_all(repo.path(), "base");
         write(repo.path(), "a.rs", b"pub fn b() {}\n");
         git(repo.path(), &["add", "a.rs"]);
-        record("{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}");
-        let snapshot = ready(prepare_staged(repo.path(), SnapshotBudget::DEFAULT));
-        assert_eq!(*crate::git_support::tree_view(observed.path()), gitlink());
-        record("");
-        drop(snapshot);
-        assert_eq!(
-            *crate::git_support::tree_view(observed.path()),
-            TreeView::Snapshot(Vec::new())
+        fake_snapshot_record(
+            observed.path(),
+            "{\"path\":\"vendor/sub\",\"kind\":\"gitlink\"}",
         );
+        let snapshot = ready(prepare_staged(repo.path(), SnapshotBudget::DEFAULT));
+        assert_eq!(
+            omitted(),
+            Some(vec![(PathBuf::from("vendor/sub"), OmittedKind::Gitlink)])
+        );
+        fake_snapshot_record(observed.path(), "");
+        drop(snapshot);
+        assert_eq!(omitted(), Some(Vec::new()));
     }
 
     #[test]

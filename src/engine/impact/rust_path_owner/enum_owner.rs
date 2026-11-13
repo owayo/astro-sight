@@ -322,7 +322,8 @@ impl EnumFile {
 }
 
 fn ordinary_file(dir: &Path, path: &Path) -> Option<bool> {
-    // snapshot が書き出さなかった要素 (やその下) は、無いと決められない (Issue #376)。
+    // snapshot が書き出さなかった要素のために実際の checkout と有無が違いうるなら、決めない
+    // (Issue #376)。
     if crate::git_support::tree_view(dir).hides(path) {
         return None;
     }
