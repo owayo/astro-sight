@@ -233,6 +233,83 @@ fn impact_rust_cargo_reachability_keeps_callers_for_target_paths_outside_the_pac
     );
 }
 
+/// a の `run` に引数を足し、同時に `rename` を `git mv` (内容は変えない) したときの、a の
+/// 呼び出し元の path。b だけが a に依存し、`b/src/bin/probe.rs` が `a::run(1)` を呼ぶ。c は a に
+/// 依存せず、外部の `other` から import した同名の `run` を呼ぶ (到達性だけが外せる)。
+fn callers_with_hunkless_rename(rename: Option<(&str, &str)>) -> (Vec<String>, String) {
+    let repo = TestRepo::new();
+    for directory in ["a/src", "b/src/bin", "c/src", "notes"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    let package = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
+        )
+    };
+    repo.write("a/Cargo.toml", package("a", ""));
+    repo.write(
+        "b/Cargo.toml",
+        package("b", "[dependencies]\na = { path = \"../a\" }\n"),
+    );
+    repo.write(
+        "c/Cargo.toml",
+        package("c", "[dependencies]\nother = \"1\"\n"),
+    );
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write("b/src/lib.rs", "");
+    repo.write("b/src/bin/probe.rs", "fn main() {\n    a::run(1);\n}\n");
+    repo.write(
+        "c/src/lib.rs",
+        "use other::run;\n\npub fn caller() -> u8 {\n    run(1)\n}\n",
+    );
+    repo.write("notes/a.md", "note\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    if let Some((from, to)) = rename {
+        repo.create_dir_all(std::path::Path::new(to).parent().unwrap());
+        repo.git(["mv", from, to]);
+    }
+    let context = repo.run_json("context", &["--git"]);
+    let mut impacted: Vec<String> = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["path"] == "a/src/lib.rs")
+        .filter_map(|change| change["impacted_callers"].as_array())
+        .flatten()
+        .map(|caller| caller["path"].as_str().unwrap().to_owned())
+        .collect();
+    impacted.sort();
+    impacted.dedup();
+    (impacted, context.to_string())
+}
+
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_moved_by_hunkless_rename() {
+    // 対照: rename が無い・Rust でないファイルの rename なら、到達性で c の同名の参照を外す。
+    for rename in [None, Some(("notes/a.md", "notes/b.md"))] {
+        let (impacted, context) = callers_with_hunkless_rename(rename);
+        assert_eq!(impacted, ["b/src/bin/probe.rs"], "{rename:?}: {context}");
+    }
+    // 内容が同じまま c へ移した、変更前に b から a を呼んでいたコードは残す (Issue #374)。
+    // Rust のソースの置き場所が変わったので、作業ツリーの依存のグラフで外さない。
+    let (impacted, context) =
+        callers_with_hunkless_rename(Some(("b/src/bin/probe.rs", "c/src/bin/probe.rs")));
+    assert_eq!(
+        impacted,
+        ["c/src/bin/probe.rs", "c/src/lib.rs"],
+        "{context}"
+    );
+}
+
 #[test]
 fn impact_rust_cargo_reachability_rejects_replaced_sysroot_in_legacy_tables() {
     let source = "use std::println;\nuse anyhow::Result;\npub fn unrelated() -> Result<()> { println!(\"x\"); Ok(()) }\n";
