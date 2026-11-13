@@ -577,10 +577,17 @@ fn prepare_staged_source(
 
 /// 作業ツリーの追跡ファイルが index と同じか (`git diff --quiet`)。hook が渡した
 /// `GIT_INDEX_FILE` も staged diff と同じく尊重する。判定できなければ「違う」に倒す
-/// (参照に依存する降格を確定させない側)。
+/// (参照に依存する降格を確定させない側)。submodule の変更も、解析用の diff と同じく
+/// 利用者の ignore の設定に依らずに数える。
 fn working_tree_matches_index(dir: &str) -> bool {
     crate::git_support::git_command_for_dir(dir)
-        .args(["diff", "--quiet", "--no-ext-diff", "--no-textconv"])
+        .args([
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+        ])
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(std::process::Stdio::null())
