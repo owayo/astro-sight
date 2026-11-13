@@ -127,7 +127,7 @@ pub(crate) enum TreeView {
     /// snapshot の中ではない。
     Checkout,
     /// snapshot で、書き出さなかった要素の記録を読めた。
-    Snapshot(SnapshotOmissions),
+    Snapshot(Box<SnapshotOmissions>),
     /// snapshot だが、記録が無い・読めない・tree が合わない・不完全か、記録が snapshot の中身と
     /// 合わない (書き出さなかった symlink の名前で別の要素を開ける、gitlink の空ディレクトリが無い
     /// など) か、`dir` 自身が gitlink の下にある。
@@ -474,7 +474,7 @@ fn read_tree_view(dir: &std::path::Path) -> TreeView {
                 prefix.push(part);
             }
         }
-        Some(TreeView::Snapshot(omissions))
+        Some(TreeView::Snapshot(Box::new(omissions)))
     })()
     .unwrap_or(TreeView::Unusable)
 }
