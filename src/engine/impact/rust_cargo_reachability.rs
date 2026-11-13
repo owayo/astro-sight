@@ -66,6 +66,7 @@ impl CargoIndex {
         }
 
         let files = list()?;
+        let sources: HashSet<&Path> = files.rust_files.iter().map(PathBuf::as_path).collect();
         let mut manifests = vec![(PathBuf::new(), root_value)];
         for path in &files.manifests {
             manifests.push((path.parent()?.to_owned(), read_manifest(tree, path)?));
@@ -106,7 +107,9 @@ impl CargoIndex {
                 return None;
             }
             let package = manifest.get("package")?;
-            if package.get("workspace").is_some() || custom_target_path(&manifest) {
+            if package.get("workspace").is_some()
+                || custom_target_path(&manifest, &directory, &sources)
+            {
                 return None;
             }
             let name = package.get("name")?.as_str()?.to_owned();
@@ -494,13 +497,19 @@ fn canonical_relative(root: &Path, base: &Path, relative: &str) -> Option<PathBu
         .map(Path::to_owned)
 }
 
-fn custom_target_path(manifest: &toml::Value) -> bool {
-    // A custom build script can point directly at a source file owned by a
-    // different package, and build-dependencies can make its names available.
+/// target (`[lib]`・`[[bin]]` など) と build script の明示したパスのどれかが、package の中の走査した
+/// Rust ソースを指すと確かめられないか。外を指すと、別の package のソースをこの package の依存で
+/// コンパイルし、その依存の名前を見せうる (Issue #373: 中を指すだけの `path = "src/main.rs"` は許す)。
+fn custom_target_path(manifest: &toml::Value, directory: &Path, sources: &HashSet<&Path>) -> bool {
+    let inside = |path: &toml::Value| {
+        path.as_str()
+            .and_then(|path| package_source(directory, path))
+            .is_some_and(|path| sources.contains(path.as_path()))
+    };
     if manifest
         .get("package")
         .and_then(|package| package.get("build"))
-        .is_some_and(|build| !build.is_bool())
+        .is_some_and(|build| !build.is_bool() && !inside(build))
     {
         return true;
     }
@@ -512,11 +521,30 @@ fn custom_target_path(manifest: &toml::Value) -> bool {
             toml::Value::Array(values) => values.iter().collect(),
             value => vec![value],
         };
-        if candidates.iter().any(|target| target.get("path").is_some()) {
+        if candidates
+            .iter()
+            .filter_map(|target| target.get("path"))
+            .any(|path| !inside(path))
+        {
             return true;
         }
     }
     false
+}
+
+/// manifest のディレクトリ `directory` (root 相対) と、そこからの相対パス `raw` を字面だけで
+/// つなぐ。`..`・ルート・prefix を含むなら None。走査しない場所 (root の `target` など) の symlink を
+/// `..` で通ると、字面と実際に開くファイルが食い違う。
+fn package_source(directory: &Path, raw: &str) -> Option<PathBuf> {
+    let mut path = directory.to_owned();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::Normal(name) => path.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(path)
 }
 
 #[derive(Default)]
@@ -938,13 +966,13 @@ mod tests {
         WorkspaceTree, invokes_only_standard_macros, lexical_relative,
     };
 
-    fn proves_unreachable(
+    /// a・b・c の 3 つの package のワークスペース。b と c は manifest の末尾に追記できる。
+    fn workspace(
         workspace_extra: &str,
         b_manifest_extra: &str,
         c_manifest_extra: &str,
         b_source: &str,
-        enabled: bool,
-    ) -> bool {
+    ) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         for package in ["a", "b", "c"] {
@@ -973,7 +1001,24 @@ mod tests {
             )
             .unwrap();
         }
-        RustCargoReachability::new(root, enabled).proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
+        directory
+    }
+
+    fn proves_unreachable(
+        workspace_extra: &str,
+        b_manifest_extra: &str,
+        c_manifest_extra: &str,
+        b_source: &str,
+        enabled: bool,
+    ) -> bool {
+        let directory = workspace(
+            workspace_extra,
+            b_manifest_extra,
+            c_manifest_extra,
+            b_source,
+        );
+        RustCargoReachability::new(directory.path(), enabled)
+            .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
     }
 
     #[test]
@@ -1206,18 +1251,82 @@ mod tests {
         ));
         assert!(!proves_unreachable(
             "",
-            "[lib]\npath = \"src/lib.rs\"\n",
-            "",
-            ordinary,
-            true
-        ));
-        assert!(!proves_unreachable(
-            "",
             "build = \"../a/src/lib.rs\"\n",
             "",
             ordinary,
             true
         ));
+    }
+
+    #[test]
+    fn target_paths_must_name_sources_inside_the_package() {
+        let proves = |manifest: &str, files: &[&str]| {
+            let directory = workspace("", manifest, "", "pub fn unrelated() {}\n");
+            for file in files {
+                let path = directory.path().join("b").join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "fn main() {}\n").unwrap();
+            }
+            RustCargoReachability::new(directory.path(), true)
+                .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
+        };
+        // package の中の走査したソースを指すパスは、既定の位置と同じく証明を保つ (Issue #373)。
+        for (manifest, files) in [
+            ("[lib]\npath = \"src/lib.rs\"\n", &[][..]),
+            ("[lib]\npath = \"./src/lib.rs\"\n", &[]),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
+                &["src/main.rs"],
+            ),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+                &["tools/tool.rs"],
+            ),
+            (
+                "[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\n",
+                &["examples/demo.rs"],
+            ),
+            ("build = \"build.rs\"\n", &["build.rs"]),
+            ("build = \"scripts/build.rs\"\n", &["scripts/build.rs"]),
+            ("build = false\n", &[]),
+        ] {
+            assert!(proves(manifest, files), "{manifest}");
+        }
+        // 外・`..`・走査していない・Rust のソースでない・文字列でないパスは証明しない。
+        for (manifest, files) in [
+            ("[lib]\npath = \"../a/src/lib.rs\"\n", &[][..]),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"../a/src/lib.rs\"\n",
+                &[],
+            ),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"src/../src/lib.rs\"\n",
+                &[],
+            ),
+            ("[[bin]]\nname = \"tool\"\npath = \"src/missing.rs\"\n", &[]),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"src/main\"\n",
+                &["src/main"],
+            ),
+            ("[[bin]]\nname = \"tool\"\npath = \"\"\n", &[]),
+            ("[[bin]]\nname = \"tool\"\npath = 1\n", &[]),
+            ("[[test]]\nname = \"it\"\npath = \"/tests/it.rs\"\n", &[]),
+            ("[[test]]\nname = \"it\"\npath = \"C:/tests/it.rs\"\n", &[]),
+            ("build = [\"build.rs\"]\n", &["build.rs"]),
+        ] {
+            assert!(!proves(manifest, files), "{manifest}");
+        }
+        // 変えた側の target が b のソースをコンパイルすると、b のファイルから a の名前が見える。
+        let directory = workspace("", "", "", "pub fn unrelated() {}\n");
+        std::fs::write(
+            directory.path().join("a/Cargo.toml"),
+            "[package]\nname = \"sample-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"tool\"\npath = \"../b/src/lib.rs\"\n",
+        )
+        .unwrap();
+        assert!(
+            !RustCargoReachability::new(directory.path(), true)
+                .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
+        );
     }
 
     #[test]
@@ -1354,6 +1463,14 @@ mod tests {
     }
 
     fn scan_listed(files: &[(&str, &'static str)]) -> Option<CargoIndex> {
+        scan_listed_with_symlinks(files, &[])
+    }
+
+    /// `symlinks` はファイルを指す symlink の要素 (git の tree の mode 120000) として足す。
+    fn scan_listed_with_symlinks(
+        files: &[(&str, &'static str)],
+        symlinks: &[&str],
+    ) -> Option<CargoIndex> {
         let paths: Vec<PathBuf> = files
             .iter()
             .map(|(path, _)| Path::new(path).components().collect())
@@ -1372,10 +1489,59 @@ mod tests {
                 for path in &paths {
                     listed.add(path, TreeEntry::File)?;
                 }
+                for path in symlinks {
+                    listed.add(
+                        &Path::new(path).components().collect::<PathBuf>(),
+                        TreeEntry::Symlink {
+                            to_directory: false,
+                        },
+                    )?;
+                }
                 Some(listed)
             },
             1,
         )
+    }
+
+    #[test]
+    fn listed_tree_target_paths_must_name_regular_sources() {
+        let workspace = ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n");
+        let source = ("app/src/main.rs", "fn main() {}\n");
+        let manifest = |path: &'static str| ("app/Cargo.toml", path);
+        assert!(
+            scan_listed(&[
+                workspace,
+                manifest(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n"
+                ),
+                source,
+            ])
+            .is_some()
+        );
+        // git の tree は字面で解決するので、symlink の先や `..` の先のファイルとは限らない。
+        assert!(
+            scan_listed_with_symlinks(
+                &[
+                    workspace,
+                    manifest(
+                        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\npath = \"src/main\"\n"
+                    ),
+                    source,
+                ],
+                &["app/src/main"],
+            )
+            .is_none()
+        );
+        assert!(
+            scan_listed(&[
+                workspace,
+                manifest(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\npath = \"../app/src/main.rs\"\n"
+                ),
+                source,
+            ])
+            .is_none()
+        );
     }
 
     #[test]
