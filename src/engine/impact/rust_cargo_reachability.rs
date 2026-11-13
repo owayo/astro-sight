@@ -1398,28 +1398,6 @@ mod tests {
             RustCargoReachability::new(directory.path(), true)
                 .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
         };
-        // package の中の走査したソースを指すパスは、既定の位置と同じく証明を保つ (Issue #373)。
-        for (manifest, files) in [
-            ("[lib]\npath = \"src/lib.rs\"\n", &[][..]),
-            ("[lib]\npath = \"./src/lib.rs\"\n", &[]),
-            (
-                "[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
-                &["src/main.rs"],
-            ),
-            (
-                "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
-                &["tools/tool.rs"],
-            ),
-            (
-                "[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\n",
-                &["examples/demo.rs"],
-            ),
-            ("build = \"build.rs\"\n", &["build.rs"]),
-            ("build = \"scripts/build.rs\"\n", &["scripts/build.rs"]),
-            ("build = false\n", &[]),
-        ] {
-            assert!(proves(manifest, files), "{manifest}");
-        }
         // 外・`..`・走査していない・Rust のソースでない・文字列でないパスは証明しない。
         for (manifest, files) in [
             ("[lib]\npath = \"../a/src/lib.rs\"\n", &[][..]),
@@ -1455,6 +1433,28 @@ mod tests {
             !RustCargoReachability::new(directory.path(), true)
                 .proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
         );
+        // package の中の走査したソースを指すパスは、既定の位置と同じく証明を保つ (Issue #373)。
+        for (manifest, files) in [
+            ("build = false\n", &[][..]),
+            ("[lib]\npath = \"src/lib.rs\"\n", &[]),
+            ("[lib]\npath = \"./src/lib.rs\"\n", &[]),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
+                &["src/main.rs"],
+            ),
+            (
+                "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+                &["tools/tool.rs"],
+            ),
+            (
+                "[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\n",
+                &["examples/demo.rs"],
+            ),
+            ("build = \"build.rs\"\n", &["build.rs"]),
+            ("build = \"scripts/build.rs\"\n", &["scripts/build.rs"]),
+        ] {
+            assert!(proves(manifest, files), "{manifest}");
+        }
     }
 
     #[test]
@@ -1636,16 +1636,6 @@ mod tests {
         let workspace = ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n");
         let source = ("app/src/main.rs", "fn main() {}\n");
         let manifest = |path: &'static str| ("app/Cargo.toml", path);
-        assert!(
-            scan_listed(&[
-                workspace,
-                manifest(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n"
-                ),
-                source,
-            ])
-            .is_some()
-        );
         // git の tree は字面で解決するので、symlink の先や `..` の先のファイルとは限らない。
         assert!(
             scan_listed_with_symlinks(
@@ -1669,6 +1659,16 @@ mod tests {
                 source,
             ])
             .is_none()
+        );
+        assert!(
+            scan_listed(&[
+                workspace,
+                manifest(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n"
+                ),
+                source,
+            ])
+            .is_some()
         );
     }
 
