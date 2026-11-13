@@ -48,21 +48,27 @@ impl HunkProgress {
         }
     }
 
-    /// 本体 1 行を消費して old/new の残数を減らし、行種別を返す。
-    fn consume<'a>(&mut self, line: &'a str) -> HunkBodyLine<'a> {
+    /// 本体 1 行を消費して old/new の残数を減らし、行種別を返す。残数の無い側を消費する行や、
+    /// 本文の接頭辞 (` `・`+`・`-`・`\`、または空行) で始まらない行なら `malformed` を真にする。
+    fn consume<'a>(&mut self, line: &'a str, malformed: &mut bool) -> HunkBodyLine<'a> {
         match line.as_bytes().first() {
             Some(b'+') => {
+                *malformed |= self.new_remaining == 0;
                 self.new_remaining = self.new_remaining.saturating_sub(1);
                 HunkBodyLine::Added(&line[1..])
             }
             Some(b'-') => {
+                *malformed |= self.old_remaining == 0;
                 self.old_remaining = self.old_remaining.saturating_sub(1);
                 HunkBodyLine::Removed(&line[1..])
             }
             // `\ No newline at end of file` は old/new いずれの行数にも数えない。
             Some(b'\\') => HunkBodyLine::Metadata,
-            _ => {
+            first => {
                 // 先頭スペースの context 行、および末尾の空行を context として扱う。
+                *malformed |= first.is_some_and(|byte| *byte != b' ')
+                    || self.old_remaining == 0
+                    || self.new_remaining == 0;
                 self.old_remaining = self.old_remaining.saturating_sub(1);
                 self.new_remaining = self.new_remaining.saturating_sub(1);
                 HunkBodyLine::Context(line.strip_prefix(' ').unwrap_or(line))
@@ -103,6 +109,8 @@ pub(crate) struct DiffLines<'a> {
     /// 直前に返した行の先頭のバイト位置。
     line_start: usize,
     active_hunk: Option<HunkProgress>,
+    /// hunk の本文に、宣言した行数と合わない行か本文の形でない行があった。
+    malformed_body: bool,
 }
 
 impl<'a> DiffLines<'a> {
@@ -112,6 +120,7 @@ impl<'a> DiffLines<'a> {
             offset: 0,
             line_start: 0,
             active_hunk: None,
+            malformed_body: false,
         }
     }
 
@@ -123,6 +132,12 @@ impl<'a> DiffLines<'a> {
     /// hunk の本体の途中か (入力の終わりで真なら、宣言した行数に届かずに切れた diff)。
     pub(crate) fn in_hunk(&self) -> bool {
         self.active_hunk.is_some()
+    }
+
+    /// ここまでの hunk の本文に、残数の無い側を消費する行や本文の形でない行 (行数の足りない
+    /// hunk が次の見出しを飲み込んだなど) があったか。読み飛ばしてよい利用者は見なくてよい。
+    pub(crate) fn malformed_body(&self) -> bool {
+        self.malformed_body
     }
 }
 
@@ -137,7 +152,7 @@ impl<'a> Iterator for DiffLines<'a> {
             .strip_suffix('\n')
             .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line));
         if let Some(progress) = self.active_hunk.as_mut() {
-            let body = progress.consume(line);
+            let body = progress.consume(line, &mut self.malformed_body);
             if progress.is_complete() {
                 self.active_hunk = None;
             }
@@ -722,6 +737,539 @@ fn parse_hunkless(input: &str, empty_files: bool) -> Vec<DiffFile> {
     }
     block.finish(&mut out, empty_files);
     out
+}
+
+/// diff の 1 ブロックの片側のパス ([`scan_blocks`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlockPath {
+    /// 確定したパス (`a/`・`b/` の接頭辞を外したもの)。
+    Known(String),
+    /// その側には無い (追加・削除)。
+    Absent,
+    /// 確定できない。
+    Unknown,
+}
+
+/// diff の 1 ブロックの片側の mode ([`scan_blocks`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockMode {
+    Known(u32),
+    Absent,
+    /// diff に現れない (内容が同じ rename・copy や git 以外の unified diff)。
+    Unknown,
+}
+
+/// diff の 1 ブロックの内容の差分の形 ([`scan_blocks`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockContent {
+    /// hunk で旧新を比べられる。
+    Hunks,
+    /// binary などで旧新を比べられない。
+    Binary,
+    /// 内容の差分が無い (内容が同じ rename・mode だけの変更・空のファイルの出入り)。
+    Unchanged,
+}
+
+/// diff の 1 ブロック。`diff --git` の見出しから次の見出しまでで、git 以外の unified diff では
+/// `--- `/`+++ ` の組から始まる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffBlock {
+    pub(crate) old_path: BlockPath,
+    pub(crate) new_path: BlockPath,
+    pub(crate) old_mode: BlockMode,
+    pub(crate) new_mode: BlockMode,
+    pub(crate) content: BlockContent,
+    /// 追加・削除した行に `Subproject commit ` で始まる行がある (`--submodule=short` の gitlink の
+    /// 本文。中だけが dirty な gitlink は mode が出ないので、これでしか分からない)。
+    pub(crate) gitlink_body: bool,
+}
+
+/// [`scan_blocks`] の結果。
+pub(crate) struct BlockScan {
+    pub(crate) blocks: Vec<DiffBlock>,
+    /// 入力の全ての行を、対応する形として読み切れたか。偽なら、一覧に無い変更があり得る。
+    pub(crate) complete: bool,
+}
+
+/// diff の全てのブロックを、hunk の有無・binary・パスのクォートを問わず列挙する。
+///
+/// `parse_unified_diff` (hunk のあるファイル) と `parse_hunkless_changes` (hunk の無い rename と
+/// 空のファイル) は解析の対象を選ぶためのもので、binary のブロック・mode だけの変更・クォートした
+/// 見出しを返さない。差分が何を変えたかを漏れなく確かめる側 (Cargo の構成の変更の判定) はこれを
+/// 使う (Issue #377)。hunk の本文は [`DiffLines`] で見出しと見分け、本文に見出しのような行が
+/// あっても読み違えない。対応していない行 (`diff --cc`・解釈できない `@@ `・どのブロックにも
+/// 属さない行)、宣言した行数と合わない hunk の本文 (残数の無い側を消費する行・本文の形でない行・
+/// 途中で切れた hunk)、形の崩れたブロック ([`BlockBuilder::finish`]) があれば `complete` を偽にする。
+pub(crate) fn scan_blocks(input: &str) -> BlockScan {
+    let mut scan = BlockScan {
+        blocks: Vec::new(),
+        complete: true,
+    };
+    let mut current: Option<BlockBuilder> = None;
+    let mut lines = DiffLines::new(input);
+    let push = |scan: &mut BlockScan, block: BlockBuilder| {
+        let (block, well_formed) = block.finish();
+        scan.complete &= well_formed;
+        scan.blocks.push(block);
+    };
+    while let Some(line) = lines.next() {
+        let raw = raw_line(input, lines.line_start());
+        match line {
+            DiffLine::Body(body) => match current.as_mut() {
+                Some(block) => {
+                    block.hunks = true;
+                    if let HunkBodyLine::Added(text) | HunkBodyLine::Removed(text) = body {
+                        block.gitlink_body |= text.starts_with("Subproject commit ");
+                    }
+                }
+                None => scan.complete = false,
+            },
+            DiffLine::Hunk(_) => match current.as_mut() {
+                Some(block) if block.new_header.is_some() && strict_hunk_header(raw) => {
+                    block.hunks = true;
+                }
+                _ => scan.complete = false,
+            },
+            DiffLine::OldHeader(header) => {
+                if !current
+                    .as_ref()
+                    .is_some_and(|block| block.git && block.old_header.is_none())
+                {
+                    // git 以外の unified diff のブロック。
+                    if let Some(block) = current.take() {
+                        push(&mut scan, block);
+                    }
+                    current = Some(BlockBuilder::default());
+                }
+                if let Some(block) = current.as_mut() {
+                    block.old_header = Some(header_side(header, "--- ", "a/"));
+                }
+            }
+            DiffLine::NewHeader(header) => match current.as_mut() {
+                Some(block) if block.old_header.is_some() && block.new_header.is_none() => {
+                    block.new_header = Some(header_side(header, "+++ ", "b/"));
+                }
+                _ => scan.complete = false,
+            },
+            DiffLine::Other => {
+                if let Some(rest) = raw.strip_prefix("diff --git ") {
+                    if let Some(block) = current.take() {
+                        push(&mut scan, block);
+                    }
+                    current = Some(BlockBuilder {
+                        git: true,
+                        header: Some(git_header_paths(rest)),
+                        ..BlockBuilder::default()
+                    });
+                } else if raw.is_empty()
+                    && !current.as_ref().is_some_and(|block| block.in_binary_patch)
+                {
+                    // hunk の外の空行は何も変えない。
+                } else if raw.starts_with("\\ ")
+                    && current.as_ref().is_some_and(|block| block.hunks)
+                {
+                    // 最後の行に改行が無い印 (`\ No newline at end of file`)。hunk の行数を数え
+                    // 終えた後に来る。
+                } else if !current
+                    .as_mut()
+                    .is_some_and(|block| block.read_extended_header(raw))
+                {
+                    scan.complete = false;
+                }
+            }
+        }
+    }
+    if lines.in_hunk() || lines.malformed_body() {
+        scan.complete = false;
+    }
+    if let Some(block) = current {
+        push(&mut scan, block);
+    }
+    scan
+}
+
+/// `@@ -<旧> +<新> @@[ <見出し>]` の形か。範囲は `start` か `start,count` の 2 つだけ
+/// (`parse_hunk_header` は余分な範囲を読み飛ばす)。
+fn strict_hunk_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("@@ ") else {
+        return false;
+    };
+    let Some(end) = rest.find(" @@") else {
+        return false;
+    };
+    let after = &rest[end + " @@".len()..];
+    let range = |token: Option<&str>, sign: char| {
+        token
+            .and_then(|token| token.strip_prefix(sign))
+            .is_some_and(|spec| {
+                let mut parts = spec.splitn(2, ',');
+                parts
+                    .by_ref()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+    };
+    let mut tokens = rest[..end].split(' ');
+    range(tokens.next(), '-')
+        && range(tokens.next(), '+')
+        && tokens.next().is_none()
+        && (after.is_empty() || after.starts_with(' '))
+}
+
+/// 拡張ヘッダや見出しから取り出したパスが、リポジトリの中の相対パスとして読めるか。
+fn safe_block_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+/// `start` から行末 (`\n` の前、`\r\n` なら `\r` の前) までの行。
+fn raw_line(input: &str, start: usize) -> &str {
+    let rest = &input[start..];
+    let line = rest.split_once('\n').map_or(rest, |(line, _)| line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// `--- ` / `+++ ` の見出しの片側。
+#[derive(Clone)]
+enum HeaderSide {
+    Path(String),
+    DevNull,
+    Unknown,
+}
+
+fn header_side(header: &str, marker: &str, prefix: &str) -> HeaderSide {
+    let Some(rest) = header.strip_prefix(marker) else {
+        return HeaderSide::Unknown;
+    };
+    if rest == "/dev/null" || rest.starts_with("/dev/null\t") {
+        return HeaderSide::DevNull;
+    }
+    if rest.starts_with('"') {
+        // `--- "a/x\ty"` の後ろに TAB とタイムスタンプは付かない (クォートがラベルを閉じる)。
+        return match split_c_quoted(rest) {
+            Some((quoted, "")) => unquote_c_path(quoted)
+                .and_then(|path| path.strip_prefix(prefix).map(str::to_owned))
+                .map_or(HeaderSide::Unknown, HeaderSide::Path),
+            _ => HeaderSide::Unknown,
+        };
+    }
+    match strip_header_path(header, &format!("{marker}{prefix}")) {
+        Some(path) if !path.is_empty() => HeaderSide::Path(path.to_owned()),
+        _ => HeaderSide::Unknown,
+    }
+}
+
+/// `diff --git ` の後ろ (`a/<旧> b/<新>`) の旧新のパス。どちらか、または両方をクォートしてよい。
+/// クォートしない旧新が違うパスは、空白を含むと区切りが曖昧なので確定しない (None)。
+fn git_header_paths(rest: &str) -> Option<(String, String)> {
+    let unquote = |quoted: &str, prefix: &str| {
+        unquote_c_path(quoted).and_then(|path| path.strip_prefix(prefix).map(str::to_owned))
+    };
+    if rest.starts_with('"') {
+        let (old, tail) = split_c_quoted(rest)?;
+        let old = unquote(old, "a/")?;
+        let tail = tail.strip_prefix(' ')?;
+        let new = if tail.starts_with('"') {
+            match split_c_quoted(tail)? {
+                (new, "") => unquote(new, "b/")?,
+                _ => return None,
+            }
+        } else {
+            tail.strip_prefix("b/")?.to_owned()
+        };
+        return Some((old, new));
+    }
+    // クォートしないパスは `"` を含まない (Git は `"` を含むパスをクォートする)。
+    if let Some(quote) = rest.find('"') {
+        let old = rest[..quote].strip_suffix(' ')?.strip_prefix("a/")?;
+        return match split_c_quoted(&rest[quote..])? {
+            (new, "") => Some((old.to_owned(), unquote(new, "b/")?)),
+            _ => None,
+        };
+    }
+    let rest = rest.strip_prefix("a/")?;
+    let length = rest.len().checked_sub(" b/".len())?;
+    if length % 2 != 0 {
+        return None;
+    }
+    let (old, new) = rest.split_at_checked(length / 2)?;
+    let new = new.strip_prefix(" b/")?;
+    (old == new).then(|| (old.to_owned(), new.to_owned()))
+}
+
+/// `rename from <path>` などの拡張ヘッダのパス (接頭辞なし。クォートしてよい)。
+fn extended_header_path(path: &str) -> Option<String> {
+    if path.starts_with('"') {
+        return match split_c_quoted(path)? {
+            (quoted, "") => unquote_c_path(quoted),
+            _ => None,
+        };
+    }
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// `GIT binary patch` の本体の行: `literal <n>` / `delta <n>`、base85 の行 (長さの文字 `A`-`Z`・
+/// `a`-`z` と base85 の文字)、区切りの空行。
+fn binary_patch_line(line: &str) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    if let Some(size) = line
+        .strip_prefix("literal ")
+        .or_else(|| line.strip_prefix("delta "))
+    {
+        return !size.is_empty() && size.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    let mut bytes = line.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && line.len() > 1
+        && bytes.all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b';'
+                        | b'<'
+                        | b'='
+                        | b'>'
+                        | b'?'
+                        | b'@'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                )
+        })
+}
+
+fn parse_mode(text: &str) -> Option<u32> {
+    (text.len() == 6 && text.bytes().all(|byte| (b'0'..=b'7').contains(&byte)))
+        .then(|| u32::from_str_radix(text, 8).ok())
+        .flatten()
+}
+
+/// [`scan_blocks`] が 1 ブロックの間に集める事実。
+#[derive(Default)]
+struct BlockBuilder {
+    git: bool,
+    /// `diff --git` の見出しの旧新 (None は確定できない)。
+    header: Option<Option<(String, String)>>,
+    /// `rename from` / `copy from` (None は読めない)。
+    from: Option<Option<String>>,
+    to: Option<Option<String>>,
+    old_header: Option<HeaderSide>,
+    new_header: Option<HeaderSide>,
+    old_mode: Option<Option<u32>>,
+    new_mode: Option<Option<u32>>,
+    /// `index <旧>..<新>[ <mode>]` の旧新の OID と mode。
+    index: Option<(String, String, Option<u32>)>,
+    added: Option<Option<u32>>,
+    deleted: Option<Option<u32>>,
+    hunks: bool,
+    gitlink_body: bool,
+    binary: bool,
+    /// `GIT binary patch` の本体の途中。
+    in_binary_patch: bool,
+    /// 同じ事実を 2 度読んだなど、ブロックの形が崩れている。
+    malformed: bool,
+}
+
+const EMPTY_BLOB_SHA1: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+const EMPTY_BLOB_SHA256: &str = "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
+
+/// 空の blob の OID (省略形を含む)。
+fn is_empty_blob(oid: &str) -> bool {
+    oid.len() >= 7 && (EMPTY_BLOB_SHA1.starts_with(oid) || EMPTY_BLOB_SHA256.starts_with(oid))
+}
+
+impl BlockBuilder {
+    /// git のブロックの拡張ヘッダ (と `GIT binary patch` の本体) を 1 行読む。対応しない行なら偽。
+    fn read_extended_header(&mut self, line: &str) -> bool {
+        if self.in_binary_patch {
+            return binary_patch_line(line);
+        }
+        if !self.git || self.old_header.is_some() {
+            return false;
+        }
+        let set = |slot: &mut Option<Option<u32>>, malformed: &mut bool, text: &str| {
+            *malformed |= slot.replace(parse_mode(text)).is_some();
+        };
+        if let Some(mode) = line.strip_prefix("old mode ") {
+            set(&mut self.old_mode, &mut self.malformed, mode);
+        } else if let Some(mode) = line.strip_prefix("new mode ") {
+            set(&mut self.new_mode, &mut self.malformed, mode);
+        } else if let Some(mode) = line.strip_prefix("new file mode ") {
+            set(&mut self.added, &mut self.malformed, mode);
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
+            set(&mut self.deleted, &mut self.malformed, mode);
+        } else if let Some(index) = line.strip_prefix("index ") {
+            let (range, mode) = match index.split_once(' ') {
+                Some((range, mode)) => (range, Some(mode)),
+                None => (index, None),
+            };
+            let Some((old, new)) = range.split_once("..").filter(|(old, new)| {
+                [old, new]
+                    .iter()
+                    .all(|oid| !oid.is_empty() && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            }) else {
+                return false;
+            };
+            let mode = match mode {
+                Some(mode) => match parse_mode(mode) {
+                    Some(mode) => Some(mode),
+                    None => return false,
+                },
+                None => None,
+            };
+            self.malformed |= self
+                .index
+                .replace((old.to_owned(), new.to_owned(), mode))
+                .is_some();
+        } else if let Some(path) = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("copy from "))
+        {
+            self.malformed |= self.from.replace(extended_header_path(path)).is_some();
+        } else if let Some(path) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("copy to "))
+        {
+            self.malformed |= self.to.replace(extended_header_path(path)).is_some();
+        } else if line.starts_with("similarity index ") || line.starts_with("dissimilarity index ")
+        {
+        } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+            self.binary = true;
+        } else if line == "GIT binary patch" {
+            self.binary = true;
+            self.in_binary_patch = true;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// ブロックを確定する。形が崩れている (同じ事実の重複・追加と削除の両方・無い側の mode・
+    /// 片方だけの `---`/`+++`・本文の無い内容の変更・何も変えないブロック) なら、偽を添える。
+    fn finish(self) -> (DiffBlock, bool) {
+        let added = self.added.is_some();
+        let deleted = self.deleted.is_some();
+        // `diff --git` の見出しは、追加・削除でも無い側に同じパスを書く。無い側は mode の行か
+        // `--- /dev/null`・`+++ /dev/null` で分かる (手で書いた diff は mode の行を省く)。
+        let old_absent = added || matches!(self.old_header, Some(HeaderSide::DevNull));
+        let new_absent = deleted || matches!(self.new_header, Some(HeaderSide::DevNull));
+        let index_changed = self.index.as_ref().map(|(old, new, _)| old != new);
+        let explained = self.hunks
+            || self.binary
+            || if added || deleted {
+                // 空のファイルの出入りは本文が無い。
+                self.index
+                    .as_ref()
+                    .is_some_and(|(old, new, _)| is_empty_blob(if added { new } else { old }))
+            } else {
+                self.git
+                    && index_changed != Some(true)
+                    && (self.from.is_some()
+                        || self.to.is_some()
+                        || self.old_mode.is_some()
+                        || self.new_mode.is_some())
+            };
+        let well_formed = !self.malformed
+            && !(old_absent && new_absent)
+            && !(added && self.old_mode.is_some())
+            && !(deleted && self.new_mode.is_some())
+            && self.old_header.is_some() == self.new_header.is_some()
+            && explained;
+        let header = self.header.flatten();
+        let side = |header_path: Option<&String>,
+                    extended: &Option<Option<String>>,
+                    file_header: &Option<HeaderSide>,
+                    absent: bool| {
+            if !well_formed {
+                return BlockPath::Unknown;
+            }
+            let mut value: Option<BlockPath> = None;
+            let mut agree = |candidate: BlockPath| {
+                let candidate = match candidate {
+                    BlockPath::Known(path) if !safe_block_path(&path) => BlockPath::Unknown,
+                    candidate => candidate,
+                };
+                value = Some(match value.take() {
+                    None => candidate,
+                    Some(existing) if existing == candidate => existing,
+                    Some(_) => BlockPath::Unknown,
+                });
+            };
+            if absent {
+                agree(BlockPath::Absent);
+            } else if let Some(path) = header_path {
+                // 追加・削除の見出しは、無い側にも同じパスを書く。
+                agree(BlockPath::Known(path.clone()));
+            }
+            match extended {
+                Some(Some(path)) => agree(BlockPath::Known(path.clone())),
+                Some(None) => agree(BlockPath::Unknown),
+                None => {}
+            }
+            match file_header {
+                Some(HeaderSide::Path(path)) => agree(BlockPath::Known(path.clone())),
+                Some(HeaderSide::DevNull) => agree(BlockPath::Absent),
+                Some(HeaderSide::Unknown) => agree(BlockPath::Unknown),
+                None => {}
+            }
+            value.unwrap_or(BlockPath::Unknown)
+        };
+        let old_path = side(
+            header.as_ref().map(|(old, _)| old),
+            &self.from,
+            &self.old_header,
+            old_absent,
+        );
+        let new_path = side(
+            header.as_ref().map(|(_, new)| new),
+            &self.to,
+            &self.new_header,
+            new_absent,
+        );
+        let index_mode = self.index.as_ref().map(|(_, _, mode)| *mode);
+        let mode = |line: Option<Option<u32>>, file: Option<Option<u32>>, absent: bool| {
+            if absent {
+                return BlockMode::Absent;
+            }
+            match line.or(file).or(index_mode) {
+                Some(Some(mode)) => BlockMode::Known(mode),
+                _ => BlockMode::Unknown,
+            }
+        };
+        let block = DiffBlock {
+            old_mode: mode(self.old_mode, self.deleted, old_absent),
+            new_mode: mode(self.new_mode, self.added, new_absent),
+            old_path,
+            new_path,
+            content: if self.binary {
+                BlockContent::Binary
+            } else if self.hunks {
+                BlockContent::Hunks
+            } else {
+                BlockContent::Unchanged
+            },
+            gitlink_body: self.gitlink_body,
+        };
+        (block, well_formed)
+    }
 }
 
 /// `text` の先頭の C 形式でクォートした文字列 (`"…"`) と、その後ろ。閉じていなければ None。
@@ -1621,5 +2169,241 @@ index e69de29..0000000
         let crlf = "--- a/r.rs\n+++ b/r.rs\n@@ -1 +1 @@\n-old\r\n+new\r\n";
         let rec = reconstruct_old_source(crlf, "r.rs", b"new\r\n").expect("CRLF は復元できる");
         assert_eq!(rec.source, b"old\n");
+    }
+
+    fn known(path: &str) -> BlockPath {
+        BlockPath::Known(path.to_owned())
+    }
+
+    /// 1 ブロックだけの diff を読み、読み切れたことを確かめてそのブロックを返す。
+    fn only_block(diff: &str) -> DiffBlock {
+        let scan = scan_blocks(diff);
+        assert!(scan.complete, "{diff}");
+        assert_eq!(scan.blocks.len(), 1, "{diff}");
+        scan.blocks.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn scan_blocks_reads_every_block_form() {
+        let regular = DiffBlock {
+            old_path: known("x.rs"),
+            new_path: known("x.rs"),
+            old_mode: BlockMode::Known(0o100644),
+            new_mode: BlockMode::Known(0o100644),
+            content: BlockContent::Hunks,
+            gitlink_body: false,
+        };
+        assert_eq!(
+            only_block(
+                "diff --git a/x.rs b/x.rs\nindex aaa..bbb 100644\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n"
+            ),
+            regular
+        );
+        // 本文に見出しのような行があっても、宣言した行数の間は本文として読む。
+        assert_eq!(
+            only_block(
+                "diff --git a/x.rs b/x.rs\nindex aaa..bbb 100644\n--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n--- a/y.rs\n+++ b/y.rs\n-diff --git a/z b/z\n+diff --git a/w b/w\n\\ No newline at end of file\n"
+            ),
+            regular
+        );
+        assert_eq!(
+            only_block(
+                "diff --git a/x b/x\nnew file mode 100644\nindex 0000000..bbb\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+a\n"
+            ),
+            DiffBlock {
+                old_path: BlockPath::Absent,
+                new_path: known("x"),
+                old_mode: BlockMode::Absent,
+                new_mode: BlockMode::Known(0o100644),
+                content: BlockContent::Hunks,
+                gitlink_body: false,
+            }
+        );
+        // 空のファイルの削除は本文が無い。
+        assert_eq!(
+            only_block("diff --git a/x b/x\ndeleted file mode 100755\nindex e69de29..0000000\n"),
+            DiffBlock {
+                old_path: known("x"),
+                new_path: BlockPath::Absent,
+                old_mode: BlockMode::Known(0o100755),
+                new_mode: BlockMode::Absent,
+                content: BlockContent::Unchanged,
+                gitlink_body: false,
+            }
+        );
+        // 内容が同じ rename は mode が出ない (gitlink の rename と区別できない)。
+        assert_eq!(
+            only_block(
+                "diff --git a/a.md b/b.md\nsimilarity index 100%\nrename from a.md\nrename to b.md\n"
+            ),
+            DiffBlock {
+                old_path: known("a.md"),
+                new_path: known("b.md"),
+                old_mode: BlockMode::Unknown,
+                new_mode: BlockMode::Unknown,
+                content: BlockContent::Unchanged,
+                gitlink_body: false,
+            }
+        );
+        assert_eq!(
+            only_block(
+                "diff --git a/a.md b/b.md\nsimilarity index 80%\nrename from a.md\nrename to b.md\nindex aaa..bbb 100644\n--- a/a.md\n+++ b/b.md\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .new_mode,
+            BlockMode::Known(0o100644)
+        );
+        assert_eq!(
+            only_block("diff --git a/x b/x\nold mode 100644\nnew mode 100755\n"),
+            DiffBlock {
+                old_path: known("x"),
+                new_path: known("x"),
+                old_mode: BlockMode::Known(0o100644),
+                new_mode: BlockMode::Known(0o100755),
+                content: BlockContent::Unchanged,
+                gitlink_body: false,
+            }
+        );
+        assert_eq!(
+            only_block(
+                "diff --git a/b/Cargo.toml b/b/Cargo.toml\nindex aaa..bbb 100644\nBinary files a/b/Cargo.toml and b/b/Cargo.toml differ\n"
+            )
+            .content,
+            BlockContent::Binary
+        );
+        assert_eq!(
+            only_block(
+                "diff --git a/x.bin b/x.bin\nindex aaa..bbb 100644\nGIT binary patch\nliteral 5\nMcmZQzWMW|e00093\n\nliteral 0\nHcmV?d00001\n\n"
+            )
+            .content,
+            BlockContent::Binary
+        );
+        assert_eq!(
+            only_block(
+                "diff --git a/b b/b\nindex aaa..bbb 160000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb-dirty\n"
+            )
+            .new_mode,
+            BlockMode::Known(0o160000)
+        );
+        // 中だけが dirty な gitlink は旧新の OID が同じで、`index` 行も mode も出ない。本文で分かる。
+        let dirty = only_block(
+            "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n",
+        );
+        assert_eq!(
+            (dirty.new_mode, dirty.gitlink_body),
+            (BlockMode::Unknown, true)
+        );
+        // 空の context 行・CRLF・hunk を数え終えた後の改行なしの印は、正しい本文。
+        for diff in [
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n",
+            "diff --git a/x b/x\r\nindex aaa..bbb 100644\r\n--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n",
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n",
+        ] {
+            let block = only_block(diff);
+            assert_eq!(
+                (block.content, block.gitlink_body),
+                (BlockContent::Hunks, false),
+                "{diff}"
+            );
+        }
+        // astro-sight が未追跡のファイルに合成する追加の diff (`index` 行なし)。
+        assert_eq!(
+            only_block(
+                "diff --git a/notes/new.md b/notes/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/new.md\n@@ -0,0 +1,2 @@\n+a\n+b\n"
+            ),
+            DiffBlock {
+                old_path: BlockPath::Absent,
+                new_path: known("notes/new.md"),
+                old_mode: BlockMode::Absent,
+                new_mode: BlockMode::Known(0o100644),
+                content: BlockContent::Hunks,
+                gitlink_body: false,
+            }
+        );
+        // 安全な相対パスとして読めないパスは確定しない。
+        assert_eq!(
+            only_block(
+                "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/../x\n+++ b/../x\n@@ -1 +1 @@\n-a\n+b\n"
+            )
+            .old_path,
+            BlockPath::Unknown
+        );
+        // クォートした見出し (片側だけでもよい) は戻す。
+        let quoted = only_block(
+            "diff --git \"a/x\\ty.rs\" \"b/x\\ty.rs\"\nindex aaa..bbb 100644\n--- \"a/x\\ty.rs\"\n+++ \"b/x\\ty.rs\"\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        assert_eq!(
+            (quoted.old_path, quoted.new_path),
+            (known("x\ty.rs"), known("x\ty.rs"))
+        );
+        let renamed = only_block(
+            "diff --git a/plain.rs \"b/x\\ty.rs\"\nsimilarity index 100%\nrename from plain.rs\nrename to \"x\\ty.rs\"\n",
+        );
+        assert_eq!(
+            (renamed.old_path, renamed.new_path),
+            (known("plain.rs"), known("x\ty.rs"))
+        );
+        // 見出しと拡張ヘッダが食い違うパスは確定しない。
+        assert_eq!(
+            only_block(
+                "diff --git \"a/x\\ty\" \"b/z\"\nsimilarity index 100%\nrename from other\nrename to z\n"
+            )
+            .old_path,
+            BlockPath::Unknown
+        );
+        // git 以外の unified diff。
+        assert_eq!(
+            only_block("--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n"),
+            DiffBlock {
+                old_path: known("x.rs"),
+                new_path: known("x.rs"),
+                old_mode: BlockMode::Unknown,
+                new_mode: BlockMode::Unknown,
+                content: BlockContent::Hunks,
+                gitlink_body: false,
+            }
+        );
+        let empty = scan_blocks("");
+        assert!(empty.complete && empty.blocks.is_empty());
+        let two = scan_blocks(
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/y b/y\nold mode 100644\nnew mode 100755\n",
+        );
+        assert!(two.complete);
+        assert_eq!(two.blocks.len(), 2);
+    }
+
+    #[test]
+    fn scan_blocks_rejects_unsupported_or_truncated_input() {
+        for diff in [
+            // 結合 diff。
+            "diff --cc x.rs\nindex aaa,bbb..ccc\n--- a/x.rs\n+++ b/x.rs\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++c\n",
+            // 宣言した行数に届かずに切れた hunk。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n-a\n+b\n",
+            // 行数の足りない hunk が次のブロックの見出しを本文として飲み込む。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-a\n+b\ndiff --git a/y b/y\nold mode 100644\nnew mode 100755\n",
+            // どのブロックにも属さない行。
+            "commit 0123456\n\ndiff --git a/x b/x\nold mode 100644\nnew mode 100755\n",
+            // 解釈できない `@@ `。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ broken @@\n",
+            // `GIT binary patch` の本体の形でない行。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\nGIT binary patch\nliteral 5\ndiff --cc y\n",
+            // 対応しない拡張ヘッダ。
+            "diff --git a/x b/x\nunknown header\n",
+            // 残数の無い側を消費する本文 (宣言は削除 1 行)。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n-b\n+c\n",
+            // 余分な範囲のある hunk の見出し。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n+++ b/x\n@@ -1 +1 +2 @@\n-a\n+b\n",
+            // 内容が変わったのに本文が無い。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n",
+            // 空でないファイルの追加なのに本文が無い。
+            "diff --git a/x b/x\nnew file mode 100644\nindex 0000000..bbb\n",
+            // 何も変えないブロック。
+            "diff --git a/x b/x\n",
+            // 片方だけの `---`。
+            "diff --git a/x b/x\nindex aaa..bbb 100644\n--- a/x\n",
+            // 追加なのに旧側の mode がある。
+            "diff --git a/x b/x\nnew file mode 100644\nold mode 100644\nindex 0000000..e69de29\n",
+        ] {
+            assert!(!scan_blocks(diff).complete, "{diff}");
+        }
     }
 }

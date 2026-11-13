@@ -577,10 +577,17 @@ fn prepare_staged_source(
 
 /// 作業ツリーの追跡ファイルが index と同じか (`git diff --quiet`)。hook が渡した
 /// `GIT_INDEX_FILE` も staged diff と同じく尊重する。判定できなければ「違う」に倒す
-/// (参照に依存する降格を確定させない側)。
+/// (参照に依存する降格を確定させない側)。submodule の変更も、解析用の diff と同じく
+/// 利用者の ignore の設定に依らずに数える。
 fn working_tree_matches_index(dir: &str) -> bool {
     crate::git_support::git_command_for_dir(dir)
-        .args(["diff", "--quiet", "--no-ext-diff", "--no-textconv"])
+        .args([
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+        ])
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(std::process::Stdio::null())
@@ -1104,6 +1111,51 @@ mod snapshot_tests {
         assert!(ready.snapshot.is_some());
         assert!(ready.notice.is_none());
         assert!(!ready.keep_reference_downgrades_blocking);
+    }
+
+    #[test]
+    fn working_tree_matches_index_counts_submodules_hidden_by_ignore_settings() {
+        let upstream = tempfile::tempdir().expect("tempdir");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let git = |repo: &std::path::Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        for repo in [upstream.path(), parent.path()] {
+            git(repo, &["init", "-q"]);
+            git(repo, &["config", "user.name", "test"]);
+            git(repo, &["config", "user.email", "test@example.com"]);
+        }
+        fs::write(upstream.path().join("lib.rs"), "pub fn a() {}\n").expect("write");
+        git(upstream.path(), &["add", "-A"]);
+        git(upstream.path(), &["commit", "-qm", "sub"]);
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.path().to_str().expect("utf-8"),
+                "sub",
+            ],
+        );
+        git(parent.path(), &["commit", "-qm", "initial"]);
+        git(parent.path(), &["config", "diff.ignoreSubmodules", "all"]);
+        let dir = parent.path().to_str().expect("utf-8");
+        // 対照: submodule の中も変えていなければ一致する。
+        assert!(working_tree_matches_index(dir));
+        // submodule の中だけの変更は、利用者の ignore の設定で隠さない (Issue #377)。
+        fs::write(parent.path().join("sub/lib.rs"), "pub fn b() {}\n").expect("write");
+        assert!(!working_tree_matches_index(dir));
     }
 
     #[test]

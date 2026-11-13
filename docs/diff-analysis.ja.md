@@ -292,7 +292,7 @@ Rust の型と自由関数の参照では、通常の Cargo モジュール配�
 
 Cargo の依存で変更元の package に届かない別 package の同名参照も、到達性を証明できた場合だけ除外する。この走査では、修飾なしの標準の式マクロと組み込みの derive・属性を許す。ワークスペース全体のマクロ定義・import と、`std` / `core` / `alloc` の名前を差し替える宣言・依存・library 名を調べ、使った標準名を上書きし得る場合は証明しない。依存は `dev-dependencies` / `build-dependencies` と従来の `dev_dependencies` / `build_dependencies` を、target 別の表も含めて同じ条件で調べる。マクロの引数内は token tree なので、そこに `use`・`extern`・マクロ定義・属性があれば保留する。glob は標準クレート起点のものと、`crate` / `self` / `super` だけを通るものに限る。テスト内の `use super::*` は許すが、`use crate::facade::*` は `facade` が外部クレートの別名を何段でも経由し得るため保留する。
 
-未知のマクロ・独自の derive・属性マクロ・修飾したマクロ呼び出し（`std::println!` も含む）は保留する。未知マクロの定義元クレートと依存の解決は行わない。`include!`・`path`、独自のビルド構成、ソースの読み取り・解析失敗、LFS のポインタなどの既存の障壁も維持する。この到達性の検査は削除した Rust 自由関数の API 判定と共有し、`refs` と dead-code の出現一覧を変えない。
+未知のマクロ・独自の derive・属性マクロ・修飾したマクロ呼び出し（`std::println!` も含む）は保留する。未知マクロの定義元クレートと依存の解決は行わない。`include!`・`path` 属性、package の外や走査していないファイルを指す target・build script のパス、ソースの読み取り・解析失敗、LFS のポインタなどの既存の障壁も維持する。`[[bin]]` の `path = "src/main.rs"` のように、target・build script に明示したパスが、manifest のディレクトリからの `..` を含まない相対パスで自分の package の中の Rust ソースを指すだけなら、証明を止めない。差分が manifest や Rust のソースの置き場所を変える場合は、作業ツリーの依存のグラフで旧側を証明できないため使わない。binary と扱われる manifest の変更、submodule (gitlink) の更新や submodule の中だけの変更、symlink の変更、内容が同じ rename・copy (Rust でないファイルも含む。diff に mode が出ず gitlink と区別できない)、読み切れない diff も同じく扱う。staged の解析（`impact --staged`・`review --staged`）でも使わない。index を展開した解析用のディレクトリは symlink を書き出さないので、package をまたぐソースの取り込みを確かめられない。この到達性の検査は削除した Rust 自由関数の API 判定と共有し、`refs` と dead-code の出現一覧を変えない。
 
 ```bash
 # git diff を自動取得して未解決影響を検出（推奨）
