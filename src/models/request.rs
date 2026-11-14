@@ -84,6 +84,10 @@ pub struct AstgenRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Command {
+    #[serde(rename = "scan_symbols")]
+    ScanSymbols,
+    #[serde(rename = "split_identifier")]
+    SplitIdentifier,
     Metrics,
     Ast,
     Symbols,

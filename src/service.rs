@@ -240,7 +240,7 @@ impl AppService {
     }
 
     /// ディレクトリパスを検証して正規化し、正規化済みパスを返す。
-    fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
+    pub(crate) fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
         let candidate = self.workspace_candidate(dir);
         let outside = || {
             AstroError::new(

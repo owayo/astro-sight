@@ -14,3 +14,4 @@ pub mod output;
 pub mod service;
 pub mod session;
 pub mod skill;
+pub mod vocabulary;

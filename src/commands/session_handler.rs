@@ -24,6 +24,28 @@ pub fn handle_request(
     use crate::models::request::Command;
 
     match req.command {
+        Command::ScanSymbols => Ok(serde_json::to_value(service.scan_symbols(
+            req.dir.as_deref().unwrap_or("."),
+            req.source_files.as_deref(),
+        )?)?),
+        Command::SplitIdentifier => {
+            let names = req
+                .names
+                .or_else(|| req.name.map(|n| vec![n]))
+                .ok_or_else(|| {
+                    AstroError::new(ErrorCode::InvalidRequest, "name or names is required")
+                })?;
+            if names.len() > 10_000 || names.iter().any(|n| n.len() > 1024) {
+                return Err(AstroError::new(
+                    ErrorCode::InvalidRequest,
+                    "identifier input exceeds limits",
+                )
+                .into());
+            }
+            Ok(
+                serde_json::json!({"parts":names.iter().map(|s|crate::vocabulary::split_identifier(s)).collect::<Vec<_>>()}),
+            )
+        }
         Command::Metrics => Ok(serde_json::to_value(service.analyze_metrics(
             &crate::models::metrics::MetricsOptions {
                 dir: req.dir.unwrap_or_else(|| ".".into()),
