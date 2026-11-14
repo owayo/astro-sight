@@ -107,7 +107,8 @@ pub(super) struct RefEventMini {
     /// Rust type path structurally resolved to a local declaration file.
     pub(super) rust_owner_path_id: u32,
     pub(super) rust_owner_is_free_function: bool,
-    pub(super) rust_associated_type_path: bool,
+    /// 型の関連パスかパスの途中の名前で、自由関数を指さない。
+    pub(super) rust_non_function_path: bool,
     /// A same-name direct declaration in the reference file owns this use.
     pub(super) rust_local_owner: bool,
     pub(super) rust_direct_import_site: bool,
@@ -773,14 +774,16 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     self.rust_path_owner_project,
                 )
             });
-        let rust_associated_type_path = owner_index.zip(owner_node).is_some_and(|(index, node)| {
-            index.is_local_associated_path(
-                node,
-                owner_source,
-                Path::new(self.dir),
-                self.path_str,
-                self.rust_path_owner_project,
-            )
+        let rust_non_function_path = owner_index.zip(owner_node).is_some_and(|(index, node)| {
+            super::rust_path_owner::RustPathOwnerIndex::is_nonterminal_path(node)
+                || index.is_local_associated_path(
+                    node,
+                    owner_source,
+                    Path::new(self.dir),
+                    self.path_str,
+                    self.rust_path_owner_project,
+                    self.rust_cargo_reachability,
+                )
         });
         let rust_plain_name = self.ref_lang == Some(LangId::Rust)
             && !rust_macro_callee
@@ -917,7 +920,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             python_import_owner_id,
             rust_owner_path_id,
             rust_owner_is_free_function,
-            rust_associated_type_path,
+            rust_non_function_path,
             rust_local_owner,
             rust_direct_import_site,
             rust_import_binding_safe,
@@ -1292,7 +1295,7 @@ impl<'a> ImpactCollector<'a> {
         if e.rust_std_origin && ctx.lang_id == LangId::Rust {
             return true;
         }
-        if e.rust_associated_type_path
+        if e.rust_non_function_path
             && ctx.lang_id == LangId::Rust
             && !filter_disabled
             && ctx.rust_free_function_names.contains(name)
@@ -1679,7 +1682,7 @@ mod tests {
             python_attribute_write: false,
             rust_owner_path_id: u32::MAX,
             rust_owner_is_free_function: false,
-            rust_associated_type_path: false,
+            rust_non_function_path: false,
             rust_local_owner: false,
             rust_direct_import_site: false,
             rust_import_binding_safe: false,

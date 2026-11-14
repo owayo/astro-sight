@@ -41,6 +41,7 @@ struct NamedImport {
     target_module: Vec<String>,
     target_name: String,
     visibility: Visibility,
+    origin: UsePathOrigin,
 }
 
 #[derive(Eq, PartialEq)]
@@ -84,6 +85,76 @@ pub(super) fn associated_type_binding(
             name,
             Namespace::Type,
             &module,
+            project,
+            &mut HashSet::new(),
+            0,
+        )
+    };
+    prove().is_some()
+}
+
+/// crate root の通常の named import を、実際の path 依存の型宣言まで解決する。
+pub(super) fn external_associated_type_binding(
+    name: &str,
+    dir: &Path,
+    ref_path: &str,
+    project: &RustPathOwnerProjectProof,
+    cargo: &super::rust_cargo_reachability::RustCargoReachability,
+) -> bool {
+    let prove = || {
+        if !project.allows_external_alias_paths() {
+            return None;
+        }
+        // Cargo の index が、crate root と全ソースの取り込み・マクロの束縛を確認する。
+        cargo.root_package(ref_path)?;
+        let bindings = load_bindings(dir, Path::new(ref_path), &[], project)?;
+        if bindings.opaque
+            || !bindings.globs.is_empty()
+            || bindings.types.contains_key(name)
+            || bindings.unknown_types.contains(name)
+            || bindings.modules.iter().any(|(module, _)| module == name)
+        {
+            return None;
+        }
+        let imports: Vec<_> = bindings
+            .named
+            .iter()
+            .filter(|edge| edge.name == name)
+            .collect();
+        let [edge] = imports.as_slice() else {
+            return None;
+        };
+        let (crate_name, module) = edge.target_module.split_first()?;
+        if edge.origin != UsePathOrigin::Bare
+            || bindings.types.contains_key(crate_name)
+            || bindings.unknown_types.contains(crate_name)
+            || bindings
+                .modules
+                .iter()
+                .any(|(module, _)| module == crate_name)
+            || bindings.named.iter().any(|edge| &edge.name == crate_name)
+        {
+            return None;
+        }
+        let (caller, dependency) = cargo.direct_dependency_roots(ref_path, crate_name)?;
+        for package in [caller, dependency] {
+            if !project
+                .cargo_configs
+                .keeps_dependency_sources(&dir.join(package))
+                || !project
+                    .cargo_configs
+                    .keeps_dependency_sources(&project.canonical_root.as_ref()?.join(package))
+            {
+                return None;
+            }
+        }
+        resolve_name(
+            dir,
+            &dependency.join("src"),
+            module,
+            &edge.target_name,
+            Namespace::Type,
+            &[],
             project,
             &mut HashSet::new(),
             0,
@@ -767,6 +838,7 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
                                 target_module,
                                 target_name: target_item,
                                 visibility,
+                                origin,
                             });
                         } else {
                             bindings.unknown_types.insert(exported_name.clone());

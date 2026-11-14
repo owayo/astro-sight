@@ -261,8 +261,9 @@ impl RustScopeIndex {
         let mut proven = pattern_position;
         let mut child = node;
         while let Some(parent) = child.parent() {
-            // for の本体へ同名の束縛を持ち込まないと確かめた場合だけ、外側の let を探す。
+            // match の値には arm の束縛が届かない。for の本体は同名の束縛が無い場合だけ通す。
             let opaque_scope = OPAQUE_SCOPES.contains(&parent.kind())
+                && !(parent.kind() == "match_expression" && field_contains(parent, "value", node))
                 && !(parent.kind() == "for_expression"
                     && name.is_ascii()
                     && field_contains(parent, "body", node)
@@ -577,6 +578,27 @@ mod tests {
                     "{source}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rust_scope_resolves_match_values_without_entering_arm_bindings() {
+        for source in [
+            "fn f(mut comments: impl FnMut() -> u8) { match comments() { 0 => {}, _ => {} } }",
+            "fn f() { let comments = || 1; match comments() { 0 => {}, _ => {} } }",
+        ] {
+            assert_eq!(
+                resolve_last(source),
+                LexicalBinding::RustValueBinding,
+                "{source}"
+            );
+        }
+        for source in [
+            "fn f() { match comments() { 0 => {}, _ => {} } }",
+            "fn f(comments: fn()) { match value { Some(comments) => comments(), _ => {} } }",
+            "fn f(comments: fn()) { match value { Some(other) => comments(), _ => {} } }",
+        ] {
+            assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
         }
     }
 

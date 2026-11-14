@@ -2,6 +2,197 @@
 
 use super::support::*;
 
+fn distinct_function_workspace(update_caller: bool, print: bool, scenario: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("Cargo.toml", "[workspace]\nmembers = [\"crates/core-lib\", \"crates/fetch-lib\", \"crates/sched-lib\", \"crates/app\"]\nresolver = \"3\"\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    for (package, dependencies) in [
+        ("core-lib", ""),
+        ("fetch-lib", "core-lib = { path = '../core-lib' }"),
+        ("sched-lib", "core-lib = { path = '../core-lib' }"),
+        (
+            "app",
+            "core-lib = { path = '../core-lib' }\nfetch-lib = { path = '../fetch-lib' }\nsched-lib = { path = '../sched-lib' }",
+        ),
+    ] {
+        repo.create_dir_all(format!("crates/{package}/src"));
+        repo.write(format!("crates/{package}/Cargo.toml"), format!("[package]\nname = '{package}'\nversion.workspace = true\nedition.workspace = true\n[dependencies]\n{dependencies}\n"));
+    }
+    for (path, source) in [
+        (
+            "core-lib/src/lib.rs",
+            "pub mod catalog; pub mod image_ref; pub mod paths;\n",
+        ),
+        (
+            "core-lib/src/catalog.rs",
+            "pub fn resolve(names: &[&str]) -> Vec<String> { names.iter().map(|name| name.to_string()).collect() }\n",
+        ),
+        (
+            "core-lib/src/paths.rs",
+            "pub struct AppPaths { pub root: String }\nimpl AppPaths { pub fn resolve() -> Self { Self { root: String::new() } } }\n",
+        ),
+        (
+            "core-lib/src/image_ref.rs",
+            "pub fn expand(html: &str, mut resolve: impl FnMut(&str) -> Option<String>) -> String { match resolve(html) { Some(url) => url, None => html.to_string() } }\npub fn expand_local(html: &str) -> String { let resolve = |text: &str| Some(text.to_uppercase()); resolve(html).unwrap_or_default() }\n",
+        ),
+        (
+            "fetch-lib/src/lib.rs",
+            "mod engine; pub use engine::absolute;\n",
+        ),
+        (
+            "fetch-lib/src/engine.rs",
+            "use core_lib::image_ref::expand;\npub fn absolute(raw: &str) -> Option<String> { let raw = expand(raw, |_| None); Some(raw).and_then(|raw| resolve(&raw, \"https://example.com\")) }\nfn resolve(raw: &str, base: &str) -> Option<String> { Some(format!(\"{base}/{raw}\")) }\n",
+        ),
+        (
+            "sched-lib/src/lib.rs",
+            "mod facts; mod resolve; pub use facts::local;\n",
+        ),
+        (
+            "sched-lib/src/resolve.rs",
+            "pub struct Local { pub name: String }\n",
+        ),
+        (
+            "sched-lib/src/facts.rs",
+            "use core_lib::paths::AppPaths;\nuse crate::resolve::Local;\npub fn local() -> Local { let root = AppPaths { root: String::new() }.root; crate::resolve::Local { name: root } }\n",
+        ),
+        (
+            "app/src/services.rs",
+            "pub fn sources() -> Vec<String> { core_lib::catalog::resolve(&[\"a\", \"b\"]) }\n",
+        ),
+    ] {
+        repo.write(format!("crates/{path}"), source);
+    }
+    let output = if print {
+        "println!(\"{} {:?} {:?}\", paths.root, fetch_lib::absolute(\"a\"), services::sources());"
+    } else {
+        "let _ = (paths.root, fetch_lib::absolute(\"a\"), services::sources());"
+    };
+    repo.write("crates/app/src/main.rs", format!("mod services;\nuse core_lib::paths::AppPaths;\nfn main() {{ let paths = AppPaths::resolve(); let _ = sched_lib::local(); {output} }}\n"));
+    match scenario {
+        "module alias" => repo.write("crates/app/src/main.rs", "use core_lib::catalog as AppPaths;\nfn main() { let _ = AppPaths::resolve(&[\"a\"]); }\n"),
+        "local crate name" => repo.write("crates/app/src/main.rs", "mod core_lib { pub mod paths { pub use ::core_lib::catalog as AppPaths; } }\nuse core_lib::paths::AppPaths;\nfn main() { let _ = AppPaths::resolve(&[\"a\"]); }\n"),
+        "type alias" => repo.write("crates/core-lib/src/paths.rs", "pub type AppPaths = String;\n"),
+        "conditional type" => repo.write("crates/core-lib/src/paths.rs", "#[cfg(feature = \"enabled\")] pub struct AppPaths;\n"),
+        "macro shadow" => repo.write("crates/app/src/main.rs", "use core_lib::paths::AppPaths;\nmacro_rules! println { ($($arg:tt)*) => {}; }\nfn main() { let _ = AppPaths::resolve(); println!(\"ready\"); }\n"),
+        "compiler config" => {
+            repo.create_dir_all(".cargo");
+            repo.write(".cargo/config.toml", "[build]\nrustflags = [\"--extern\", \"core_lib=other.rlib\"]\n");
+        }
+        "renamed" => {
+            repo.write("crates/app/Cargo.toml", "[package]\nname = 'app'\nversion.workspace = true\nedition.workspace = true\n[dependencies]\nshared = { package = 'core-lib', path = '../core-lib' }\nfetch-lib = { path = '../fetch-lib' }\nsched-lib = { path = '../sched-lib' }\n");
+            repo.write("crates/app/src/main.rs", format!("mod services;\nuse shared::paths::AppPaths;\nfn main() {{ let paths = AppPaths::resolve(); let _ = sched_lib::local(); {output} }}\n"));
+            repo.write("crates/app/src/services.rs", "pub fn sources() -> Vec<String> { shared::catalog::resolve(&[\"a\", \"b\"]) }\n");
+        }
+        "plain" => {}
+        _ => panic!("unknown scenario: {scenario}"),
+    }
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("crates/core-lib/src/catalog.rs", "pub fn resolve(names: &[&str], upper: bool) -> Vec<String> { names.iter().map(|name| if upper { name.to_uppercase() } else { name.to_string() }).collect() }\n");
+    if update_caller {
+        let crate_name = if scenario == "renamed" {
+            "shared"
+        } else {
+            "core_lib"
+        };
+        repo.write("crates/app/src/services.rs", format!("pub fn sources() -> Vec<String> {{ {crate_name}::catalog::resolve(&[\"a\", \"b\"], false) }}\n"));
+    }
+    repo
+}
+
+#[test]
+fn impact_rust_distinguishes_workspace_function_uses() {
+    for print in [false, true] {
+        for update in [false, true] {
+            let repo = distinct_function_workspace(update, print, "plain");
+            let context = repo.run_json("context", &["--git"]);
+            let callers: Vec<_> = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|change| change["impacted_callers"].as_array().into_iter().flatten())
+                .map(|caller| caller["path"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                callers,
+                vec!["crates/app/src/services.rs"],
+                "{print} / {update}: {context}"
+            );
+            let output = cargo_bin()
+                .args(["impact", "--git", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(i32::from(!update)), "{context}");
+            assert!(
+                context["changes"].as_array().unwrap().iter().all(|change| {
+                    change["low_confidence_callers"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|caller| caller["path"] != "crates/core-lib/src/image_ref.rs")
+                }),
+                "{context}"
+            );
+            if update && !print {
+                let references = repo.run_json("refs", &["--name", "resolve"]);
+                for path in [
+                    "crates/app/src/main.rs",
+                    "crates/core-lib/src/image_ref.rs",
+                    "crates/sched-lib/src/facts.rs",
+                ] {
+                    assert!(
+                        references["refs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|reference| reference["path"] == path),
+                        "{references}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn impact_rust_external_associated_types_require_binding_proof() {
+    for scenario in [
+        "module alias",
+        "local crate name",
+        "type alias",
+        "conditional type",
+        "macro shadow",
+        "compiler config",
+    ] {
+        let repo = distinct_function_workspace(true, true, scenario);
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"].as_array().unwrap().iter().any(|change| {
+                change["impacted_callers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|caller| caller["path"] == "crates/app/src/main.rs")
+            }),
+            "{scenario}: {context}"
+        );
+    }
+    let repo = distinct_function_workspace(true, true, "renamed");
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|change| change["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|caller| caller["path"] != "crates/app/src/main.rs")),
+        "{context}"
+    );
+}
+
 #[test]
 fn impact_rust_associated_paths_ignore_unrelated_file_syntax() {
     for (declaration, extra, body, imported) in [
