@@ -112,6 +112,8 @@ pub(super) struct RustPathOwnerIndex {
     root_associated_paths: HashSet<usize>,
     enum_variant_paths: HashSet<usize>,
     associated_types: RefCell<HashMap<String, bool>>,
+    external_associated_types: RefCell<HashMap<String, bool>>,
+    external_associated_paths: OnceLock<HashSet<usize>>,
     source_hash: blake3::Hash,
     direct_imports: HashMap<String, Vec<String>>,
     local_type_names: HashSet<String>,
@@ -1126,8 +1128,10 @@ impl RustPathOwnerIndex {
         Self {
             current: FileEvidence::collect(node, source).map(Arc::new),
             root_associated_paths: root_associated_paths(node, source),
-            enum_variant_paths: root_associated_paths_with_attributes(node, source, true),
+            enum_variant_paths: root_associated_paths_with_attributes(node, source, true, false),
             associated_types: RefCell::new(HashMap::new()),
+            external_associated_types: RefCell::new(HashMap::new()),
+            external_associated_paths: OnceLock::new(),
             source_hash: blake3::hash(source),
             direct_imports,
             local_type_names,
@@ -1214,6 +1218,30 @@ impl RustPathOwnerIndex {
             .then(|| ref_file.to_owned())
     }
 
+    /// パスの途中の名前は、自由関数を指さない。
+    pub(super) fn is_nonterminal_path(node: Node<'_>) -> bool {
+        if has_uncertain_ancestor(node) {
+            return false;
+        }
+        let mut child = node;
+        while let Some(parent) = child.parent() {
+            if !matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier"
+            ) {
+                return false;
+            }
+            if parent
+                .child_by_field_name("path")
+                .is_some_and(|path| path.id() == child.id())
+            {
+                return true;
+            }
+            child = parent;
+        }
+        false
+    }
+
     /// 宣言または named import から型と確認できるパスは、別 module の自由関数を指さない。
     pub(super) fn is_local_associated_path(
         &self,
@@ -1222,6 +1250,7 @@ impl RustPathOwnerIndex {
         dir: &Path,
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
+        cargo: &super::rust_cargo_reachability::RustCargoReachability,
     ) -> bool {
         if node.kind() != "identifier" || has_uncertain_ancestor(node) {
             return false;
@@ -1252,25 +1281,57 @@ impl RustPathOwnerIndex {
             }
             return false;
         }
-        if !self.root_associated_paths.contains(&parent.id()) {
-            return false;
-        }
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|evidence| evidence.types.contains(&path[0]))
+        let ordinary_scope = self.root_associated_paths.contains(&parent.id());
+        if ordinary_scope
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|evidence| evidence.types.contains(&path[0]))
         {
             return true;
         }
-        if let Some(proven) = self.associated_types.borrow().get(&path[0]) {
-            return *proven;
+        if ordinary_scope {
+            let cached = self.associated_types.borrow().get(&path[0]).copied();
+            let proven = cached.unwrap_or_else(|| {
+                let proven = super::rust_reexport_owner::associated_type_binding(
+                    &path[0], dir, ref_path, project,
+                );
+                self.associated_types
+                    .borrow_mut()
+                    .insert(path[0].clone(), proven);
+                proven
+            });
+            if proven {
+                return true;
+            }
         }
-        let proven =
-            super::rust_reexport_owner::associated_type_binding(&path[0], dir, ref_path, project);
-        self.associated_types
-            .borrow_mut()
-            .insert(path[0].clone(), proven);
-        proven
+        let cached = self
+            .external_associated_types
+            .borrow()
+            .get(&path[0])
+            .copied();
+        let external = cached.unwrap_or_else(|| {
+            let proven = super::rust_reexport_owner::external_associated_type_binding(
+                &path[0], dir, ref_path, project, cargo,
+            );
+            self.external_associated_types
+                .borrow_mut()
+                .insert(path[0].clone(), proven);
+            proven
+        });
+        external
+            && (ordinary_scope
+                || self
+                    .external_associated_paths
+                    .get_or_init(|| {
+                        let mut root = node;
+                        while let Some(parent) = root.parent() {
+                            root = parent;
+                        }
+                        // path 依存の証明が、全ソースの標準マクロの束縛も確認している。
+                        root_associated_paths_with_attributes(root, source, true, true)
+                    })
+                    .contains(&parent.id()))
     }
 
     fn resolve_qualified(
@@ -1459,13 +1520,14 @@ struct AssociatedScope {
 
 /// 型名を再束縛し得るスコープだけを一度走査し、参照ごとの祖先の再走査を避ける。
 fn root_associated_paths(root: Node<'_>, source: &[u8]) -> HashSet<usize> {
-    root_associated_paths_with_attributes(root, source, false)
+    root_associated_paths_with_attributes(root, source, false, false)
 }
 
 fn root_associated_paths_with_attributes(
     root: Node<'_>,
     source: &[u8],
     check_attributes: bool,
+    standard_macros_proven: bool,
 ) -> HashSet<usize> {
     if root.has_error() {
         return HashSet::new();
@@ -1517,7 +1579,14 @@ fn root_associated_paths_with_attributes(
                 if matches!(
                     parent_kind,
                     "source_file" | "block" | "expression_statement"
-                ) =>
+                ) && !(standard_macros_proven
+                    && node
+                        .child_by_field_name("macro")
+                        .filter(|callee| callee.kind() == "identifier")
+                        .and_then(|callee| callee.utf8_text(source).ok())
+                        .is_some_and(|name| {
+                            is_allowed_expression_macro(name.strip_prefix("r#").unwrap_or(name))
+                        })) =>
             {
                 scopes[scope].opaque = true
             }

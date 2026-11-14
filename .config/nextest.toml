@@ -27,6 +27,12 @@ filter = 'test(=integration::required_type_members::property_removal_preserves_u
 priority = 50
 threads-required = 2
 
+# Rust の同名の関連関数・引数・モジュールと、本当の呼び出し元を複数の構成で確認する。
+[[profile.default.overrides]]
+filter = 'test(=integration::impact_rust_scope::impact_rust_distinguishes_workspace_function_uses) | test(=integration::impact_rust_scope::impact_rust_external_associated_types_require_binding_proof)'
+priority = 50
+threads-required = 2
+
 # 除外した JS の束縛と未証明の利用を、複数のビルド出力で確認する。
 [[profile.default.overrides]]
 filter = 'test(=integration::optional_param_removal::trailing_optional_removal_tolerates_unrelated_ignored_function) | test(=integration::optional_param_removal::trailing_optional_removal_keeps_unproven_ignored_functions_blocking)'

@@ -23,6 +23,8 @@ struct Package {
     dependencies: Vec<usize>,
     /// ワークスペースのメンバーに解決しない依存 (registry や git) の package 名。
     external_dependencies: Vec<String>,
+    extern_prelude: bool,
+    direct_crates: HashMap<String, Option<usize>>,
 }
 
 /// ワークスペースの package と、依存の種類を区別しない依存の辺。
@@ -110,6 +112,21 @@ impl CargoIndex {
                 return None;
             }
             let name = package.get("name")?.as_str()?.to_owned();
+            let edition = match package.get("edition") {
+                Some(toml::Value::String(edition)) => Some(edition.as_str()),
+                Some(toml::Value::Table(inherited))
+                    if inherited.len() == 1
+                        && inherited.get("workspace").and_then(toml::Value::as_bool)
+                            == Some(true) =>
+                {
+                    root_manifest
+                        .get("package")
+                        .and_then(|package| package.get("edition"))
+                        .and_then(toml::Value::as_str)
+                }
+                _ => None,
+            };
+            let extern_prelude = matches!(edition, Some("2018" | "2021" | "2024"));
             // Sysroot crates can be visible without an ordinary Cargo dependency.
             if is_sysroot(&name) {
                 return None;
@@ -120,6 +137,8 @@ impl CargoIndex {
                 manifest,
                 dependencies: Vec::new(),
                 external_dependencies: Vec::new(),
+                extern_prelude,
+                direct_crates: HashMap::new(),
             });
         }
         if packages.len() < minimum_packages {
@@ -162,6 +181,7 @@ impl CargoIndex {
             external.sort_unstable();
             package.dependencies = edges;
             package.external_dependencies = external;
+            package.direct_crates = dependencies.direct_crates;
         }
         // A source file may be compiled by a different package through #[path],
         // include!, or a macro. A path-based owner is safe only when no Rust source
@@ -478,6 +498,48 @@ impl RustCargoReachability {
         };
         reference_owner != changed_owner && !index.may_reach(reference_owner, changed_owner)
     }
+
+    /// 外部クレートの名前を prelude から解決できる通常の crate root の package。
+    pub(super) fn root_package(&self, reference: &str) -> Option<&Path> {
+        if !self.enabled {
+            return None;
+        }
+        let index = self
+            .index
+            .get_or_init(|| CargoIndex::scan_directory(&self.root, 2))
+            .as_ref()?;
+        let owner = index.owner(reference)?;
+        let package = &index.packages[owner];
+        let src = package.directory.join("src");
+        if !package.extern_prelude
+            || ![src.join("main.rs"), src.join("lib.rs")].contains(&PathBuf::from(reference))
+        {
+            return None;
+        }
+        Some(&package.directory)
+    }
+
+    /// 通常の crate root から一意な path 依存の既定 library へ解決する。
+    pub(super) fn direct_dependency_roots(
+        &self,
+        reference: &str,
+        name: &str,
+    ) -> Option<(&Path, &Path)> {
+        let caller = self.root_package(reference)?;
+        let index = self.index.get()?.as_ref()?;
+        let package = &index.packages[index.owner(reference)?];
+        let dependency = &index.packages[package.direct_crates.get(name).copied().flatten()?];
+        if dependency.manifest.get("lib").is_some()
+            || !self
+                .root
+                .join(&dependency.directory)
+                .join("src/lib.rs")
+                .is_file()
+        {
+            return None;
+        }
+        Some((caller, &dependency.directory))
+    }
 }
 
 fn canonical_relative(root: &Path, base: &Path, relative: &str) -> Option<PathBuf> {
@@ -524,6 +586,7 @@ struct Dependencies {
     edges: HashSet<usize>,
     /// メンバーに解決しない依存の package 名。
     external: HashSet<String>,
+    direct_crates: HashMap<String, Option<usize>>,
 }
 
 fn package_dependencies(
@@ -617,10 +680,22 @@ fn collect_dependencies(
             }
             _ => return None,
         };
+        let mut direct = None;
         if let Some(path) = path {
             let directory = tree.resolve(base, path)?;
-            dependencies.edges.insert(*by_directory.get(&directory)?);
+            let owner = *by_directory.get(&directory)?;
+            dependencies.edges.insert(owner);
+            direct = (by_name.get(name) == Some(&owner)).then_some(owner);
         }
+        dependencies
+            .direct_crates
+            .entry(key.replace('-', "_"))
+            .and_modify(|previous| {
+                if *previous != direct {
+                    *previous = None;
+                }
+            })
+            .or_insert(direct);
         if let Some(&owner) = by_name.get(name) {
             dependencies.edges.insert(owner);
         } else if path.is_none() {
@@ -974,6 +1049,59 @@ mod tests {
             .unwrap();
         }
         RustCargoReachability::new(root, enabled).proves_unreachable("b/src/lib.rs", "a/src/lib.rs")
+    }
+
+    #[test]
+    fn direct_path_dependency_requires_one_crate_binding() {
+        for (dependencies, expected) in [
+            (
+                "[dependencies]\nshared-name = { package = 'sample-a', path = '../a' }\n",
+                true,
+            ),
+            (
+                "[dependencies]\nshared-name = { package = 'sample-a', path = '../a' }\n[dev-dependencies]\nshared-name = { package = 'sample-a', path = '../a' }\n",
+                true,
+            ),
+            ("[dependencies]\nshared-name = '1'\n", false),
+            (
+                "[target.'cfg(unix)'.dependencies]\nshared-name = { package = 'sample-a', path = '../a' }\n[target.'cfg(windows)'.dependencies]\nshared-name = { package = 'sample-c', path = '../c' }\n",
+                false,
+            ),
+            (
+                "[dependencies]\nshared-name = { package = 'sample-a', path = '../a' }\n[build-dependencies]\nshared_name = { package = 'sample-c', path = '../c' }\n",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[workspace]\nmembers = ['a', 'b', 'c']\n[workspace.package]\nedition = '2024'\n",
+            )
+            .unwrap();
+            for package in ["a", "b", "c"] {
+                std::fs::create_dir_all(root.join(package).join("src")).unwrap();
+                std::fs::write(root.join(package).join("Cargo.toml"), format!("[package]\nname = 'sample-{package}'\nversion = '0.1.0'\nedition.workspace = true\n{}", if package == "b" { dependencies } else { "" })).unwrap();
+                std::fs::write(root.join(package).join("src/lib.rs"), "pub struct Item;\n")
+                    .unwrap();
+            }
+            let cargo = RustCargoReachability::new(root, true);
+            assert_eq!(
+                cargo.direct_dependency_roots("b/src/lib.rs", "shared_name"),
+                expected.then_some((Path::new("b"), Path::new("a"))),
+                "{dependencies}"
+            );
+            assert!(
+                cargo
+                    .direct_dependency_roots("b/src/nested.rs", "shared_name")
+                    .is_none()
+            );
+            assert!(
+                RustCargoReachability::new(root, false)
+                    .direct_dependency_roots("b/src/lib.rs", "shared_name")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
