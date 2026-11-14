@@ -106,23 +106,19 @@ fn is_condition_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bo
 
 /// `item` の直前に並ぶ外側の属性のうち、`cfg`・`cfg_attr` のトークンの並び (書いた順)。
 pub(crate) fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
-    let mut attributes = Vec::new();
-    let mut previous = item.prev_named_sibling();
-    while let Some(sibling) = previous {
-        match sibling.kind() {
-            "attribute_item" => {
-                if is_condition_attribute(sibling, source) {
-                    attributes.push(sibling);
-                }
-            }
-            "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        previous = sibling.prev_named_sibling();
-    }
+    let mut attributes = preceding_attribute_items(item);
+    attributes.reverse();
+    conditions_after(&attributes, source)
+}
+
+/// 直前に並ぶ外側の属性 `preceding` (書いた順。走査で集めたもの) のうち、`cfg`・`cfg_attr` のトークンの並び
+/// ([`preceding_conditions`] と同じ。兄弟をたどり直さない。Issue #381)。
+pub(crate) fn conditions_after(preceding: &[tree_sitter::Node<'_>], source: &[u8]) -> Vec<String> {
     let mut tokens = Vec::new();
-    for attribute in attributes.into_iter().rev() {
-        push_tokens(attribute, source, &mut tokens);
+    for attribute in preceding {
+        if is_condition_attribute(*attribute, source) {
+            push_tokens(*attribute, source, &mut tokens);
+        }
     }
     tokens
 }
@@ -256,23 +252,10 @@ fn cfg_attr_applications(
     let flatten = |predicates: &[Vec<String>]| -> Vec<String> {
         predicates.iter().flatten().cloned().collect()
     };
-    let mut cursor = arguments.walk();
-    let children: Vec<tree_sitter::Node<'_>> = arguments
-        .children(&mut cursor)
-        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
-        .collect();
-    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+    let Some(groups) = argument_groups(arguments) else {
         found.push(flatten(outer));
         return;
     };
-    let mut groups: Vec<Vec<tree_sitter::Node<'_>>> = vec![Vec::new()];
-    for child in inner {
-        if child.kind() == "," {
-            groups.push(Vec::new());
-        } else if let Some(group) = groups.last_mut() {
-            group.push(*child);
-        }
-    }
     let Some((predicate, attributes)) = groups.split_first() else {
         found.push(flatten(outer));
         return;
@@ -372,6 +355,62 @@ fn inert_unsafe_arguments(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bo
     }
 }
 
+/// クレート全体に付ける組み込みの属性 (Issue #381)。組み込みの属性なので同じ名前のマクロを指さず、項目も
+/// 名前も作らない。module の中身の属性 (`#![..]`) で数える。
+const CRATE_ATTRIBUTES: [&str; 10] = [
+    "feature",
+    "no_std",
+    "no_main",
+    "no_core",
+    "no_builtins",
+    "recursion_limit",
+    "type_length_limit",
+    "crate_name",
+    "crate_type",
+    "windows_subsystem",
+];
+
+/// 属性 (`attribute_item`・`inner_attribute_item`) が、項目を置き換えない組み込みの属性か (`cfg_attr` の中も)。
+/// 中身の属性 (`#![..]`) は、クレート全体の組み込みの属性 ([`CRATE_ATTRIBUTES`]) も認める (Issue #381)。
+pub(crate) fn inert_attribute_node(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let extra: &[&str] = if node.kind() == "inner_attribute_item" {
+        &CRATE_ATTRIBUTES
+    } else {
+        &[]
+    };
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+        .is_some_and(|attribute| inert_attribute_with(attribute, source, extra))
+}
+
+/// 属性 (`attribute_item`・`inner_attribute_item`) が展開しないか (Issue #381)。組み込みの不活性な属性
+/// ([`inert_attribute_node`]。それらだけを付ける `cfg_attr` も) だけ。`test`・`derive` のような prelude の
+/// 属性マクロと、ツールの属性 (`rustfmt::skip`) は、同じ名前の取り込み (`use helper as rustfmt;`) に隠れ得るので
+/// 含めない。
+pub(crate) fn transparent_attribute(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    inert_attribute_node(node, source)
+}
+
+/// 引数 `arguments` (`token_tree`) の中身を `,` で分けた組 (括弧とコメントを除く)。
+fn argument_groups(arguments: tree_sitter::Node<'_>) -> Option<Vec<Vec<tree_sitter::Node<'_>>>> {
+    let mut cursor = arguments.walk();
+    let children: Vec<tree_sitter::Node<'_>> = arguments
+        .children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    let inner = children.get(1..children.len().saturating_sub(1))?;
+    let mut groups: Vec<Vec<tree_sitter::Node<'_>>> = vec![Vec::new()];
+    for child in inner {
+        if child.kind() == "," {
+            groups.push(Vec::new());
+        } else if let Some(group) = groups.last_mut() {
+            group.push(*child);
+        }
+    }
+    Some(groups)
+}
+
 /// 外側の属性 (`attribute_item`) が、項目を置き換えない組み込みの属性か。
 fn inert_attribute_item(attribute_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut cursor = attribute_item.walk();
@@ -408,22 +447,9 @@ fn inert_attribute_with(attribute: tree_sitter::Node<'_>, source: &[u8], extra: 
 
 /// `cfg_attr(述語, 属性, ..)` の引数 (`token_tree`) の、付ける属性がどれも項目を置き換えないか。
 fn inert_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8], extra: &[&str]) -> bool {
-    let mut cursor = arguments.walk();
-    let children: Vec<tree_sitter::Node<'_>> = arguments
-        .children(&mut cursor)
-        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
-        .collect();
-    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+    let Some(groups) = argument_groups(arguments) else {
         return false;
     };
-    let mut groups: Vec<Vec<tree_sitter::Node<'_>>> = vec![Vec::new()];
-    for child in inner {
-        if child.kind() == "," {
-            groups.push(Vec::new());
-        } else if let Some(group) = groups.last_mut() {
-            group.push(*child);
-        }
-    }
     groups.iter().skip(1).all(|group| {
         let Some((first, rest)) = group.split_first() else {
             return true;
@@ -558,13 +584,15 @@ pub(crate) fn item_availability(
     (availability, condition_tokens(&attributes, source))
 }
 
-/// 項目自身の有る条件だけを読む。祖先の条件を走査スタックで保持する経路で使う。
-pub(super) fn own_item_availability(
+/// 項目 `item` 自身の有る条件だけを、直前に並ぶ外側の属性 `preceding` (書いた順。走査で集めたもの) と、inline
+/// module の中身の先頭の属性から読む。祖先の条件を走査スタックで保持する経路で使う。兄弟をたどり直さない
+/// (`prev_named_sibling` は親を根から探し直すので、深い入れ子の中でノードごとに呼ぶと二乗になる。Issue #381)。
+pub(super) fn availability_after(
     item: tree_sitter::Node<'_>,
+    preceding: &[tree_sitter::Node<'_>],
     source: &[u8],
 ) -> Option<Vec<AvailabilityAttr>> {
-    let mut attributes = preceding_attribute_items(item);
-    attributes.reverse();
+    let mut attributes = preceding.to_vec();
     if item.kind() == "mod_item"
         && let Some(body) = item.child_by_field_name("body")
     {

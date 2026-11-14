@@ -313,13 +313,13 @@ impl<'a> CrateVersion<'a> {
 }
 
 /// `dir` 相対のパス `path` の親のディレクトリ (無ければ空)。
-fn parent_dir(path: &str) -> &str {
+pub(crate) fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// ディレクトリ `dir` と相対のパス `relative` をつなぎ、`.`・`..` を畳む。`dir` の外 (リポジトリの外)
 /// へ出るか、絶対パス・`\` を含むパスなら None。
-fn join_path(dir: &str, relative: &str) -> Option<String> {
+pub(crate) fn join_path(dir: &str, relative: &str) -> Option<String> {
     if relative.is_empty()
         || relative.starts_with('/')
         || relative.contains('\\')
