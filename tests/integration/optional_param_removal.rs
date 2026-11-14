@@ -654,6 +654,47 @@ fn trailing_optional_removal_tolerates_unrelated_ignored_files() {
 }
 
 #[test]
+fn trailing_optional_removal_tolerates_unrelated_ignored_function() {
+    for path in ["dist/bundle.js", ".build/bundle.js"] {
+        let repo = spacing_removal_repo(&[(".gitignore", "dist/\n")]);
+        assert_removal(&repo, true, "before build output");
+        repo.create_dir_all(path.rsplit_once('/').unwrap().0);
+        repo.write(
+            path,
+            "function spacing(a) { return a; }\nvar one = spacing(1);\n",
+        );
+        assert_removal(&repo, true, path);
+        let output = cargo_bin()
+            .args(["refs", "--name", "spacing", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            refs["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|reference| { !reference["path"].as_str().unwrap().ends_with(path) })
+        );
+    }
+}
+
+#[test]
+fn trailing_optional_removal_keeps_unproven_ignored_functions_blocking() {
+    for source in [
+        "spacing(1);\n",
+        "function spacing(a) { return a; }\neval('spacing(1)');\n",
+        "function spacing(a) { return a; }\nspacing = globalThis.other;\nspacing(1);\n",
+        "function spacing(a) { return a; }\nobj.spacing(1);\n",
+        "import { spacing as original } from '../spacing';\nfunction spacing(a) { return original(a); }\nspacing(1);\n",
+    ] {
+        let repo = spacing_removal_repo(&[(".gitignore", "dist/\n"), ("dist/bundle.js", source)]);
+        assert_removal(&repo, false, source);
+    }
+}
+
+#[test]
 fn trailing_optional_removal_rejects_ignored_outputs_that_mention_the_name() {
     // 名前の現れる ignore したビルド出力は在庫に加え、同じ規則で証明する。
     let large = format!("spacing;\n{}\n", "/* padding */".repeat(700_000));

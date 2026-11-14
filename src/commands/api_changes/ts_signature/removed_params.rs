@@ -407,6 +407,7 @@ pub(super) fn prove_repository_uses(
             FileContext {
                 paths: &inventory.paths,
                 packages,
+                outside: inventory.extra.contains_key(path),
             },
             &mut proven_positions,
         )?;
@@ -686,12 +687,52 @@ fn direct_call_arity(identifier: Node<'_>) -> Option<usize> {
     Some(count)
 }
 
+/// 除外した JS の同名の出現が、一意なローカル関数の宣言と直接呼び出しだけか。
+fn unrelated_local_function(file: &RemovalFile, name: &str, nodes: &[Node<'_>]) -> bool {
+    use crate::engine::js_scope::{LocalResolution, resolve_reference_binding};
+
+    let source = &file.source;
+    let Some((function, _)) = unique_function_declaration(file.tree.root_node(), source, name)
+    else {
+        return false;
+    };
+    let Some(declaration) = function.child_by_field_name("name") else {
+        return false;
+    };
+    nodes.iter().all(|node| {
+        if !matches!(
+            node.kind(),
+            "identifier"
+                | "type_identifier"
+                | "property_identifier"
+                | "shorthand_property_identifier"
+                | "shorthand_property_identifier_pattern"
+                | "statement_identifier"
+        ) || node.utf8_text(source).ok() != Some(name)
+            || node.id() == declaration.id()
+        {
+            return true;
+        }
+        let position = node.start_position();
+        direct_call_arity(*node).is_some()
+            && resolve_reference_binding(
+                &file.tree,
+                source,
+                file.lang,
+                name,
+                position.row,
+                position.column,
+            ) == LocalResolution::SameFileFunction
+    })
+}
+
 /// 在庫のファイルを証明するときに共有する、依存の解決の材料。
 #[derive(Clone, Copy)]
 struct FileContext<'a> {
     paths: &'a HashMap<String, Vec<String>>,
     /// registry の依存を見分ける材料。None なら解決できない import を 1 つも許さない。
     packages: Option<&'a PackageBoundary>,
+    outside: bool,
 }
 
 fn prove_file(
@@ -703,7 +744,11 @@ fn prove_file(
     context: FileContext<'_>,
     positions: &mut HashSet<(String, usize, usize)>,
 ) -> Option<usize> {
-    let FileContext { paths, packages } = context;
+    let FileContext {
+        paths,
+        packages,
+        outside,
+    } = context;
     let root = file.tree.root_node();
     let source = &file.source;
     let nodes = checked_nodes(root)?;
@@ -846,6 +891,13 @@ fn prove_file(
             }
             _ => {}
         }
+    }
+    if outside
+        && file.lang == LangId::Javascript
+        && import_names.is_empty()
+        && unrelated_local_function(file, name, &nodes)
+    {
+        return Some(0);
     }
     let bindings = bindings_named(root, source, name);
     let declaration_name = if path == target {
