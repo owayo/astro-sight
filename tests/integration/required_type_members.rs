@@ -4,6 +4,126 @@
 use super::support::{TestRepo, cargo_bin};
 
 #[test]
+fn property_removal_preserves_unchanged_callable_members() {
+    for extension in ["ts", "tsx"] {
+        for member in ["render(): string;", "readonly render: () => string;"] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.create_dir_all("src");
+            let options = format!(
+                "export interface Options {{\n readonly size: number;\n readonly label: string;\n {member}\n}}\n"
+            );
+            let defaults = "import type { Options } from './options';\nexport function defaults(): Options {\n return { size: 1, label: 'a', render: () => 'x' };\n}\n";
+            let target = format!("src/options.{extension}");
+            let factory = format!("src/defaults.{extension}");
+            repo.write(&target, &options);
+            repo.write(&factory, defaults);
+            repo.commit_all("initial");
+            repo.write(&target, options.replace(" readonly label: string;\n", ""));
+            repo.write(&factory, defaults.replace(", label: 'a'", ""));
+            for staged in [false, true] {
+                if staged {
+                    repo.stage_all();
+                    repo.write(&factory, "unstaged invalid source");
+                }
+                let mut args = vec!["--git", "--hook"];
+                if staged {
+                    args.push("--staged");
+                }
+                let output = cargo_bin()
+                    .args(["review", "--dir"])
+                    .arg(repo.root())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{extension} {member} {staged}: {json}"
+                );
+                assert_eq!(json["blocking_categories"], serde_json::json!([]), "{json}");
+                assert!(
+                    json["api"]["mod_closed"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["n"] == "Options"),
+                    "{json}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn property_removal_callable_members_keep_unproven_uses_blocking() {
+    for member in ["render(): string;", "readonly render: () => string;"] {
+        for (case, usage, callback) in [
+            (
+                "read",
+                "export function label(value: Options): string { return value.label; }\n",
+                "render: () => 'x'",
+            ),
+            (
+                "type key",
+                "export type Label = Options['label'];\n",
+                "render: () => 'x'",
+            ),
+            ("changed implementation", "", "render: () => 'y'"),
+            ("missing callback", "", ""),
+        ] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.create_dir_all("src");
+            let options = format!(
+                "export interface Options {{\n size: number;\n label: string;\n {member}\n}}\n{usage}"
+            );
+            let defaults = "import type { Options } from './options';\nexport function defaults(): Options {\n return { size: 1, label: 'a', render: () => 'x' };\n}\n";
+            repo.write("src/options.ts", &options);
+            repo.write("src/defaults.ts", defaults);
+            repo.commit_all("initial");
+            repo.write("src/options.ts", options.replace(" label: string;\n", ""));
+            repo.write(
+                "src/defaults.ts",
+                defaults
+                    .replace(", label: 'a'", "")
+                    .replace("render: () => 'x'", callback),
+            );
+            for staged in [false, true] {
+                if staged {
+                    repo.stage_all();
+                    repo.write("src/defaults.ts", "unstaged invalid source");
+                }
+                let mut args = vec!["--git", "--hook"];
+                if staged {
+                    args.push("--staged");
+                }
+                let output = cargo_bin()
+                    .args(["review", "--dir"])
+                    .arg(repo.root())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{member} {case} {staged}: {json}"
+                );
+                assert!(
+                    json["api"]["mod"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["n"] == "Options"),
+                    "{json}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn typed_array_literals_close_required_member_additions() {
     for extension in ["ts", "tsx"] {
         for (annotation, literal) in [

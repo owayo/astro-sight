@@ -3,7 +3,7 @@
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
     MemberChangeMode, RemovedMembers, RequiredMemberChange, RequiredMemberDelta, RetainedProperty,
-    invariant_members::{property_builtin_names, supported_property_type},
+    invariant_members::{property_builtin_names, supported_retained_member},
     simple_type,
 };
 
@@ -115,12 +115,9 @@ pub(crate) fn classify_member_property_removal(
                 .child_by_field_name("type")
                 .and_then(|annotation| simple_annotation_type(annotation, source))
                 .is_some_and(|ty| ty.iter().all(is_scalar_atom));
-            if member.kind() != "property_signature"
+            if !supported_retained_member(*member, source)
                 || name.contains('\\')
                 || !names.insert(name)
-                || member
-                    .child_by_field_name("type")
-                    .is_none_or(|annotation| !supported_property_type(annotation, source))
             {
                 return RequiredMemberChange::Unsupported;
             }

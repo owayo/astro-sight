@@ -42,6 +42,60 @@ pub(crate) fn supported_property_type(annotation: Node<'_>, source: &[u8]) -> bo
     only_named_child(annotation).is_some_and(|ty| supported_type(ty, source, 0))
 }
 
+/// 残るメンバーの型。関数は組み込みの型だけの単純な契約を、値と周辺の不変性と併せて確かめる。
+pub(crate) fn supported_retained_member(member: Node<'_>, source: &[u8]) -> bool {
+    match member.kind() {
+        "property_signature" => member
+            .child_by_field_name("type")
+            .is_some_and(|annotation| {
+                supported_property_type(annotation, source)
+                    || only_named_child(annotation).is_some_and(|ty| {
+                        ty.kind() == "function_type" && supported_callable(ty, source)
+                    })
+            }),
+        "method_signature" => supported_callable(member, source),
+        _ => false,
+    }
+}
+
+fn supported_callable(node: Node<'_>, source: &[u8]) -> bool {
+    if node.child_by_field_name("type_parameters").is_some() {
+        return false;
+    }
+    let plain = |ty: Node<'_>| {
+        let ty = if ty.kind() == "type_annotation" {
+            only_named_child(ty)
+        } else {
+            Some(ty)
+        };
+        ty.and_then(|ty| simple_type(ty, source))
+            .is_some_and(|atoms| plain_atoms(&atoms))
+    };
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| parameter.kind() != "comment")
+        .all(|parameter| {
+            matches!(
+                parameter.kind(),
+                "required_parameter" | "optional_parameter"
+            ) && parameter.child_by_field_name("value").is_none()
+                && parameter
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| {
+                        pattern.kind() == "identifier"
+                            && pattern
+                                .utf8_text(source)
+                                .is_ok_and(|name| name != "this" && !name.contains('\\'))
+                    })
+                && parameter.child_by_field_name("type").is_some_and(plain)
+        })
+        && node.child_by_field_name("return_type").is_some_and(plain)
+}
+
 fn supported_type(ty: Node<'_>, source: &[u8], depth: usize) -> bool {
     if depth >= MAX_ARRAY_DEPTH {
         return false;
@@ -442,6 +496,7 @@ fn plain_value(value: Node<'_>, source: &[u8], depth: usize) -> bool {
         return false;
     }
     match value.kind() {
+        "arrow_function" => literal_callback(value, source),
         "string" | "number" | "true" | "false" | "null" => value
             .utf8_text(source)
             .is_ok_and(|text| !text.contains('\\')),
@@ -504,6 +559,53 @@ fn plain_value(value: Node<'_>, source: &[u8], depth: usize) -> bool {
     }
 }
 
+/// 外の値や receiver を読まず、リテラルだけを返すアロー関数。実装の不変性はファイル全体で比べる。
+fn literal_callback(function: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = function.walk();
+    if function.child_by_field_name("type_parameters").is_some()
+        || function
+            .children(&mut cursor)
+            .any(|child| child.kind() == "async")
+    {
+        return false;
+    }
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = parameters.walk();
+    if !parameters
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() != "comment")
+        .all(|parameter| {
+            parameter.kind() == "required_parameter"
+                && parameter.child_by_field_name("value").is_none()
+                && parameter
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| {
+                        pattern.kind() == "identifier"
+                            && pattern
+                                .utf8_text(source)
+                                .is_ok_and(|name| name != "this" && !name.contains('\\'))
+                    })
+                && parameter.child_by_field_name("type").is_none_or(|ty| {
+                    supported_property_type(ty, source)
+                        && property_builtin_names(ty, source).is_empty()
+                })
+        })
+    {
+        return false;
+    }
+    function
+        .child_by_field_name("body")
+        .and_then(unwrap_parens)
+        .is_some_and(|body| {
+            matches!(body.kind(), "string" | "number" | "true" | "false" | "null")
+                && body
+                    .utf8_text(source)
+                    .is_ok_and(|text| !text.contains('\\'))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +631,9 @@ mod tests {
                 "(member_expression)",
                 "(subscript_expression)",
                 "(parenthesized_expression)",
+                "(method_signature parameters: (formal_parameters) return_type: (type_annotation))",
+                "(function_type parameters: (formal_parameters) return_type: (_))",
+                "(arrow_function parameters: (formal_parameters) body: (_))",
             ] {
                 tree_sitter::Query::new(&lang.ts_language(), query).unwrap();
             }
