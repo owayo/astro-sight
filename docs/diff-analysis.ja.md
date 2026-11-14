@@ -197,7 +197,9 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 
 inline object 型の引数からキーを消した通常関数では、変更された呼び出しにも削除キーを渡さない証明を課す。JSX の明示属性と直接の object 引数を調べ、spread・計算キー・引用名・変数の引数・暗黙の children は未証明とする。名前付き型の削除で値の構築・利用の証明に失敗した参照も含め、これらは hook の `impacts` に残し、ファイルや呼び出し行が変わっただけでは解決済みにしない。削除キーを渡さないと証明できた呼び出しには、既存の実変更行などの閉包条件も引き続き求める。
 
-ファイル直下でexportしたinterface/object型のtype aliasからproperty signatureだけを削除した変更は、観測できるproducerとconsumerの追随を全て証明できれば`api.mod_closed`にする。宣言ヘッダと残るメンバーが不変で、旧新の全メンバーが一意な識別子名を持つpropertyであることを求める。scalar型だけの変更は、従来の値の型照合で証明する。必須・optionalのどちらも削除できる。削除するメンバー自身はscalar型に限る。generic・継承・index signature・メソッド・関数値や対応外の型・自己参照・宣言の曖昧性や解析不能・追加や型変更との混在は、全参照行が変わっていてもblockingに残す。
+ファイル直下でexportしたinterface/object型のtype aliasからproperty signatureだけを削除した変更は、観測できるproducerとconsumerの追随を全て証明できれば`api.mod_closed`にする。宣言ヘッダと残るメンバーが不変で、旧新の全メンバーが一意な識別子名を持つことを求める。scalar型だけの変更は、従来の値の型照合で証明する。必須・optionalのどちらも削除できる。削除するメンバー自身はscalar型に限る。generic・継承・index signature・対応外の型・自己参照・宣言の曖昧性や解析不能・追加や型変更との混在は、全参照行が変わっていてもblockingに残す。
+
+残るメソッドシグネチャと関数型のプロパティは、引数・戻り値が単純な組み込みの型で、generic・rest・`this` 引数を持たない場合に、不変性の証明で扱う。値は外の値や receiver を読まず、式本体でリテラルだけを返す非 async のアロー関数に限る。型宣言と削除キーを除いたファイル全体のトークン列が旧新で一致し、残る必須メンバーが全て存在することも求める。実装の変更、削除キーの参照、対応外の関数値は blocking のまま残す。
 
 値を作る箇所は、ちょうど`Row`を返す直下の通常関数と、同ファイルの`const x: Row`に限る。残る必須プロパティがあり、値の型が合うことを確かめる。追加・縮小と違い、そのプロパティが変更行にある必要はない。any・unknown・assertion・不適切な初期化子に依存する値、spread・computed key・メソッド・getterやfallthroughは保留し、先行constの初期化子を追う既存の上限付き検査を使う。consumerには明示戻り型と直接呼出しの証明を求める。型付きRowの値とproducerの直接呼出し結果も調べ、`const key = "extra"; row[key]`等の動的/文字列キー、分割代入、別名、未知の呼出しや持出しはblockingに残す。satisfies・arrowによるproducer・クラスメンバー・importしたRow定数・戻り型の推論は、この削除の証明には含めない。追加・縮小の既存契約は維持する。
 
