@@ -27,6 +27,12 @@ filter = 'test(=integration::required_type_members::property_removal_preserves_u
 priority = 50
 threads-required = 2
 
+# 除外した JS の束縛と未証明の利用を、複数のビルド出力で確認する。
+[[profile.default.overrides]]
+filter = 'test(=integration::optional_param_removal::trailing_optional_removal_tolerates_unrelated_ignored_function) | test(=integration::optional_param_removal::trailing_optional_removal_keeps_unproven_ignored_functions_blocking)'
+priority = 50
+threads-required = 2
+
 # worktree と index の公開経路を複数の cfg 構成で確認する回帰を先に始める。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & (test(=integration::rust_relative_reexport::review_rust_glob_module_shadow_requires_unconditional_binding) | test(=integration::rust_relative_reexport::review_rust_global_reexport_distinguishes_external_and_local_crates) | test(=integration::rust_relative_reexport::review_rust_public_signatures_expose_hidden_types_individually) | test(=integration::rust_relative_reexport::review_rust_cfg_reexports_require_module_activation_proof) | test(=integration::rust_relative_reexport::review_rust_glob_external_names_require_complete_namespace_proof))'
