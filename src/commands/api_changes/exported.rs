@@ -339,6 +339,9 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     python_decorator_imports: std::cell::OnceCell<crate::engine::symbols::PythonDecoratorImports>,
     /// TS の `stripInternal`: `@internal` の宣言とメンバーを宣言ファイルから消す (Issue #274)。
     strip_internal: bool,
+    /// Rust の外へ名前で出す属性を付けた関数と static の開始位置 (Issue #394)。dead-code の経路だけで
+    /// 作り、ほかの経路と Rust 以外では空。
+    rust_extern_items: HashSet<(usize, usize)>,
 }
 
 impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
@@ -408,6 +411,13 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         // ファイル単位で 1 回だけ行う。非 Python では構築しない。
         let python_export_policy = (lang_id == crate::language::LangId::Python)
             .then(|| crate::engine::symbols::python_module_export_policy(root, source));
+        // 実行時入口を除外する dead-code の経路だけで、ファイル単位で 1 回作る。
+        let rust_extern_items =
+            if exclude_framework_entrypoints && lang_id == crate::language::LangId::Rust {
+                super::extern_indicator_items(root, source)
+            } else {
+                HashSet::new()
+            };
 
         Self {
             root,
@@ -423,6 +433,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             python_export_policy,
             python_decorator_imports: std::cell::OnceCell::new(),
             strip_internal: false,
+            rust_extern_items,
         }
     }
 
@@ -894,6 +905,17 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 sym.kind,
                 &sym.range,
             )
+        {
+            return true;
+        }
+        // Rust の外へ名前で出す関数と static (`#[no_mangle]`・`#[export_name]`・`#[used]`。Rust 2024 の
+        // `unsafe(..)` と `cfg_attr` の中も)。リンカやほかの言語が名前で呼ぶので、リポジトリの中の呼び出し元は
+        // 0 件が正常 (rustc も dead_code の対象にしない。Issue #394)。エントリポイントと同じく dead-code の
+        // 経路だけで除外し、API 差分 (ABI の変更) には残す。
+        if self.exclude_framework_entrypoints
+            && self
+                .rust_extern_items
+                .contains(&(sym.range.start.line, sym.range.start.column))
         {
             return true;
         }

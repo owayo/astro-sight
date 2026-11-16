@@ -2927,6 +2927,77 @@ fn go_test_entrypoints_do_not_block_review_hook() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("TestAdd"));
 }
 
+/// Rust の cdylib が `#[unsafe(no_mangle)]` で外へ出す関数は、`--include-wip-dead` でも、ABI を変えた
+/// ときも hook の dead にしない (Issue #394)。ABI の変更は api.mod に残し、同じ module の属性の無い
+/// 未参照の関数は対照として dead のまま。
+#[test]
+fn rust_extern_exports_do_not_block_review_hook() {
+    fn hook(repo: &TestRepo, extra: &[&str]) -> (Option<i32>, serde_json::Value) {
+        let output = cargo_bin()
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .args(extra)
+            .output()
+            .unwrap();
+        let value = serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)));
+        (output.status.code(), value)
+    }
+    fn dead_names(value: &serde_json::Value) -> Vec<&str> {
+        value["dead"]
+            .as_array()
+            .map(|dead| dead.iter().filter_map(|d| d["n"].as_str()).collect())
+            .unwrap_or_default()
+    }
+    let export = "#[unsafe(no_mangle)]\npub extern \"system\" fn host_export_probe(value: u32) -> u32 {\n    value.saturating_add(7)\n}\n";
+    let repo = TestRepo::new();
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"host-export-example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+    );
+    repo.create_dir_all("src");
+    repo.write("src/lib.rs", "");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/lib.rs", "mod exports;\n");
+    repo.write("src/exports.rs", export);
+    repo.git(["add", "--intent-to-add", "src/exports.rs"]);
+    let (code, value) = hook(&repo, &["--include-wip-dead"]);
+    assert_eq!(code, Some(0), "{value}");
+    assert!(dead_names(&value).is_empty(), "{value}");
+
+    repo.write(
+        "src/exports.rs",
+        format!("{export}pub fn unused_helper() -> u32 {{\n    1\n}}\n"),
+    );
+    let (code, value) = hook(&repo, &["--include-wip-dead"]);
+    assert_eq!(code, Some(1), "{value}");
+    assert_eq!(dead_names(&value), ["unused_helper"], "{value}");
+
+    repo.write("src/exports.rs", export);
+    repo.commit_all("export");
+    repo.write(
+        "src/exports.rs",
+        "#[unsafe(no_mangle)]\npub extern \"system\" fn host_export_probe(value: u32) -> u64 {\n    u64::from(value).saturating_add(7)\n}\n",
+    );
+    let (code, value) = hook(&repo, &[]);
+    assert_eq!(code, Some(1), "{value}");
+    assert_eq!(
+        value["blocking_categories"],
+        serde_json::json!(["api.mod"]),
+        "{value}"
+    );
+    assert!(dead_names(&value).is_empty(), "{value}");
+    assert!(
+        value["api"]["mod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["n"] == "host_export_probe"),
+        "{value}"
+    );
+}
+
 #[test]
 fn go_test_entrypoints_accept_alias_types_and_testmain_t() {
     for source in [

@@ -881,6 +881,7 @@ Ruby では `Builder.new`・`Demo::Builder.new`・`::Demo::Builder.new` のよ�
   - Java: private でない `void main`（引数なしか `String[]` 1 個。Java 25 の instance main を含む）
   - C#: `static Main`（引数なしか `string[]` 1 個）
   - Java / C# / Kotlin では、エントリポイントを宣言する型（ネストした型の外側の型を含む）も除外する
+- **Rust の外へ名前で出す関数と static**: `#[no_mangle]`・`#[export_name = "..."]`・`#[used]` を付けたもの（Rust 2024 の `#[unsafe(..)]` と、`#[cfg_attr(..)]` で付けるものも。`cfg_attr` の述語は評価しない）。リンカやほかの言語が名前で呼ぶので、rustc も dead_code の対象にしない。API 差分（ABI の変更）には残す
 
 ### 生成ファイルの扱い
 

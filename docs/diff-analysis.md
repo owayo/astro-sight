@@ -848,6 +848,7 @@ Symbols that frameworks and test runners call dynamically, by naming convention 
   - Java: non-private `void main` (with no parameters or a single `String[]`, including Java 25 instance main)
   - C#: `static Main` (with no parameters or a single `string[]`)
   - In Java / C# / Kotlin, the type that declares the entry point (including the outer types of a nested type) is excluded too
+- **Rust functions and statics exported by name**: those with `#[no_mangle]`, `#[export_name = "..."]`, or `#[used]` (including Rust 2024 `#[unsafe(..)]` and attributes attached through `#[cfg_attr(..)]`; the `cfg_attr` predicate is not evaluated). The linker or other languages call them by name, and rustc does not lint them as dead code either. They stay in the API diff (ABI changes)
 
 ### Generated Files
 

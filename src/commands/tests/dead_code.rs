@@ -1432,3 +1432,121 @@ fn detect_api_changes_rust_allow_dead_marker_does_not_hide_contract_changes() {
     let api = detect_api_changes_from_worktree(repo);
     assert!(api.removed.iter().any(|s| s.name == "kept"), "{api:?}");
 }
+
+/// 外へ名前で出す属性 (`no_mangle`・`export_name`・`used`。Rust 2024 の `unsafe(..)` と `cfg_attr` の
+/// 中も) を付けた関数と static は、リンカやほかの言語が名前で呼ぶので dead にしない (Issue #394)。
+/// 属性の無い関数、別の属性、経路の属性、文字列やコメントの中の名前、前の項目の属性は対照として dead のまま。
+#[test]
+fn detect_dead_rust_extern_indicators_exclude_only_exported_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    fs::write(
+        repo.join("api.rs"),
+        r#"#[no_mangle]
+pub extern "C" fn plain_export() -> u32 { 1 }
+#[unsafe(no_mangle)]
+pub extern "system" fn unsafe_export() -> u32 { 2 }
+#[export_name = "renamed_export"]
+pub extern "C" fn renamed() -> u32 { 3 }
+#[unsafe(export_name = "renamed_unsafe_export")]
+pub extern "C" fn renamed_unsafe() -> u32 { 4 }
+#[cfg_attr(windows, unsafe(no_mangle))]
+pub extern "C" fn conditional() -> u32 { 5 }
+#[cfg_attr(unix, cfg_attr(target_os = "linux", export_name = "nested_export"))]
+pub extern "C" fn nested_conditional() -> u32 { 6 }
+#[unsafe(no_mangle)]
+/// Exported version.
+#[allow(non_upper_case_globals)]
+pub static exported_version: u32 = 7;
+#[used]
+pub static KEPT: u32 = 8;
+pub struct Holder;
+impl Holder {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn method_export() -> u32 { 9 }
+    pub fn plain_method(&self) -> u32 { 10 }
+}
+pub fn unused_plain() -> u32 { 11 }
+#[inline]
+pub extern "C" fn inline_only() -> u32 { 12 }
+#[macros::no_mangle]
+pub extern "C" fn path_attribute() -> u32 { 13 }
+#[r#unsafe(no_mangle)]
+pub extern "C" fn raw_unsafe() -> u32 { 14 }
+#[doc = "no_mangle export_name used"]
+pub fn documented() -> u32 { 15 }
+#[cfg_attr(windows, inline)]
+pub fn conditional_inline() -> u32 { 16 }
+// no_mangle
+pub fn commented() -> u32 { 17 }
+#[no_mangle]
+pub extern "C" fn first_export() -> u32 { 18 }
+pub fn after_export() -> u32 { 19 }
+"#,
+    )
+    .unwrap();
+    let (dead, test_only) =
+        detect_dead_symbols_from_files(repo.to_str().unwrap(), &[repo.join("api.rs")]);
+    assert!(test_only.is_empty(), "{test_only:?}");
+    let names: HashSet<_> = dead.iter().map(|s| s.name.as_str()).collect();
+    for exported in [
+        "plain_export",
+        "unsafe_export",
+        "renamed",
+        "renamed_unsafe",
+        "conditional",
+        "nested_conditional",
+        "exported_version",
+        "KEPT",
+        "Holder.method_export",
+        "first_export",
+    ] {
+        assert!(!names.contains(exported), "{exported}: {names:?}");
+    }
+    for unused in [
+        "Holder.plain_method",
+        "unused_plain",
+        "inline_only",
+        "path_attribute",
+        "raw_unsafe",
+        "documented",
+        "conditional_inline",
+        "commented",
+        "after_export",
+    ] {
+        assert!(names.contains(unused), "{unused}: {names:?}");
+    }
+}
+
+/// 外へ名前で出す属性で dead から外しても、API 差分 (ABI の変更と削除) は残す (Issue #394)。削除は
+/// リポジトリの中に参照が無いので、従来どおり参照の無い削除 (`removed_dead`) として報告する。
+#[test]
+fn detect_api_changes_rust_extern_indicator_keeps_abi_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/lib.rs",
+            "#[unsafe(no_mangle)]\npub extern \"C\" fn probe(value: u32) -> u32 { value }\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn probe(value: u32) -> u64 { u64::from(value) }\n",
+    )
+    .unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.modified.iter().any(|s| s.name == "probe"), "{api:?}");
+    fs::write(repo.join("src/lib.rs"), "\n").unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed
+            .iter()
+            .chain(&api.removed_dead)
+            .any(|s| s.name == "probe"),
+        "{api:?}"
+    );
+}
