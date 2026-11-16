@@ -339,7 +339,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-`session` reads NDJSON requests from stdin and writes NDJSON responses to stdout, handling any number of requests in a row. It supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, and `cochange`. Each line is limited to 100MB (the raw input size without the newline). When `ASTRO_SIGHT_WORKSPACE` is set, only paths under that directory are handled, and relative `path` / `dir` values in requests are resolved from the workspace root. An invalid workspace value (an empty string, non-UTF-8, a path that does not exist, and so on) ends the session with `INVALID_REQUEST`.
+`session` reads NDJSON requests from stdin and writes NDJSON responses to stdout, handling any number of requests in a row. It supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange`, and `scan_symbols`. Each line is limited to 100MB (the raw input size without the newline). When `ASTRO_SIGHT_WORKSPACE` is set, only paths under that directory are handled, and relative `path` / `dir` values in requests are resolved from the workspace root. An invalid workspace value (an empty string, non-UTF-8, a path that does not exist, and so on) ends the session with `INVALID_REQUEST`.
 
 ```bash
 # calls
@@ -353,6 +353,13 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 ```
 
 `refs` in a session also requires `name` or `names` (not an empty string).
+
+`scan_symbols` collects symbols for a project dictionary (`{"command":"scan_symbols","dir":"."}`). With `source_files` (paths relative to `dir`), it reads only those paths again. Full and incremental scans apply the same selection: `.gitignore`, `.ignore`, `.git/info/exclude`, and global excludes, hidden files, language detection, the 1 MiB limit, and the generated-file decision.
+
+- In an incremental result (`full_scan: false`), each requested path lands in either `files` or `removed`. Both stand for the path and everything below it (paths starting with `path + "/"`): drop the dictionary entries of a `removed` path, and replace the entries of a `files` path with its content. Deleted files and directories, and paths a full scan would no longer return (excluded by ignore rules, hidden, symlinks, unsupported, generated, too large, or unparsable), go to `removed`
+- On a case-insensitive file system, a path given with a different spelling is read under its actual spelling, and the given spelling goes to `removed`
+- Paths that could not be judged because of a limit or a walk failure go to neither list; the result reports `complete: false` and `not judged: <path>` in `diagnostics`
+- An existing directory, the project root (`.`), `.gitignore`, `.ignore`, `.gitattributes`, `.git/info/exclude`, or more than 10,000 paths switch to a full scan (`full_scan: true` with `full_scan_reason`). Replace the whole dictionary with a full result only when `complete` is `true`. When rules outside `dir` change (global excludes, a parent `.gitignore`), the caller requests a full scan
 
 ## metrics: Complexity and Dependency Metrics
 
