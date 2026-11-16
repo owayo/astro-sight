@@ -340,19 +340,135 @@ fn unsafe_keyword(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
 /// `unsafe(..)` の引数 `arguments` (`token_tree`) の中の属性が、項目を置き換えない組み込みの属性か
 /// (`unsafe` は組み込みの属性にしか付けられない)。
 fn inert_unsafe_arguments(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    unsafe_attribute_name(arguments, source).is_some_and(|name| INERT_ATTRIBUTES.contains(&name))
+}
+
+/// `unsafe(..)` の引数 `arguments` (`token_tree`) の中の属性の名前。経路の属性 (`a::b`) と、読めないものは None。
+fn unsafe_attribute_name<'a>(
+    arguments: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<&'a str> {
     let mut cursor = arguments.walk();
     let children: Vec<tree_sitter::Node<'_>> = arguments
         .children(&mut cursor)
         .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
         .collect();
     match children.get(1..children.len().saturating_sub(1)) {
-        Some([first, rest @ ..]) => {
-            !rest.first().is_some_and(|next| next.kind() == "::")
-                && plain_identifier(*first, source)
-                    .is_some_and(|name| INERT_ATTRIBUTES.contains(&name))
+        Some([first, rest @ ..]) if !rest.first().is_some_and(|next| next.kind() == "::") => {
+            plain_identifier(*first, source)
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// 項目を外へ名前で出す組み込みの属性 (Issue #394)。`no_mangle`・`export_name` は名前のまま公開し、`used` は
+/// static を出力に残す。rustc はこれらを付けた項目を dead_code の対象にしない。
+const EXTERN_INDICATOR_ATTRIBUTES: [&str; 3] = ["no_mangle", "export_name", "used"];
+
+/// ファイルの中で、外へ名前で出す属性 ([`EXTERN_INDICATOR_ATTRIBUTES`]。Rust 2024 の `unsafe(..)` と、
+/// `cfg_attr` で付けるものも) を付けた関数と static の開始位置 (行, 列。0 始まり。Issue #394)。リンカや
+/// ほかの言語が名前で呼ぶので、リポジトリの中の呼び出し元は 0 件が正常。`cfg_attr` の述語は評価しない
+/// (付き得るなら外から呼ばれ得るとし、dead と断定しない側に倒す)。
+pub(crate) fn extern_indicator_items(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> HashSet<(usize, usize)> {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+
+    let mut items = HashSet::new();
+    if !EXTERN_INDICATOR_ATTRIBUTES
+        .iter()
+        .any(|name| memchr::memmem::find(source, name.as_bytes()).is_some())
+    {
+        return items;
+    }
+    // 深さごとに、直前の兄弟までに外へ出す属性があったか (項目ごとに兄弟をたどり直さない)。
+    let mut pending: Vec<bool> = Vec::new();
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+        pending.truncate(depth + 1);
+        pending.resize(depth + 1, false);
+        match node.kind() {
+            "attribute_item" => {
+                if extern_indicator_attribute_item(node, source) {
+                    pending[depth] = true;
+                }
+                return ControlFlow::Continue(Walk::Skip);
+            }
+            // 属性と項目の間の (文書) コメントは、属性の付き先を変えない。
+            "line_comment" | "block_comment" => return ControlFlow::Continue(Walk::Skip),
+            _ => {}
+        }
+        if std::mem::take(&mut pending[depth])
+            && matches!(node.kind(), "function_item" | "static_item")
+        {
+            let start = node.start_position();
+            items.insert((start.row, start.column));
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    items
+}
+
+/// 外側の属性 (`attribute_item`) が、外へ名前で出す組み込みの属性 ([`EXTERN_INDICATOR_ATTRIBUTES`]) を付けるか。
+fn extern_indicator_attribute_item(attribute_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = attribute_item.walk();
+    let Some(attribute) = attribute_item
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+    else {
+        return false;
+    };
+    let Some(path) = attribute.named_child(0) else {
+        return false;
+    };
+    let arguments = attribute.child_by_field_name("arguments");
+    if plain_identifier(path, source) == Some("cfg_attr") {
+        return arguments.is_some_and(|arguments| extern_indicator_cfg_attr(arguments, source));
+    }
+    extern_indicator_plain(path, arguments.as_slice(), source)
+}
+
+/// `cfg_attr(述語, 属性, ..)` の引数 (`token_tree`) の、付ける属性のどれかが外へ名前で出すものか (入れ子もたどる)。
+fn extern_indicator_cfg_attr(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(groups) = argument_groups(arguments) else {
+        return false;
+    };
+    groups.iter().skip(1).any(|group| {
+        let Some((first, rest)) = group.split_first() else {
+            return false;
+        };
+        if nested_cfg_attr(*first, rest, source) {
+            return matches!(
+                rest,
+                [nested] if nested.kind() == "token_tree" && extern_indicator_cfg_attr(*nested, source)
+            );
+        }
+        extern_indicator_plain(*first, rest, source)
+    })
+}
+
+/// `cfg_attr` 以外の属性 (経路の先頭のノード `first` と、続くノード `rest`) が、外へ名前で出す組み込みの属性か。
+/// 経路の属性 (`a::no_mangle`) は組み込みでない。Rust 2024 の `unsafe(..)` は中の属性で決める。
+fn extern_indicator_plain(
+    first: tree_sitter::Node<'_>,
+    rest: &[tree_sitter::Node<'_>],
+    source: &[u8],
+) -> bool {
+    if rest.first().is_some_and(|next| next.kind() == "::") {
+        return false;
+    }
+    let name = if unsafe_keyword(first, source) {
+        match rest {
+            [arguments] if arguments.kind() == "token_tree" => {
+                unsafe_attribute_name(*arguments, source)
+            }
+            _ => None,
+        }
+    } else {
+        plain_identifier(first, source)
+    };
+    name.is_some_and(|name| EXTERN_INDICATOR_ATTRIBUTES.contains(&name))
 }
 
 /// クレート全体に付ける組み込みの属性 (Issue #381)。組み込みの属性なので同じ名前のマクロを指さず、項目も
