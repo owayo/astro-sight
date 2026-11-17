@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::parser;
 use crate::models::impact::DiffFile;
-use crate::models::review::CompatibleApiModification;
+use crate::models::review::{ApiChanges, CompatibleApiModification};
 
 use super::super::git_input::GitBlobBatch;
 use super::{ExportedSymbols, unfiltered_declaration_signatures};
@@ -46,10 +46,20 @@ pub(crate) fn compatible_impact_names(
     base: &str,
     diff_files: &[DiffFile],
 ) -> BTreeMap<String, BTreeSet<String>> {
+    let api = detect_api_changes(dir, base, diff_files);
+    compatible_impact_names_for_api(dir, base, diff_files, &api)
+}
+
+/// review と同じ基点・新側ソースから得た API の分類を再利用する。
+pub(crate) fn compatible_impact_names_for_api(
+    dir: &str,
+    base: &str,
+    diff_files: &[DiffFile],
+    api: &ApiChanges,
+) -> BTreeMap<String, BTreeSet<String>> {
     let mut candidates: BTreeMap<String, Vec<CompatibleApiModification>> = BTreeMap::new();
     let mut names = BTreeSet::new();
-    let api = detect_api_changes(dir, base, diff_files);
-    let mut changes = api.compatible_modified;
+    let mut changes = api.compatible_modified.clone();
     if api.modified_closed_in_diff.iter().any(|change| {
         matches!(change.kind.as_str(), "function" | "interface" | "trait")
             && matches!(
@@ -60,16 +70,16 @@ pub(crate) fn compatible_impact_names(
         let blobs = GitBlobBatch::new(dir, base);
         if let Some(proof) = super::ts_function_values::HandoffProof::build(dir, &blobs, diff_files)
         {
-            for change in api.modified_closed_in_diff {
+            for change in &api.modified_closed_in_diff {
                 if proof.covers(&change.file, &change.name) {
                     changes.push(CompatibleApiModification {
                         change_evidence: None,
-                        inline_module: change.inline_module,
-                        name: change.name,
-                        kind: change.kind,
-                        file: change.file,
-                        old_signature: change.old_signature,
-                        new_signature: change.new_signature,
+                        inline_module: change.inline_module.clone(),
+                        name: change.name.clone(),
+                        kind: change.kind.clone(),
+                        file: change.file.clone(),
+                        old_signature: change.old_signature.clone(),
+                        new_signature: change.new_signature.clone(),
                         reason: "closed_function_value_handoff".to_owned(),
                     });
                 }
@@ -231,4 +241,80 @@ fn declarations(source: &[u8], path: &str, names: &BTreeSet<String>) -> Option<D
             Some(path),
         )),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::tests::common::{
+        git_commit_files, init_git_repo_for_test, resolve_git_diff_parts,
+    };
+
+    #[test]
+    fn python_compatible_method_names_require_every_changed_declaration_proven() {
+        let order = "class Order:\n    def sealed(self):\n        return True\n";
+        let compatible = order.replace("self)", "self, limit=None)");
+        for (old_other, new_other) in [
+            (
+                "class Other:\n    def sealed(self):\n        return True\n",
+                "class Other:\n    def sealed(self, required):\n        return True\n",
+            ),
+            (
+                "class _Private:\n    def sealed(self):\n        return True\n",
+                "class _Private:\n    def sealed(self, required):\n        return True\n",
+            ),
+            (
+                "class _Private:\n    def sealed(self):\n        return True\n",
+                "class _Private:\n    def sealed(self):\n        return False\n",
+            ),
+            (
+                "def factory():\n    def sealed():\n        return True\n    return sealed\n",
+                "def factory():\n    def sealed(required):\n        return True\n    return sealed\n",
+            ),
+            (
+                "def factory():\n    def sealed():\n        return True\n    return sealed\n",
+                "def factory():\n    def sealed():\n        return False\n    return sealed\n",
+            ),
+        ] {
+            for same_file in [false, true] {
+                let repo = tempfile::tempdir().unwrap();
+                let dir = repo.path();
+                let path = if same_file { "order.py" } else { "other.py" };
+                let before = if same_file {
+                    format!("{order}\n{old_other}")
+                } else {
+                    old_other.to_owned()
+                };
+                init_git_repo_for_test(dir);
+                git_commit_files(dir, &[("order.py", order), (path, &before)], "initial");
+                std::fs::write(dir.join("order.py"), &compatible).unwrap();
+                let after = if same_file {
+                    format!("{compatible}\n{new_other}")
+                } else {
+                    new_other.to_owned()
+                };
+                std::fs::write(dir.join(path), after).unwrap();
+                let (diff, _) = resolve_git_diff_parts(dir);
+                let files = crate::engine::diff::parse_unified_diff(&diff);
+                let api = detect_api_changes(dir.to_str().unwrap(), "HEAD", &files);
+                assert!(
+                    api.compatible_modified
+                        .iter()
+                        .any(|change| change.name == "Order.sealed"),
+                    "{api:?}"
+                );
+                let proven =
+                    compatible_impact_names_for_api(dir.to_str().unwrap(), "HEAD", &files, &api);
+                assert!(
+                    !proven.contains_key(path),
+                    "{same_file}/{new_other}: {proven:?}"
+                );
+                if old_other.lines().find(|line| line.contains("def sealed"))
+                    != new_other.lines().find(|line| line.contains("def sealed"))
+                {
+                    assert!(proven.is_empty(), "{same_file}/{new_other}: {proven:?}");
+                }
+            }
+        }
+    }
 }
