@@ -8,6 +8,12 @@ nextest-version = { required = "0.9.150" }
 # 60 秒を超えたテストを報告する (libtest の "has been running for over 60 seconds" と同じ間隔)。報告だけで止めない
 slow-timeout = { period = "60s" }
 
+# 同名の別定義があっても、通常・index の実際のメソッド呼び出しを保持する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::impact_competing_definitions::)'
+priority = 50
+threads-required = 2
+
 # Python の同名呼出しの帰属を、通常・index・未知の受け手の対照で確認する。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & test(integration::python_method_closure::)'

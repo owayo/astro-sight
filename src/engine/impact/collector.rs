@@ -6,7 +6,7 @@
 //!   `on_ref` 時点で import 判定と caller_name intern まで済ませておき、context の
 //!   文字列コピーを廃して per-file バッファの heap を削減する。
 //! - `ImpactCollector`: `refs::RefVisitor` を実装し、per-file visit の callback を
-//!   直接受け取って `finish_file` で Stage 1-6 (Stage 4b 除く) を適用する。
+//!   直接受け取って `finish_file` で参照位置ごとのフィルタを適用する。
 use lru::LruCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -340,7 +340,7 @@ impl RouteDecisionContext<'_> {
 }
 
 /// `RefVisitor` の実装: per-file の ref 走査中は最小限の buffering だけ行い、
-/// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
+/// ファイル走査完了後に `finish_file` で参照位置ごとの filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
 pub(super) struct ImpactCollector<'a> {
     pub(super) new_side_is_worktree: bool,
@@ -1089,7 +1089,7 @@ struct ScopeEvidence {
 }
 
 impl<'a> ImpactCollector<'a> {
-    /// ファイル走査完了時に呼ぶ。buffered events に対して Stage 1-6 (Stage 4b 除く) の
+    /// ファイル走査完了時に呼ぶ。buffered events に対して参照位置ごとの
     /// filter を適用し、`local_maps` / `local_def_paths` に push する。バッファは clear して
     /// 次ファイルで再利用する。
     ///
@@ -1104,7 +1104,7 @@ impl<'a> ImpactCollector<'a> {
         }
         collector.record_definitions();
 
-        // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す。
+        // References: 1 件ずつ参照位置ごとの filter を適用し local_maps へ流す。
         // Stage 6 (import 判定) と caller_name の抽出は on_ref 時点で済ませてあるため、
         // ここでは flag / ID で判定する。Phase 4: confidence == BareNameOnly + シンボル名が
         // generic (new/update/...) なら local_low_maps へ振り分け、強い impact 信号を汚染しない。

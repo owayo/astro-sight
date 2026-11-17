@@ -1,67 +1,26 @@
-//! Pass 3/4 per-fc 組み立て: Stage 4b 適用と `FileImpact` の最終化。
+//! Pass 3/4 per-fc 組み立て: 呼び出し元の復号と `FileImpact` の最終化。
 //!
 //! `analyze_impact_streaming` は各 `FileContext` を 1 件ずつ回し、
-//!   Pass 3: `apply_stage4b_single` で `TypedCallerMap` → `CallerMap` (String 版) に decode
+//!   Pass 3: `decode_caller_map` で `TypedCallerMap` → `CallerMap` (String 版) に decode
 //!   Pass 4: `build_file_impact` で call_edges マージ + `ImpactedCaller` 整形 → `FileImpact`
 //! を実行してすぐ callback に渡す。中間 `Vec<CallerMap>` を保持しないため RSS が節約される。
 use std::collections::{HashMap, HashSet};
 
 use crate::models::impact::{FileImpact, ImpactedCaller};
 
-use super::filters::is_same_source_file;
 use super::types::{CallerMap, StringPool, TypedCallerMap};
 use super::{FileContext, ci_key};
 
-/// method parent type を持つ sym_ix のビットセット相当の map を返す。
-/// Stage 4b は method scope のシンボルだけに適用する。
-pub(super) fn compute_has_parent_by_ix(
-    sym_ix: &HashMap<String, usize>,
-    method_parent_types: &HashMap<String, String>,
-) -> HashMap<u32, bool> {
-    let mut has_parent: HashMap<u32, bool> = HashMap::new();
-    for parent_child in method_parent_types.keys() {
-        if let Some(&ix) = sym_ix.get(parent_child) {
-            has_parent.insert(ix as u32, true);
-        }
-    }
-    has_parent
-}
-
-/// Pass 3 (per-fc): 1 つの `TypedCallerMap` に Stage 4b (競合 Definition) を適用し、
-/// interning ID を剥がした `CallerMap` を返す。呼び出し側で 1 fc_ix ずつ処理し、完了後
+/// Pass 3 (per-fc): 1 つの `TypedCallerMap` の ID を剥がして `CallerMap` を返す。
+/// 呼び出し側で 1 fc_ix ずつ処理し、完了後
 /// すぐ drop することで、旧実装の `Vec<CallerMap>` 全件同時保持 (0.7-1.2 GB) を回避する。
-pub(super) fn apply_stage4b_single(
-    typed_map: TypedCallerMap,
-    def_paths_by_ix: &[Vec<u32>],
-    pool: &StringPool,
-    has_parent_by_ix: &HashMap<u32, bool>,
-    ctx: &FileContext,
-) -> CallerMap {
-    let source_path = &ctx.new_path;
+pub(super) fn decode_caller_map(typed_map: TypedCallerMap, pool: &StringPool) -> CallerMap {
     let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
     for ((path_id, line), (caller_name_id, sym_entries)) in typed_map {
         let path_str = pool.get(path_id).to_string();
         let caller_name = pool.get(caller_name_id).to_string();
         let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
-        for (sym_ix_val, sym_name_id) in sym_entries {
-            // A private inherent method can be called by descendants even when another
-            // type declares the same name. Keep ambiguous calls instead of discarding
-            // genuine callers through a name-only competing-definition check.
-            if ctx.lang_id != crate::language::LangId::Python
-                && !ctx
-                    .rust_private_method_owners
-                    .contains_key(pool.get(sym_name_id))
-                && *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
-                && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
-            {
-                let has_competing_def = paths.iter().any(|&pid| {
-                    let p = pool.get(pid);
-                    !is_same_source_file(p, source_path)
-                });
-                if has_competing_def {
-                    continue;
-                }
-            }
+        for (_, sym_name_id) in sym_entries {
             let sym_name = pool.get(sym_name_id).to_string();
             if !kept.contains(&sym_name) {
                 kept.push(sym_name);
