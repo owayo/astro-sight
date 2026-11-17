@@ -10,6 +10,8 @@ use tree_sitter::Node;
 use crate::engine::parser;
 use crate::language::LangId;
 
+mod non_method;
+
 struct ImportBinding {
     owner: PathBuf,
     after: usize,
@@ -17,6 +19,7 @@ struct ImportBinding {
 
 pub(super) struct PythonImportIndex {
     bindings: HashMap<String, ImportBinding>,
+    non_method_sites: HashSet<usize>,
 }
 
 /// 1 回の impact 走査に閉じた証拠。別の問い合わせへ再利用しない。
@@ -25,6 +28,7 @@ pub(super) struct PythonImportCache {
     workspace: OnceLock<Option<PathBuf>>,
     packages: Mutex<HashMap<PathBuf, bool>>,
     owners: Mutex<HashMap<PathBuf, Option<HashSet<String>>>>,
+    namespace_directories: non_method::NamespaceCache,
     pub(super) source_paths: OnceLock<Vec<Option<String>>>,
 }
 
@@ -49,6 +53,17 @@ impl PythonImportIndex {
             .get_or_init(|| Path::new(dir).canonicalize().ok())
             .as_ref()?;
         let ref_path = workspace.join(path);
+        let non_method_sites = if allow_local_functions {
+            non_method::sites(
+                root,
+                source,
+                workspace,
+                &ref_path,
+                &cache.namespace_directories,
+            )
+        } else {
+            HashSet::new()
+        };
         let mut candidates = HashMap::new();
         let mut ignored = HashSet::new();
         let mut duplicates = HashSet::new();
@@ -123,6 +138,7 @@ impl PythonImportIndex {
         if candidates.is_empty() {
             return Some(Self {
                 bindings: candidates,
+                non_method_sites,
             });
         }
         let blocked = blocked_names(root, source, &ignored)?;
@@ -142,7 +158,12 @@ impl PythonImportIndex {
         });
         Some(Self {
             bindings: candidates,
+            non_method_sites,
         })
+    }
+
+    pub(super) fn is_non_method_site(&self, node: Node<'_>) -> bool {
+        self.non_method_sites.contains(&node.id())
     }
 
     pub(super) fn owner(&self, node: Node<'_>, source: &[u8]) -> Option<&Path> {
@@ -370,12 +391,9 @@ fn blocked_names(
                 }))
             || matches!(
                 node.kind(),
-                "wildcard_import"
-                    | "named_expression"
-                    | "match_statement"
-                    | "type_alias_statement"
-                    | "type_parameter"
+                "wildcard_import" | "named_expression" | "match_statement" | "type_alias_statement"
             )
+            || (node.kind() == "type_parameter" && !ignored.contains(&node.id()))
         {
             return None;
         }

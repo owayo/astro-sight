@@ -166,6 +166,9 @@ fn proven_added_declarations(
     lang: LangId,
     new_parts: &BTreeMap<(String, String), Vec<Option<Parts>>>,
 ) -> BTreeSet<(String, String)> {
+    if lang == LangId::Python {
+        return proven_python_class_additions(old_root, old, new_root, new);
+    }
     if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
         // JS の Unicode escape は normalize_identifier で同一視できない。
         || old.windows(2).any(|bytes| bytes == b"\\u")
@@ -202,6 +205,124 @@ fn proven_added_declarations(
         })
         .map(|(key, _)| key.clone())
         .collect()
+}
+
+fn proven_python_class_additions(
+    old_root: Node<'_>,
+    old: &[u8],
+    new_root: Node<'_>,
+    new: &[u8],
+) -> BTreeSet<(String, String)> {
+    let Some(old_names) = python_static_names(old_root, old) else {
+        return BTreeSet::new();
+    };
+    if python_static_names(new_root, new).is_none() {
+        return BTreeSet::new();
+    }
+    let mut class_counts = BTreeMap::<String, usize>::new();
+    let _: ControlFlow<()> = walk_preorder(new_root, Children::Named, |node, _| {
+        if node.kind() == "class_definition"
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(name) = name.utf8_text(new)
+        {
+            *class_counts.entry(name.to_owned()).or_default() += 1;
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    let mut result = BTreeSet::new();
+    let mut cursor = new_root.walk();
+    for class in new_root.named_children(&mut cursor) {
+        if class.kind() != "class_definition" {
+            continue;
+        }
+        let Some(name) = class
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(new).ok())
+        else {
+            continue;
+        };
+        if old_names.contains(name) || class_counts.get(name) != Some(&1) {
+            continue;
+        }
+        result.insert((name.to_owned(), "class".to_owned()));
+        let Some(body) = class.child_by_field_name("body") else {
+            continue;
+        };
+        let mut methods = BTreeMap::<String, usize>::new();
+        let mut body_cursor = body.walk();
+        for statement in body.named_children(&mut body_cursor) {
+            if statement.kind() == "function_definition"
+                && let Some(method) = statement
+                    .child_by_field_name("name")
+                    .and_then(|method| method.utf8_text(new).ok())
+            {
+                *methods.entry(method.to_owned()).or_default() += 1;
+            }
+        }
+        for (method, count) in methods {
+            if count == 1 {
+                result.insert((format!("{name}.{method}"), "function".to_owned()));
+            }
+        }
+    }
+    result
+}
+
+// import / 代入を含む旧側の名前をすべて調べ、動的な束縛があれば追加と断定しない。
+fn python_static_names(root: Node<'_>, source: &[u8]) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let result = walk_preorder(root, Children::Named, |node, _| {
+        if node.is_missing()
+            || matches!(
+                node.kind(),
+                "wildcard_import"
+                    | "named_expression"
+                    | "match_statement"
+                    | "type_alias_statement"
+                    | "type_parameter"
+            )
+        {
+            return ControlFlow::Break(());
+        }
+        if node.kind() == "identifier" {
+            let Ok(name) = node.utf8_text(source) else {
+                return ControlFlow::Break(());
+            };
+            // Python は識別子を NFKC 正規化する。未正規化の綴りを同一視できない場合は保留する。
+            if !name.is_ascii()
+                || matches!(
+                    name,
+                    "__path__"
+                        | "__package__"
+                        | "__getattr__"
+                        | "__dict__"
+                        | "__setattr__"
+                        | "f_globals"
+                        | "__globals__"
+                        | "f_locals"
+                        | "modules"
+                        | "__class__"
+                        | "__getattribute__"
+                        | "__spec__"
+                        | "exec"
+                        | "eval"
+                        | "globals"
+                        | "locals"
+                        | "vars"
+                        | "setattr"
+                        | "__import__"
+                        | "__builtins__"
+                        | "getattr"
+                        | "delattr"
+                )
+            {
+                return ControlFlow::Break(());
+            }
+            names.insert(name.to_owned());
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    matches!(result, ControlFlow::Continue(())).then_some(names)
 }
 
 fn supported(lang: LangId) -> bool {
@@ -554,6 +675,132 @@ fn compare(old: &Parts, new: &Parts) -> ChangeEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_python_added_classes_keep_method_owners_distinct() {
+        let old = "class _Trail:\n    def join(self, part):\n        return part\n";
+        let new = "class _Trail:\n    def join(self, part, origin):\n        return origin + part\n\nclass _Bundle:\n    def join(self, part, origin):\n        return origin + part\n";
+        let proof =
+            ChangeEvidenceIndex::from_sources(old.as_bytes(), new.as_bytes(), LangId::Python);
+        assert!(proof.proves_added("_Bundle", "class", LangId::Python));
+        assert!(proof.proves_added("_Bundle.join", "function", LangId::Python));
+        assert!(!proof.proves_added("_Trail", "class", LangId::Python));
+        assert!(!proof.proves_added("_Trail.join", "function", LangId::Python));
+        assert!(!proof.proves_added("join", "function", LangId::Python));
+    }
+
+    #[test]
+    fn evidence_python_added_class_requires_absent_static_old_binding() {
+        let class = "\nclass Counter:\n    def count(self):\n        return 0\n";
+        for old in [
+            "from collections import Counter\n",
+            "from collections import Counter as Counter\n",
+            "Counter = other\n",
+            "Counter: object\n",
+            "class Counter:\n    pass\n",
+            "def Counter():\n    return other\n",
+            "if flag:\n    Counter = other\n",
+            "Ｃｏｕｎｔｅｒ = other\n",
+        ] {
+            let new = format!("{old}{class}");
+            let proof =
+                ChangeEvidenceIndex::from_sources(old.as_bytes(), new.as_bytes(), LangId::Python);
+            assert!(
+                !proof.proves_added("Counter", "class", LangId::Python),
+                "{old}"
+            );
+            assert!(
+                !proof.proves_added("Counter.count", "function", LangId::Python),
+                "{old}"
+            );
+        }
+        for hazard in [
+            "from library import *\n",
+            "exec(code)\n",
+            "eval(code)\n",
+            "globals().update(values)\n",
+            "locals().update(values)\n",
+            "vars().update(values)\n",
+            "setattr(module, name, value)\n",
+            "value.__dict__.update(values)\n",
+            "def __getattr__(name):\n    return other\n",
+            "value.__globals__.update(values)\n",
+            "value.f_globals.update(values)\n",
+            "__builtins__[\"exec\"](\"class Counter: pass\")\n",
+            "getattr(__builtins__, \"exec\")(\"class Counter: pass\")\n",
+        ] {
+            for (old_hazard, new_hazard) in [(true, false), (false, true), (true, true)] {
+                let old = if old_hazard { hazard } else { "value = 0\n" };
+                let new = format!("{}{class}", if new_hazard { hazard } else { "value = 0\n" });
+                let proof = ChangeEvidenceIndex::from_sources(
+                    old.as_bytes(),
+                    new.as_bytes(),
+                    LangId::Python,
+                );
+                assert!(
+                    !proof.proves_added("Counter", "class", LangId::Python),
+                    "{old_hazard}: {hazard}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_python_added_class_rejects_ambiguous_or_indirect_declarations() {
+        for new in [
+            "class Counter:\n    pass\nclass Counter:\n    pass\n",
+            "class Counter:\n    pass\nclass Holder:\n    class Counter:\n        pass\n",
+            "@decorate\nclass Counter:\n    pass\n",
+            "if flag:\n    class Counter:\n        pass\n",
+        ] {
+            let proof = ChangeEvidenceIndex::from_sources(b"", new.as_bytes(), LangId::Python);
+            assert!(
+                !proof.proves_added("Counter", "class", LangId::Python),
+                "{new}"
+            );
+        }
+        let new = "class Counter:\n    def count(self):\n        return 0\n    def count(self, required):\n        return required\n";
+        let proof = ChangeEvidenceIndex::from_sources(b"", new.as_bytes(), LangId::Python);
+        assert!(proof.proves_added("Counter", "class", LangId::Python));
+        assert!(!proof.proves_added("Counter.count", "function", LangId::Python));
+    }
+
+    #[test]
+    fn evidence_python_added_class_keeps_unavailable_sources_unproven() {
+        let new = b"class Counter:\n    def count(self):\n        return 0\n";
+        let oversized = vec![b' '; MAX_EVIDENCE_SOURCE_BYTES + 1];
+        for proof in [
+            ChangeEvidenceIndex::unavailable(),
+            ChangeEvidenceIndex::from_sources(b"class Broken(\n", new, LangId::Python),
+            ChangeEvidenceIndex::from_sources(b"", b"class Counter(\n", LangId::Python),
+            ChangeEvidenceIndex::from_sources(&oversized, new, LangId::Python),
+            ChangeEvidenceIndex::from_sources(b"", &oversized, LangId::Python),
+        ] {
+            assert!(!proof.proves_added("Counter", "class", LangId::Python));
+            assert!(!proof.proves_added("Counter.count", "function", LangId::Python));
+        }
+    }
+
+    #[test]
+    fn evidence_python_added_class_node_kinds_exist() {
+        let language = LangId::Python.ts_language();
+        for kind in [
+            "class_definition",
+            "function_definition",
+            "identifier",
+            "wildcard_import",
+            "named_expression",
+            "match_statement",
+            "type_alias_statement",
+            "type_parameter",
+        ] {
+            assert!(
+                (0..language.node_kind_count())
+                    .any(|id| language.node_kind_for_id(id as u16) == Some(kind)),
+                "{kind}"
+            );
+        }
+    }
 
     fn evidence(lang: LangId, old: &str, new: &str, name: &str, kind: &str) -> ChangeEvidence {
         ChangeEvidenceIndex::from_sources(old.as_bytes(), new.as_bytes(), lang)

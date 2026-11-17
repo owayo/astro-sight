@@ -298,6 +298,21 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         &mut affected,
         &mut sig_changes,
     );
+    // 同名の別クラスのメソッドを、行比較による旧宣言との対応付けに混ぜない。
+    // 宣言比較の後に、元の所有型で証明した新規追加だけを確定する。
+    if lang_id == LangId::Python && single_in_place_file {
+        for (symbol, original) in affected.iter_mut().zip(&originals) {
+            let name = original.container.as_ref().map_or_else(
+                || original.name.clone(),
+                |owner| format!("{owner}.{}", original.name),
+            );
+            if symbol.change_type == "modified"
+                && syntax_evidence.proves_added(&name, &symbol.kind, lang_id)
+            {
+                symbol.change_type = "added".to_owned();
+            }
+        }
+    }
     if lang_id == LangId::Rust {
         let equivalent_names = crate::engine::rust_cfg::exclusive_const_names(root, &source);
         if !equivalent_names.is_empty() {
