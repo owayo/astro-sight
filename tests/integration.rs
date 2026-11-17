@@ -88,6 +88,7 @@ mod integration {
     mod rust_import_path;
     mod rust_parameter_patterns;
     mod rust_private_inline_test;
+    mod rust_private_macro_api;
     mod rust_reference_sites;
     mod rust_relative_reexport;
     mod rust_unicode_escapes;

@@ -1103,7 +1103,14 @@ pub(crate) fn exports(
                 }
                 "macro_invocation" | "expression_statement" => {
                     let (availability, availability_raw) = item_availability(item, source);
-                    let tokens = tokens_of(item, source);
+                    let binding_tokens = |node| {
+                        private_macro_bodies::binding_tokens(
+                            node,
+                            source,
+                            &index.private_macro_bodies,
+                        )
+                    };
+                    let tokens = binding_tokens(item);
                     // 呼び出すマクロの名前 (`a::b!` なら `b`)。
                     let invocation = if item.kind() == "macro_invocation" {
                         Some(item)
@@ -1136,7 +1143,7 @@ pub(crate) fn exports(
                                 .named_children(&mut inner_cursor)
                                 .find(|child| child.kind() == "token_tree")
                         })
-                        .map(|tree| tokens_of(tree, source))
+                        .map(binding_tokens)
                         .unwrap_or_else(|| tokens.clone());
                     if let Some(name) = &macro_name {
                         order.push((
