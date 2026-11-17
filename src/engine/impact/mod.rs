@@ -37,10 +37,7 @@ use crate::models::impact::{AffectedSymbol, DiffFile, FileImpact, HunkInfo, Sign
 use crate::models::symbol::SymbolKind;
 
 use pass2::{Pass2Evidence, stream_caller_maps_and_defs};
-use pass3::{
-    apply_stage4b_single, build_file_impact, compute_has_parent_by_ix,
-    demote_private_method_local_competitors,
-};
+use pass3::{build_file_impact, decode_caller_map, demote_private_method_local_competitors};
 pub(crate) use python_imports::non_method::{
     NamespaceCache as PythonNamespaceCache, sites as python_non_method_sites,
 };
@@ -186,10 +183,9 @@ fn ci_key(lang: LangId, name: &str) -> String {
 /// 3 パス方式で cross-file 参照を流し込む：
 ///   Pass 1:  変更ファイルをパースし affected シンボルを収集
 ///   Pass 2:  per-file で tree-sitter parse を 1 回実行し、Definition 集合と References を
-///            同時に集める。References は Stage 1-6 (Stage 4b 除く) を per-file で適用して
+///            同時に集める。References は参照位置ごとのフィルタを per-file で適用して
 ///            その場で `caller_map` に流し、候補 Vec を保持しない
-///   Pass 3:  結合済み caller_maps に Stage 4b (competing definition) を post-filter として
-///            適用し、FileImpact を組み立てる
+///   Pass 3:  結合済み caller_maps の ID を復号し、FileImpact を組み立てる
 ///
 /// candidate 保持を廃止し per-file で caller_map に即流すことで、worker ローカルの
 /// 中間バッファを `caller_map` のサイズ (数百MB) まで抑え、融合版で発生した
@@ -317,9 +313,6 @@ where
         string_pool,
     } = pass2_maps;
 
-    // Stage 4b 判定用: method parent を持つ sym_ix のビットセット
-    let has_parent_by_ix = compute_has_parent_by_ix(&sym_ix, &method_parent_types);
-
     // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → callback → drop。
     // 旧実装は `Vec<CallerMap>` 全件を String 化してから `FileImpact` を作っていたため、
     // 中間表現が 2 重に materialize されて RSS の 0.7-1.2 GB を食っていた（codex 分析）。
@@ -330,20 +323,8 @@ where
         let typed_map = std::mem::take(&mut caller_maps[fc_ix]);
         let typed_low_map = std::mem::take(&mut low_caller_maps[fc_ix]);
         let typed_informational_map = std::mem::take(&mut informational_caller_maps[fc_ix]);
-        let mut caller_map = apply_stage4b_single(
-            typed_map,
-            &def_paths_by_ix,
-            &string_pool,
-            &has_parent_by_ix,
-            &ctx,
-        );
-        let mut low_caller_map = apply_stage4b_single(
-            typed_low_map,
-            &def_paths_by_ix,
-            &string_pool,
-            &has_parent_by_ix,
-            &ctx,
-        );
+        let mut caller_map = decode_caller_map(typed_map, &string_pool);
+        let mut low_caller_map = decode_caller_map(typed_low_map, &string_pool);
         demote_private_method_local_competitors(
             &mut caller_map,
             &mut low_caller_map,
@@ -352,13 +333,7 @@ where
             &string_pool,
             &sym_ix,
         );
-        let informational_caller_map = apply_stage4b_single(
-            typed_informational_map,
-            &def_paths_by_ix,
-            &string_pool,
-            &has_parent_by_ix,
-            &ctx,
-        );
+        let informational_caller_map = decode_caller_map(typed_informational_map, &string_pool);
         let impact = build_file_impact(ctx, caller_map, low_caller_map, informational_caller_map);
         // affected_symbols / impacted_callers / signature_changes / low_confidence_callers /
         // informational_callers が
@@ -694,15 +669,10 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
 /// クラスベース言語 → クラス/トレイト/インタフェース/enum 名を返す
 /// Zig `const Foo = struct { fn bar() {} };` → `Some("Foo")` を返す
 ///
-/// **PHP trait の認識は load-bearing**: 大規模 Laravel/DDD 系プロジェクトで
-/// `trait Factory` のような trait 内 method 変更時、`find_parent_type_name` が
-/// None を返すと `method_parent_types` から該当エントリが消え Stage 4b の
-/// parent_in_this_file チェックが完全にバイパスされる。結果として
-/// `Other::new()` 等の同名 method 全件が誤って impacted_callers に流れる
-/// (実測: 1 リポで数千件規模の偽陽性)。
+/// PHP trait も親型として扱い、参照ファイルに現れる型名の照合に使う。
 ///
 /// **namespace は意図的に対象外**: TS `internal_module` / C++ `namespace_definition`
-/// は「scope」であって「親型」ではない。Stage 4b に混ぜると非修飾呼び出しや
+/// は「scope」であって「親型」ではない。親型の照合に混ぜると非修飾呼び出しや
 /// alias import を持つ正当な参照を落としてしまうため対象外とする。
 fn find_parent_type_name(
     root: tree_sitter::Node,

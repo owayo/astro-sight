@@ -34,6 +34,7 @@ mod integration {
     mod hidden_and_angular_liveness;
     mod identifier_spellings;
     mod impact;
+    mod impact_competing_definitions;
     mod impact_diff_input;
     mod impact_import_context;
     mod impact_jsx_props;

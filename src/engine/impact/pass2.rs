@@ -84,7 +84,7 @@ pub(super) struct StreamCallerMaps {
 struct SymIndexes {
     /// sym_ix → そのシンボルを cross-file 検索対象に含めた FileContext の index 列。
     sym_to_fc: Vec<Vec<u32>>,
-    /// sym_ix → 親型の sym_ix (method のみ、Stage 4b 判定用)。
+    /// sym_ix → 親型の sym_ix (method のみ、参照ファイルの型名照合用)。
     parent_ix_by_sym: Vec<Option<usize>>,
 }
 
@@ -297,7 +297,7 @@ fn impact_worker_count() -> usize {
 }
 
 /// Pass 2: per-file で tree-sitter parse を 1 回実行し、Definition 集合と References を
-/// 同時に集める。References は Stage 1-6 のうち Stage 4b を除くフィルタを per-file で
+/// 同時に集める。References は参照位置ごとのフィルタを per-file で
 /// 適用し、その場で per-worker local の `TypedCallerMap` に流す。候補 Vec は保持しない。
 ///
 /// worker local state の肥大化を抑えるため、ファイル群を `CHUNK_SIZE` 件ずつに区切って
