@@ -1545,7 +1545,9 @@ impl<'a> ImpactCollector<'a> {
         {
             return true;
         }
+        // C++ は auto・factory・型別名で所有型の名前を書かずに呼べる。
         if ctx.lang_id != LangId::Python
+            && ctx.lang_id != LangId::Cpp
             && facts.has_parent_type
             && !facts.parent_in_this_file
             && !private_method_candidate
