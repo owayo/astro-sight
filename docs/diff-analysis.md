@@ -39,6 +39,10 @@ The TS/TSX extension check inspects matching `tsconfig*.json` and `jsconfig*.jso
 
 If source/configuration evidence cannot be read or an analysis budget is exhausted, `truncations` reports `ts_extension_proof_unavailable` (`trunc[].r` in the hook), while unproven file changes retain the conservative classification. External configuration limits are 10,000 matching files, 2 MiB per file, 64 MiB total, and 128 ancestor levels.
 
+For Python, removing a public class's direct ordinary method does not produce `api.rm` when the same diff introduces a single local base that preserves the same callable binding. The proof requires unique unconditional file-root classes, identical method syntax and literal contents, plain positional parameters, and no free module names in the body. Primitive return annotations must remain unshadowed in both module and class scope. The base may be in the same file or imported directly from a regular local module resolved exactly under the workspace root or `src`, with inert package initializers. The owning class modification and its impacts remain visible; a preserved binding is not reported as dead cleanup.
+
+The owning module must also resolve exactly from the workspace root; its containing packages must have inert initializers in both the pinned base and new version. Owners below `src` remain unsupported because `src` may itself be a package with a different module identity. Decorators, metaclasses, multiple or unknown bases, aliases, forward annotations, future annotations, dynamic namespaces, unrelated imports, ambiguous roots/configuration, and unavailable or invalid sources retain the removal. This proof caches source facts per analysis and is bounded to 1 MiB and 100,000 named AST nodes per source, 8 MiB and 32 source versions total, 32 module resolutions, 64 directories, and 4,096 entries per directory. Exhausted evidence leaves the existing API removal blocking; it does not omit an output entry. Staged analysis uses index sources, independently of divergent working-tree files.
+
 ## context: Smart Context (Diff → Impact Analysis)
 
 For the additive reference evidence on newly exported names in `review`, see

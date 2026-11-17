@@ -147,6 +147,7 @@ pub(crate) struct DetectionInputs<'a> {
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
 pub(crate) struct DetectionState<'a> {
     pub(crate) buckets: &'a mut ApiChangeBuckets,
+    pub(crate) python_inherited: super::python_inherited_members::InheritedMembers,
     /// base/worktree を同じライフタイムへ閉じた Rust 公開面解析コンテキスト。
     pub(crate) rust_public: &'a mut RustPublicApiContext,
     pub(crate) closure_caches: &'a mut crate::commands::api_changes::ref_index::ApiClosureCaches,

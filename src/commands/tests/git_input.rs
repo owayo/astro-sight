@@ -18,6 +18,73 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn git_blob_mode_uses_pinned_revision_and_literal_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_git_repo_for_test(root);
+    git_commit_files(
+        root,
+        &[
+            ("a[1].py", "class Owner: pass\n"),
+            ("a1.py", "class Other: pass\n"),
+            ("package/item.py", "pass\n"),
+        ],
+        "base",
+    );
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let revision = String::from_utf8(revision.stdout).unwrap();
+    let pinned = git_input::GitBlobBatch::new(root.to_str().unwrap(), revision.trim());
+    assert!(pinned.is_regular_file("a[1].py"));
+    assert!(!pinned.is_regular_file("a*.py"));
+    assert!(!pinned.is_regular_file("package"));
+    assert!(!pinned.is_regular_file("missing.py"));
+    assert!(!pinned.is_regular_file("--missing.py"));
+    let object = Command::new("git")
+        .args(["rev-parse", "HEAD:a1.py"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(object.status.success());
+    let object = String::from_utf8(object.stdout).unwrap();
+    git_in(
+        root,
+        &[
+            "update-index",
+            "--cacheinfo",
+            "120000",
+            object.trim(),
+            "a[1].py",
+        ],
+    );
+    git_in(root, &["update-index", "--chmod=+x", "package/item.py"]);
+    git_in(
+        root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            revision.trim(),
+            "nested",
+        ],
+    );
+    git_in(root, &["commit", "-m", "link mode"]);
+    assert!(pinned.is_regular_file("a[1].py"));
+    let current = git_input::GitBlobBatch::new(root.to_str().unwrap(), "HEAD");
+    assert!(!current.is_regular_file("a[1].py"));
+    assert!(!current.is_regular_file("nested"));
+    assert!(current.is_regular_file("package/item.py"));
+    let subtree =
+        git_input::GitBlobBatch::new(root.join("package").to_str().unwrap(), revision.trim());
+    assert!(subtree.is_regular_file("item.py"));
+}
+
 /// 利用者がサブモジュール内部の diff を選んでも、gitlink のポインタ差分として扱う。
 #[test]
 fn run_git_diff_submodule_setting_keeps_gitlink_deletion_parseable() {
