@@ -363,6 +363,13 @@ pub(super) fn collect_removed_symbols(
                 });
                 continue;
             }
+            // 新しい基底に同じ通常メソッドが残る場合、公開束縛は削除されていない。
+            if state
+                .python_inherited
+                .proves(inputs, &df.old_path, &df.new_path, name, kind)
+            {
+                continue;
+            }
             // 同名宣言が 1 件ずつの場合だけ、ERROR 内のヘッダを未検証の証拠にする。
             // 複数定義の一部削除を隠さず、move / dead の相殺にも流さない。
             if kind == "function"

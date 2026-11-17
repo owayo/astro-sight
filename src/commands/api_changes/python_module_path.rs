@@ -34,13 +34,16 @@ fn competing_module(parent: &Path, name: &str) -> Option<bool> {
     Some(false)
 }
 
-fn inert_package(parent: &Path) -> Option<()> {
+fn package_initializer(parent: &Path) -> Option<PathBuf> {
     if competing_module(parent, "__init__")? {
         return None;
     }
-    let init = exact_entry(parent, "__init__.py")?;
-    let path = camino::Utf8PathBuf::from_path_buf(init).ok()?;
-    let source = crate::engine::parser::read_file(&path).ok()?;
+    exact_entry(parent, "__init__.py")
+}
+
+fn inert_initializer(init: &Path) -> Option<()> {
+    let path = camino::Utf8Path::from_path(init)?;
+    let source = crate::engine::parser::read_file(path).ok()?;
     if source.len() > 1_000_000 {
         return None;
     }
@@ -69,6 +72,14 @@ fn inert_package(parent: &Path) -> Option<()> {
 }
 
 pub(crate) fn resolve(dir: &str, module: &str) -> Option<String> {
+    resolve_with_package_check(dir, module, inert_initializer)
+}
+
+pub(super) fn resolve_with_package_check(
+    dir: &str,
+    module: &str,
+    mut package_check: impl FnMut(&Path) -> Option<()>,
+) -> Option<String> {
     let parts: Vec<_> = module.split('.').collect();
     if parts.is_empty()
         || parts.iter().any(|part| {
@@ -116,7 +127,7 @@ pub(crate) fn resolve(dir: &str, module: &str) -> Option<String> {
         if !parent.is_dir() {
             return None;
         }
-        inert_package(&parent)?;
+        package_check(&package_initializer(&parent)?)?;
     }
     let name = parts.last()?;
     if competing_module(&parent, name)? {
@@ -134,7 +145,7 @@ pub(crate) fn resolve(dir: &str, module: &str) -> Option<String> {
         if p.is_dir()
             && (p.join("__init__.py").try_exists().ok()? || competing_module(&p, "__init__")?)
         {
-            inert_package(&p)?;
+            package_check(&package_initializer(&p)?)?;
             Some(exact_entry(&p, "__init__.py")?)
         } else {
             None

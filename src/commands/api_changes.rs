@@ -198,6 +198,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
+        python_inherited: python_inherited_members::InheritedMembers::default(),
         rust_public: &mut rust_public,
         closure_caches: &mut closure_caches,
     };
@@ -1013,6 +1014,7 @@ mod python_contract;
 pub(crate) mod python_module_path;
 
 mod python_import_rebinding;
+mod python_inherited_members;
 mod python_literal;
 mod python_member_origin;
 mod python_optional_removal;
