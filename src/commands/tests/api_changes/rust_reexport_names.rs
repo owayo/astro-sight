@@ -3085,3 +3085,85 @@ fn private_module_aliases_remain_inputs_of_public_aliases() {
     assert_ne!(classify(&api, "exposed").0, "none", "{api:?}");
     assert!(!incomplete(&api), "{api:?}");
 }
+
+#[test]
+fn private_glob_additions_do_not_expand_unrelated_path_names() {
+    let imports: String = (0..10_001)
+        .map(|index| format!("use crate::stable::Item as A{index};\n"))
+        .collect();
+    let old = format!("pub mod stable {{ pub struct Item; }}\nmod consumer {{\n{imports}}}\n");
+    let new = format!("{old}mod detail;\n");
+    let api = api_changes(
+        &[("src/lib.rs", &old)],
+        &[
+            ("src/lib.rs", &new),
+            ("src/detail.rs", "use super::*;\nfn untouched() {}\n"),
+        ],
+    );
+    assert!(!incomplete(&api), "{api:?}");
+    assert!(api.added.is_empty(), "{api:?}");
+    assert!(api.removed.is_empty(), "{api:?}");
+    assert!(api.modified.is_empty(), "{api:?}");
+}
+
+#[test]
+fn unknown_path_prefixes_keep_the_reexport_name_limit() {
+    let imports: String = (0..10_001)
+        .map(|index| format!("use remote::stable::Item as A{index};\n"))
+        .collect();
+    let old = format!("pub mod stable {{ pub struct Item; }}\nmod consumer {{\n{imports}}}\n");
+    let new = format!("{old}mod detail;\n");
+    let api = api_changes(
+        &[("src/lib.rs", &old)],
+        &[
+            ("src/lib.rs", &new),
+            ("src/detail.rs", "use super::*;\nfn untouched() {}\n"),
+        ],
+    );
+    assert!(incomplete(&api), "{api:?}");
+}
+
+#[test]
+fn actual_public_reexports_keep_the_reexport_name_limit() {
+    let exports: String = (0..10_001)
+        .map(|index| format!("pub use crate::stable::Item as A{index};\n"))
+        .collect();
+    let new = exports.replace("::Item as", "::Other as");
+    let api = api_changes(
+        &[
+            (
+                "src/lib.rs",
+                "pub mod stable { pub struct Item; pub struct Other; }\npub mod consumer;\n",
+            ),
+            ("src/consumer.rs", &exports),
+        ],
+        &[("src/consumer.rs", &new)],
+    );
+    assert!(incomplete(&api), "{api:?}");
+}
+
+#[test]
+fn scoped_path_users_keep_public_alias_and_glob_changes() {
+    let modules = "mod left { pub mod api { pub struct Old; } }\nmod right { pub mod api { pub struct New; } }\nmod unrelated { use crate::left as selected; }\n";
+    for reexport in [
+        "pub use selected::api as exposed;\n",
+        "pub mod exposed { pub use super::selected::api::*; }\n",
+    ] {
+        let old = format!("{modules}use crate::left as selected;\n{reexport}");
+        let new = old.replace(
+            "use crate::left as selected;\n",
+            "use crate::right as selected;\n",
+        );
+        let api = api_changes(&[("src/lib.rs", &old)], &[("src/lib.rs", &new)]);
+        if reexport.starts_with("pub use") {
+            assert_eq!(classify(&api, "exposed").0, "mod", "{api:?}");
+        } else {
+            assert!(
+                matches!(classify(&api, "Old").0, "rm" | "rm_dead"),
+                "{api:?}"
+            );
+            assert_eq!(classify(&api, "New").0, "add", "{api:?}");
+        }
+        assert!(!incomplete(&api), "{api:?}");
+    }
+}
