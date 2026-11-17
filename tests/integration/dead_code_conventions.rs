@@ -1395,7 +1395,7 @@ export class TrimPipe implements PipeTransform {
 /// 他の未参照シンボルは引き続き dead として報告する (対照)。
 #[test]
 fn dead_code_excludes_program_entrypoints() {
-    let cases: [(&str, &str, &[&str], &[&str]); 5] = [
+    let cases: [(&str, &str, &[&str], &[&str]); 6] = [
         (
             "main.c",
             "int main(void) { return 0; }\nint unused_c_helper(void) { return 1; }\n",
@@ -1407,6 +1407,12 @@ fn dead_code_excludes_program_entrypoints() {
             "#include <cstdio>\nint main() { return 0; }\nint unused_cpp_helper() { return 1; }\n",
             &["main"],
             &["unused_cpp_helper"],
+        ),
+        (
+            "windows.cpp",
+            "#ifdef _WIN32\nint wmain(int count, wchar_t**) { return count; }\n#else\nint main(int count, char**) { return count; }\n#endif\nint WINAPI wWinMain(HINSTANCE a, HINSTANCE b, LPWSTR c, int d) { return d; }\nint unused_win_helper() { return 1; }\n",
+            &["wmain", "main", "wWinMain"],
+            &["unused_win_helper"],
         ),
         (
             "Main.kt",
@@ -1445,6 +1451,49 @@ fn dead_code_excludes_program_entrypoints() {
             );
         }
     }
+}
+
+#[test]
+fn windows_crt_entrypoints_do_not_block_review_hook() {
+    let repo = TestRepo::new();
+    let original = "#ifdef _WIN32\nint wmain(int count, wchar_t**) { return count; }\n#else\nint main(int count, char**) { return count; }\n#endif\nint unused_win_helper() { return 1; }\n";
+    repo.write("main.cpp", original);
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "main.cpp",
+        original.replace("return count;", "return count + 1;"),
+    );
+    let json = repo.run_json("review", &["--git"]);
+    assert!(
+        json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["name"] != "wmain" && symbol["name"] != "main"),
+        "{json}"
+    );
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 対照: 同じ差分で変更した通常の未参照関数は dead に残る。
+    repo.write("main.cpp", original.replace("return 1;", "return 2;"));
+    let json = repo.run_json("review", &["--git"]);
+    assert!(
+        json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "unused_win_helper"),
+        "{json}"
+    );
 }
 
 #[test]

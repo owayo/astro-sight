@@ -876,7 +876,7 @@ Ruby では `Builder.new`・`Demo::Builder.new`・`::Demo::Builder.new` のよ�
 - **PHP のアノテーションと属性**: docblock に大文字で始まるアノテーション（`@Route` / `@Entity` など）か PHPUnit の `@test` / `@dataProvider` などを書いたメソッド・クラスと、同じ名前の PHP 8 の属性（`#[Route]` / `#[Test]` など）を付けたもの
 - **構文から呼ばれるメソッド**: Kotlin の `operator fun` と Swift の `callAsFunction`。演算子や関数呼び出しの構文から呼ばれ、名前では参照されない。API 差分には残す
 - **プログラムのエントリポイント**: 次を除外する。API 差分には残す
-  - C / C++: グローバルスコープの `main`
+  - C / C++: グローバルスコープの `main`、Windows CRT の入口 `wmain`・`WinMain`・`wWinMain`・`DllMain`、`<tchar.h>` のマクロ `_tmain`・`_tWinMain`
   - Kotlin: トップレベルの `fun main`、`object` / `companion object` 直下の `@JvmStatic fun main`
   - Java: private でない `void main`（引数なしか `String[]` 1 個。Java 25 の instance main を含む）
   - C#: `static Main`（引数なしか `string[]` 1 個）
