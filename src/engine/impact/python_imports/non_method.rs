@@ -15,6 +15,12 @@ struct LocalFunction {
     after: usize,
 }
 
+struct LiteralBinding {
+    name: String,
+    function: usize,
+    after: usize,
+}
+
 struct Module {
     binding: String,
     receiver: String,
@@ -22,9 +28,10 @@ struct Module {
 }
 
 #[derive(Default)]
-pub(super) struct NamespaceCache {
+pub(crate) struct NamespaceCache {
     directories: Mutex<HashMap<PathBuf, Option<Arc<DirectoryShadows>>>>,
     source_roots: Mutex<HashMap<PathBuf, Arc<SourceRoot>>>,
+    snapshot_namespaces: Mutex<HashMap<PathBuf, bool>>,
 }
 
 enum SourceRoot {
@@ -39,6 +46,15 @@ struct DirectoryShadows {
 }
 
 impl NamespaceCache {
+    fn snapshot_namespaces_are_visible(&self, workspace: &Path) -> bool {
+        *self
+            .snapshot_namespaces
+            .lock()
+            .expect("Python snapshot cache poisoned")
+            .entry(workspace.to_owned())
+            .or_insert_with(|| snapshot_has_only_regular_entries(workspace))
+    }
+
     fn directory(&self, path: &Path) -> Option<Arc<DirectoryShadows>> {
         self.directories
             .lock()
@@ -73,7 +89,7 @@ impl NamespaceCache {
     }
 }
 
-pub(super) fn sites(
+pub(crate) fn sites(
     root: Node<'_>,
     source: &[u8],
     workspace: &Path,
@@ -84,11 +100,22 @@ pub(super) fn sites(
         return HashSet::new();
     }
     let mut ancestors = Vec::<Node<'_>>::new();
+    let mut function_scopes = Vec::<(usize, usize)>::new();
     let mut functions = Vec::new();
+    let mut literals = Vec::new();
     let mut calls = Vec::new();
     let mut ignored = HashSet::new();
     let traversal = walk_preorder(root, Children::Named, |node, depth| {
         ancestors.truncate(depth);
+        while function_scopes
+            .last()
+            .is_some_and(|(scope, _)| *scope >= depth)
+        {
+            function_scopes.pop();
+        }
+        if node.kind() == "function_definition" {
+            function_scopes.push((depth, node.id()));
+        }
         if node.kind() == "identifier"
             && node.utf8_text(source).ok().is_none_or(|name| {
                 !name.is_ascii()
@@ -139,7 +166,29 @@ pub(super) fn sites(
             }
         }
         if node.kind() == "call" {
-            calls.push(node);
+            calls.push((node, function_scopes.last().map(|(_, function)| *function)));
+        }
+        // 関数直下で初期化した空リストだけを扱い、条件付きの代入や closure は証明しない。
+        if node.kind() == "assignment"
+            && let [.., function, block, statement] = ancestors.as_slice()
+            && function.kind() == "function_definition"
+            && block.kind() == "block"
+            && statement.kind() == "expression_statement"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+            && right.kind() == "list"
+            && right.named_child_count() == 0
+            && let Ok(name) = left.utf8_text(source)
+        {
+            ignored.insert(left.id());
+            literals.push(LiteralBinding {
+                name: name.to_owned(),
+                function: function.id(),
+                after: node.end_byte(),
+            });
         }
         ancestors.push(node);
         ControlFlow::Continue(Walk::Descend)
@@ -202,6 +251,7 @@ pub(super) fn sites(
         .iter()
         .map(|function| function.name.as_str())
         .chain(modules.iter().map(|module| module.binding.as_str()))
+        .chain(literals.iter().map(|literal| literal.name.as_str()))
     {
         *counts.entry(name).or_default() += 1;
     }
@@ -214,7 +264,11 @@ pub(super) fn sites(
         .iter()
         .map(|module| (module.receiver.as_str(), module))
         .collect();
-    for call in calls {
+    let literals: HashMap<_, _> = literals
+        .iter()
+        .map(|literal| (literal.name.as_str(), literal))
+        .collect();
+    for (call, function) in calls {
         let Some(callee) = call.child_by_field_name("function") else {
             continue;
         };
@@ -245,7 +299,12 @@ pub(super) fn sites(
             let Ok(receiver) = receiver.utf8_text(source) else {
                 continue;
             };
-            if modules.get(receiver).is_some_and(|module| {
+            if literals.get(receiver).is_some_and(|literal| {
+                Some(literal.function) == function
+                    && literal.after < call.start_byte()
+                    && !blocked.contains(receiver)
+                    && counts.get(receiver) == Some(&1)
+            }) || modules.get(receiver).is_some_and(|module| {
                 module.after < call.start_byte()
                     && !blocked.contains(&module.binding)
                     && counts.get(module.binding.as_str()) == Some(&1)
@@ -263,6 +322,9 @@ fn shadow_roots(
     path: &Path,
     cache: &NamespaceCache,
 ) -> Option<Vec<Arc<DirectoryShadows>>> {
+    if !cache.snapshot_namespaces_are_visible(workspace) {
+        return None;
+    }
     let mut current = path.parent()?.canonicalize().ok()?;
     if !current.starts_with(workspace) {
         return None;
@@ -302,6 +364,42 @@ fn shadow_roots(
     }
 }
 
+// snapshot が省いたリンクを「モジュールがない」証拠にしない。固定 tree の mode だけ読む。
+fn snapshot_has_only_regular_entries(workspace: &Path) -> bool {
+    if !crate::git_support::is_inside_index_snapshot(workspace) {
+        return true;
+    }
+    let check = || {
+        let tree = crate::git_support::index_snapshot_tree(workspace)?;
+        let mut child = crate::git_support::git_command_for_dir(workspace)
+            .args(["ls-tree", "-r", "-z", "--format=%(objectmode)"])
+            .arg(tree)
+            .current_dir(workspace)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let output = crate::commands::read_bytes_limited_and_drain(
+            child.stdout.take()?,
+            1024 * 1024,
+            "Python snapshot modes",
+        );
+        if !child.wait().ok()?.success() {
+            return None;
+        }
+        let output = output.ok()?;
+        let modes = output.strip_suffix(b"\0")?;
+        (!modes.is_empty()
+            && modes
+                .split(|byte| *byte == 0)
+                .all(|mode| matches!(mode, b"100644" | b"100755")))
+        .then_some(())
+    };
+    check().is_some()
+}
+
 fn read_directory(path: &Path) -> Option<DirectoryShadows> {
     let mut roots = HashSet::new();
     let mut entries = 0usize;
@@ -339,6 +437,23 @@ mod tests {
     use super::*;
     use crate::engine::parser;
     use crate::language::LangId;
+
+    #[test]
+    fn python_namespace_snapshot_failure_is_cached_for_one_query() {
+        for marker in ["invalid", "0000000000000000000000000000000000000000"] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().canonicalize().unwrap();
+            let git = workspace.join(".git");
+            std::fs::create_dir(&git).unwrap();
+            let path = git.join(crate::git_support::INDEX_SNAPSHOT_MARKER);
+            std::fs::write(&path, marker).unwrap();
+            let cache = NamespaceCache::default();
+            assert!(!cache.snapshot_namespaces_are_visible(&workspace));
+            std::fs::remove_file(&path).unwrap();
+            assert!(!cache.snapshot_namespaces_are_visible(&workspace));
+            assert!(NamespaceCache::default().snapshot_namespaces_are_visible(&workspace));
+        }
+    }
 
     #[test]
     fn python_namespace_packaging_configs_keep_module_calls_unproven() {
@@ -658,6 +773,10 @@ mod tests {
             "attribute",
             "string",
             "concatenated_string",
+            "assignment",
+            "expression_statement",
+            "list",
+            "for_in_clause",
         ] {
             assert!(
                 tree_sitter::Query::new(&language, &format!("({kind}) @probe")).is_ok(),

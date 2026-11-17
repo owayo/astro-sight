@@ -10,7 +10,7 @@ use tree_sitter::Node;
 use crate::engine::parser;
 use crate::language::LangId;
 
-mod non_method;
+pub(super) mod non_method;
 
 struct ImportBinding {
     owner: PathBuf,
@@ -404,7 +404,7 @@ fn blocked_names(
                     collect_names(name, source, ignored, &mut blocked);
                 }
             }
-            "assignment" | "augmented_assignment" | "for_statement" => {
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
                 if let Some(left) = node.child_by_field_name("left") {
                     collect_names(left, source, ignored, &mut blocked);
                 }

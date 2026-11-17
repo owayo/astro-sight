@@ -19,7 +19,6 @@ mod reference_evidence;
 pub use crate::output::{OutputFormat, OutputOptions, serialize_cli_document, serialize_document};
 #[cfg(test)]
 pub(crate) use common::ChangedFileSet;
-#[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
 pub(crate) use common::{
     DiffCallerResolution, cache_hash_for_path, log_phase, read_to_string_limited,

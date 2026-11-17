@@ -41,6 +41,9 @@ use pass3::{
     apply_stage4b_single, build_file_impact, compute_has_parent_by_ix,
     demote_private_method_local_competitors,
 };
+pub(crate) use python_imports::non_method::{
+    NamespaceCache as PythonNamespaceCache, sites as python_non_method_sites,
+};
 use reexport_move::ReexportMoveIndex;
 pub(crate) use rust_path_owner::scan_ordinary_sources as rust_import_path_environment_is_closed;
 use signature::detect_signature_changes;
