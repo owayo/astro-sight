@@ -27,7 +27,6 @@ struct Source {
 struct Facts {
     identifiers: HashSet<String>,
     classes: HashSet<String>,
-    methods: HashSet<String>,
     annotations: HashSet<String>,
     uncertain_annotation: bool,
     has_all: bool,
@@ -164,14 +163,6 @@ impl PrivateOwnerRemovals {
         let Some(project) = project else {
             return false;
         };
-        // 同名のメソッドが残る移設に限定する。定義も無い未知 caller は従来どおり保留。
-        if !project
-            .current
-            .values()
-            .any(|facts| facts.methods.contains(member))
-        {
-            return false;
-        }
         *self
             .proven
             .entry((
@@ -537,16 +528,6 @@ impl Source {
                     return None;
                 }
                 facts.classes.insert(name.to_owned());
-            }
-            if node.kind() == "function_definition"
-                && node
-                    .parent()
-                    .and_then(|body| body.parent())
-                    .is_some_and(|class| class.kind() == "class_definition")
-            {
-                facts
-                    .methods
-                    .insert(text(node.child_by_field_name("name")?, &bytes)?.to_owned());
             }
         }
         let invalid_uses: HashSet<String> = all

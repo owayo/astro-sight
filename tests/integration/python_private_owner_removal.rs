@@ -5,6 +5,176 @@ use super::support::*;
 const BEFORE: &str = "class _Layout:\n    def __init__(self, items):\n        self.items = items\n\n    def width(self):\n        return len(self.items)\n\n    def build(self):\n        return '-' * self.width()\n\ndef draw_bars(items):\n    return _Layout(items).build()\n";
 const AFTER: &str = "class _Frame:\n    def __init__(self, items):\n        self.items = items\n\n    def width(self):\n        return len(self.items)\n\nclass _BarLayout(_Frame):\n    def build(self):\n        return '-' * self.width()\n\ndef draw_bars(items):\n    return _BarLayout(items).build()\n";
 
+const DELETED_CLASS: &str = "class _Table:\n    def add(self, key):\n        return key\n\n    def fuse(self, other):\n        return other\n\ndef count(values):\n    table = _Table()\n    for value in values:\n        table.add(value)\n    table.fuse(None)\n    return 0\n";
+const DELETED_CLASS_AFTER: &str = "def count(values):\n    return sorted(values)\n";
+const UNRELATED_CALLS: &str = "def unique(values):\n    seen = set()\n    for value in values:\n        seen.add(value)\n    return seen\n\ndef combine(left, right):\n    return left.fuse(right)\n";
+
+fn deletion_fixture(before: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("pkg");
+    repo.write("pkg/__init__.py", "");
+    repo.write("pkg/table.py", before);
+    repo.write("pkg/seen.py", UNRELATED_CALLS);
+    repo.commit_all("fixture");
+    repo
+}
+
+fn assert_deleted_class_closed(repo: &TestRepo, staged: bool) {
+    let args = if staged {
+        &["--git", "--staged"][..]
+    } else {
+        &["--git"][..]
+    };
+    let review = repo.run_json("review", args);
+    assert!(
+        review["api_changes"]["removed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{review}"
+    );
+    for name in ["_Table.add", "_Table.fuse"] {
+        assert!(
+            review["api_changes"]["removed_dead"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == name),
+            "{review}"
+        );
+    }
+    let output = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(args)
+        .arg("--hook")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(hook["blocking_categories"], serde_json::json!([]), "{hook}");
+    for name in ["_Table.add", "_Table.fuse"] {
+        assert!(
+            hook["api"]["rm_dead"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["n"] == name),
+            "{hook}"
+        );
+    }
+}
+
+fn assert_deleted_class_blocked(repo: &TestRepo, owner: &str) {
+    let output = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    for member in ["add", "fuse"] {
+        assert!(
+            hook["api"]["rm"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["n"] == format!("{owner}.{member}")),
+            "{hook}"
+        );
+    }
+}
+
+#[test]
+fn python_private_owner_removal_deletes_a_closed_class_without_replacement() {
+    for delete_file in [false, true] {
+        let repo = deletion_fixture(DELETED_CLASS);
+        if delete_file {
+            repo.remove_file("pkg/table.py");
+        } else {
+            repo.write("pkg/table.py", DELETED_CLASS_AFTER);
+        }
+        assert_deleted_class_closed(&repo, false);
+        for name in ["add", "fuse"] {
+            let single = repo.run_json("refs", &["--name", name]);
+            let batch = repo.run_json("refs", &["--names", name]);
+            assert_eq!(single, batch);
+            let refs = single["refs"].as_array().unwrap();
+            assert_eq!(refs.len(), 1, "{single}");
+            assert_eq!(refs[0]["path"], "pkg/seen.py", "{single}");
+            assert_eq!(refs[0]["kind"], "ref", "{single}");
+        }
+    }
+}
+
+#[test]
+fn python_private_owner_removal_deletes_a_closed_class_from_the_index() {
+    for delete_file in [false, true] {
+        let repo = deletion_fixture(DELETED_CLASS);
+        if delete_file {
+            repo.remove_file("pkg/table.py");
+        } else {
+            repo.write("pkg/table.py", DELETED_CLASS_AFTER);
+        }
+        repo.stage_all();
+        repo.write(
+            "pkg/table.py",
+            "def count(values):\n    return _Table().add(values)\n",
+        );
+        assert_deleted_class_closed(&repo, true);
+        assert_deleted_class_blocked(&repo, "_Table");
+    }
+}
+
+#[test]
+fn python_private_owner_removal_keeps_pure_deletion_public_paths_blocking() {
+    let repo = deletion_fixture(&DELETED_CLASS.replace("_Table", "Table"));
+    repo.write(
+        "pkg/public.py",
+        "from pkg.table import Table\n\ndef use():\n    return Table().add(1), Table().fuse(None)\n",
+    );
+    repo.commit_all("public caller");
+    repo.write("pkg/table.py", DELETED_CLASS_AFTER);
+    assert_deleted_class_blocked(&repo, "Table");
+
+    let mut cases = vec![DELETED_CLASS.replace(
+        "    table.fuse(None)\n    return 0",
+        "    return table.fuse(table)",
+    )];
+    for extra in [
+        "Public = _Table\n",
+        "def create():\n    return _Table()\n",
+        "def create():\n    table = _Table()\n    return lambda: table.add(1)\n",
+        "def consume(table: '_Table'):\n    return table.add(1)\n",
+    ] {
+        cases.push(format!("{DELETED_CLASS}\n{extra}"));
+    }
+    for before in cases {
+        let repo = deletion_fixture(&before);
+        repo.write("pkg/table.py", DELETED_CLASS_AFTER);
+        assert_deleted_class_blocked(&repo, "_Table");
+    }
+}
+
+#[test]
+fn python_private_owner_removal_keeps_unproven_pure_deletions_blocking() {
+    for extra in [
+        "from pkg.table import _Table\n",
+        "def reflect():\n    return getattr(object(), 'add')\n",
+        "def broken(:\n    pass\n",
+    ] {
+        let repo = deletion_fixture(DELETED_CLASS);
+        repo.write("pkg/unproven.py", extra);
+        repo.commit_all("unproven sources");
+        repo.write("pkg/table.py", DELETED_CLASS_AFTER);
+        assert_deleted_class_blocked(&repo, "_Table");
+    }
+}
+
 fn refactor(before: &str, after: &str, extras: &[(&str, &str)]) -> std::process::Output {
     let mut files = vec![("draw/__init__.py", ""), ("draw/chart.py", before)];
     files.extend_from_slice(extras);
