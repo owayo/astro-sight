@@ -229,8 +229,8 @@ fn type_declares_entrypoint(type_node: Node, source: &[u8], lang_id: LangId) -> 
 
 // --- C / C++ ---
 
-/// グローバルスコープの自由関数 `main` か。引数の形は問わない
-/// (`int main(void)` / `int main(int, char**)` / 環境変数付きなど処理系で幅がある)。
+/// グローバルスコープで CRT が名前で呼ぶ自由関数か。`_tmain` / `_tWinMain` は `<tchar.h>` の入口マクロ。
+/// 引数の型や呼び出し規約には処理系ごとの差やマクロがあるので、形は問わない。
 fn is_c_family_main(
     function: Node,
     source: &[u8],
@@ -253,7 +253,10 @@ fn is_c_family_main(
     }
     // クラス内のメソッドは field_identifier、クラス外定義は qualified_identifier になる。
     declarator.kind() == "identifier"
-        && node_text(declarator, source) == "main"
+        && matches!(
+            node_text(declarator, source),
+            "main" | "wmain" | "WinMain" | "wWinMain" | "DllMain" | "_tmain" | "_tWinMain"
+        )
         && !has_ancestor(function, non_global_scope_kinds)
 }
 
@@ -761,6 +764,29 @@ int main(int argc, char **argv) { return 0; }
 #endif
 "#;
         assert_entrypoints(LangId::Cpp, cpp, &[("main", 10)]);
+    }
+
+    #[test]
+    fn c_and_cpp_windows_crt_entrypoints_are_global_free_functions_only() {
+        for lang in [LangId::C, LangId::Cpp] {
+            assert_entrypoints(
+                lang,
+                "int wmain(int count, wchar_t **args) { return count; }\nint WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) { return d; }\nint WINAPI wWinMain(HINSTANCE a, HINSTANCE b, LPWSTR c, int d) { return d; }\nBOOL APIENTRY DllMain(HMODULE a, DWORD b, LPVOID c) { return 1; }\nint _tmain(int count, TCHAR **args) { return count; }\nint WINAPI _tWinMain(HINSTANCE a, HINSTANCE b, LPTSTR c, int d) { return d; }\nint Wmain() { return 1; }\nint wmain_helper() { return 2; }\n",
+                &[
+                    ("wmain", 0),
+                    ("WinMain", 1),
+                    ("wWinMain", 2),
+                    ("DllMain", 3),
+                    ("_tmain", 4),
+                    ("_tWinMain", 5),
+                ],
+            );
+        }
+        assert_entrypoints(
+            LangId::Cpp,
+            "namespace app { int wmain() { return 1; } }\nclass App { public: int WinMain() { return 2; } };\nint App::wWinMain() { return 3; }\n#ifdef _WIN32\nint wmain(int count, wchar_t**) { return count; }\n#else\nint main(int count, char**) { return count; }\n#endif\n",
+            &[("wmain", 4), ("main", 6)],
+        );
     }
 
     #[test]

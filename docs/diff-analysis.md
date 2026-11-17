@@ -843,7 +843,7 @@ Symbols that frameworks and test runners call dynamically, by naming convention 
 - **Methods called through syntax**: Kotlin `operator fun` and Swift `callAsFunction`. They are called through operators or call syntax, not by name. They stay in the API diff
 - **Swift external protocol witnesses**: `applicationShouldTerminateAfterLastWindowClosed(_:)`, `menuNeedsUpdate(_:)`, `hash(into:)`, `makeNSView(context:)`, and `updateNSView(_:context:)` are excluded when the owning type's SDK/standard-library conformance and the method signature are established. Helpers and unused owners remain candidates. Additional requirements can be declared in [configuration](configuration.md#swift-protocol-methods); API changes and `refs` are unchanged
 - **Program entry points**: the following are excluded (they stay in the API diff)
-  - C / C++: `main` at global scope
+  - C / C++: global-scope `main`, Windows CRT entry points `wmain`, `WinMain`, `wWinMain`, and `DllMain`, and the `<tchar.h>` macros `_tmain` and `_tWinMain`
   - Kotlin: top-level `fun main`, and `@JvmStatic fun main` directly inside an `object` / `companion object`
   - Java: non-private `void main` (with no parameters or a single `String[]`, including Java 25 instance main)
   - C#: `static Main` (with no parameters or a single `string[]`)
