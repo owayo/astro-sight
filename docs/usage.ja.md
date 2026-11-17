@@ -341,7 +341,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1 行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、リクエスト内の相対 `path` / `dir` はワークスペースルート基準で解決する。空文字・非 UTF-8・存在しないパスなどの不正なワークスペース値は `INVALID_REQUEST` で終了する。
+stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange`, `scan_symbols` をサポートする。1 行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、リクエスト内の相対 `path` / `dir` はワークスペースルート基準で解決する。空文字・非 UTF-8・存在しないパスなどの不正なワークスペース値は `INVALID_REQUEST` で終了する。
 
 ```bash
 # calls コマンド
@@ -355,6 +355,13 @@ printf '%s\n' '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/s
 ```
 
 `refs` を session で使う場合も `name` または `names` の指定が必須（空文字不可）。
+
+`scan_symbols` は、プロジェクト辞書のためにシンボルを集める（`{"command":"scan_symbols","dir":"."}`）。`source_files`（`dir` からの相対パス）を渡すと、そのパスだけを読み直す。全体と差分のどちらも同じ選別（`.gitignore`・`.ignore`・`.git/info/exclude`・global の除外、隠しファイル、言語、1MiB の上限、生成物の判定）を当てる。
+
+- 差分の結果（`full_scan: false`）では、要求した各パスが `files` か `removed` のどちらかに入る。どちらも、そのパスと、その下のパス（`パス + "/"` で始まるもの）の項目を表す。`removed` のパスは辞書から消し、`files` のパスはその内容で置き換える。消えたファイルとディレクトリ、全体の走査で返らなくなったパス（ignore の規則で除外・隠し・symlink・未対応・生成物・大きすぎる・解析できない）が `removed` に入る
+- 大文字小文字を区別しないファイルシステムで綴りの違うパスを渡すと、実際の綴りで読み、渡した綴りを `removed` に入れる
+- 上限や走査の失敗で判定できなかったパスはどちらにも入らず、`complete: false` と `diagnostics` の `not judged: パス` で申告する
+- 既存のディレクトリ、プロジェクトの根（`.`）、`.gitignore`・`.ignore`・`.gitattributes`・`.git/info/exclude`、1 万件を超えるパスを渡すと、全体の走査に切り替える（`full_scan: true` と `full_scan_reason`）。全体の結果は、`complete: true` のときだけ辞書全体をこの結果で置き換える。`dir` の外にある規則（global の除外、親の `.gitignore`）を変えたときは、呼び出し側が全体の走査を要求する
 
 ## metrics - 複雑度と依存構造の測定
 
