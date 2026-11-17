@@ -81,11 +81,15 @@ pub const DEFAULT_BLAME_BASE: &str = DEFAULT_GIT_BASE;
 ///   なり、解析対象のファイル内容と行が一致しない → `--no-textconv`
 /// - `diff.submodule=diff`: gitlink の更新がサブモジュール内部のファイル差分に展開され、
 ///   親リポジトリに存在しないソースの削除に見える → `--submodule=short`
-pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 11] = [
+/// - `diff.ignoreSubmodules` / `.gitmodules` の `ignore`: gitlink の更新が diff から消え、
+///   サブモジュールの manifest の変更を Cargo の構成の変更と認識できない (Issue #377)
+///   → `--ignore-submodules=none`
+pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 12] = [
     "--no-ext-diff",
     "--no-color",
     "--no-textconv",
     "--submodule=short",
+    "--ignore-submodules=none",
     "--src-prefix=a/",
     "--dst-prefix=b/",
     "--diff-algorithm=myers",
