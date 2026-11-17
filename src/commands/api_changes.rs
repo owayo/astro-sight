@@ -1021,6 +1021,7 @@ mod python_private_owner;
 mod python_protocol_arg;
 mod python_return_usage;
 
+mod kotlin_signature;
 mod python_signature;
 
 mod ref_index;

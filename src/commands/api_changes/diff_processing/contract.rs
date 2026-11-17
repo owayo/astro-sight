@@ -74,6 +74,21 @@ pub(super) fn decide_signature_change(
     if let Some(compatible) = super::rust_import_path::detect(inputs, &site, sources) {
         return SignatureDecision::Compatible(compatible);
     }
+    if let Some(detection) =
+        super::kotlin_signature::detect(&site, sources, inputs.diff_files, ref_index)
+    {
+        return match detection {
+            super::kotlin_signature::Detection::Compatible(compatible) => {
+                SignatureDecision::Compatible(compatible)
+            }
+            super::kotlin_signature::Detection::Unverified => {
+                SignatureDecision::Unverified(ApiModificationUnverified {
+                    reason: ApiModificationUnverifiedReason::CompatibilityUnverified,
+                    first_unproven: None,
+                })
+            }
+        };
+    }
     if let Some(compat) = compatible_modification(
         ref_index,
         &site,
