@@ -1004,6 +1004,9 @@ fn classify_reference_owner(
     }
     if target.python_method {
         use super::python_call_arity::MethodCallMatch;
+        if super::python_call_arity::reference_is_non_method(dir, target.bare, r, caches) {
+            return ReferenceOwner::Other;
+        }
         if target.has_foreign_defs && !target.python_foreign_defs_updated {
             match super::python_call_arity::method_reference_owner(
                 dir,

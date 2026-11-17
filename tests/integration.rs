@@ -74,6 +74,7 @@ mod integration {
     mod python_import_rebinding;
     mod python_inherited_members;
     mod python_member_removal;
+    mod python_method_closure;
     mod python_optional_removal;
     mod python_private_owner_removal;
     mod reference_evidence;

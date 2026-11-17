@@ -35,6 +35,9 @@ pub(crate) struct PythonClassCache {
     import_modules: HashMap<(String, String), Option<String>>,
     /// (ファイル, 関数, 変数) → 無引数 Mock の設定にしか使われない束縛。
     mock_receivers: HashMap<(String, usize, String), bool>,
+    /// ファイルごとに既存の解析木から証明した、対象メソッド以外への呼び出し位置。
+    non_method_sites: HashMap<String, HashSet<usize>>,
+    namespace_directories: crate::engine::impact::PythonNamespaceCache,
     /// キャッシュが効いていることを確かめるための計算回数 (テスト用)。
     #[cfg(test)]
     pub(super) stats: PythonClassCacheStats,
@@ -142,7 +145,11 @@ fn binds_name(node: Node<'_>, source: &[u8], name: &str) -> bool {
         "function_definition" | "class_definition" => node
             .child_by_field_name("name")
             .is_some_and(|child| contains_identifier(child, source, name)),
-        "assignment" | "augmented_assignment" | "for_statement" | "type_alias_statement" => node
+        "assignment"
+        | "augmented_assignment"
+        | "for_statement"
+        | "for_in_clause"
+        | "type_alias_statement" => node
             .child_by_field_name("left")
             .is_some_and(|child| contains_identifier(child, source, name)),
         "named_expression" => node
@@ -153,7 +160,7 @@ fn binds_name(node: Node<'_>, source: &[u8], name: &str) -> bool {
             .and_then(|index| node.named_child(index))
             .is_some_and(|child| contains_identifier(child, source, name)),
         "import_statement" | "import_from_statement" => import_binds_name(node, source, name),
-        "global_statement" => contains_identifier(node, source, name),
+        "global_statement" | "nonlocal_statement" => contains_identifier(node, source, name),
         "delete_statement" | "match_statement" => contains_identifier(node, source, name),
         _ => false,
     }
@@ -897,18 +904,37 @@ fn receiver_kind(
 ) -> Option<ResolvedReceiver> {
     let source = file.source;
     let mut current = receiver.parent();
+    let mut comprehension = false;
     while let Some(parent) = current {
+        if parent.kind() == "lambda" {
+            return None;
+        }
         if matches!(
             parent.kind(),
-            "lambda"
-                | "list_comprehension"
+            "list_comprehension"
                 | "set_comprehension"
                 | "dictionary_comprehension"
                 | "generator_expression"
         ) {
-            return None;
+            comprehension = true;
         }
         current = parent.parent();
+    }
+    if comprehension {
+        if receiver.kind() != "identifier" {
+            return None;
+        }
+        // 内包表記の新しい束縛に隠れない、関数直下の通常コンストラクタ代入だけを扱う。
+        let name = node_text(receiver, source)?;
+        let owner = local_constructor_binding(receiver, file, dir, name, caches)?;
+        if parameter_in_enclosing_scopes(receiver, source, &owner) {
+            return None;
+        }
+        return Some(ResolvedReceiver {
+            kind: ReceiverKind::Instance,
+            owner,
+            exact_class: true,
+        });
     }
     match receiver.kind() {
         "identifier" => {
@@ -985,6 +1011,54 @@ pub(super) fn definition_belongs_to_method(
                 column: reference.column,
             }
     })
+}
+
+pub(super) fn reference_is_non_method(
+    dir: &str,
+    name: &str,
+    reference: &SymbolReference,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let Some(file) = parsed_ref_file_shared(dir, &reference.path, caches) else {
+        return false;
+    };
+    if file.lang_id != crate::language::LangId::Python {
+        return false;
+    }
+    let point = tree_sitter::Point {
+        row: reference.line,
+        column: reference.column,
+    };
+    let Some(node) = file
+        .tree
+        .root_node()
+        .descendant_for_point_range(point, point)
+    else {
+        return false;
+    };
+    if node.kind() != "identifier" || node_text(node, &file.source) != Some(name) {
+        return false;
+    }
+    let sites = caches
+        .python_classes
+        .non_method_sites
+        .entry(reference.path.clone())
+        .or_insert_with(|| {
+            let load = || {
+                let root = std::path::Path::new(dir).canonicalize().ok()?;
+                let path = root.join(&reference.path).canonicalize().ok()?;
+                path.starts_with(&root).then_some(())?;
+                Some(crate::engine::impact::python_non_method_sites(
+                    file.tree.root_node(),
+                    &file.source,
+                    &root,
+                    &path,
+                    &caches.python_classes.namespace_directories,
+                ))
+            };
+            load().unwrap_or_default()
+        });
+    sites.contains(&node.id())
 }
 
 fn module_lookup_is_dynamic(file: PyFile<'_>, caches: &mut ApiClosureCaches) -> bool {
