@@ -55,7 +55,8 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.partition }}/2)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # macOS は正常なビルド・検査でも20分に達するため、終了処理を含めて余裕を持たせる。
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
