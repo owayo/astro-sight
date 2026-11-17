@@ -605,6 +605,8 @@ fn accumulate_hook_impacts(
 /// でも informational として扱う。ここを揃えないと api.mod_compat 自体は非 blocking なのに、同じ
 /// シンボルの参照一覧が impacts として blocking になる。
 struct HookImpactPolicy<'a> {
+    /// 同名の変更をすべて確かめた、素の参照名に対応する互換証拠。
+    compatible_info: &'a BTreeMap<String, BTreeSet<String>>,
     /// 参照を hook の停止に使わない modified 系シンボル。
     informational_modified: HashSet<(&'a str, &'a str)>,
     /// 型注釈だけの変更。互換性は未確認なので、strict でも参照の分類は保ち、専用 policy で確認を求める。
@@ -617,7 +619,11 @@ struct HookImpactPolicy<'a> {
 }
 
 impl<'a> HookImpactPolicy<'a> {
-    fn new(api: &'a ApiChanges, strict_const_values: bool) -> Self {
+    fn new(
+        api: &'a ApiChanges,
+        strict_const_values: bool,
+        compatible_info: &'a BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
         let annotation_info: HashSet<(&str, &str)> = api
             .type_annotation_changes
             .iter()
@@ -681,6 +687,7 @@ impl<'a> HookImpactPolicy<'a> {
             .map(|m| (m.file.as_str(), m.name.as_str()))
             .collect();
         Self {
+            compatible_info,
             informational_modified,
             annotation_info,
             import_rebinding_info,
@@ -693,6 +700,13 @@ impl<'a> HookImpactPolicy<'a> {
     fn blocks(&self, path: &str, flags: Option<&HookChangeFlags>, symbol: &str) -> bool {
         flags.is_some_and(|flags| flags.has_non_added)
             && !self.informational_modified.contains(&(path, symbol))
+            && !self.compatible(path, symbol)
+    }
+
+    fn compatible(&self, path: &str, symbol: &str) -> bool {
+        self.compatible_info
+            .get(path)
+            .is_some_and(|names| names.contains(symbol))
     }
 
     /// `impacted_callers` の参照のうち、確認箇所として `impact_info` に残すシンボルか
@@ -702,6 +716,7 @@ impl<'a> HookImpactPolicy<'a> {
             && (self.annotation_info.contains(&(path, symbol))
                 || self.optional_removal_info.contains(&(path, symbol))))
             || self.import_rebinding_info.contains(&(path, symbol))
+            || self.compatible(path, symbol)
     }
 }
 
@@ -884,6 +899,7 @@ pub(crate) fn build_review_hook_json(
 
 /// `diff_input` / `diff_files` はレビュー対象の diff。呼び出し側が diff 内で解決済みか
 /// (`DiffCallerResolution`) の判定に使う。
+#[cfg(test)]
 pub(crate) fn build_review_hook_json_for_diff(
     result: &ReviewResult,
     dir: &str,
@@ -892,7 +908,27 @@ pub(crate) fn build_review_hook_json_for_diff(
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> HookJsonBuild {
-    let policy = HookImpactPolicy::new(&result.api_changes, strict_const_values);
+    build_review_hook_json_with_compatibility(
+        result,
+        dir,
+        strict_const_values,
+        strict_type_annotations,
+        diff_input,
+        diff_files,
+        &BTreeMap::new(),
+    )
+}
+
+fn build_review_hook_json_with_compatibility(
+    result: &ReviewResult,
+    dir: &str,
+    strict_const_values: bool,
+    strict_type_annotations: bool,
+    diff_input: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+    compatible_info: &BTreeMap<String, BTreeSet<String>>,
+) -> HookJsonBuild {
+    let policy = HookImpactPolicy::new(&result.api_changes, strict_const_values, compatible_info);
     // 呼び出し側が diff 内で解決済みかは `impact --hook` と同じ判定 (`DiffCallerResolution`) にする。
     // 影響分析の結果 (`impact.changes`) だけで判定すると、トップレベルの呼び出しだけを更新した
     // ファイルが diff 外扱いになり誤ってブロックする。
@@ -1157,14 +1193,16 @@ pub(crate) fn review_hook_output(
     strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
+    compatible_info: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<bool> {
-    let build = build_review_hook_json_for_diff(
+    let build = build_review_hook_json_with_compatibility(
         result,
         dir,
         strict_const_values,
         strict_type_annotations,
         diff_input,
         diff_files,
+        compatible_info,
     );
     let Some(hook_output) = build.value else {
         return Ok(false);

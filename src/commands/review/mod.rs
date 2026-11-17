@@ -458,6 +458,16 @@ fn review_attempt_with_swift_protocols(
     super::host_entries::attach_api_proofs(&mut result);
     super::reference_evidence::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
     rename_candidates::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
+    let compatible_impacts = if hook && !keep_reference_downgrades_blocking {
+        super::api_changes::compatible_impact_names_for_api(
+            analysis_dir,
+            analysis_base,
+            &diff_files,
+            &result.api_changes,
+        )
+    } else {
+        Default::default()
+    };
     before_check(&result, analysis_dir);
     ensure_review_diff_unchanged(
         dir,
@@ -475,6 +485,7 @@ fn review_attempt_with_swift_protocols(
             strict_public_type_annotations,
             &diff_input,
             &diff_files,
+            &compatible_impacts,
         )?;
         // `process::exit` はデストラクタを走らせないため、staged の一時スナップショットを
         // exit の前に片付ける (Drop 任せにすると blocking のたびに一時ディレクトリが残る)。
@@ -1429,6 +1440,7 @@ fn emit_review_short_circuit(
             strict_type_annotations,
             "",
             &[],
+            &Default::default(),
         )? {
             std::process::exit(1);
         }

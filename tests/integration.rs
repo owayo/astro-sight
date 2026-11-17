@@ -68,6 +68,7 @@ mod integration {
     mod output_format;
     mod php_member_liveness;
     mod property_removal_arrays;
+    mod python_compatible_method_impacts;
     mod python_import_rebinding;
     mod python_member_removal;
     mod python_optional_removal;

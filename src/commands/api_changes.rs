@@ -1069,7 +1069,7 @@ mod type_dependency_symbols;
 pub(crate) use candidate::ApiSymbolCandidate;
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
-pub(crate) use impact_compatibility::compatible_impact_names;
+pub(crate) use impact_compatibility::{compatible_impact_names, compatible_impact_names_for_api};
 use js_const::detect_callback_body_only_change;
 use moved_members::{
     MemberFileFacts, MovedMemberChange, Side, pair_moved_member_changes, proves_member_binding,
