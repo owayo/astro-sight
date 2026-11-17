@@ -95,8 +95,8 @@ pub(super) struct Index<'p> {
     /// (呼ぶマクロの名前の組, 呼び出しの経路の名前) → 呼び出しの見る定義を決める入力の指紋 (求めたものを
     /// 覚える)。
     bodies_memo: RefCell<HashMap<CallKey, String>>,
-    /// 呼び出しの見る定義が crate の並びに依るとき (同じ名前の定義が 2 つ以上か、マクロを定義するマクロか
-    /// `#[macro_use]` がある)、crate の全てのスコープのマクロの並び (置き場も) の指紋。
+    /// 同名の定義・マクロを定義するマクロ・`#[macro_use]` のために要る、crate の並びの指紋。
+    /// 同名の定義はそのマクロの入力へ、影響する名前を絞れない場合は全呼び出しへ含める。
     textual_order: Option<String>,
     /// module → スコープごとの置き場 (ファイル・inline module・着く条件) の短い指紋 (長い条件を項目ごとに
     /// 写さない)。
@@ -156,6 +156,8 @@ struct InputGraph {
     local: Vec<Vec<u64>>,
     edges: Vec<Vec<usize>>,
     digests: Vec<u64>,
+    /// `#[macro_use]` かマクロを定義するマクロがあり、順序の影響を名前で絞れない。
+    all_calls_need_textual_order: bool,
 }
 
 /// 値のハッシュ (同じ版の比較の中だけで使う)。
@@ -519,7 +521,7 @@ impl<'p> Index<'p> {
         }
         // 同じ名前のマクロを 2 度以上定義するか、マクロを定義するマクロか `#[macro_use]` があれば、呼び出しの
         // 見る定義は crate の並びに依る (textual scope。`#[macro_use]` の module の定義は、後の module で取り込み
-        // より先に見る)。そのときは全ての呼び出しの指紋に crate の並びを入れる。
+        // より先に見る)。必要なマクロの入力へ伝えるため、その並びを覚える。
         if macro_use
             || macro_definitions.values().any(|definition| {
                 definition.count >= 2 || definition.mentions.contains("macro_rules")
@@ -1104,9 +1106,12 @@ impl<'p> Index<'p> {
                     .map(|name| graph.digest(Role::Macro, name)),
             )
             .collect();
+        let textual_order = graph
+            .all_calls_need_textual_order
+            .then_some(&self.textual_order);
         let found = format!(
             "{:016x}",
-            hash_of(&(digests, &self.textual_order, format!("{:?}", self.edition)))
+            hash_of(&(digests, textual_order, format!("{:?}", self.edition)))
         );
         self.bodies_memo
             .borrow_mut()
@@ -1122,13 +1127,24 @@ impl<'p> Index<'p> {
     ///   取り込みの経路の名前と先の名前へたどる)
     /// - glob の節: 全ての glob (置き場ごと。経路の名前へたどる)
     fn build_input_graph(&self) -> InputGraph {
-        let mut graph = InputGraph::default();
+        let mut graph = InputGraph {
+            all_calls_need_textual_order: self
+                .macro_definitions
+                .values()
+                .any(|definition| definition.mentions.contains("macro_rules")),
+            ..InputGraph::default()
+        };
         let globs = graph.id(Role::Globs, "");
         let relevant = self.macro_relevant_names();
         for (module, scopes) in &self.modules {
             for (scope_index, scope) in scopes.iter().enumerate() {
                 let placed = &self.placed[module][scope_index];
                 let order = order_digest(&scope.exports.macro_order);
+                graph.all_calls_need_textual_order |= scope
+                    .exports
+                    .macro_order
+                    .iter()
+                    .any(|entry| entry.starts_with("use-"));
                 for provider in &scope.exports.providers {
                     let entry = hash_of(&format!(
                         "{module:?} {placed} {}",
@@ -1188,6 +1204,14 @@ impl<'p> Index<'p> {
                     let id = graph.id(Role::Macro, &body.name);
                     graph.local[id]
                         .push(hash_of(&format!("{} @ {placed} {order:016x}", body.text)));
+                    if self
+                        .macro_definitions
+                        .get(&body.name)
+                        .is_some_and(|definition| definition.count >= 2)
+                    {
+                        // 順序の変化は、その定義へ alias・本体の呼び出しで着く入力だけへ伝える。
+                        graph.local[id].push(hash_of(&self.textual_order));
+                    }
                     for call in &body.calls {
                         graph.edge(id, Role::Macro, call);
                     }

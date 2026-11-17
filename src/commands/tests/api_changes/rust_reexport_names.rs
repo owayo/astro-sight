@@ -2987,3 +2987,101 @@ fn external_macro_arguments_that_are_not_macros_are_not_inputs() {
     );
     assert_eq!(classify(&api, "LangId").0, "none", "{api:?}");
 }
+
+#[test]
+fn unrelated_private_macro_modules_do_not_recheck_external_calls() {
+    let manifest = format!("{CARGO}\n[dependencies]\ntree-sitter = \"0.27\"\n");
+    let lib = "pub mod parser;\nmod first;\nmod second;\n";
+    let parser = "use tree_sitter::Parser;\nthread_local! {\n    static POOL: std::cell::RefCell<std::collections::HashMap<(), Parser>> = std::cell::RefCell::new(std::collections::HashMap::new());\n}\npub fn parse() -> bool { true }\n";
+    for addition in [
+        "macro_rules! own { () => {} }\n",
+        "macro_rules! own { () => {} }\nown!();\n",
+    ] {
+        let api = api_changes_with(
+            &manifest,
+            &[
+                ("src/lib.rs", lib),
+                ("src/parser.rs", parser),
+                ("src/first.rs", "macro_rules! repeat { () => {} }\n"),
+                ("src/second.rs", "macro_rules! repeat { () => {} }\n"),
+            ],
+            &[
+                ("src/lib.rs", &format!("{lib}mod addition;\n")),
+                ("src/addition.rs", addition),
+            ],
+        );
+        assert_eq!(classify(&api, "Parser").0, "none", "{api:?}");
+        assert!(!incomplete(&api), "{api:?}");
+    }
+}
+
+#[test]
+fn unrelated_private_macros_keep_public_reexport_changes() {
+    let lib = "pub mod parser;\nmod first;\nmod second;\nmod detail { pub fn item() {} }\npub use detail::item;\n";
+    let parser =
+        "use tree_sitter::Parser;\nthread_local! { static POOL: Option<Parser> = None; }\n";
+    let api = api_changes(
+        &[
+            ("src/lib.rs", lib),
+            ("src/parser.rs", parser),
+            ("src/first.rs", "macro_rules! repeat { () => {} }\n"),
+            ("src/second.rs", "macro_rules! repeat { () => {} }\n"),
+        ],
+        &[
+            (
+                "src/lib.rs",
+                &format!(
+                    "{}mod addition;\n",
+                    lib.replace(
+                        "pub use detail::item;",
+                        "#[cfg(feature = \"x\")]\npub use detail::item;"
+                    )
+                ),
+            ),
+            ("src/addition.rs", "macro_rules! own { () => {} }\n"),
+        ],
+    );
+    assert!(
+        matches!(classify(&api, "item").0, "rm" | "rm_dead"),
+        "{api:?}"
+    );
+    assert_eq!(classify(&api, "Parser").0, "none", "{api:?}");
+    assert!(!incomplete(&api), "{api:?}");
+}
+
+#[test]
+fn private_module_aliases_do_not_change_public_reachability() {
+    let manifest = format!("{CARGO}\n[dependencies]\ntree-sitter = \"0.27\"\n");
+    let lib = "pub mod parser;\n";
+    let parser = "use tree_sitter::Parser;\nthread_local! { static POOL: Option<Parser> = None; }\npub fn parse() {}\n";
+    for addition in [
+        "use crate::parser;\nunknown!(tree_sitter);\n",
+        "use crate::parser;\npub fn parser() {}\nunknown!(tree_sitter);\n",
+    ] {
+        let api = api_changes_with(
+            &manifest,
+            &[("src/lib.rs", lib), ("src/parser.rs", parser)],
+            &[
+                ("src/lib.rs", &format!("{lib}mod addition;\n")),
+                ("src/addition.rs", addition),
+            ],
+        );
+        assert_eq!(classify(&api, "Parser").0, "none", "{api:?}");
+        assert!(!incomplete(&api), "{api:?}");
+    }
+}
+
+#[test]
+fn private_module_aliases_remain_inputs_of_public_aliases() {
+    let lib = "mod origin { pub mod api { pub fn item() {} } }\nmod replacement { pub mod api { pub fn item() {} } }\nmod bridge;\npub use bridge::exposed;\n";
+    let bridge = "use crate::origin as private_alias;\npub use private_alias::api as exposed;\n";
+    let api = api_changes(
+        &[("src/lib.rs", lib), ("src/bridge.rs", bridge)],
+        &[(
+            "src/bridge.rs",
+            &bridge.replace("crate::origin", "crate::replacement"),
+        )],
+    );
+    assert_ne!(classify(&api, "exposed").0, "none", "{api:?}");
+    assert!(!incomplete(&api), "{api:?}");
+}
