@@ -51,6 +51,7 @@ mod integration {
     mod impact_rust_visibility_widening;
     mod impact_ts_barrels;
     mod js_signature_sites;
+    mod kotlin_constructor_compatibility;
     mod kotlin_grammar;
     mod languages;
     mod linguist_generated_attributes;
