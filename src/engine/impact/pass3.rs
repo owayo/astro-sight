@@ -47,9 +47,10 @@ pub(super) fn apply_stage4b_single(
             // A private inherent method can be called by descendants even when another
             // type declares the same name. Keep ambiguous calls instead of discarding
             // genuine callers through a name-only competing-definition check.
-            if !ctx
-                .rust_private_method_owners
-                .contains_key(pool.get(sym_name_id))
+            if ctx.lang_id != crate::language::LangId::Python
+                && !ctx
+                    .rust_private_method_owners
+                    .contains_key(pool.get(sym_name_id))
                 && *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
                 && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
             {

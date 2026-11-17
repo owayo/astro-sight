@@ -104,6 +104,7 @@ pub(super) struct RefEventMini {
     /// Python の相対 import または同一ファイルの直下関数の所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
     pub(super) python_attribute_write: bool,
+    pub(super) python_non_method_site: bool,
     /// Rust type path structurally resolved to a local declaration file.
     pub(super) rust_owner_path_id: u32,
     pub(super) rust_owner_is_free_function: bool,
@@ -885,6 +886,13 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
         self.ref_events.push(RefEventMini {
+            python_non_method_site: self.ref_lang == Some(LangId::Python)
+                && node.is_some_and(|node| {
+                    self.python_imports
+                        .get()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|index| index.is_non_method_site(node))
+                }),
             python_attribute_write: self.ref_lang == Some(LangId::Python)
                 && self.new_side_is_worktree
                 && self
@@ -1270,6 +1278,9 @@ impl<'a> ImpactCollector<'a> {
         let all_symbol_names = self.all_symbol_names;
         let name = &all_symbol_names[e.sym_ix as usize];
         let filter_disabled = evidence.filter_disabled;
+        if ctx.lang_id == LangId::Python && e.python_non_method_site {
+            return true;
+        }
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && e.rust_local_owner
@@ -1534,7 +1545,11 @@ impl<'a> ImpactCollector<'a> {
         {
             return true;
         }
-        if facts.has_parent_type && !facts.parent_in_this_file && !private_method_candidate {
+        if ctx.lang_id != LangId::Python
+            && facts.has_parent_type
+            && !facts.parent_in_this_file
+            && !private_method_candidate
+        {
             return true;
         }
         is_ref_in_target_test_context(
@@ -1680,6 +1695,7 @@ mod tests {
             rust_value_binding: false,
             python_import_owner_id: u32::MAX,
             python_attribute_write: false,
+            python_non_method_site: false,
             rust_owner_path_id: u32::MAX,
             rust_owner_is_free_function: false,
             rust_non_function_path: false,

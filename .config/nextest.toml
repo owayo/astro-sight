@@ -8,6 +8,12 @@ nextest-version = { required = "0.9.150" }
 # 60 秒を超えたテストを報告する (libtest の "has been running for over 60 seconds" と同じ間隔)。報告だけで止めない
 slow-timeout = { period = "60s" }
 
+# 混在 hunk の Python 宣言と、4096 エントリの名前空間予算を先に検証する。
+[[profile.default.overrides]]
+filter = '(binary_id(astro-sight::integration) & test(integration::python_added_declarations::)) | test(=engine::impact::python_imports::non_method::tests::python_namespace_cache_preserves_the_combined_ancestor_entry_budget) | test(=engine::impact::python_imports::non_method::tests::python_namespace_src_root_shares_the_ancestor_entry_budget_without_double_counting)'
+priority = 50
+threads-required = 2
+
 # C++ の内部呼出しを通常・index・流出の対照で検証する。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & test(integration::cpp_internal_closure::)'
