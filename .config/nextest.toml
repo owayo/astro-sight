@@ -38,6 +38,12 @@ filter = 'binary_id(astro-sight::integration) & test(integration::kotlin_constru
 priority = 50
 threads-required = 2
 
+# Rust の非公開 module 追加と公開 import 変更を、逆向きの worktree / index で確認する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::rust_private_macro_api::rust_private_module_additions_preserve_api_in_worktree_and_index)'
+priority = 50
+threads-required = 2
+
 # 数万段の入れ子を解析するストレステスト。ほかのテストと違って CPU を長く使い、各コマンドに 300 秒の期限がある。
 # 最初に始めて最後まで残らないようにし、2 スレッド分を割り当てて CPU の取り合いを減らす
 [[profile.default.overrides]]

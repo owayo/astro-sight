@@ -177,3 +177,70 @@ fn rust_private_macro_binding_and_unknown_changes_remain_blocking() {
         "{result}"
     );
 }
+
+#[test]
+fn rust_private_module_additions_preserve_api_in_worktree_and_index() {
+    let parser = "use tree_sitter::Parser;\nthread_local! { static POOL: Option<Parser> = None; }\npub fn parse() {}\n";
+    let public_parser = parser.replace("use tree_sitter", "pub use tree_sitter");
+    let lib = "pub mod parser;\nmod first;\nmod second;\n";
+    for public_in_index in [false, true] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write("Cargo.toml", "[package]\nname=\"reader\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\ntree-sitter=\"0.27\"\n");
+        repo.write("src/lib.rs", lib);
+        repo.write("src/parser.rs", parser);
+        for file in ["src/first.rs", "src/second.rs"] {
+            repo.write(file, "macro_rules! repeat { () => {} }\n");
+        }
+        repo.commit_all("base");
+        repo.write("src/lib.rs", format!("{lib}mod addition;\n"));
+        repo.write(
+            "src/addition.rs",
+            "use crate::parser;\nunknown!(tree_sitter);\nmacro_rules! own { () => {} }\n",
+        );
+        repo.write(
+            "src/parser.rs",
+            if public_in_index {
+                &public_parser
+            } else {
+                parser
+            },
+        );
+        repo.stage_all();
+        repo.write(
+            "src/parser.rs",
+            if public_in_index {
+                parser
+            } else {
+                &public_parser
+            },
+        );
+        for staged in [false, true] {
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--git", "--dir"]).arg(repo.root());
+            if staged {
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().expect("review");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("review JSON");
+            let changed = ["added", "removed", "modified"]
+                .into_iter()
+                .any(|category| {
+                    result["api_changes"][category]
+                        .as_array()
+                        .expect("API changes")
+                        .iter()
+                        .any(|change| change["name"] == "Parser")
+                });
+            assert_eq!(changed, staged == public_in_index, "{result}");
+            assert!(result.get("truncations").is_none(), "{result}");
+        }
+    }
+}

@@ -328,7 +328,30 @@ impl<'a, 'p> Cone<'a, 'p> {
                         .glob_importers(&binder.0)
                         .map(|importer| (importer.clone(), binder.1.clone())),
                 );
-                found.push(binder);
+                // 非公開の別名も再公開先の探索には使う。公開の型の束縛を作れない名前は、到達性の入力にはしない。
+                let public_type = self.index.entries(&binder).iter().any(|&entry| {
+                    let provider = self.index.provider(&binder.0, entry).1;
+                    provider.scope.is_none()
+                        && provider.namespaces & super::rust_dependencies::exports::TYPE != 0
+                });
+                if public_type
+                    || self
+                        .index
+                        .globs(&binder.0)
+                        .any(|(scope_index, position, glob)| {
+                            glob.scope.is_none()
+                                && self.index.glob_may_bring(
+                                    &binder.0,
+                                    scope_index,
+                                    position,
+                                    &binder.1,
+                                )
+                        })
+                    || !self.index.opaque_affecting(&binder.0, &binder.1).is_empty()
+                    || self.index.module_uncertain(&binder.0)
+                {
+                    found.push(binder);
+                }
             }
             for binder in &found {
                 self.visit_key(binder);
