@@ -38,6 +38,7 @@ pub(crate) mod crates;
 pub(crate) mod dependents;
 pub(crate) mod exports;
 pub(crate) mod placements;
+mod private_macro_bodies;
 mod resolver;
 pub(crate) mod test_scopes;
 pub(crate) mod use_scan;
@@ -544,6 +545,8 @@ pub(crate) struct DependencyIndex {
     file_conditions: Vec<String>,
     tree: tree_sitter::Tree,
     source: Vec<u8>,
+    /// 既知の local macro が作る private メソッド本体。束縛の指紋からだけ除く。
+    private_macro_bodies: Vec<std::ops::Range<usize>>,
 }
 
 /// 旧新の比較の結果。
@@ -665,6 +668,7 @@ impl DependencyIndex {
         if tree.root_node().has_error() {
             return None;
         }
+        let private_macro_bodies = private_macro_bodies::ranges(tree.root_node(), source);
         let mut index = Self {
             scopes: HashMap::new(),
             file_module,
@@ -675,6 +679,7 @@ impl DependencyIndex {
             file_conditions: Vec::new(),
             tree,
             source: source.to_vec(),
+            private_macro_bodies,
         };
         let root = index.tree.root_node();
         index.file_availability = file_availability(root, &index.source);
@@ -696,6 +701,7 @@ impl DependencyIndex {
                 index.file_module.as_deref(),
                 &mut scopes,
                 &mut definitions,
+                &index.private_macro_bodies,
             ));
         }
         // cfg で分けた同じ名前の inline module は、同じ経路のスコープとしてまとめる (束縛には
@@ -1433,6 +1439,7 @@ fn collect_scope<'tree>(
     file_module: Option<&[String]>,
     scopes: &mut Vec<(Vec<String>, ScopeBindings)>,
     definitions: &mut Vec<String>,
+    private_macro_bodies: &[std::ops::Range<usize>],
 ) -> Vec<ChildScope<'tree>> {
     let ChildScope {
         body: scope,
@@ -1716,7 +1723,11 @@ fn collect_scope<'tree>(
                 }
             }
             "macro_invocation" | "expression_statement" => {
-                bindings.macros.extend(tokens_of(item, source));
+                bindings.macros.extend(private_macro_bodies::binding_tokens(
+                    item,
+                    source,
+                    private_macro_bodies,
+                ));
                 bindings.invokes_macros = true;
                 bindings.macro_conditions.push(conditions());
             }
