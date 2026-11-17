@@ -111,6 +111,12 @@ Rust の `match` の値の式では、外側の引数やローカルの束縛を
 - `low_confidence_callers`: owner（メソッドが属するクラスや型）を確定できない汎用名や、直接 import の証拠がない TS/Rust の同名参照
 - `informational_callers`: 名前と引数個数が変わっていないシンボルへの関数値参照や、名前が変わっていない modified シンボルの import 行。blocking 対象にしない
 
+### C++ の内部メソッド変更
+
+C++ のシグネチャ変更は、旧新の実 AST に対する限定した証明に通る場合だけ省く。解析ルートが実際の Git repository root と一致し、submodule でないことを求める。部分ディレクトリからの解析は外側の利用を確認できないため blocking に残す。対象は、無名 namespace 1 つの中の単純な struct 1 つ、`int`/`bool` の値フィールドと値引数、変わらない primitive 戻り型、`int main()` の直下で宣言したローカル実体への直接 dot 呼出しである。旧新それぞれの全呼出しが、その版の引数契約に boolean literal または 0〜32767 の十進整数 literal で適合することを求める。フィールド、実体の束縛、出現順の受け手一覧も旧新で一致する必要がある。無関係な Python の同名メソッドはこの証明を妨げず、通常の `refs` の出現一覧は維持する。
+
+メソッド本体は primitive の算術・条件・代入・return に限る。`main` の追加の呼出しは、`int` フィールドを値渡しする厳密な `printf("%d\n", instance.field)` の形だけを認める。include は `<cstdio>` だけとし、ほかの `printf` の束縛や利用があれば証明しない。公開 owner、登録、型・実体・`this`・フィールドの流出、別名、メンバ関数ポインタ、継承、template、constructor、overload、属性、ほかの call/include、preprocessor の条件、parse 不完全、未証明の引数は blocking な `api.mod` に残す。証明の予算は各版 1 MiB・AST 100,000 ノード・フィールド/引数/実体それぞれ 64 件であり、超過時も API 変更を残す。さらに、base の追跡ファイルと、新側の追跡ファイル・通常の未追跡ファイルを ignore や生成物設定による絞り込みと別に確認する。対象以外の C/C++ ソースがあれば include・macro 経由を証明せず blocking に残し、既知の解析未対応 source 拡張子も、検索名の生文字列が無くても旧新とも拒否する。他ファイルの owner 型名参照は言語を問わず拒否する。member 名の他ファイル参照は、完全に解析できた Python だけを区別できる。各版の外部ファイル一覧は 256 件・一覧 1 MiB・1 ファイル 1 MiB・内容合計 8 MiB までとし、読めないファイル・不明なソース・リンクや予算超過も省略の根拠にしない。C++ 全般のソース互換性や ABI の互換性を判定するものではない。staged review は index snapshot を使う。
+
 ### JS / TS のシグネチャに依存しない参照
 
 JS / TS / TSX のトップレベル関数について、別ファイルの同名の出現がシグネチャに依存しないと確認できれば、`modified_closed_in_diff` (`api.mod_closed`) の判定から外す。旧新とも一意なトップレベルの直接関数宣言がある変更に限り、宣言種別が変わる変更には適用しない。対象は、非 computed な `property_signature` の名前と、用途が真偽判定だけの引数である。プロパティ型は、直接書いた `boolean`・`string`・`number` などの非 callable な組み込み型、リテラル型、その union に限る。型の別名・関数型・method signature・モックのキーは除外しない。

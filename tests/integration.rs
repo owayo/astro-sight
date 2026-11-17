@@ -18,6 +18,7 @@ mod integration {
     mod cochange;
     mod constructor_optional_params;
     mod context;
+    mod cpp_internal_closure;
     mod dead_code;
     mod dead_code_conventions;
     mod dead_code_languages;

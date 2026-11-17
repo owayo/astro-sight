@@ -11,6 +11,7 @@ use crate::models::review::{ApiModificationUnverified, ApiModificationUnverified
 
 mod availability;
 mod contract;
+mod cpp_internal;
 mod files;
 mod moved_availability;
 mod moves;
