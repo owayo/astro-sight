@@ -236,6 +236,8 @@ fn prepare_scan(
 /// 除外しない。`bin` を一律に除外すると `src/bin/*.rs` の呼び出し側が申告なしで落ち、
 /// refs / dead-code では数えられるのに impact だけ見逃す状態になっていた。
 /// `Cargo.toml` の有無は `cargo_package_roots` にパッケージルートごとにキャッシュする。
+/// staged の snapshot が書き出さなかった symlink のために、実際の checkout と有無が違いうる
+/// `Cargo.toml` はあるとみなし、除外しない (Issue #376)。
 fn is_excluded_bin_path(
     rel: &Path,
     dir: &Path,
@@ -250,7 +252,11 @@ fn is_excluded_bin_path(
             let package_root: std::path::PathBuf = components[..i - 1].iter().collect();
             *cargo_package_roots
                 .entry(package_root)
-                .or_insert_with_key(|root| dir.join(root).join("Cargo.toml").is_file())
+                .or_insert_with_key(|root| {
+                    let manifest = root.join("Cargo.toml");
+                    crate::git_support::tree_view(dir).hides(&manifest)
+                        || dir.join(manifest).is_file()
+                })
         };
         !is_cargo_src_bin
     })
@@ -644,6 +650,39 @@ mod tests {
         );
         // bin を含まないパスは対象外。
         assert!(!excluded("src/main.rs"));
+    }
+
+    /// staged の snapshot が `Cargo.toml` の symlink を書き出さなくても、実際の checkout では
+    /// パッケージの `src/bin` なので除外しない。大文字小文字だけが違う名前の symlink も、
+    /// `Cargo.toml` として開けうる (Issue #376)。
+    #[test]
+    fn bin_exclusion_keeps_src_bin_beside_manifests_omitted_by_the_snapshot() {
+        for (link, kept) in [
+            ("Cargo.toml", "src/bin/tool.rs"),
+            ("crates/tool/CARGO.TOML", "crates/tool/src/bin/run.rs"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("crates/tool/src/bin")).unwrap();
+            std::fs::create_dir_all(root.join("src/bin")).unwrap();
+            std::fs::create_dir_all(root.join("web/src/bin")).unwrap();
+            crate::git_support::fake_snapshot_record(
+                root,
+                &format!(
+                    "{{\"path\":\"{link}\",\"kind\":\"symlink\",\"target\":\"regular_file\"}}"
+                ),
+            );
+            let mut cache = HashMap::new();
+            assert!(
+                !is_excluded_bin_path(Path::new(kept), root, &mut cache),
+                "{link}"
+            );
+            // 対照: 書き出さなかった symlink の無いディレクトリの `src/bin` は除外する。
+            assert!(
+                is_excluded_bin_path(Path::new("web/src/bin/cli.js"), root, &mut cache),
+                "{link}"
+            );
+        }
     }
 
     // CI 言語と通常言語が混在する diff では skip しない
