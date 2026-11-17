@@ -8,6 +8,12 @@ nextest-version = { required = "0.9.150" }
 # 60 秒を超えたテストを報告する (libtest の "has been running for over 60 seconds" と同じ間隔)。報告だけで止めない
 slow-timeout = { period = "60s" }
 
+# index のリンク・submodule と通常の namespace を、Git の mode で対比する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::impact_python_snapshot_namespaces::)'
+priority = 50
+threads-required = 2
+
 # 内包表記の束縛と通常の namespace を、通常・index の7形式で対比する。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & test(integration::impact_python_comprehensions::)'

@@ -42,6 +42,7 @@ mod integration {
     mod impact_output;
     mod impact_python_bindings;
     mod impact_python_comprehensions;
+    mod impact_python_snapshot_namespaces;
     mod impact_rust_anonymous_const;
     mod impact_rust_cargo_reachability;
     mod impact_rust_line_endings;
