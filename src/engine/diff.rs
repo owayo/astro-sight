@@ -1163,7 +1163,7 @@ impl BlockBuilder {
     }
 
     /// ブロックを確定する。形が崩れている (同じ事実の重複・追加と削除の両方・無い側の mode・
-    /// 片方だけの `---`/`+++`・本文の無い内容の変更・何も変えないブロック) なら、偽を添える。
+    /// mode の根拠の矛盾・片方だけの `---`/`+++`・本文の無い内容の変更・何も変えないブロック) なら、偽を添える。
     fn finish(self) -> (DiffBlock, bool) {
         let added = self.added.is_some();
         let deleted = self.deleted.is_some();
@@ -1171,6 +1171,26 @@ impl BlockBuilder {
         // `--- /dev/null`・`+++ /dev/null` で分かる (手で書いた diff は mode の行を省く)。
         let old_absent = added || matches!(self.old_header, Some(HeaderSide::DevNull));
         let new_absent = deleted || matches!(self.new_header, Some(HeaderSide::DevNull));
+        let index_mode = self.index.as_ref().and_then(|(_, _, mode)| *mode);
+        // 同じ側の全ての根拠を照合し、別の記述で symlink などの mode を隠さない。
+        let mode = |line: Option<Option<u32>>, file: Option<Option<u32>>, absent: bool| {
+            if absent {
+                return (BlockMode::Absent, line.is_none() && file.is_none());
+            }
+            let mut value = index_mode;
+            for evidence in [line, file].into_iter().flatten() {
+                let Some(mode) = evidence else {
+                    return (BlockMode::Unknown, false);
+                };
+                if value.is_some_and(|known| known != mode) {
+                    return (BlockMode::Unknown, false);
+                }
+                value = Some(mode);
+            }
+            (value.map_or(BlockMode::Unknown, BlockMode::Known), true)
+        };
+        let (old_mode, old_mode_valid) = mode(self.old_mode, self.deleted, old_absent);
+        let (new_mode, new_mode_valid) = mode(self.new_mode, self.added, new_absent);
         let index_changed = self.index.as_ref().map(|(old, new, _)| old != new);
         let explained = self.hunks
             || self.binary
@@ -1188,6 +1208,8 @@ impl BlockBuilder {
                         || self.new_mode.is_some())
             };
         let well_formed = !self.malformed
+            && old_mode_valid
+            && new_mode_valid
             && !(old_absent && new_absent)
             && !(added && self.old_mode.is_some())
             && !(deleted && self.new_mode.is_some())
@@ -1244,19 +1266,9 @@ impl BlockBuilder {
             &self.new_header,
             new_absent,
         );
-        let index_mode = self.index.as_ref().map(|(_, _, mode)| *mode);
-        let mode = |line: Option<Option<u32>>, file: Option<Option<u32>>, absent: bool| {
-            if absent {
-                return BlockMode::Absent;
-            }
-            match line.or(file).or(index_mode) {
-                Some(Some(mode)) => BlockMode::Known(mode),
-                _ => BlockMode::Unknown,
-            }
-        };
         let block = DiffBlock {
-            old_mode: mode(self.old_mode, self.deleted, old_absent),
-            new_mode: mode(self.new_mode, self.added, new_absent),
+            old_mode,
+            new_mode,
             old_path,
             new_path,
             content: if self.binary {
@@ -2369,6 +2381,20 @@ index e69de29..0000000
         );
         assert!(two.complete);
         assert_eq!(two.blocks.len(), 2);
+    }
+
+    #[test]
+    fn scan_blocks_rejects_conflicting_index_modes() {
+        for diff in [
+            "diff --git a/x b/x\nold mode 100644\nnew mode 100644\nindex aaa..bbb 120000\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/x b/x\nnew file mode 100644\nindex 0000000..bbb 120000\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+b\n",
+            "diff --git a/x b/x\ndeleted file mode 100644\nindex aaa..0000000 120000\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
+        ] {
+            // 同じ mode の記述は許すが、symlink と通常のファイルの矛盾は確定しない。
+            let control = diff.replace(" 120000\n", " 100644\n");
+            assert!(scan_blocks(&control).complete, "{control}");
+            assert!(!scan_blocks(diff).complete, "{diff}");
+        }
     }
 
     #[test]

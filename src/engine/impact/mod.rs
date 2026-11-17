@@ -1035,6 +1035,8 @@ mod tests {
             // mode が出ない: 中だけが dirty な gitlink (本文で分かる) と、手で書いた rename。
             "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit aaa-dirty\n",
             "--- a/notes/a.md\n+++ b/notes/b.md\n@@ -1 +1 @@\n-a\n+b\n",
+            // symlink と通常のファイルで mode の根拠が矛盾する。
+            "diff --git a/x b/x\nold mode 100644\nnew mode 100644\nindex aaa..bbb 120000\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
             // symlink の付け替えと、通常のファイルから symlink への型の変更 (削除と追加の組)。
             "diff --git a/crates/b b/crates/b\nindex aaa..bbb 120000\n--- a/crates/b\n+++ b/crates/b\n@@ -1 +1 @@\n-../x\n+../y\n",
             "diff --git a/src/x.rs b/src/x.rs\ndeleted file mode 100644\nindex aaa..0000000\n--- a/src/x.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\ndiff --git a/src/x.rs b/src/x.rs\nnew file mode 120000\nindex 0000000..bbb\n--- /dev/null\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+y.rs\n\\ No newline at end of file\n",
