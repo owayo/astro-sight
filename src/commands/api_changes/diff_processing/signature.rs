@@ -222,6 +222,17 @@ impl<'a> ChangedSignatureFiles<'a> {
         // api.mod にすら出なくなる。判定が `NotApplicable` なら
         // `decide_signature_change` 側で従来どおり捨てる。
         let internally_closed = self.is_internally_closed(inputs, state, &candidate);
+        if self.lang_id == Some(crate::language::LangId::Cpp) {
+            // C++ は受け手・契約・流出を証明した場合だけ省く。名前だけの後段判定へ戻さない。
+            return (
+                change,
+                if internally_closed {
+                    SignatureDecision::Omit
+                } else {
+                    SignatureDecision::Blocking(None)
+                },
+            );
+        }
         if internally_closed
             && !may_be_python_typed_dict_total_change(
                 candidate.kind,
@@ -542,6 +553,10 @@ impl<'a> ChangedSignatureFiles<'a> {
         state: &mut DetectionState<'_>,
         candidate: &SignatureCandidate<'_>,
     ) -> bool {
+        if self.lang_id == Some(crate::language::LangId::Cpp) {
+            return self.moved_from.is_none()
+                && super::cpp_internal::prove(inputs, self.old_path, self.new_path, candidate);
+        }
         let name = candidate.name;
         !candidate.name_is_shared()
             && !candidate.callee_is_shared()

@@ -867,6 +867,17 @@ impl PreparedDiff {
         let in_file_callees = facts.callees;
         let new_export_surface_names = facts.export_surface_names;
         if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
+            if crate::language::LangId::from_path(camino::Utf8Path::new(&df.new_path)).ok()
+                == Some(crate::language::LangId::Cpp)
+            {
+                // 内部メソッドでも、型名を使う別翻訳単位の登録・include 利用を見落とさない。
+                self.index_names
+                    .extend(old.iter().chain(new).filter_map(|(name, kind, _)| {
+                        (kind == "method")
+                            .then(|| name.split_once('.').map(|(owner, _)| owner.to_owned()))
+                            .flatten()
+                    }));
+            }
             self.index_names.extend(
                 new.iter()
                     .filter(|(name, _, _)| {
