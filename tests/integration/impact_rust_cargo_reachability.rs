@@ -326,6 +326,66 @@ fn impact_rust_cargo_reachability_keeps_callers_moved_by_hunkless_rename() {
     );
 }
 
+#[test]
+fn impact_rust_cargo_reachability_keeps_callers_for_directory_modes() {
+    let repo = TestRepo::new();
+    for directory in ["a/src", "b/src/calls", "c/src"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    for name in ["a", "b", "c"] {
+        let dependencies = if name == "b" {
+            "[dependencies]\na = { path = \"../a\" }\n"
+        } else {
+            ""
+        };
+        repo.write(
+            format!("{name}/Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
+            ),
+        );
+    }
+    repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 {\n    x\n}\n");
+    repo.write("b/src/lib.rs", "pub mod calls;\n");
+    repo.write("b/src/calls/mod.rs", B_CALLER);
+    repo.write("c/src/lib.rs", "");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.git(["mv", "b/src/calls", "c/src/calls"]);
+    repo.write(
+        "a/src/lib.rs",
+        "pub fn run(x: u8, extra: u8) -> u8 {\n    x + extra\n}\n",
+    );
+    let changed_run = "diff --git a/a/src/lib.rs b/a/src/lib.rs\nindex aaa..bbb 100644\n--- a/a/src/lib.rs\n+++ b/a/src/lib.rs\n@@ -1,3 +1,3 @@\n-pub fn run(x: u8) -> u8 {\n-    x\n+pub fn run(x: u8, extra: u8) -> u8 {\n+    x + extra\n }\n";
+    // 対照のファイル単位の rename と mode 不明の directory の後に、directory mode を確かめる。
+    for (suffix, modes) in [
+        ("/mod.rs", ""),
+        ("", ""),
+        ("", "old mode 040000\nnew mode 040000\n"),
+    ] {
+        let diff = format!(
+            "{changed_run}diff --git a/b/src/calls{suffix} b/c/src/calls{suffix}\n{modes}similarity index 100%\nrename from b/src/calls{suffix}\nrename to c/src/calls{suffix}\n"
+        );
+        let context = repo.run_json("context", &["--diff", &diff]);
+        let mut callers: Vec<String> = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|change| change["path"] == "a/src/lib.rs")
+            .filter_map(|change| change["impacted_callers"].as_array())
+            .flatten()
+            .map(|caller| caller["path"].as_str().unwrap().to_owned())
+            .collect();
+        callers.sort();
+        callers.dedup();
+        assert_eq!(callers, ["c/src/calls/mod.rs"], "{modes}: {context}");
+    }
+}
+
 /// b だけが a に依存し、`b/src/lib.rs` が `a::run(1)` を呼ぶワークスペース (c は a に依存せず、
 /// 外部の `other` の同名の `run` を呼ぶ) で、a の `run` に引数を足したときの a の呼び出し元の path。
 /// `prepare` はコミットの前に、`change` は a を変えた後に呼ぶ。

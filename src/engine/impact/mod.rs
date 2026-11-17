@@ -49,7 +49,7 @@ use test_context::is_in_test_context;
 /// 差分が Cargo の入力 (manifest と Rust のソースの置き場所) を変えないと確かめられるか。
 ///
 /// diff の全てのブロック ([`diff::scan_blocks`]) を見る。読み切れない入力、パスを確定できない
-/// ブロック、gitlink・symlink (中だけが dirty な gitlink は本文で見分ける)、mode の出ない内容が
+/// ブロック、通常ファイル以外の mode (中だけが dirty な gitlink は本文で見分ける)、mode の出ない内容が
 /// 同じ rename・copy (gitlink の rename と区別できない)、旧新を比べられない Rust のソース (binary
 /// や、`parse_unified_diff` が読まないクォートした見出し。module の配線の比較から漏れる) は
 /// 変えたとみなす (Issue #374・#377)。
@@ -71,8 +71,8 @@ fn block_keeps_rust_cargo_inputs(
     allow_rs_add_remove: bool,
 ) -> bool {
     use diff::{BlockContent, BlockMode, BlockPath};
-    const GITLINK: u32 = 0o160000;
-    const SYMLINK: u32 = 0o120000;
+    const FILE_TYPE_MASK: u32 = 0o170000;
+    const REGULAR_FILE: u32 = 0o100000;
     fn side(path: &BlockPath) -> Option<&str> {
         match path {
             BlockPath::Known(path) => Some(path.as_str()),
@@ -83,13 +83,13 @@ fn block_keeps_rust_cargo_inputs(
     let (Some(old_path), Some(new_path)) = (side(&block.old_path), side(&block.new_path)) else {
         return false;
     };
-    // gitlink と symlink は置き場所を変えうる (通常のファイルとの型の変更も、削除と追加の組として
-    // 現れる)。中だけが dirty な gitlink は mode が出ず、本文の `Subproject commit` で分かる。
+    // directory の移動も配下の Rust ソースの置き場所を変えうるので、通常ファイル以外は証明しない。
+    // 中だけが dirty な gitlink は mode が出ず、本文の `Subproject commit` で分かる。
     let modes = [block.old_mode, block.new_mode];
     if block.gitlink_body
-        || modes
-            .iter()
-            .any(|mode| matches!(mode, BlockMode::Known(GITLINK) | BlockMode::Known(SYMLINK)))
+        || modes.iter().any(
+            |mode| matches!(*mode, BlockMode::Known(mode) if mode & FILE_TYPE_MASK != REGULAR_FILE),
+        )
     {
         return false;
     }
@@ -1022,6 +1022,8 @@ mod tests {
             "diff --git a/b b/b\nnew file mode 160000\nindex 0000000..bbb\n--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+Subproject commit bbb\n",
             "diff --git a/b b/b\ndeleted file mode 160000\nindex aaa..0000000\n--- a/b\n+++ /dev/null\n@@ -1 +0,0 @@\n-Subproject commit aaa\n",
             "diff --git a/b b/b\nindex aaa..bbb 160000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb-dirty\n",
+            // directory の rename は配下の Rust ソースを移しうる。
+            "diff --git a/b/src/calls b/c/src/calls\nold mode 040000\nnew mode 040000\nsimilarity index 100%\nrename from b/src/calls\nrename to c/src/calls\n",
             // 内容が同じ rename (mode が出ず、gitlink の rename と区別できない)。
             "diff --git a/a.md b/b.md\nsimilarity index 100%\nrename from a.md\nrename to b.md\n",
             "diff --git a/b/src/x.rs b/c/src/x.rs\nsimilarity index 100%\nrename from b/src/x.rs\nrename to c/src/x.rs\n",
