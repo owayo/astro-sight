@@ -33,7 +33,9 @@ use super::rust_dependencies::placements::Clause;
 use super::*;
 use crate::engine::rust_use_tree::UsePathOrigin;
 use crate::models::review::CfgAvailability;
-use index::{CallKey, Entry, ExportsCache, Hole, Index, Key, NAMESPACES, Place, User};
+use index::{
+    CallKey, Entry, ExportsCache, Hole, Index, Key, NAMESPACES, PathReadCache, Place, User,
+};
 use resolve::{Binders, Binding, Conditions, Resolver, State, Target, Via};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -1773,6 +1775,7 @@ fn reexporting_names(
     let mut names = seeds.clone();
     let mut queue: Vec<Key> = seeds.into_iter().collect();
     let mut globs_seen: HashSet<(usize, Vec<String>, usize, usize)> = HashSet::new();
+    let mut path_reads = [PathReadCache::default(), PathReadCache::default()];
     while let Some(key) = queue.pop() {
         if names.len() > MAX_NAMES {
             return None;
@@ -1793,6 +1796,9 @@ fn reexporting_names(
                     .map(|importer| (importer.clone(), key.1.clone())),
             );
             for user in version.path_users(&key.1) {
+                if !version.path_user_reads(user, &key, &mut path_reads[side]) {
+                    continue;
+                }
                 match user {
                     User::Named(named) => {
                         found.insert(named.clone());

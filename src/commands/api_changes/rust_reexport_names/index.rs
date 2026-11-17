@@ -57,6 +57,63 @@ pub(super) enum User {
     Glob(Vec<String>, usize, usize),
 }
 
+type PathReadId<'a> = (
+    &'a [String],
+    &'a [String],
+    std::mem::Discriminant<UsePathOrigin>,
+);
+
+/// 閉包を求める間だけ、同じ経路の既知の依存を共有する。None は絞れない経路。
+#[derive(Default)]
+pub(super) struct PathReadCache<'a> {
+    paths: HashMap<PathReadId<'a>, Option<HashSet<Key>>>,
+    reads: usize,
+}
+
+const MAX_CACHED_PATHS: usize = 4096;
+const MAX_PATH_READS: usize = 200_000;
+
+impl<'a> PathReadCache<'a> {
+    fn may_read(
+        &mut self,
+        index: &Index<'_>,
+        module: &'a [String],
+        path: &'a [String],
+        origin: UsePathOrigin,
+        key: &Key,
+    ) -> bool {
+        let id = (module, path, std::mem::discriminant(&origin));
+        if let Some(found) = self.paths.get(&id) {
+            return found.as_ref().is_none_or(|reads| reads.contains(key));
+        }
+        // 証明の予算を超えた経路は、従来どおり同名の変更を伝える。
+        if self.paths.len() >= MAX_CACHED_PATHS || self.reads >= MAX_PATH_READS {
+            return true;
+        }
+        let lookup = |scope: &[String], segment: &str| {
+            index
+                .module_names
+                .get(scope)
+                .and_then(|names| names.get(segment))
+                .map(|(modules, open)| (modules, *open))
+        };
+        let mut reads = Vec::new();
+        let (_, open) = index.walk_with_limit(
+            &lookup,
+            module,
+            path,
+            origin,
+            Some(&mut reads),
+            MAX_PATH_READS - self.reads,
+        );
+        self.reads += reads.len();
+        let found: Option<HashSet<Key>> = (!open).then(|| reads.into_iter().collect());
+        let may_read = found.as_ref().is_none_or(|reads| reads.contains(key));
+        self.paths.insert(id, found);
+        may_read
+    }
+}
+
 /// 版の lib crate の索引。
 pub(super) struct Index<'p> {
     pub(super) placements: &'p Placements,
@@ -1649,7 +1706,20 @@ impl<'p> Index<'p> {
         module: &[String],
         path: &[String],
         origin: UsePathOrigin,
+        reads: Option<&mut Vec<Key>>,
+    ) -> (BTreeSet<Vec<String>>, bool) {
+        self.walk_with_limit(lookup, module, path, origin, reads, usize::MAX)
+    }
+
+    /// 読む名前を上限付きで集める。足し切れないときは絞れない経路として返す。
+    fn walk_with_limit<'t>(
+        &self,
+        lookup: &Lookup<'_, 't>,
+        module: &[String],
+        path: &[String],
+        origin: UsePathOrigin,
         mut reads: Option<&mut Vec<Key>>,
+        read_limit: usize,
     ) -> (BTreeSet<Vec<String>>, bool) {
         let mut open = false;
         let starts: Vec<Vec<String>> = match origin {
@@ -1675,6 +1745,9 @@ impl<'p> Index<'p> {
             let mut next = BTreeSet::new();
             for scope in &current {
                 if let Some(reads) = reads.as_deref_mut() {
+                    if reads.len() >= read_limit {
+                        return (BTreeSet::new(), true);
+                    }
                     reads.push((scope.clone(), segment.clone()));
                 }
                 match lookup(scope, segment) {
@@ -1774,6 +1847,38 @@ impl<'p> Index<'p> {
     /// 経路に名前 `name` を使うもの。
     pub(super) fn path_users(&self, name: &str) -> &[User] {
         self.path_users.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// 同じ字面の経路でも、別の module の束縛だけを読むと証明できれば変更を伝えない。
+    pub(super) fn path_user_reads<'a>(
+        &'a self,
+        user: &'a User,
+        key: &Key,
+        cache: &mut PathReadCache<'a>,
+    ) -> bool {
+        match user {
+            User::Named(importer) => self.entries(importer).iter().any(|&entry| {
+                let (_, provider) = self.provider(&importer.0, entry);
+                match &provider.kind {
+                    ProviderKind::Use {
+                        module: path,
+                        origin,
+                        ..
+                    } => cache.may_read(self, &importer.0, path, *origin, key),
+                    _ => false,
+                }
+            }),
+            User::Glob(module, scope_index, position) => {
+                let Some(glob) = self
+                    .scopes(module)
+                    .get(*scope_index)
+                    .and_then(|scope| scope.exports.globs.get(*position))
+                else {
+                    return true;
+                };
+                cache.may_read(self, module, &glob.module, glob.origin, key)
+            }
+        }
     }
 
     /// module `module` を glob で取り込み得る module。
@@ -1951,3 +2056,57 @@ pub(super) fn visible(scope: &Option<Vec<String>>, viewer: &[String]) -> bool {
 
 /// 名前空間のビットの並び。
 pub(super) const NAMESPACES: [u8; 3] = [exports::TYPE, exports::VALUE, exports::MACRO];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_read_proofs_keep_users_when_their_budget_is_exhausted() {
+        let placements = Placements::default();
+        let mut index = Index::new(
+            &placements,
+            Some(RustEdition::E2018OrLater),
+            &mut ExportsCache::new(),
+        );
+        index.module_names.insert(
+            Vec::new(),
+            BTreeMap::from([("stable".to_owned(), (BTreeSet::from([Vec::new()]), false))]),
+        );
+        let root = Vec::new();
+        let path = vec!["stable".to_owned(), "stable".to_owned()];
+        let unrelated = (vec!["other".to_owned()], "stable".to_owned());
+        let mut known = PathReadCache::default();
+        assert!(!known.may_read(&index, &root, &path, UsePathOrigin::Anchored, &unrelated));
+        assert_eq!(known.reads, 2);
+        assert!(!known.may_read(&index, &root, &path, UsePathOrigin::Anchored, &unrelated));
+        assert_eq!(known.reads, 2);
+
+        let mut limited = PathReadCache {
+            reads: MAX_PATH_READS - 1,
+            ..PathReadCache::default()
+        };
+        assert!(limited.may_read(&index, &root, &path, UsePathOrigin::Anchored, &unrelated));
+        assert_eq!(limited.reads, MAX_PATH_READS);
+        assert_eq!(limited.paths.len(), 1);
+        assert!(limited.paths.values().all(Option::is_none));
+
+        let suffix = vec!["stable".to_owned(), "missing".to_owned()];
+        let mut unknown = PathReadCache::default();
+        assert!(unknown.may_read(&index, &root, &suffix, UsePathOrigin::Anchored, &unrelated));
+        assert_eq!(unknown.reads, 2);
+        assert!(unknown.paths.values().all(Option::is_none));
+
+        let paths: Vec<Vec<String>> = (0..MAX_CACHED_PATHS)
+            .map(|number| vec![format!("missing{number}")])
+            .collect();
+        let mut full = PathReadCache::default();
+        for path in &paths {
+            assert!(full.may_read(&index, &root, path, UsePathOrigin::Anchored, &unrelated));
+        }
+        assert_eq!(full.reads, MAX_CACHED_PATHS);
+        assert_eq!(full.paths.len(), MAX_CACHED_PATHS);
+        assert!(full.may_read(&index, &root, &path, UsePathOrigin::Anchored, &unrelated));
+        assert_eq!(full.paths.len(), MAX_CACHED_PATHS);
+    }
+}
