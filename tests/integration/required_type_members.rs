@@ -1278,6 +1278,84 @@ fn property_removal_keeps_removed_non_scalar_members_outside_the_proof() {
 }
 
 #[test]
+fn required_callbacks_close_only_when_each_producer_provides_a_callable() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let options = "export interface Options { readonly size: number; }\n";
+    let defaults = "import type { Options } from './options';\n\
+        const callback = () => {};\n\
+        function namedCallback() {}\n\
+        export function defaults(): Options {\n return { size: 1 };\n}\n\
+        export function draft(): Options {\n return { size: 2 };\n}\n";
+    repo.write("options.ts", options);
+    repo.write("defaults.ts", defaults);
+    repo.write(
+        "app.ts",
+        "import { defaults, draft } from './defaults';\nexport const options = [defaults(), draft()];\n",
+    );
+    repo.commit_all("initial");
+
+    for signature in ["reset(): void", "readonly reset: () => void"] {
+        repo.write(
+            "options.ts",
+            options.replace("; }", &format!("; {signature}; }}")),
+        );
+        for (second, expected) in [
+            (", reset() {}", 0),
+            (", reset: callback", 0),
+            (", reset: namedCallback", 0),
+            ("", 1),
+            (", reset: 0", 1),
+            (", reset: callback as any", 1),
+            (", get reset() { return 0; }", 1),
+            (", reset: (required: number) => {}", 1),
+        ] {
+            repo.write(
+                "defaults.ts",
+                defaults
+                    .replace("size: 1", "size: 1, reset: () => {}")
+                    .replace("size: 2", &format!("size: 2{second}")),
+            );
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{signature}/{second}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+        }
+        for (declaration, expected) in [
+            ("const reset = () => {};", 0),
+            ("const reset: () => void = () => {};", 0),
+            ("function reset() {}", 0),
+            ("function reset() {}\nreset = 0 as any;", 1),
+        ] {
+            repo.write(
+                "defaults.ts",
+                defaults
+                    .replace("const callback = () => {};", declaration)
+                    .replace("size: 1", "size: 1, reset")
+                    .replace("size: 2", "size: 2, reset"),
+            );
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{signature}/{declaration}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+        }
+    }
+    repo.write(
+        "options.ts",
+        options.replace("; }", "; reset(): void; reset(required: number): void; }"),
+    );
+    repo.write(
+        "defaults.ts",
+        defaults
+            .replace("size: 1", "size: 1, reset() {}")
+            .replace("size: 2", "size: 2, reset() {}"),
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(json["api"]["mod"][0]["n"], "Options", "{json}");
+}
+
+#[test]
 fn type_modifications_explain_unverified_proofs_without_changing_classification() {
     for extension in ["ts", "tsx"] {
         for case in [

@@ -93,6 +93,12 @@ filter = 'test(=integration::required_type_members::property_removal_preserves_u
 priority = 50
 threads-required = 2
 
+# 必須コールバックの両方の宣言と、複数の作成箇所への追随を確認する。
+[[profile.default.overrides]]
+filter = 'test(=integration::required_type_members::required_callbacks_close_only_when_each_producer_provides_a_callable)'
+priority = 50
+threads-required = 2
+
 # Rust の同名の関連関数・引数・モジュールと、本当の呼び出し元を複数の構成で確認する。
 [[profile.default.overrides]]
 filter = 'test(=integration::impact_rust_scope::impact_rust_distinguishes_workspace_function_uses) | test(=integration::impact_rust_scope::impact_rust_external_associated_types_require_binding_proof)'

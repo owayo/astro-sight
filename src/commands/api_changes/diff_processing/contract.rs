@@ -415,7 +415,7 @@ pub(super) fn closure_or_blocking_decision(
     let python_protocol =
         super::python_protocol_arg::prepare_protocol_argument_change(site, sources);
     // interface / object 型の type alias のメンバー変更は、値を作る箇所・受け取る箇所
-    // ごとの証明だけで閉じる。証明に対応しない形 (generic / extends / メソッド追加など) は、
+    // ごとの証明だけで閉じる。証明に対応しない形 (generic / extends / オーバーロードなど) は、
     // 参照行が変更行にあるだけでは追随済みと言えないので閉じない (Issue #89)。
     let required_members =
         match super::ts_signature::classify_required_member_addition(site, sources) {
