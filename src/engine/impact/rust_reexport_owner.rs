@@ -163,6 +163,86 @@ pub(super) fn external_associated_type_binding(
     prove().is_some()
 }
 
+/// 修飾呼び出しの名前が、有効な registry 依存から持ち込まれた束縛か確かめる。
+pub(super) fn registry_qualifier_binding(
+    name: &str,
+    dir: &Path,
+    ref_path: &str,
+    project: &RustPathOwnerProjectProof,
+) -> bool {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    let prove = || {
+        if !project.allows_external_alias_paths()
+            || project
+                .reexport_old_sources
+                .contains_key(Path::new(ref_path))
+        {
+            return None;
+        }
+        let file = Path::new(ref_path);
+        let (_, src, module) = cached_source_module_path(dir, file, project)?;
+        if cached_module_file(dir, &src, &module, project)? != file {
+            return None;
+        }
+        stable_module_chain(dir, &src, &module, project)?;
+        let bindings = load_bindings(dir, file, &module, project)?;
+        let shadows = |name: &str| {
+            bindings
+                .types
+                .keys()
+                .chain(bindings.unknown_types.iter())
+                .chain(bindings.modules.iter().map(|(name, _)| name))
+                .any(|other| may_bind_rust_name(other, name))
+        };
+        if bindings.opaque
+            || !bindings.globs.is_empty()
+            || shadows(name)
+            || bindings.named.iter().any(|edge| !edge.name.is_ascii())
+        {
+            return None;
+        }
+        let mut imports = bindings
+            .named
+            .iter()
+            .filter(|edge| may_bind_rust_name(&edge.name, name));
+        let edge = imports.next()?;
+        let [dependency] = edge.target_module.strip_prefix(module.as_slice())? else {
+            return None;
+        };
+        if edge.origin != UsePathOrigin::Bare
+            || imports.next().is_some()
+            || matches!(dependency.as_str(), "std" | "core" | "alloc")
+            || shadows(dependency)
+            || bindings
+                .named
+                .iter()
+                .any(|edge| may_bind_rust_name(&edge.name, dependency))
+        {
+            return None;
+        }
+        let manifest = external_crate_manifest(dependency, dir, ref_path, project)?;
+        let spec = manifest.get("dependencies")?.get(dependency)?;
+        (spec
+            .get("optional")
+            .is_none_or(|value| value.as_bool() == Some(false))
+            && manifest.get("target").is_none()
+            && ["build-dependencies", "dev-dependencies"]
+                .iter()
+                .all(|table| {
+                    manifest
+                        .get(table)
+                        .and_then(|deps| deps.get(dependency))
+                        .is_none()
+                }))
+        .then_some(())
+    };
+    prove().is_some()
+}
+
+fn may_bind_rust_name(candidate: &str, name: &str) -> bool {
+    !candidate.is_ascii() || candidate.strip_prefix("r#").unwrap_or(candidate) == name
+}
+
 pub(super) fn owner(
     node: Node<'_>,
     source: &[u8],
@@ -400,112 +480,124 @@ fn proven_external_alias(
     ref_path: &str,
     project: &RustPathOwnerProjectProof,
 ) -> bool {
-    let proof = || -> Option<()> {
-        if !project.allows_external_alias_paths()
-            || project
-                .reexport_old_sources
-                .contains_key(Path::new(ref_path))
-        {
-            return None;
-        }
+    let proof = || {
         let argument = statement.child_by_field_name("argument")?;
         let alias_clause = argument.kind().eq("use_as_clause").then_some(argument)?;
         let target = alias_clause.named_child(0)?;
         let segments = path_segments(target, source)?;
         let first = segments.first()?.as_str();
-        if segments.len() < 2 || matches!(first, "crate" | "self" | "super") {
+        if segments.len() < 2 {
             return None;
         }
-        let (_package, src, _module) =
-            cached_source_module_path(dir, Path::new(ref_path), project)?;
-        let manifest = read_input_text_file(&dir.join(src.parent()?.join("Cargo.toml")))?;
-        let manifest: toml::Value = toml::from_str(&manifest).ok()?;
-        let edition = manifest.get("package")?.get("edition")?.as_str()?;
-        if !matches!(edition, "2018" | "2021" | "2024") {
-            return None;
-        }
-        let package_name = manifest.get("package")?.get("name")?.as_str()?;
-        let lib_name = manifest
-            .get("lib")
-            .and_then(|lib| lib.get("name"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| package_name.replace('-', "_"));
-        if first == lib_name {
-            return None;
-        }
-        if !matches!(first, "std" | "core" | "alloc") {
-            if manifest.get("patch").is_some() || manifest.get("replace").is_some() {
-                return None;
-            }
-            // 祖先のワークスペースの `[patch]` と、Cargo が読む設定 (祖先と `$CARGO_HOME`) による
-            // 依存の取得元・コンパイラの差し替えを除く。
-            let package_root =
-                super::rust_cargo_config::absolute_package_root(&dir.join(src.parent()?))?;
-            let cargo = &project.cargo_configs;
-            if cargo
-                .ancestors(&package_root)
-                .skip(1)
-                .any(|parent| parent.join("Cargo.toml").exists())
-                || !cargo.keeps_dependency_sources(&package_root)
-            {
-                return None;
-            }
-            let dependency = ["dependencies", "dev-dependencies", "build-dependencies"]
-                .iter()
-                .find_map(|table| manifest.get(table).and_then(|deps| deps.get(first)))?;
-            let registry_version = dependency.is_str()
-                || dependency.as_table().is_some_and(|table| {
-                    table.get("version").is_some_and(toml::Value::is_str)
-                        && !["path", "workspace", "git"]
-                            .iter()
-                            .any(|key| table.contains_key(*key))
-                });
-            if !registry_version {
-                return None;
-            }
-        }
-        let root_file = cached_module_file(dir, &src, &[], project)?;
-        if project.reexport_old_sources.contains_key(&root_file) {
-            return None;
-        }
-        let root_source = read_input_file(&dir.join(&root_file))?;
-        let tree = parser::parse_source(&root_source, LangId::Rust).ok()?;
-        let root = tree.root_node();
-        if root.has_error() {
-            return None;
-        }
-        let mut cursor = root.walk();
-        for item in root.named_children(&mut cursor) {
-            match item.kind() {
-                "attribute_item" | "inner_attribute_item" => {
-                    super::rust_std_origin::safe_attribute(item, &root_source)?;
-                }
-                "macro_invocation" | "extern_crate_declaration" => return None,
-                "use_declaration" => {
-                    let argument = item.child_by_field_name("argument")?;
-                    let edges = expand_use_edges(argument, &root_source, &[])?;
-                    if edges.iter().any(|edge| match edge {
-                        RustPubUseEdge::Named { exported_name, .. } => exported_name == first,
-                        RustPubUseEdge::Wildcard { .. } => true,
-                    }) {
-                        return None;
-                    }
-                }
-                _ => {
-                    if item
-                        .child_by_field_name("name")
-                        .and_then(|name| name.utf8_text(&root_source).ok())
-                        == Some(first)
-                    {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some(())
+        external_crate_manifest(first, dir, ref_path, project)
     };
     proof().is_some()
+}
+
+/// 外部クレート名の束縛を確認し、依存指定を含む呼び出し元の manifest を返す。
+fn external_crate_manifest(
+    first: &str,
+    dir: &Path,
+    ref_path: &str,
+    project: &RustPathOwnerProjectProof,
+) -> Option<toml::Value> {
+    if !project.allows_external_alias_paths()
+        || project
+            .reexport_old_sources
+            .contains_key(Path::new(ref_path))
+        || matches!(first, "crate" | "self" | "super")
+    {
+        return None;
+    }
+    let (_package, src, _module) = cached_source_module_path(dir, Path::new(ref_path), project)?;
+    let manifest = read_input_text_file(&dir.join(src.parent()?.join("Cargo.toml")))?;
+    let manifest: toml::Value = toml::from_str(&manifest).ok()?;
+    let edition = manifest.get("package")?.get("edition")?.as_str()?;
+    if !matches!(edition, "2018" | "2021" | "2024") {
+        return None;
+    }
+    let package_name = manifest.get("package")?.get("name")?.as_str()?;
+    let lib_name = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| package_name.replace('-', "_"));
+    if first == lib_name {
+        return None;
+    }
+    if !matches!(first, "std" | "core" | "alloc") {
+        if manifest.get("patch").is_some() || manifest.get("replace").is_some() {
+            return None;
+        }
+        // 祖先のワークスペースの `[patch]` と、Cargo が読む設定 (祖先と `$CARGO_HOME`) による
+        // 依存の取得元・コンパイラの差し替えを除く。
+        let package_root =
+            super::rust_cargo_config::absolute_package_root(&dir.join(src.parent()?))?;
+        let cargo = &project.cargo_configs;
+        if cargo
+            .ancestors(&package_root)
+            .skip(1)
+            .any(|parent| parent.join("Cargo.toml").exists())
+            || !cargo.keeps_dependency_sources(&package_root)
+        {
+            return None;
+        }
+        let dependency = ["dependencies", "dev-dependencies", "build-dependencies"]
+            .iter()
+            .find_map(|table| manifest.get(table).and_then(|deps| deps.get(first)))?;
+        let registry_version = dependency.is_str()
+            || dependency.as_table().is_some_and(|table| {
+                table.get("version").is_some_and(toml::Value::is_str)
+                    && !["path", "workspace", "git"]
+                        .iter()
+                        .any(|key| table.contains_key(*key))
+            });
+        if !registry_version {
+            return None;
+        }
+    }
+    let root_file = cached_module_file(dir, &src, &[], project)?;
+    if project.reexport_old_sources.contains_key(&root_file) {
+        return None;
+    }
+    let root_source = read_input_file(&dir.join(&root_file))?;
+    let tree = parser::parse_source(&root_source, LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        match item.kind() {
+            "attribute_item" | "inner_attribute_item" => {
+                super::rust_std_origin::safe_attribute(item, &root_source)?;
+            }
+            "macro_invocation" | "extern_crate_declaration" => return None,
+            "use_declaration" => {
+                let argument = item.child_by_field_name("argument")?;
+                let edges = expand_use_edges(argument, &root_source, &[])?;
+                if edges.iter().any(|edge| match edge {
+                    RustPubUseEdge::Named { exported_name, .. } => {
+                        may_bind_rust_name(exported_name, first)
+                    }
+                    RustPubUseEdge::Wildcard { .. } => true,
+                }) {
+                    return None;
+                }
+            }
+            _ => {
+                if item
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(&root_source).ok())
+                    .is_some_and(|name| may_bind_rust_name(name, first))
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(manifest)
 }
 
 fn qualified_target(

@@ -110,10 +110,11 @@ impl FileEvidence {
 pub(super) struct RustPathOwnerIndex {
     current: Option<Arc<FileEvidence>>,
     root_associated_paths: HashSet<usize>,
-    enum_variant_paths: HashSet<usize>,
+    unshadowed_qualified_paths: HashSet<usize>,
     associated_types: RefCell<HashMap<String, bool>>,
     external_associated_types: RefCell<HashMap<String, bool>>,
     external_associated_paths: OnceLock<HashSet<usize>>,
+    registry_qualifiers: RefCell<HashMap<String, bool>>,
     source_hash: blake3::Hash,
     direct_imports: HashMap<String, Vec<String>>,
     local_type_names: HashSet<String>,
@@ -1136,10 +1137,13 @@ impl RustPathOwnerIndex {
         Self {
             current: FileEvidence::collect(node, source).map(Arc::new),
             root_associated_paths: root_associated_paths(node, source),
-            enum_variant_paths: root_associated_paths_with_attributes(node, source, true, false),
+            unshadowed_qualified_paths: root_associated_paths_with_attributes(
+                node, source, true, false,
+            ),
             associated_types: RefCell::new(HashMap::new()),
             external_associated_types: RefCell::new(HashMap::new()),
             external_associated_paths: OnceLock::new(),
+            registry_qualifiers: RefCell::new(HashMap::new()),
             source_hash: blake3::hash(source),
             direct_imports,
             local_type_names,
@@ -1340,6 +1344,48 @@ impl RustPathOwnerIndex {
                         root_associated_paths_with_attributes(root, source, true, true)
                     })
                     .contains(&parent.id()))
+    }
+
+    pub(super) fn is_registry_qualified_call(
+        &self,
+        node: Node<'_>,
+        source: &[u8],
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        let Some(path) = node.parent().filter(|path| {
+            self.unshadowed_qualified_paths.contains(&path.id())
+                && path
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id())
+        }) else {
+            return false;
+        };
+        if !path.parent().is_some_and(|call| {
+            call.kind() == "call_expression"
+                && call
+                    .child_by_field_name("function")
+                    .is_some_and(|callee| callee.id() == path.id())
+        }) {
+            return false;
+        }
+        let Some(qualifier) = path
+            .child_by_field_name("path")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            return false;
+        };
+        if let Some(proven) = self.registry_qualifiers.borrow().get(qualifier) {
+            return *proven;
+        }
+        let proven = super::rust_reexport_owner::registry_qualifier_binding(
+            qualifier, dir, ref_path, project,
+        );
+        self.registry_qualifiers
+            .borrow_mut()
+            .insert(qualifier.to_owned(), proven);
+        proven
     }
 
     fn resolve_qualified(
