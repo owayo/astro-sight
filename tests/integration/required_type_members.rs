@@ -1356,6 +1356,60 @@ fn required_callbacks_close_only_when_each_producer_provides_a_callable() {
 }
 
 #[test]
+fn replaced_properties_close_only_after_all_values_and_uses_follow() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let options = "export interface Options { readonly size: number; readonly label: string; }\n";
+    let defaults = "import type { Options } from './options';\n\
+        export function defaults(): Options {\n return {\n size: 1,\n label: 'a',\n };\n}\n\
+        export function draft(): Options {\n return { size: 2, label: 'b' };\n}\n";
+    let view = "import type { Options } from './options';\n\
+        export function describe(options: Options): string {\n return options.label;\n}\n";
+    repo.write("options.ts", options);
+    repo.write("defaults.ts", defaults);
+    repo.write("view.ts", view);
+    repo.write(
+        "app.ts",
+        "import { defaults, draft } from './defaults';\n\
+         import { describe } from './view';\n\
+         export const descriptions = [describe(defaults()), describe(draft())];\n",
+    );
+    repo.commit_all("initial");
+    repo.write("options.ts", options.replace("label", "title"));
+    for (draft, read, expected) in [
+        (", title: 'b'", "title", 0),
+        ("", "title", 1),
+        (", label: 'b', title: 'b'", "title", 1),
+        (", title: 42", "title", 1),
+        (", title: 'b'", "label", 1),
+    ] {
+        repo.write(
+            "defaults.ts",
+            defaults
+                .replace("label: 'a'", "title: 'a'")
+                .replace(", label: 'b'", draft),
+        );
+        repo.write(
+            "view.ts",
+            view.replace("options.label", &format!("options.{read}")),
+        );
+        let (code, json) = hook(&repo);
+        let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+        assert_eq!(code, expected, "{draft}/{read}: {json}");
+        assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+    }
+    repo.write("defaults.ts", defaults.replace("label:", "title:"));
+    repo.write("view.ts", view.replace("options.label", "options.title"));
+    repo.write(
+        "options.ts",
+        options.replace("label", "title").replace("number", "1 | 2"),
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(json["api"]["mod"][0]["n"], "Options", "{json}");
+}
+
+#[test]
 fn type_modifications_explain_unverified_proofs_without_changing_classification() {
     for extension in ["ts", "tsx"] {
         for case in [

@@ -109,7 +109,7 @@ pub(crate) enum TypeAtom {
     Unknown,
 }
 
-/// 必須プロパティ追加・既存プロパティの型縮小・純粋なプロパティ削除の分類。
+/// 必須プロパティ追加・既存プロパティの型縮小・プロパティ削除と置き換えの分類。
 pub(crate) enum RequiredMemberChange {
     /// この変更種別には当たらない (従来の判定へ)。
     NotApplicable,
@@ -134,6 +134,7 @@ pub(crate) enum MemberChangeMode {
 
 pub(crate) struct RemovedMembers {
     pub(crate) names: Vec<String>,
+    pub(crate) required_additions: HashSet<String>,
     /// 非 scalar の残存メンバーでは、値の型照合に代えて旧新の不変性を証明する。
     pub(crate) invariant_properties: Option<Vec<RetainedProperty>>,
     pub(crate) builtin_names: BTreeSet<&'static str>,
@@ -1120,7 +1121,7 @@ impl Prover<'_, '_> {
     }
 
     /// object literal が検査対象の必須プロパティを 1 つずつ持ち、値の型が適合するか。
-    /// 追加・縮小ではその行の変更も求め、削除では既に適合する未変更の値も許す。
+    /// 追加・縮小したキーは変更行に必要。削除後も残るキーは未変更の値を許す。
     fn prove_object_literal(
         &self,
         object: Node<'_>,
@@ -1144,7 +1145,11 @@ impl Prover<'_, '_> {
                 return self.prove_spread_object(object, parsed, path, diff_files, caches);
             }
         }
-        let changed = if matches!(self.delta.mode, MemberChangeMode::Removal(_)) {
+        let additions_with_removal = match &self.delta.mode {
+            MemberChangeMode::Removal(removed) => Some(&removed.required_additions),
+            _ => None,
+        };
+        let changed = if additions_with_removal.is_some_and(HashSet::is_empty) {
             None
         } else {
             let Some(changed) = changed_lines_for_ref_path(
@@ -1250,7 +1255,7 @@ impl Prover<'_, '_> {
             let Some([(value, line)]) = found.get(property.name.as_str()).map(Vec::as_slice) else {
                 return false;
             };
-            if !matches!(self.delta.mode, MemberChangeMode::Removal(_))
+            if additions_with_removal.is_none_or(|names| names.contains(&property.name))
                 && !changed.as_ref().is_some_and(|lines| lines.contains(line))
             {
                 return false;
