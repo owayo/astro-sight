@@ -722,6 +722,10 @@
       "required": true,
       "types": [
         {
+          "type": "member_expression",
+          "named": true
+        },
+        {
           "type": "primary_type",
           "named": true
         }

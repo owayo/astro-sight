@@ -45,6 +45,43 @@ fn typescript_node_with_text<'a>(
         .unwrap_or_else(|| panic!("ノードがない: {kind} {text}: {}", root.to_sexp()))
 }
 
+#[test]
+fn typescript_import_type_arrays_preserve_nested_element_types() {
+    let source = br#"
+type Single = import("./level").Level[];
+type Nested = import("./level").Namespace.Level[][];
+type Bare = import("./level").Level;
+"#;
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let tree = assert_typescript_parse_clean(source, lang);
+        let root = tree.root_node();
+        let single =
+            typescript_node_with_text(root, source, "array_type", r#"import("./level").Level[]"#);
+        assert_eq!(single.named_child(0).unwrap().kind(), "member_expression");
+        let nested = typescript_node_with_text(
+            root,
+            source,
+            "array_type",
+            r#"import("./level").Namespace.Level[][]"#,
+        );
+        let inner = nested.named_child(0).unwrap();
+        assert_eq!(inner.kind(), "array_type");
+        assert_eq!(inner.named_child(0).unwrap().kind(), "member_expression");
+        let declarations = typescript_nodes(root);
+        let bare = declarations
+            .iter()
+            .find(|node| {
+                node.kind() == "type_alias_declaration"
+                    && node.utf8_text(source).unwrap().starts_with("type Bare")
+            })
+            .unwrap();
+        assert_eq!(
+            bare.child_by_field_name("value").unwrap().kind(),
+            "member_expression"
+        );
+    }
+}
+
 fn typescript_point_at(source: &[u8], byte: usize) -> Point {
     let prefix = &source[..byte];
     Point::new(

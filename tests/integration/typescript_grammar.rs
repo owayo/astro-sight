@@ -490,6 +490,48 @@ fn typescript_import_type_arguments_cli_keeps_malformed_diagnostics() {
 }
 
 #[test]
+fn typescript_import_type_array_does_not_block_optional_interface_addition() {
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        let target = format!("shapes.{extension}");
+        let old = r#"export interface Item {
+  levels: import("./level").Level[];
+}
+export interface Change {
+  oldPath: string;
+  newPath: string;
+}
+export const existing: Change = { oldPath: "a", newPath: "b" };
+"#;
+        repo.write("level.ts", "export type Level = 'high' | 'low';\n");
+        repo.write(&target, old);
+        repo.init_git();
+        repo.commit_all("initial");
+        for (property, compatible) in [("newFile?: boolean", true), ("newFile: boolean", false)] {
+            let new = old.replace(
+                "  newPath: string;",
+                &format!("  newPath: string;\n  {property};"),
+            );
+            repo.write(&target, &new);
+            let output = cargo_bin()
+                .args(["review", "--git", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let hook: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.success(), compatible, "{extension}: {hook}");
+            let bucket = if compatible { "mod_compat" } else { "mod" };
+            assert!(
+                hook["api"][bucket]
+                    .as_array()
+                    .is_some_and(|changes| changes.iter().any(|change| change["n"] == "Change")),
+                "{extension}: {hook}"
+            );
+        }
+    }
+}
+
+#[test]
 fn typescript_generic_tagged_template_keeps_optional_parameter_compatibility() {
     for extension in ["ts", "tsx"] {
         for case in [
