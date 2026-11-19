@@ -499,24 +499,7 @@ pub(crate) struct LibraryVersions<'a> {
 /// `src/bin/`・`tests/`・`examples/`・`benches/`・`build.rs`) のソースでなければ、`src/` の外のファイル
 /// (`#[path]` で読む) も含める。
 pub(crate) fn crate_package(dir: &str, path: &str) -> Option<String> {
-    if path == "/dev/null" || !path.ends_with(".rs") {
-        return None;
-    }
-    let mut ancestor = parent_dir(path);
-    let package = loop {
-        let manifest = if ancestor.is_empty() {
-            "Cargo.toml".to_owned()
-        } else {
-            format!("{ancestor}/Cargo.toml")
-        };
-        if std::path::Path::new(dir).join(&manifest).is_file() {
-            break ancestor;
-        }
-        if ancestor.is_empty() {
-            return None;
-        }
-        ancestor = parent_dir(ancestor);
-    };
+    let package = package_of(dir, path)?;
     let relative = if package.is_empty() {
         path
     } else {
@@ -527,23 +510,25 @@ pub(crate) fn crate_package(dir: &str, path: &str) -> Option<String> {
         || ["src/bin/", "tests/", "examples/", "benches/"]
             .iter()
             .any(|prefix| relative.starts_with(prefix));
-    (!other_target).then(|| package.to_owned())
+    (!other_target).then_some(package)
 }
 
 /// パスの package (いちばん近い `Cargo.toml` のあるディレクトリ)。別の target のソースも含める
 /// (`#[path]` で lib が読み得る。lib の module かは置き場の索引で決める。Issue #305)。
+/// 手前の manifest が snapshot で省かれた可能性があれば、外側の package へ帰属させない。
 pub(crate) fn package_of(dir: &str, path: &str) -> Option<String> {
     if path == "/dev/null" || !path.ends_with(".rs") {
         return None;
     }
+    let root = std::path::Path::new(dir);
+    let view = crate::git_support::tree_view(root);
     let mut ancestor = parent_dir(path);
     loop {
-        let manifest = if ancestor.is_empty() {
-            "Cargo.toml".to_owned()
-        } else {
-            format!("{ancestor}/Cargo.toml")
-        };
-        if std::path::Path::new(dir).join(&manifest).is_file() {
+        let manifest = manifest_path(ancestor);
+        if view.hides(std::path::Path::new(&manifest)) {
+            return None;
+        }
+        if root.join(&manifest).is_file() {
             return Some(ancestor.to_owned());
         }
         if ancestor.is_empty() {

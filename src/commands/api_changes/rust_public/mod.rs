@@ -3,6 +3,7 @@ pub(crate) use crate::engine::rust_use_tree::*;
 use crate::engine::symbols::rust_node_has_unrestricted_pub_visibility;
 
 use super::super::git_input::validate_git_revision;
+use super::rust_dependencies::crates::package_of;
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
 
 mod impl_owner;
@@ -37,35 +38,18 @@ fn is_rust_source_path(path: &str) -> bool {
 /// 保守的に false (binary-only ではない) を返す。Rust ファイル以外や `Cargo.toml` が
 /// 見つからない場合も false を返す。
 pub(crate) fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
-    let path = std::path::Path::new(file_path);
-    if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+    let Some(package) = package_of(dir, file_path) else {
+        return false;
+    };
+    let root = std::path::Path::new(dir);
+    let package = std::path::Path::new(&package);
+    let lib = package.join("src/lib.rs");
+    if crate::git_support::tree_view(root).hides(&lib) || root.join(&lib).is_file() {
         return false;
     }
-    let full = std::path::Path::new(dir).join(file_path);
-    let dir_canonical = std::fs::canonicalize(dir).ok();
-    let mut current = full.parent();
-    while let Some(d) = current {
-        let cargo_toml = d.join("Cargo.toml");
-        if cargo_toml.is_file() {
-            if d.join("src").join("lib.rs").is_file() {
-                return false;
-            }
-            // Cargo.toml に `[lib]` セクションがあれば custom path の lib crate。
-            // パース失敗時は保守的に lib crate 扱い (false = binary-only ではない)。
-            let Ok(text) = std::fs::read_to_string(&cargo_toml) else {
-                return false;
-            };
-            return !cargo_toml_text_declares_lib(&text);
-        }
-        // dir より上には探索しない
-        if let (Some(root), Ok(canon)) = (dir_canonical.as_ref(), std::fs::canonicalize(d))
-            && canon == *root
-        {
-            return false;
-        }
-        current = d.parent();
-    }
-    false
+    let manifest = root.join(package).join("Cargo.toml");
+    crate::engine::bounded_read::read_input_text_file(&manifest)
+        .is_some_and(|text| !cargo_toml_text_declares_lib(&text))
 }
 
 /// `api.rm` 側専用: `base` リビジョン時点での crate type を判定する。
@@ -194,26 +178,12 @@ pub(crate) fn rust_private_module_info(
     file_path: &str,
 ) -> Option<RustPrivateModuleInfo> {
     use std::path::{Path, PathBuf};
+    let crate_root_rel = PathBuf::from(package_of(dir, file_path)?);
     let rel = Path::new(file_path);
-    if rel.extension().and_then(|s| s.to_str()) != Some("rs") {
-        return None;
-    }
     let canonical_dir = std::fs::canonicalize(dir).ok()?;
     let abs = canonical_dir.join(rel);
-    let mut crate_root: Option<PathBuf> = None;
-    let mut anc = abs.parent();
-    while let Some(d) = anc {
-        if d.join("Cargo.toml").is_file() {
-            crate_root = Some(d.to_path_buf());
-            break;
-        }
-        if d == canonical_dir {
-            break;
-        }
-        anc = d.parent();
-    }
-    let crate_root = crate_root?;
-    let src_dir = crate_root.join("src");
+    let src_root_rel = crate_root_rel.join("src");
+    let src_dir = canonical_dir.join(&src_root_rel);
     if !src_dir.join("lib.rs").is_file() {
         return None;
     }
@@ -222,8 +192,6 @@ pub(crate) fn rust_private_module_info(
     if segments.is_empty() {
         return None;
     }
-    let crate_root_rel = crate_root.strip_prefix(&canonical_dir).ok()?.to_path_buf();
-    let src_root_rel = crate_root_rel.join("src");
     let mut current_rel = PathBuf::from("lib.rs");
     for (idx, seg) in segments.iter().enumerate() {
         let module_source = read_rust_module_source(source, dir, &crate_root_rel, &current_rel)?;
