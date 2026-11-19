@@ -9,7 +9,7 @@ use crate::language::{LangId, normalize_identifier};
 use crate::models::change_evidence::{
     ChangeAnalysis, ChangeEvidence, ChangeUnknownReason, ChangedPart,
 };
-use crate::models::symbol::{Symbol, SymbolKind};
+use crate::models::symbol::{Symbol, SymbolKind, symbol_kind_str};
 
 use super::tree_walk::{Children, Walk, walk_preorder};
 use super::{parser, symbols};
@@ -115,22 +115,24 @@ impl ChangeEvidenceIndex {
             proven_added_declarations(old_root, old, new_root, new, lang, &new_parts);
         let mut entries = BTreeMap::new();
         for (key, current) in new_parts {
-            let evidence = match (old_parts.get(&key), current.as_slice()) {
-                (Some(previous), [Some(new)]) if previous.len() == 1 => match &previous[0] {
-                    Some(old) => compare(old, new),
-                    None => ChangeEvidence::unknown(ChangeUnknownReason::UnsupportedSyntax),
-                },
-                (Some(previous), [_]) if previous.len() == 1 => {
-                    ChangeEvidence::unknown(ChangeUnknownReason::UnsupportedSyntax)
+            let previous = old_parts.get(&key).map(Vec::as_slice).unwrap_or_default();
+            let evidence = match (previous, current.as_slice()) {
+                (previous, current) if previous.len() > 1 || current.len() > 1 => {
+                    ChangeEvidence::unknown(ChangeUnknownReason::DeclarationPairingAmbiguous)
                 }
-                _ => ChangeEvidence::unknown(ChangeUnknownReason::DeclarationPairingAmbiguous),
+                _ if !supported_declaration_kind(&key.1) => {
+                    ChangeEvidence::unknown(ChangeUnknownReason::UnsupportedDeclarationKind)
+                }
+                ([Some(old)], [Some(new)]) => compare(old, new),
+                ([_], [_]) => ChangeEvidence::unknown(ChangeUnknownReason::UnsupportedSyntax),
+                _ => ChangeEvidence::unknown(ChangeUnknownReason::DeclarationPairingUnavailable),
             };
             entries.insert(key, evidence);
         }
         Self {
             entries,
             added_declarations,
-            fallback: ChangeUnknownReason::DeclarationPairingAmbiguous,
+            fallback: ChangeUnknownReason::DeclarationPairingUnavailable,
         }
     }
 
@@ -154,7 +156,16 @@ impl ChangeEvidenceIndex {
                 }
             })
             .cloned()
-            .unwrap_or_else(|| ChangeEvidence::unknown(self.fallback))
+            .unwrap_or_else(|| {
+                let reason = if self.fallback == ChangeUnknownReason::DeclarationPairingUnavailable
+                    && !supported_declaration_kind(kind)
+                {
+                    ChangeUnknownReason::UnsupportedDeclarationKind
+                } else {
+                    self.fallback
+                };
+                ChangeEvidence::unknown(reason)
+            })
     }
 }
 
@@ -358,10 +369,10 @@ fn declarations(
     for symbol in
         symbols::extract_symbols_without_complexity(root, source, lang).unwrap_or_default()
     {
-        let Some(kind) = kind_name(symbol.kind) else {
-            continue;
-        };
-        let parts = partition(root, source, &symbol, lang);
+        let kind = symbol_kind_str(symbol.kind);
+        let parts = supported_declaration_kind(kind)
+            .then(|| partition(root, source, &symbol, lang))
+            .flatten();
         let name = normalize_identifier(lang, &symbol.name).into_owned();
         result
             .entry((name.clone(), kind.to_owned()))
@@ -377,15 +388,11 @@ fn declarations(
     result
 }
 
-fn kind_name(kind: SymbolKind) -> Option<&'static str> {
-    match kind {
-        SymbolKind::Function => Some("function"),
-        SymbolKind::Method => Some("method"),
-        SymbolKind::Variable => Some("variable"),
-        SymbolKind::Constant => Some("constant"),
-        SymbolKind::Field => Some("field"),
-        _ => None,
-    }
+fn supported_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function" | "method" | "variable" | "constant" | "field"
+    )
 }
 
 fn declaration_kinds(lang: LangId) -> &'static [&'static str] {
@@ -960,6 +967,33 @@ mod tests {
             proof.unknown_reason,
             Some(ChangeUnknownReason::UnsupportedLanguage)
         );
+    }
+
+    #[test]
+    fn evidence_distinguishes_duplicate_and_unmatched_declarations() {
+        let single = "export interface Shape { width: number; }";
+        let duplicate =
+            "export interface Shape { width: number; }\nexport interface Shape { height: number; }";
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            for (old, new) in [(single, duplicate), (duplicate, single)] {
+                let proof = evidence(lang, old, new, "Shape", "trait");
+                assert_eq!(
+                    proof.unknown_reason,
+                    Some(ChangeUnknownReason::DeclarationPairingAmbiguous)
+                );
+            }
+            let proof = evidence(
+                lang,
+                "export function count() { return 1; }",
+                "export const count = 2;",
+                "count",
+                "variable",
+            );
+            assert_eq!(
+                proof.unknown_reason,
+                Some(ChangeUnknownReason::DeclarationPairingUnavailable)
+            );
+        }
     }
 
     #[test]

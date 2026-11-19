@@ -40,8 +40,10 @@ pub enum ChangeUnknownReason {
     SourceUnavailable,
     ParseError,
     UnsupportedLanguage,
+    UnsupportedDeclarationKind,
     UnsupportedSyntax,
     DeclarationPairingAmbiguous,
+    DeclarationPairingUnavailable,
     ResourceLimit,
 }
 

@@ -21,6 +21,26 @@ pub enum SymbolKind {
     Parameter,
 }
 
+pub(crate) fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Class => "class",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Constant => "constant",
+        SymbolKind::Module => "module",
+        SymbolKind::Import => "import",
+        SymbolKind::Type => "type",
+        SymbolKind::Field => "field",
+        SymbolKind::Parameter => "parameter",
+    }
+}
+
 /// ソースコードから抽出したシンボル定義。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
