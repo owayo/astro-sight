@@ -438,6 +438,7 @@ mod tests {
                     ty: vec![TypeAtom::Array(vec![TypeAtom::String])],
                 }],
                 mode: MemberChangeMode::Addition,
+                builtin_names: BTreeSet::new(),
             };
             let mut prover = Prover {
                 scope: &scope,

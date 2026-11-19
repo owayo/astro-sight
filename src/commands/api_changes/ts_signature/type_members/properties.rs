@@ -21,6 +21,10 @@ pub(super) fn simple_annotation_type(annotation: Node<'_>, source: &[u8]) -> Opt
 pub(super) fn is_scalar_atom(atom: &TypeAtom) -> bool {
     !matches!(
         atom,
-        TypeAtom::Array(_) | TypeAtom::Any | TypeAtom::Unknown | TypeAtom::StrLit(None)
+        TypeAtom::Array(_)
+            | TypeAtom::ReadonlyArray(_)
+            | TypeAtom::Any
+            | TypeAtom::Unknown
+            | TypeAtom::StrLit(None)
     )
 }

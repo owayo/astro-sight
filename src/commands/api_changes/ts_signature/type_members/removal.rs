@@ -197,7 +197,7 @@ pub(crate) fn classify_member_property_removal(
                 .collect(),
             required_additions,
             invariant_properties,
-            builtin_names,
         }),
+        builtin_names,
     })
 }

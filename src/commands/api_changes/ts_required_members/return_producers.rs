@@ -64,14 +64,6 @@ fn wrapped_return<'t>(function: Node<'t>, source: &[u8], name: &str) -> Option<W
         })
 }
 
-fn generic_argument<'t>(ty: Node<'t>, source: &[u8], name: &str) -> Option<Node<'t>> {
-    (ty.kind() == "generic_type"
-        && ty.child_by_field_name("name")?.kind() == "type_identifier"
-        && ty.child_by_field_name("name")?.utf8_text(source).ok() == Some(name))
-    .then_some(())?;
-    only_named_child(ty.child_by_field_name("type_arguments")?)
-}
-
 impl Prover<'_, '_> {
     pub(super) fn prove_wrapped_return(
         &mut self,

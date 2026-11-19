@@ -130,8 +130,9 @@ fn supported_type(ty: Node<'_>, source: &[u8], depth: usize) -> bool {
                     key.kind() == "predefined_type"
                         && key.utf8_text(source).ok() == Some("string")
                         && simple_type(*value, source).is_some_and(|atoms| {
-                            atoms.iter().all(|atom| !matches!(atom, TypeAtom::Array(_)))
-                                && plain_atoms(&atoms)
+                            atoms.iter().all(|atom| {
+                                !matches!(atom, TypeAtom::Array(_) | TypeAtom::ReadonlyArray(_))
+                            }) && plain_atoms(&atoms)
                         })
                 }
                 _ => false,
@@ -143,7 +144,7 @@ fn supported_type(ty: Node<'_>, source: &[u8], depth: usize) -> bool {
 
 fn plain_atoms(atoms: &[TypeAtom]) -> bool {
     atoms.iter().all(|atom| match atom {
-        TypeAtom::Array(items) => plain_atoms(items),
+        TypeAtom::Array(items) | TypeAtom::ReadonlyArray(items) => plain_atoms(items),
         TypeAtom::Any | TypeAtom::Unknown | TypeAtom::StrLit(None) => false,
         _ => true,
     })
@@ -160,7 +161,7 @@ impl Prover<'_, '_> {
     ) -> bool {
         if !*self
             .invariant_builtins
-            .get_or_init(|| self.invariant_builtins_are_plain(caches))
+            .get_or_init(|| self.property_builtins_are_plain(caches))
         {
             return false;
         }
@@ -177,12 +178,9 @@ impl Prover<'_, '_> {
             .is_some_and(|objects| objects.contains(&(object.start_byte(), object.end_byte())))
     }
 
-    fn invariant_builtins_are_plain(&self, caches: &mut ApiClosureCaches) -> bool {
-        let MemberChangeMode::Removal(removed) = &self.delta.mode else {
-            return false;
-        };
-        ensure_name_refs(self.scope.dir, &removed.builtin_names, caches);
-        for name in &removed.builtin_names {
+    pub(super) fn property_builtins_are_plain(&self, caches: &mut ApiClosureCaches) -> bool {
+        ensure_name_refs(self.scope.dir, &self.delta.builtin_names, caches);
+        for name in &self.delta.builtin_names {
             let Some(refs) = name_refs(caches, name) else {
                 return false;
             };

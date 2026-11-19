@@ -169,6 +169,7 @@ pub(crate) fn classify_member_type_narrowing(
         RequiredMemberChange::Supported(RequiredMemberDelta {
             added: narrowed,
             mode: crate::commands::api_changes::ts_required_members::MemberChangeMode::Narrowing,
+            builtin_names: Default::default(),
         })
     }
 }
