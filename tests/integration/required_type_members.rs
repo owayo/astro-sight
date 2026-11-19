@@ -136,6 +136,54 @@ fn typed_array_literals_close_required_member_additions() {
 }
 
 #[test]
+fn typed_tuple_arrays_close_required_additions_with_unused_same_file_consumer() {
+    let repo = TestRepo::new();
+    let old_type = "export interface Flags {\n  red: boolean;\n  blue: boolean;\n}\n\
+        export function countFlags(flags: Flags): number {\n  return Object.values(flags).filter(Boolean).length;\n}\n";
+    let old_value = "{ red: true, blue: false }";
+    let updated_value = "{ red: true, blue: false, green: true }";
+    let table = |first, second| {
+        format!(
+            "import type {{ Flags }} from './flags';\n\
+            const samples: Array<[Flags, number]> = [\n  [{first}, 1],\n  [{second}, 2],\n];\n\
+            export const sampleCount = samples.length;\n"
+        )
+    };
+    repo.write("flags.ts", old_type);
+    repo.write("table.ts", table(old_value, old_value));
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "flags.ts",
+        old_type.replace("  blue: boolean;", "  blue: boolean;\n  green: boolean;"),
+    );
+
+    for (source, expected) in [
+        (table(updated_value, updated_value), 0),
+        (table(updated_value, old_value), 1),
+        (
+            format!(
+                "{}import {{ countFlags }} from './flags';\ncountFlags({old_value});\n",
+                table(updated_value, updated_value)
+            ),
+            1,
+        ),
+        ("export const sampleCount = 0;\n".to_owned(), 1),
+    ] {
+        repo.write("table.ts", &source);
+        let (code, json) = hook(&repo);
+        let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+        assert_eq!(code, expected, "{source}: {json}");
+        assert!(
+            json["api"][bucket]
+                .as_array()
+                .is_some_and(|changes| changes.iter().any(|change| change["n"] == "Flags")),
+            "{source}: {json}"
+        );
+    }
+}
+
+#[test]
 fn typed_array_container_forms_prove_all_target_positions() {
     for extension in ["ts", "tsx"] {
         for (annotation, literal) in [

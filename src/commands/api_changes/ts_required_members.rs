@@ -329,8 +329,12 @@ pub(super) fn prove_closure(
             return false;
         }
     }
-    // 値を作る箇所も受け取る箇所も無い (公開するだけ) なら、利用者を 1 件も確かめていない。
-    prover.sites > 0
+    // 値を作る箇所も必須引数で受け取る箇所も無ければ、利用者を 1 件も確かめていない。
+    (prover.sites > 0
+        || prover
+            .consumers
+            .iter()
+            .any(|site| site.optional_members.is_none()))
         && prover.prove_deferred(diff_files, caches)
         && (!delta.audits_uses() || prover.prove_narrowed_uses(caches))
         && (delta.removed_names().is_empty() || prover.prove_removed_keys_absent(caches))
@@ -484,7 +488,7 @@ struct Prover<'s, 'a> {
     partial_builtin: OnceCell<bool>,
     array_literal_builtins: OnceCell<bool>,
     wrapped_producers: Vec<row_array_map::WrappedProducer>,
-    /// 証明した値を作る箇所・受け取る箇所の数。
+    /// 証明した値を作る箇所の数。
     sites: usize,
 }
 
@@ -810,7 +814,6 @@ impl Prover<'_, '_> {
             index,
             optional_members,
         });
-        self.sites += usize::from(!partial);
         true
     }
 
@@ -897,7 +900,8 @@ impl Prover<'_, '_> {
     }
 
     /// 受け取る関数の全参照が、import・export か、対象の型と証明できる値を渡す直接呼び出し
-    /// であること。直接呼び出しが 1 件も無ければ (外部の利用者しかいなければ) 証明しない。
+    /// であること。必須プロパティを足す場合、同じファイルの関数に呼び出しがなくても、別途値を作る箇所を
+    /// 証明できていれば、リポジトリ内の利用は閉じている (Issue #434)。
     fn prove_consumer_calls(
         &self,
         consumer: &ConsumerSite,
@@ -928,7 +932,11 @@ impl Prover<'_, '_> {
                 ConsumerRef::Unproven => return false,
             }
         }
-        calls > 0 || consumer.optional_members.is_some()
+        calls > 0
+            || consumer.optional_members.is_some()
+            || (matches!(self.delta.mode, MemberChangeMode::Addition)
+                && self.sites > 0
+                && self.same_path(self.scope.target_path, &consumer.path))
     }
 
     fn classify_consumer_reference(
