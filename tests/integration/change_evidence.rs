@@ -28,7 +28,11 @@ fn hook(repo: &TestRepo, staged: bool) -> (Value, i32) {
 }
 
 fn impact_evidence<'a>(review: &'a Value, path: &str, name: &str) -> &'a Value {
-    &review["impact"]["changes"]
+    &impact_symbol(review, path, name)["change_evidence"]
+}
+
+fn impact_symbol<'a>(review: &'a Value, path: &str, name: &str) -> &'a Value {
+    review["impact"]["changes"]
         .as_array()
         .unwrap()
         .iter()
@@ -38,7 +42,7 @@ fn impact_evidence<'a>(review: &'a Value, path: &str, name: &str) -> &'a Value {
         .unwrap()
         .iter()
         .find(|symbol| symbol["name"] == name)
-        .unwrap()["change_evidence"]
+        .unwrap()
 }
 
 #[test]
@@ -301,6 +305,124 @@ fn change_evidence_added_typescript_bindings_in_replaced_arrow_hunk() {
 #[test]
 fn change_evidence_added_typescript_bindings_in_addition_only_hunk() {
     assert_added_typescript_bindings(false, false);
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_across_changed_files() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "shape.ts",
+        "export function area(width: number): number { return width * width; }\n",
+    );
+    repo.write(
+        "text.ts",
+        "export function label(): string { return 'a'; }\n",
+    );
+    repo.write(
+        "use.ts",
+        "import { area } from './shape';\n\nexport const total: number = area(2);\n",
+    );
+    repo.commit_all("initial");
+    repo.write("use.ts", "import { area as size } from './shape';\n\nexport const total: number = size(2);\nexport const wide = size(2) > 10;\n");
+
+    let check = |staged| {
+        let args = if staged {
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let review = repo.run_json("review", args);
+        let context = repo.run_json("context", args);
+        assert_eq!(review["impact"]["changes"], context["changes"]);
+        let added = impact_symbol(&review, "use.ts", "wide");
+        assert_eq!(added["change_type"], "added", "{review}");
+        assert!(added.get("change_evidence").is_none(), "{added}");
+        assert_eq!(
+            impact_symbol(&review, "use.ts", "total")["change_type"],
+            "modified"
+        );
+        let (report, _) = hook(&repo, staged);
+        let entries = report["change_evidence"].as_array().unwrap();
+        assert!(
+            entries.iter().any(|entry| entry["n"] == "total"),
+            "{report}"
+        );
+        assert!(entries.iter().all(|entry| entry["n"] != "wide"), "{report}");
+    };
+    check(false);
+    repo.write(
+        "text.ts",
+        "export function label(): string { return 'b'; }\n",
+    );
+    check(false);
+    repo.stage_all();
+    repo.write("text.ts", "export function label() {\n");
+    check(true);
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_check_the_other_old_declarations() {
+    for (old, new, expected) in [
+        ("export const wide = true;\n", None, "modified"),
+        (
+            "export function wide() { return true; }\n",
+            Some("export function wide() { return false; }\n"),
+            "added",
+        ),
+        (
+            "export const broken = (\n",
+            Some("export const repaired = true;\n"),
+            "modified",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("old.js", old);
+        repo.write("use.ts", "export function status() { return 1; }\n");
+        repo.commit_all("initial");
+        if let Some(new) = new {
+            repo.write("old.js", new);
+        } else {
+            repo.git(["rm", "old.js"]);
+        }
+        repo.write(
+            "use.ts",
+            "export function status() { return 2; }\nexport const wide = true;\n",
+        );
+        let review = repo.run_json("review", &["--git"]);
+        let symbol = impact_symbol(&review, "use.ts", "wide");
+        assert_eq!(symbol["change_type"], expected, "{old}: {review}");
+        if expected == "modified" {
+            assert_eq!(
+                symbol["change_evidence"]["unknown_reason"], "declaration_pairing_ambiguous",
+                "{review}"
+            );
+        } else {
+            assert!(symbol.get("change_evidence").is_none(), "{symbol}");
+        }
+    }
+}
+
+#[test]
+fn change_evidence_added_typescript_bindings_keep_hunkless_moves_unproven() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("old.js", "export const wide = true;\n");
+    repo.write("use.ts", "export function status() { return 1; }\n");
+    repo.commit_all("initial");
+    repo.git(["mv", "old.js", "moved.js"]);
+    repo.write(
+        "use.ts",
+        "export function status() { return 2; }\nexport const wide = true;\n",
+    );
+    let review = repo.run_json("review", &["--git"]);
+    let symbol = impact_symbol(&review, "use.ts", "wide");
+    assert_eq!(symbol["change_type"], "modified", "{review}");
+    assert_eq!(
+        symbol["change_evidence"]["unknown_reason"], "declaration_pairing_ambiguous",
+        "{review}"
+    );
 }
 
 #[test]
