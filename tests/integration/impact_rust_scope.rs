@@ -194,6 +194,71 @@ fn impact_rust_external_associated_types_require_binding_proof() {
 }
 
 #[test]
+fn impact_rust_distinguishes_registry_calls_from_private_functions() {
+    for (stale, shadowed) in [(false, false), (true, false), (false, true)] {
+        let outer = TestRepo::new();
+        outer.init_git();
+        let repo = TestRepo::new_in(outer.root());
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = 'sample'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nsha2 = '0.10'\n",
+        );
+        let crate_root = if shadowed {
+            "mod cache;\nmod checksum;\nmod r#sha2 {}\n"
+        } else {
+            "mod cache;\nmod checksum;\n"
+        };
+        repo.write("src/lib.rs", crate_root);
+        repo.write(
+            "src/checksum.rs",
+            "use sha2::{Digest, Sha256};\n\
+            pub fn sum(bytes: &[u8]) -> [u8; 32] {\n    Sha256::digest(bytes).into()\n}\n",
+        );
+        let child_module = if stale {
+            repo.create_dir_all("src/cache");
+            repo.write(
+                "src/cache/child.rs",
+                "use crate::cache as Sha256;\npub fn stale() -> usize { Sha256::digest(b\"ab\") }\n",
+            );
+            "mod child;\n"
+        } else {
+            ""
+        };
+        let before = format!(
+            "fn digest(bytes: &[u8]) -> usize {{ bytes.len() }}\n\
+             pub fn key() -> usize {{ digest(b\"ab\") }}\n{child_module}"
+        );
+        repo.write("src/cache.rs", &before);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/cache.rs",
+            before
+                .replace("bytes: &[u8])", "bytes: &[u8], mode: bool)")
+                .replace("bytes.len()", "bytes.len() + usize::from(mode)")
+                .replace("digest(b\"ab\")", "digest(b\"ab\", true)"),
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/cache.rs")
+            .unwrap();
+        let paths: Vec<_> = change["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|caller| caller["path"].as_str())
+            .collect();
+        assert_eq!(paths.contains(&"src/checksum.rs"), shadowed, "{context}");
+        assert_eq!(paths.contains(&"src/cache/child.rs"), stale, "{context}");
+    }
+}
+
+#[test]
 fn impact_rust_associated_paths_ignore_unrelated_file_syntax() {
     for (declaration, extra, body, imported) in [
         (

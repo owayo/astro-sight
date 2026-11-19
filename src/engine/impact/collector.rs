@@ -110,6 +110,7 @@ pub(super) struct RefEventMini {
     pub(super) rust_owner_is_free_function: bool,
     /// 型の関連パスかパスの途中の名前で、自由関数を指さない。
     pub(super) rust_non_function_path: bool,
+    pub(super) rust_registry_qualified_call: bool,
     /// A same-name direct declaration in the reference file owns this use.
     pub(super) rust_local_owner: bool,
     pub(super) rust_direct_import_site: bool,
@@ -786,6 +787,16 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     self.rust_cargo_reachability,
                 )
         });
+        let rust_registry_qualified_call = !rust_non_function_path
+            && rust_owner_index.zip(node).is_some_and(|(index, node)| {
+                index.is_registry_qualified_call(
+                    node,
+                    source,
+                    Path::new(self.dir),
+                    self.path_str,
+                    self.rust_path_owner_project,
+                )
+            });
         let rust_plain_name = self.ref_lang == Some(LangId::Rust)
             && !rust_macro_callee
             && owner_node.is_some_and(|node| {
@@ -929,6 +940,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_owner_path_id,
             rust_owner_is_free_function,
             rust_non_function_path,
+            rust_registry_qualified_call,
             rust_local_owner,
             rust_direct_import_site,
             rust_import_binding_safe,
@@ -1306,10 +1318,13 @@ impl<'a> ImpactCollector<'a> {
         if e.rust_std_origin && ctx.lang_id == LangId::Rust {
             return true;
         }
-        if e.rust_non_function_path
-            && ctx.lang_id == LangId::Rust
+        if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && ctx.rust_free_function_names.contains(name)
+            && (e.rust_non_function_path
+                || (e.rust_registry_qualified_call
+                    && ctx.rust_private_root_names.contains(name)
+                    && !filters::is_same_source_file(self.path_str, &ctx.new_path)))
         {
             return true;
         }
@@ -1701,6 +1716,7 @@ mod tests {
             rust_owner_path_id: u32::MAX,
             rust_owner_is_free_function: false,
             rust_non_function_path: false,
+            rust_registry_qualified_call: false,
             rust_local_owner: false,
             rust_direct_import_site: false,
             rust_import_binding_safe: false,

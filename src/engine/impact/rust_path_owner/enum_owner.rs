@@ -443,7 +443,7 @@ impl RustPathOwnerIndex {
         }
         if parent.kind() != "scoped_identifier"
             || parent.child_by_field_name("name").map(|node| node.id()) != Some(node.id())
-            || !self.enum_variant_paths.contains(&parent.id())
+            || !self.unshadowed_qualified_paths.contains(&parent.id())
         {
             return None;
         }
