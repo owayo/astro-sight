@@ -1,4 +1,4 @@
-//! 単純な property signature の削除だけを分類する (Issue #141)。
+//! property signature の削除と、scalar 型の必須プロパティへの置き換えを分類する。
 
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
@@ -73,9 +73,6 @@ pub(crate) fn classify_member_property_removal(
             != normalized_prefix(new_outer, new_body, &src.new)
         || normalized_suffix(old_outer, old_body, &src.old)
             != normalized_suffix(new_outer, new_body, &src.new)
-        || new
-            .iter()
-            .any(|(signature, _)| !old.iter().any(|(previous, _)| previous == signature))
     {
         return RequiredMemberChange::Unsupported;
     }
@@ -89,6 +86,12 @@ pub(crate) fn classify_member_property_removal(
         return RequiredMemberChange::Unsupported;
     }
     let mut invariant = false;
+    let old_signatures: HashSet<_> = old
+        .iter()
+        .map(|(signature, _)| signature.as_str())
+        .collect();
+    let mut old_names = HashSet::new();
+    let mut required_additions = HashSet::new();
     let mut builtin_names = std::collections::BTreeSet::new();
     for (decl, members, source, is_new) in [
         (old_decl, &old, src.old.as_slice(), false),
@@ -107,7 +110,7 @@ pub(crate) fn classify_member_property_removal(
         ) {
             return RequiredMemberChange::Unsupported;
         }
-        for (_, member) in members {
+        for (signature, member) in members {
             let Some(Some(name)) = member_name(*member, source) else {
                 return RequiredMemberChange::Unsupported;
             };
@@ -117,17 +120,34 @@ pub(crate) fn classify_member_property_removal(
                 .is_some_and(|ty| ty.iter().all(is_scalar_atom));
             if !supported_retained_member(*member, source)
                 || name.contains('\\')
-                || !names.insert(name)
+                || !names.insert(name.clone())
             {
                 return RequiredMemberChange::Unsupported;
             }
             if is_new {
+                if !old_signatures.contains(signature.as_str()) {
+                    if old_names.contains(&name)
+                        || member.kind() != "property_signature"
+                        || ts_property_signature_is_optional(*member)
+                        || !scalar
+                        || name == "__proto__"
+                    {
+                        return RequiredMemberChange::Unsupported;
+                    }
+                    required_additions.insert(name);
+                }
                 invariant |= !scalar;
                 if let Some(annotation) = member.child_by_field_name("type") {
                     builtin_names.extend(property_builtin_names(annotation, source));
                 }
             }
         }
+        if !is_new {
+            old_names = names;
+        }
+    }
+    if invariant && !required_additions.is_empty() {
+        return RequiredMemberChange::Unsupported;
     }
     let invariant_properties = if invariant {
         let properties = new
@@ -175,6 +195,7 @@ pub(crate) fn classify_member_property_removal(
                 .iter()
                 .filter_map(|(_, member)| member_name(*member, &src.old).flatten())
                 .collect(),
+            required_additions,
             invariant_properties,
             builtin_names,
         }),
