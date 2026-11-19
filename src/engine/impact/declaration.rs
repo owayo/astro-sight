@@ -1061,6 +1061,17 @@ pub(super) fn reconcile_declaration_changes(
                 change.new_signature = new_header.display.clone();
             }
         }
+        if input.lang_id == LangId::Rust
+            && !is_added
+            && has_text_sig_change
+            && header_pair.is_none()
+            && *rust_import_environment_unchanged
+                .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
+            && rust_same_name_parameter_patterns_changed(input, &symbol_change.name, &mut old_side)
+        {
+            sig_changes.retain(|sc| sc.name != symbol_change.name);
+            continue;
+        }
         // Python は単一の宣言を新旧とも確認できる場合、共通のトークン比較を正本にする。
         // 行比較の空白誤検出を打ち消す一方、文字列内部の空白変更の見逃しも補う。
         // 同名の別メソッド・overload や構文エラーがあれば従来の検出を維持する。
@@ -1694,6 +1705,41 @@ fn unique_header_pair(
         .ok()?;
     let new_header = declaration_header(input.root, input.source, symbol, input.lang_id)?;
     Some((old_header, new_header))
+}
+
+/// 同名の宣言が複数あると、行比較の結果を特定の宣言に帰属させられない。囲む impl や trait を含む
+/// 呼び出し契約で全宣言が一意に対応し、通常引数のパターンに差がある場合だけ取り消す (Issue #435)。
+fn rust_same_name_parameter_patterns_changed(
+    input: &DeclarationChangeInput<'_>,
+    name: &str,
+    old_side: &mut LazyOldSide,
+) -> bool {
+    let Some(old) = old_side.get(input) else {
+        return false;
+    };
+    let headers_by_contract = |root: Node<'_>, source: &[u8], symbols: &[Symbol]| {
+        let mut headers = HashMap::new();
+        for symbol in symbols.iter().filter(|symbol| symbol.name == name) {
+            let header = declaration_header(root, source, symbol, LangId::Rust)?;
+            if headers
+                .insert(header.rust_parameter_contract?, header.tokens)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(headers)
+    };
+    let (Some(old_headers), Some(new_headers)) = (
+        headers_by_contract(old.tree.root_node(), &old.source, &old.symbols),
+        headers_by_contract(input.root, input.source, input.syms),
+    ) else {
+        return false;
+    };
+    old_headers.len() > 1
+        && old_headers.len() == new_headers.len()
+        && old_headers.keys().all(|key| new_headers.contains_key(key))
+        && old_headers != new_headers
 }
 
 /// 行ベースの検出 (`detect_signature_changes`) が `name` の変更前後のシグネチャ行を

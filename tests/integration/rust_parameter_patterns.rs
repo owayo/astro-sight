@@ -185,6 +185,78 @@ fn rust_parameter_patterns_do_not_block_hooks() {
 }
 
 #[test]
+fn rust_test_trait_impl_keeps_same_named_method_contracts_distinct() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("tests");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = 'demo'\nversion = '0.1.0'\nedition = '2021'\n",
+    );
+    let trait_source =
+        "pub mod runtime;\npub trait Driver {\n    fn key(&self, id: u8) -> u8;\n}\n";
+    repo.write("src/lib.rs", trait_source);
+    repo.write("src/runtime.rs", "use crate::Driver;\npub fn evaluate(engine: impl Driver) -> u8 {\n    engine.key(1)\n}\npub fn matches(cached: u8, key: u8) -> bool {\n    cached == key\n}\n");
+    let path = "tests/driver.rs";
+    let old = "use demo::Driver;\nstruct Backend;\nimpl Driver for Backend {\n    fn key(&self, _: u8) -> u8 {\n        0\n    }\n}\nstruct Fixture;\nimpl Fixture {\n    fn key(&self) -> u8 {\n        Backend.key(1)\n    }\n}\n";
+    repo.write(path, old);
+    repo.init_git();
+    repo.commit_all("initial");
+    let with_binding = old
+        .replace("fn key(&self, _: u8)", "fn key(&self, id: u8)")
+        .replace("        0", "        id + 1");
+
+    let signature_changed = |change: &serde_json::Value| {
+        change["signature_changes"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|signature| signature["name"] == "key"))
+    };
+    for (new, breaking) in [
+        (with_binding.clone(), false),
+        (
+            with_binding.replace("fn key(&self) -> u8", "fn key(&self, extra: u8) -> u8"),
+            true,
+        ),
+    ] {
+        repo.write(path, new);
+        let context = repo.run_json("context", &["--git"]);
+        let change = &context["changes"][0];
+        assert_eq!(change["path"], path, "{context}");
+        assert_eq!(signature_changed(change), breaking, "{context}");
+        if !breaking {
+            assert!(
+                change["affected_symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol["name"] == "key"),
+                "{context}"
+            );
+            for kind in ["impacted_callers", "low_confidence_callers"] {
+                assert!(
+                    change[kind].as_array().is_none_or(|callers| callers
+                        .iter()
+                        .all(|caller| caller["path"] != "src/runtime.rs")),
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    repo.write(path, &with_binding);
+    repo.write("src/lib.rs", trait_source.replace("id: u8", "id: u16"));
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["path"] == "src/lib.rs" && signature_changed(change)),
+        "{context}"
+    );
+}
+
+#[test]
 fn rust_parameter_contract_and_macro_attributes_remain_blocking() {
     for (old, new) in [
         (
