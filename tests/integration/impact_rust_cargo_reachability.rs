@@ -557,6 +557,53 @@ fn add_symlink_to_index(repo: &TestRepo, path: &str, target: &str) {
 }
 
 #[test]
+fn review_staged_keeps_rust_api_change_with_omitted_manifest() {
+    for symlink in [false, true] {
+        let repo = TestRepo::new();
+        for directory in ["a/src", "b/src", "manifests"] {
+            repo.create_dir_all(directory);
+        }
+        let manifest = "[package]\nname = 'a'\nversion = '0.1.0'\nedition = '2021'\n";
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = ['a', 'b']\nresolver = '2'\n",
+        );
+        repo.write(
+            if symlink {
+                "manifests/a.toml"
+            } else {
+                "a/Cargo.toml"
+            },
+            manifest,
+        );
+        repo.write(
+            "b/Cargo.toml",
+            "[package]\nname = 'b'\nversion = '0.1.0'\nedition = '2021'\n[dependencies]\na = { path = '../a' }\n",
+        );
+        repo.write("a/src/lib.rs", "pub fn run(x: u8) -> u8 { x }\n");
+        repo.write("b/src/lib.rs", "pub fn caller() -> u8 { a::run(1) }\n");
+        repo.init_git();
+        repo.stage_all();
+        if symlink {
+            add_symlink_to_index(&repo, "a/Cargo.toml", "../manifests/a.toml");
+        }
+        repo.git(["commit", "-q", "-m", "initial"]);
+        repo.write("a/src/lib.rs", "pub fn run(x: u8, y: u8) -> u8 { x + y }\n");
+        repo.git(["add", "a/src/lib.rs"]);
+        repo.write("b/src/lib.rs", "pub fn caller() -> u8 { a::run(1, 2) }\n");
+
+        let review = repo.run_json("review", &["--git", "--staged"]);
+        let modified = review["api_changes"]["modified"].as_array().unwrap();
+        assert!(
+            modified
+                .iter()
+                .any(|entry| entry["name"] == "run" && entry["file"] == "a/src/lib.rs"),
+            "symlink={symlink}: {review}"
+        );
+    }
+}
+
+#[test]
 fn impact_rust_cargo_reachability_is_not_used_inside_the_staged_snapshot() {
     // b の src/shared.rs は c の src/shared.rs への symlink で、c のファイルは b の module として
     // b の依存 a を呼ぶ。staged の snapshot は symlink を書き出さないので、c が a に依存しない
