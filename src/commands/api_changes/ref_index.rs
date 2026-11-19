@@ -1609,7 +1609,7 @@ pub(crate) struct ApiClosureCaches {
     pub(super) unproven_symbol_sites:
         std::collections::HashMap<String, super::ts_required_members::UnprovenSymbolSites>,
     pub(super) unresolved_modified_callers: Vec<crate::models::review::UnresolvedApiCall>,
-    pub(super) literal_union_removal: super::ts_literal_union_removal::RemovalCache,
+    pub(super) literal_union: super::ts_literal_union_removal::ProofCache,
     pub(super) function_handoffs: super::ts_function_values::HandoffCache,
     /// Rust の参照側 AST に ERROR / MISSING がないか、ファイルごとに一度だけ確認する。
     rust_clean_files: std::collections::HashMap<String, bool>,

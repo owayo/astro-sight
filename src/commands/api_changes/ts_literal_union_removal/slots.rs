@@ -66,6 +66,7 @@ pub(super) struct Plan {
     pub(super) target: Site,
     pub(super) records: Vec<Record>,
     pub(super) arrays: Vec<Site>,
+    pub(super) producers: Vec<Site>,
     pub(super) consumers: Vec<Consumer>,
     pub(super) bindings: Vec<Binding>,
 }
@@ -74,6 +75,23 @@ pub(super) fn collect(
     inventory: &inventory::Inventory,
     site: &CompatibleModSite<'_>,
     removal: &shape::Removal,
+) -> Option<Plan> {
+    collect_slots(inventory, site, &removal.kept, false)
+}
+
+pub(super) fn collect_addition(
+    inventory: &inventory::Inventory,
+    site: &CompatibleModSite<'_>,
+    values: &BTreeSet<String>,
+) -> Option<Plan> {
+    collect_slots(inventory, site, values, true)
+}
+
+fn collect_slots(
+    inventory: &inventory::Inventory,
+    site: &CompatibleModSite<'_>,
+    values: &BTreeSet<String>,
+    addition: bool,
 ) -> Option<Plan> {
     let source = inventory.source(site.new_path)?;
     let declaration = shape::declaration(inventory.root(site.new_path)?, source, site.name)?;
@@ -85,6 +103,7 @@ pub(super) fn collect(
         },
         records: Vec::new(),
         arrays: Vec::new(),
+        producers: Vec::new(),
         consumers: Vec::new(),
         bindings: Vec::new(),
     };
@@ -123,8 +142,19 @@ pub(super) fn collect(
             if node.kind() != "type_identifier" {
                 return None;
             }
-            if let Some(declarator) = carrier_declaration(node) {
-                let record = record_slot(inventory, path, declarator, node, removal)?;
+            let record = if let Some(declarator) = carrier_declaration(node) {
+                Some(record_slot(inventory, path, declarator, node, values)?)
+            } else if addition && let Some(parent) = record_satisfies_expression(node) {
+                Some(satisfies_record_slot(
+                    inventory, path, parent, node, values,
+                )?)
+            } else {
+                None
+            };
+            if let Some(record) = record {
+                if addition && values.contains("__proto__") {
+                    return None;
+                }
                 if !plan
                     .records
                     .iter()
@@ -132,8 +162,14 @@ pub(super) fn collect(
                 {
                     plan.records.push(record);
                 }
-            } else if let Some(declarator) = array_declaration(node) {
-                let array = array_slot(inventory, path, declarator, removal)?;
+            } else if addition && node.parent()?.kind() == "array_type" {
+                let producer =
+                    super::addition::array_producer(inventory, path, node, &plan.target, values)?;
+                if !plan.producers.contains(&producer) {
+                    plan.producers.push(producer);
+                }
+            } else if !addition && let Some(declarator) = array_declaration(node) {
+                let array = array_slot(inventory, path, declarator, values)?;
                 if !plan.arrays.contains(&array) {
                     plan.arrays.push(array);
                 }
@@ -400,7 +436,7 @@ fn root_site(
     })
 }
 
-fn declared_site(
+pub(super) fn declared_site(
     inventory: &inventory::Inventory,
     path: &str,
     declaration: Node<'_>,
@@ -430,6 +466,18 @@ fn carrier_declaration(node: Node<'_>) -> Option<Node<'_>> {
         .filter(|parent| parent.kind() == "variable_declarator")?;
     (declaration.child_by_field_name("type")?.id() == annotation.id()).then_some(declaration)
 }
+
+fn record_satisfies_expression(node: Node<'_>) -> Option<Node<'_>> {
+    let arguments = node
+        .parent()
+        .filter(|node| node.kind() == "type_arguments")?;
+    let generic = arguments
+        .parent()
+        .filter(|node| node.kind() == "generic_type")?;
+    generic
+        .parent()
+        .filter(|node| node.kind() == "satisfies_expression")
+}
 fn array_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
     node = node
         .parent()
@@ -444,7 +492,7 @@ fn array_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
         .parent()
         .filter(|parent| parent.kind() == "variable_declarator")
 }
-fn is_const(declaration: Node<'_>) -> bool {
+pub(super) fn is_const(declaration: Node<'_>) -> bool {
     declaration
         .parent()
         .is_some_and(|parent| parent.kind() == "lexical_declaration" && token(parent, "const"))
@@ -455,13 +503,55 @@ fn record_slot(
     path: &str,
     declaration: Node<'_>,
     mode: Node<'_>,
-    removal: &shape::Removal,
+    values: &BTreeSet<String>,
 ) -> Option<Record> {
     if !is_const(declaration) {
         return None;
     }
     let source = inventory.source(path)?;
     let generic = only(declaration.child_by_field_name("type")?)?;
+    let object = declaration.child_by_field_name("value")?;
+    let primitive = record_value_type(generic, object, mode, source, values)?;
+    Some(Record {
+        site: declared_site(inventory, path, declaration)?,
+        primitive,
+    })
+}
+
+fn satisfies_record_slot(
+    inventory: &inventory::Inventory,
+    path: &str,
+    expression: Node<'_>,
+    mode: Node<'_>,
+    values: &BTreeSet<String>,
+) -> Option<Record> {
+    let declaration = expression
+        .parent()
+        .filter(|node| node.kind() == "variable_declarator")?;
+    if !is_const(declaration)
+        || declaration.child_by_field_name("type").is_some()
+        || declaration.child_by_field_name("value") != Some(expression)
+    {
+        return None;
+    }
+    let children = children(expression);
+    let [object, generic] = children.as_slice() else {
+        return None;
+    };
+    let primitive = record_value_type(*generic, *object, mode, inventory.source(path)?, values)?;
+    Some(Record {
+        site: declared_site(inventory, path, declaration)?,
+        primitive,
+    })
+}
+
+fn record_value_type(
+    generic: Node<'_>,
+    object: Node<'_>,
+    mode: Node<'_>,
+    source: &str,
+    values: &BTreeSet<String>,
+) -> Option<Primitive> {
     if generic.kind() != "generic_type"
         || generic
             .child_by_field_name("name")
@@ -478,12 +568,9 @@ fn record_slot(
         return None;
     }
     let primitive = Primitive::read(*value, source)?;
-    if primitive == Primitive::Void {
+    if primitive == Primitive::Void || object.kind() != "object" {
         return None;
     }
-    let object = declaration
-        .child_by_field_name("value")
-        .filter(|value| value.kind() == "object")?;
     let mut keys = BTreeSet::new();
     for member in children(object) {
         if member.kind() != "pair" {
@@ -502,21 +589,28 @@ fn record_slot(
             return None;
         }
     }
-    (keys == removal.kept)
-        .then(|| declared_site(inventory, path, declaration).map(|site| Record { site, primitive }))
-        .flatten()
+    (keys == *values).then_some(primitive)
 }
 fn array_slot(
     inventory: &inventory::Inventory,
     path: &str,
     declaration: Node<'_>,
-    removal: &shape::Removal,
+    values: &BTreeSet<String>,
 ) -> Option<Site> {
     if !is_const(declaration) {
         return None;
     }
     let source = inventory.source(path)?;
     let array = declaration.child_by_field_name("value")?;
+    literal_array(array, source, values)?;
+    declared_site(inventory, path, declaration)
+}
+
+pub(super) fn literal_array(
+    array: Node<'_>,
+    source: &str,
+    values: &BTreeSet<String>,
+) -> Option<()> {
     if array.kind() != "array" {
         return None;
     }
@@ -532,7 +626,7 @@ fn array_slot(
                 expect = true;
             }
             "string" => {
-                if !removal.kept.contains(&decode::string(node, source)?) {
+                if !values.contains(&decode::string(node, source)?) {
                     return None;
                 }
                 expect = false;
@@ -540,7 +634,7 @@ fn array_slot(
             _ => return None,
         }
     }
-    declared_site(inventory, path, declaration)
+    Some(())
 }
 fn consumer_slot(
     inventory: &inventory::Inventory,

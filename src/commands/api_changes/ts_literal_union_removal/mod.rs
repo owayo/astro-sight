@@ -1,4 +1,4 @@
-//! 文字列・判別 union の純粋な削除を、限定した値の受け口と利用から証明する。
+//! 文字列 union の要素変更と判別 union の要素削除を、限定した値の利用から証明する。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -11,7 +11,9 @@ use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use crate::engine::js_scope::{Namespace, ScopeBinding, resolve_binding_scope};
 use crate::engine::tree_walk::{Children, any_node};
 use crate::language::LangId;
+use crate::models::review::ApiModificationUnverifiedReason;
 
+mod addition;
 mod decode;
 mod flows;
 mod inventory;
@@ -30,18 +32,18 @@ struct Site {
 }
 
 #[derive(Default)]
-pub(super) struct RemovalCache {
+pub(super) struct ProofCache {
     inventory: Option<Option<Rc<inventory::Inventory>>>,
     residue: HashMap<Vec<String>, bool>,
 }
 
-/// 対象の削除形を認めた後の失敗は、参照行だけの証拠へ戻さない。
-pub(super) fn prove_removal(
+/// 対象の変更形を認めた後の失敗は、参照行だけの証拠へ戻さない。
+pub(super) fn prove_change(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
-    cache: &mut RemovalCache,
-) -> Option<bool> {
+    cache: &mut ProofCache,
+) -> Option<Result<(), ApiModificationUnverifiedReason>> {
     if !matches!(site.lang_id, Some(LangId::Typescript | LangId::Tsx))
         || site.kind != "type"
         || site.old_path != site.new_path
@@ -49,54 +51,67 @@ pub(super) fn prove_removal(
         return None;
     }
     let pair = sources.get(site)?;
+    use ApiModificationUnverifiedReason::{LiteralUnionProofFailed, UnsupportedTypeChange};
     let (removal, objects) = match shape::classify(site, pair) {
         shape::Change::NotApplicable => return None,
-        shape::Change::Unsupported => return Some(false),
+        shape::Change::Unsupported => return Some(Err(LiteralUnionProofFailed)),
+        shape::Change::UnsupportedAddition => return Some(Err(UnsupportedTypeChange)),
+        shape::Change::Addition(values) => {
+            return Some(
+                cache
+                    .inventory_for(index, site, &pair.new)
+                    .and_then(|inventory| addition::audit(&inventory, site, &values))
+                    .ok_or(UnsupportedTypeChange),
+            );
+        }
         shape::Change::Removal(removal) => (removal, None),
         shape::Change::ObjectRemoval(removal, objects) => (removal, Some(objects)),
     };
-    let Some(references) = index.complete_refs_for(site.name) else {
-        return Some(false);
+    let Some(inventory) = cache.inventory_for(index, site, &pair.new) else {
+        return Some(Err(LiteralUnionProofFailed));
     };
-    let Some(inventory) = cache
-        .inventory
-        .get_or_insert_with(|| inventory::Inventory::load(site.dir).map(Rc::new))
-        .clone()
-    else {
-        return Some(false);
-    };
-    if inventory
-        .files
-        .get(site.new_path)
-        .is_none_or(|file| file.source.as_bytes() != pair.new.as_ref())
-    {
-        return Some(false);
-    }
-    if references.iter().any(|reference| {
-        matches!(
-            LangId::from_path(camino::Utf8Path::new(&reference.path)),
-            Ok(LangId::Javascript | LangId::Typescript | LangId::Tsx)
-        ) && !inventory.files.contains_key(&reference.path)
-    }) {
-        return Some(false);
-    }
     let Some(plan) = slots::collect(&inventory, site, &removal) else {
-        return Some(false);
+        return Some(Err(LiteralUnionProofFailed));
     };
     let audited = match objects.as_ref() {
         Some(objects) => flows::audit_objects(&inventory, &plan, &removal, objects),
         None => flows::audit(&inventory, &plan, &removal),
     };
     if audited.is_none() {
-        return Some(false);
+        return Some(Err(LiteralUnionProofFailed));
     }
     let key = removal.removed.iter().cloned().collect::<Vec<_>>();
-    Some(
-        *cache
-            .residue
-            .entry(key)
-            .or_insert_with(|| residue::absent(&inventory, &removal)),
-    )
+    let absent = *cache
+        .residue
+        .entry(key)
+        .or_insert_with(|| residue::absent(&inventory, &removal));
+    Some(absent.then_some(()).ok_or(LiteralUnionProofFailed))
+}
+
+impl ProofCache {
+    fn inventory_for(
+        &mut self,
+        index: &ApiRefIndex,
+        site: &CompatibleModSite<'_>,
+        source: &[u8],
+    ) -> Option<Rc<inventory::Inventory>> {
+        let references = index.complete_refs_for(site.name)?;
+        let inventory = self
+            .inventory
+            .get_or_insert_with(|| inventory::Inventory::load(site.dir).map(Rc::new))
+            .clone()?;
+        if inventory.source(site.new_path)?.as_bytes() != source
+            || references.iter().any(|reference| {
+                matches!(
+                    LangId::from_path(camino::Utf8Path::new(&reference.path)),
+                    Ok(LangId::Javascript | LangId::Typescript | LangId::Tsx)
+                ) && !inventory.files.contains_key(&reference.path)
+            })
+        {
+            return None;
+        }
+        Some(inventory)
+    }
 }
 
 fn span(node: Node<'_>) -> Span {

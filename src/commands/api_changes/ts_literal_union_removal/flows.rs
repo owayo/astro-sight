@@ -6,7 +6,8 @@ use slots::{Binding, Consumer, Plan, Primitive};
 struct Proof<'a> {
     inventory: &'a inventory::Inventory,
     plan: &'a Plan,
-    removal: &'a shape::Removal,
+    values: &'a BTreeSet<String>,
+    require_exhaustive: bool,
     objects: Option<&'a shape::ObjectShape>,
     callbacks: Vec<Binding>,
 }
@@ -16,7 +17,15 @@ pub(super) fn audit(
     plan: &Plan,
     removal: &shape::Removal,
 ) -> Option<()> {
-    audit_inner(inventory, plan, removal, None)
+    audit_inner(inventory, plan, &removal.kept, None, false)
+}
+
+pub(super) fn audit_addition(
+    inventory: &inventory::Inventory,
+    plan: &Plan,
+    values: &BTreeSet<String>,
+) -> Option<()> {
+    audit_inner(inventory, plan, values, None, true)
 }
 
 pub(super) fn audit_objects(
@@ -28,23 +37,25 @@ pub(super) fn audit_objects(
     if !plan.arrays.is_empty() || !plan.records.is_empty() {
         return None;
     }
-    audit_inner(inventory, plan, removal, Some(objects))
+    audit_inner(inventory, plan, &removal.kept, Some(objects), false)
 }
 
 fn audit_inner(
     inventory: &inventory::Inventory,
     plan: &Plan,
-    removal: &shape::Removal,
+    values: &BTreeSet<String>,
     objects: Option<&shape::ObjectShape>,
+    require_exhaustive: bool,
 ) -> Option<()> {
     let mut proof = Proof {
         inventory,
         plan,
-        removal,
+        values,
+        require_exhaustive,
         objects,
         callbacks: Vec::new(),
     };
-    let mut used = false;
+    let mut used = require_exhaustive && !plan.records.is_empty();
     let array_names = plan
         .arrays
         .iter()
@@ -190,7 +201,7 @@ fn audit_inner(
         }
     }
     used.then_some(())?;
-    builtin_and_transport_audit(inventory, plan, &proof.callbacks)
+    builtin_and_transport_audit(inventory, plan, &proof.callbacks, require_exhaustive)
 }
 
 fn neutral(node: Node<'_>, site: &Site) -> bool {
@@ -241,8 +252,7 @@ impl Proof<'_> {
                 return objects.accepts(node, source);
             }
         } else if node.kind() == "string" {
-            return decode::string(node, source)
-                .is_some_and(|value| self.removal.kept.contains(&value));
+            return decode::string(node, source).is_some_and(|value| self.values.contains(&value));
         }
         node.kind() == "identifier"
             && self
@@ -322,8 +332,7 @@ impl Proof<'_> {
         };
         let literal = |node: Node<'_>| {
             node.kind() == "string"
-                && decode::string(node, source)
-                    .is_some_and(|value| self.removal.kept.contains(&value))
+                && decode::string(node, source).is_some_and(|value| self.values.contains(&value))
         };
         (self.known_discriminant(path, left) && literal(right))
             || (literal(left) && self.known_discriminant(path, right))
@@ -366,7 +375,12 @@ impl Proof<'_> {
                 continue;
             }
             return match parent.kind() {
-                "binary_expression" => self.comparison(path, parent).then_some(()),
+                "binary_expression" if !self.require_exhaustive => {
+                    self.comparison(path, parent).then_some(())
+                }
+                "variable_declarator" if self.require_exhaustive => {
+                    addition::proves_never_use(current, self.source(path)?, self.values)
+                }
                 "arguments" => {
                     let call = parent.parent()?;
                     let consumer = self.consumer(path, call)?;
@@ -388,6 +402,9 @@ impl Proof<'_> {
                         && (self.objects.is_none() || projected) =>
                 {
                     let source = self.source(path)?;
+                    if self.require_exhaustive {
+                        return addition::exhaustive_switch(parent, source, self.values);
+                    }
                     let body = parent.child_by_field_name("body")?;
                     children(body)
                         .iter()
@@ -396,9 +413,8 @@ impl Proof<'_> {
                                 || (case.kind() == "switch_case"
                                     && case.child_by_field_name("value").is_some_and(|value| {
                                         value.kind() == "string"
-                                            && decode::string(value, source).is_some_and(|value| {
-                                                self.removal.kept.contains(&value)
-                                            })
+                                            && decode::string(value, source)
+                                                .is_some_and(|value| self.values.contains(&value))
                                     }))
                         })
                         .then_some(())
@@ -579,10 +595,12 @@ fn builtin_and_transport_audit(
     inventory: &inventory::Inventory,
     plan: &Plan,
     callbacks: &[Binding],
+    require_exhaustive: bool,
 ) -> Option<()> {
     let mut names = BTreeSet::from([plan.target.name.clone()]);
     names.extend(plan.records.iter().map(|record| record.site.name.clone()));
     names.extend(plan.arrays.iter().map(|site| site.name.clone()));
+    names.extend(plan.producers.iter().map(|site| site.name.clone()));
     names.extend(
         plan.consumers
             .iter()
@@ -600,12 +618,13 @@ fn builtin_and_transport_audit(
     if !plan.records.is_empty() {
         builtins.insert("Record");
     }
-    if !plan.arrays.is_empty() {
+    if !plan.arrays.is_empty() || !plan.producers.is_empty() {
         builtins.extend(["Array", "ReadonlyArray"]);
     }
     let owned = std::iter::once(plan.target.path.as_str())
         .chain(plan.records.iter().map(|record| record.site.path.as_str()))
         .chain(plan.arrays.iter().map(|site| site.path.as_str()))
+        .chain(plan.producers.iter().map(|site| site.path.as_str()))
         .chain(
             plan.consumers
                 .iter()
@@ -660,6 +679,15 @@ fn builtin_and_transport_audit(
         }
         for node in slots::nodes(inventory.root(path)?) {
             let raw = text(node, &file.source)?;
+            if require_exhaustive
+                && owned.contains(path.as_str())
+                && node.kind() == "comment"
+                && ["@ts-ignore", "@ts-expect-error", "@ts-nocheck"]
+                    .iter()
+                    .any(|directive| raw.contains(directive))
+            {
+                return None;
+            }
             if node.kind() == "comment"
                 && lang == LangId::Javascript
                 && raw.starts_with("/**")

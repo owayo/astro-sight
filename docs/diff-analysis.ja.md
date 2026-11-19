@@ -243,7 +243,7 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 
 ### TypeScript の文字列 union の要素削除
 
-ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。削除のない追加・並べ替えと、後述の判別 union 以外で旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
+ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。並べ替えだけの変更と、後述の判別 union 以外で旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
 
 型の参照は、直下の `const X: Record<Mode, primitive>`、`const X: Mode[]` / `readonly Mode[]`、明示した primitive/void 戻り型を持つ通常関数の必須 `Mode` 引数に限る。primitive は `string`・`number`・`boolean`・`bigint` の keyword とし、戻り型だけ `void` も扱う。ほかの引数も型付きの必須 primitive 引数に限り、optional・既定値・rest・分割代入・generic は扱わない。Record のキーは残る集合と一致し、配列の要素は残る文字列 literal だけとする。直接の相対 named import は別名なしで一意に対象へ到達する場合だけ扱う。同名の別型は束縛で区別し、解析や所属が不明なら保留する。許可した受け口と値の実利用が少なくとも1件必要で、無参照・型位置だけの利用では閉じない。
 
@@ -256,6 +256,14 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 `createRequire`・member の `require`・`require.context`・`import.meta.glob` 等の既知loaderも保留する。JSX の HTML entity は補助走査で復元せず、対象型の JSX 利用は未対応として保留する。生成物として選択から外れたソースや、任意の loader 別名・動的な名前合成は証明対象に含めない。
 
 保証は観測範囲内の限定した静的な流れまで。外部利用者・runtime データ・reflection は証明しない。Record 定数の `const_value` と strict const の方針、standalone impact・refs・dead-code の出現契約は変えない。
+
+### TypeScript の文字列 union の要素追加
+
+同じ形式の type alias に要素を足した場合、観測した利用箇所が追加後の全要素に対応していれば `api.mod_closed` にする。宣言ヘッダと既存要素の順序・表記は旧新で一致することを求める。ソースの選択方法、import の解決、解析の上限は削除の証明と共通で、staged review では index snapshot を読む。
+
+型を指定した関数引数の `switch` は、要素ごとに一つの `case` があり、それぞれ宣言した primitive 型の値を返す場合に扱う。`default` での `const exhaustive: never = value; return exhaustive;` も網羅性検査として扱う。`Record<Alias, primitive>` の型注釈または `satisfies Record<Alias, primitive>` がある直下の `const` には、全要素と一致する静的キーと、宣言した型の literal 値が必要。case やキーの不足、所属判定、型アサーション、対象ファイルでの型検査の抑制、値の流れが分からない利用は blocking に残す。
+
+戻り型が `Alias[]` の関数は、literal 配列を返す形か、既知の要素を `.push()` で加えたローカルの `const` 配列を返す形を扱う。push は型付きの primitive 引数と literal の比較で条件付きにできる。呼び出し側にも推論で広がった型が伝わるため、この形は観測範囲に生成関数の参照がない場合に限る。
 
 ### TypeScript の判別 union の要素削除
 

@@ -381,20 +381,19 @@ pub(super) fn closure_or_blocking_decision(
     }
     if !public_name_differs
         && moved_from.is_none()
-        && let Some(closed) = super::ts_literal_union_removal::prove_removal(
+        && let Some(proof) = super::ts_literal_union_removal::prove_change(
             inputs.ref_index,
             site,
             sources,
-            &mut caches.literal_union_removal,
+            &mut caches.literal_union,
         )
     {
-        return if closed {
-            SignatureDecision::ClosedInDiff
-        } else {
-            SignatureDecision::Unverified(ApiModificationUnverified {
-                reason: ApiModificationUnverifiedReason::LiteralUnionProofFailed,
+        return match proof {
+            Ok(()) => SignatureDecision::ClosedInDiff,
+            Err(reason) => SignatureDecision::Unverified(ApiModificationUnverified {
+                reason,
                 first_unproven: None,
-            })
+            }),
         };
     }
     let removed_props = match super::ts_signature::removed_parameter_props(site, sources) {

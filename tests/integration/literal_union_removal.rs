@@ -197,6 +197,200 @@ fn discriminated_union_case(
     assert_eq!(code, expected, "{body}/{argument}/{variant}: {json}");
 }
 
+const BEFORE_EXPANSION: &str = r#"export type Mode = "early" | "seen";
+export function modesOf(n: number): Mode[] {
+    const modes: Mode[] = [];
+    if (n < 0) modes.push("early");
+    if (n === 0) modes.push("seen");
+    return modes;
+}
+"#;
+const INCOMPLETE_SWITCH: &str = r#"import type { Mode } from "./mode";
+export function describe(mode: Mode): string {
+    switch (mode) {
+        case "early": return "before the start";
+        case "seen": return "already seen";
+    }
+}
+"#;
+const NEW_CASE: &str = "        case \"filtered\": return \"filtered out\";\n";
+
+fn expand_modes(repo: &TestRepo) {
+    repo.write(
+        "src/mode.ts",
+        BEFORE_EXPANSION
+            .replace("| \"seen\";", "| \"seen\" | \"filtered\";")
+            .replace(
+                "    return modes;",
+                "    if (n > 100) modes.push(\"filtered\");\n    return modes;",
+            ),
+    );
+}
+
+fn complete_switch() -> String {
+    INCOMPLETE_SWITCH.replace("    }\n}", &format!("{NEW_CASE}    }}\n}}"))
+}
+
+#[test]
+fn literal_union_addition_checks_updated_switches_in_worktree_and_index() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write("src/describe.ts", INCOMPLETE_SWITCH);
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    repo.write("src/describe.ts", complete_switch());
+
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(code, &json, 0, true, "all cases");
+    repo.stage_all();
+    repo.write("src/describe.ts", INCOMPLETE_SWITCH);
+    let (code, json) = union_hook(&repo, true, false);
+    union_category(code, &json, 0, true, "index version has all cases");
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(code, &json, 1, false, "case missing from worktree");
+    assert_eq!(
+        json["api"]["mod"][0]["unverified"]["reason"], "unsupported_type_change",
+        "{json}"
+    );
+}
+
+#[test]
+fn literal_union_addition_checks_every_reader_and_untyped_producer_references() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write("src/describe.ts", INCOMPLETE_SWITCH);
+    repo.write(
+        "src/describe_other.ts",
+        INCOMPLETE_SWITCH.replace("describe(", "describeOther("),
+    );
+    repo.write("src/app.ts", "export const ready = true;\n");
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    repo.write("src/describe.ts", complete_switch());
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(code, &json, 1, false, "second switch misses a case");
+
+    repo.write("src/describe_other.ts", "import type { Mode } from './mode';\nexport function describeOther(mode: Mode): boolean { const values: string[] = ['early', 'seen']; return values.includes(mode); }\n");
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(code, &json, 1, false, "non-exhaustive membership check");
+
+    repo.write(
+        "src/describe_other.ts",
+        complete_switch().replace("describe(", "describeOther("),
+    );
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(code, &json, 0, true, "both switches cover all cases");
+
+    repo.write("src/app.ts", "import { modesOf } from './mode';\nexport const oldModes: ('early' | 'seen')[] = modesOf(101);\n");
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(
+        code,
+        &json,
+        1,
+        false,
+        "unproved receiver of widened producer result",
+    );
+}
+
+#[test]
+fn literal_union_addition_proves_never_from_an_exhaustive_switch() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write(
+        "src/describe.ts",
+        "import type { Mode } from './mode';\nexport function describe(mode: Mode): string { if (mode === 'early') return 'early'; return 'seen'; }\nexport const caption = describe('early');\n",
+    );
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    let with_never = complete_switch().replace(
+        "    }\n}",
+        "        default: { const exhaustive: never = mode; return exhaustive; }\n    }\n}\nexport const caption = describe('early');",
+    );
+    for (case, source, expected) in [
+        ("if replaced by complete switch", with_never.clone(), 0),
+        (
+            "never assertion",
+            with_never.replace("= mode;", "= mode as never;"),
+            1,
+        ),
+        (
+            "type-check suppression",
+            format!("// @ts-nocheck\n{with_never}"),
+            1,
+        ),
+        (
+            "incomplete switch with never",
+            with_never.replace(NEW_CASE, ""),
+            1,
+        ),
+    ] {
+        repo.write("src/describe.ts", source);
+        let (code, json) = union_hook(&repo, false, false);
+        union_category(code, &json, expected, expected == 0, case);
+    }
+}
+
+#[test]
+fn literal_union_addition_requires_complete_static_record_keys() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    let write_labels = |record: &str| {
+        repo.write(
+            "src/labels.tsx",
+            format!(
+                "import type {{ Mode }} from './mode';\n{record}\nexport function describe(mode: Mode): string {{ return labels[mode]; }}\n"
+            ),
+        );
+    };
+    write_labels("const labels: Record<Mode, string> = { early: 'Early', seen: 'Seen' };");
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    for (case, record, expected) in [
+        (
+            "annotated record",
+            "const labels: Record<Mode, string> = { early: 'Early', seen: 'Seen', filtered: 'Filtered' };",
+            0,
+        ),
+        (
+            "satisfies record",
+            "const labels = { early: 'Early', seen: 'Seen', 'filtered': 'Filtered' } satisfies Record<Mode, string>;",
+            0,
+        ),
+        (
+            "missing record key",
+            "const labels = { early: 'Early', seen: 'Seen' } satisfies Record<Mode, string>;",
+            1,
+        ),
+        (
+            "partial record",
+            "const labels = { early: 'Early', seen: 'Seen', filtered: 'Filtered' } satisfies Partial<Record<Mode, string>>;",
+            1,
+        ),
+        (
+            "computed key",
+            "const labels = { early: 'Early', seen: 'Seen', ['filtered']: 'Filtered' } satisfies Record<Mode, string>;",
+            1,
+        ),
+        (
+            "spread",
+            "const labels = { early: 'Early', seen: 'Seen', ...{ filtered: 'Filtered' } } satisfies Record<Mode, string>;",
+            1,
+        ),
+    ] {
+        write_labels(record);
+        let (code, json) = union_hook(&repo, false, false);
+        union_category(code, &json, expected, expected == 0, case);
+    }
+}
+
 const OLD_MODE: &str = r#"export type Mode = "all" | "legacy" | "recent";
 export const MODE_LABELS: Record<Mode, string> = {
     all: "All",

@@ -27,6 +27,8 @@ pub(super) struct Removal {
 pub(super) enum Change {
     NotApplicable,
     Unsupported,
+    UnsupportedAddition,
+    Addition(BTreeSet<String>),
     Removal(Removal),
     ObjectRemoval(Removal, ObjectShape),
 }
@@ -74,12 +76,17 @@ pub(super) fn classify(site: &CompatibleModSite<'_>, pair: &OldNewSources) -> Ch
         .and_then(|declaration| declaration.child_by_field_name("value"))
         .map(|value| direct_strings(value, new_source))
         .unwrap_or_default();
-    // 追加だけ・並べ替えだけは削除証明の適用外とし、既存の互換/関数型判定へ戻す。
-    if old_set.is_subset(&new_literal_set) {
+    // 集合が同じ場合は既存の互換判定へ戻す。
+    if old_set == new_literal_set {
         return Change::NotApplicable;
     }
+    let unsupported = if old_set.is_subset(&new_literal_set) {
+        Change::UnsupportedAddition
+    } else {
+        Change::Unsupported
+    };
     if !checked(old.root_node()) || !checked(new.root_node()) || !plain_name(site.name) {
-        return Change::Unsupported;
+        return unsupported;
     }
     let result = (|| {
         let old_decl = declaration(old.root_node(), old_source, site.name)?;
@@ -91,29 +98,38 @@ pub(super) fn classify(site: &CompatibleModSite<'_>, pair: &OldNewSources) -> Ch
             .iter()
             .map(|(value, _)| value.clone())
             .collect::<BTreeSet<_>>();
+        let addition = old_set.len() < new_set.len();
+        let (retained, full, retained_set, full_set) = if addition {
+            (&old_values, &new_values, &old_set, &new_set)
+        } else {
+            (&new_values, &old_values, &new_set, &old_set)
+        };
         if old_values
             .iter()
             .chain(new_values.iter())
             .any(|(_, raw)| raw.contains('\\'))
             || old_set.len() != old_values.len()
             || new_set.len() != new_values.len()
-            || new_set.len() >= old_set.len()
-            || !new_set.is_subset(&old_set)
+            || retained_set.len() >= full_set.len()
+            || !retained_set.is_subset(full_set)
             || header(old_decl, old_value, old_source)? != header(new_decl, new_value, new_source)?
-            || old_values
+            || full
                 .iter()
-                .filter(|(value, _)| new_set.contains(value))
-                .collect::<Vec<_>>()
-                != new_values.iter().collect::<Vec<_>>()
+                .filter(|(value, _)| retained_set.contains(value))
+                .ne(retained.iter())
         {
             return None;
         }
-        Some(Change::Removal(Removal {
-            removed: old_set.difference(&new_set).cloned().collect(),
-            kept: new_set,
-        }))
+        Some(if addition {
+            Change::Addition(new_set)
+        } else {
+            Change::Removal(Removal {
+                removed: old_set.difference(&new_set).cloned().collect(),
+                kept: new_set,
+            })
+        })
     })();
-    result.unwrap_or(Change::Unsupported)
+    result.unwrap_or(unsupported)
 }
 
 fn root_alias<'t>(root: Node<'t>, source: &str, name: &str) -> Option<Node<'t>> {
@@ -357,6 +373,33 @@ mod tests {
         }
     }
     #[test]
+    fn literal_union_shape_requires_ordered_pure_addition_in_both_grammars() {
+        let old = "export type Mode = 'all' | 'recent';";
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            let Change::Addition(values) =
+                classify_pair(old, "export type Mode = 'all' | 'new' | 'recent';", lang)
+            else {
+                panic!("pure addition");
+            };
+            assert_eq!(
+                values,
+                BTreeSet::from(["all".into(), "new".into(), "recent".into()])
+            );
+            for new in [
+                "export type Mode = 'recent' | 'all' | 'new';",
+                "export type Mode<T> = 'all' | 'recent' | 'new';",
+                "export type Mode = 'all' | 'recent' | 'new' | 'new';",
+                "export type Mode = 'all' | 'recent' | 'new' | string;",
+                r"export type Mode = 'all' | 'recent' | 'n\u0065w';",
+            ] {
+                assert!(
+                    matches!(classify_pair(old, new, lang), Change::UnsupportedAddition),
+                    "{new}"
+                );
+            }
+        }
+    }
+    #[test]
     fn literal_union_shape_blocks_unsupported_names_only_for_union_candidates() {
         for lang in [LangId::Typescript, LangId::Tsx] {
             for name in ["方式", r"Mo\u0064e"] {
@@ -401,10 +444,6 @@ mod tests {
                 (
                     "export type Mode = 'all' | 'recent';",
                     "export type Mode = 'recent' | 'all';",
-                ),
-                (
-                    "export type Mode = 'all' | 'recent';",
-                    "export type Mode = 'all' | 'recent' | 'other';",
                 ),
                 (
                     "namespace Box { export type Mode = 'all' | 'recent'; }",
@@ -492,7 +531,7 @@ mod tests {
         ));
     }
     #[test]
-    fn literal_union_shape_recognizes_deletion_before_shared_file_parse_barriers() {
+    fn literal_union_shape_recognizes_changes_before_shared_file_parse_barriers() {
         for lang in [LangId::Typescript, LangId::Tsx] {
             let deep = format!(
                 "const deep={}1{};",
@@ -509,7 +548,7 @@ mod tests {
                 let added = format!("export type Mode='all'|'legacy'|'recent'|'other'; {suffix}");
                 assert!(matches!(
                     classify_pair(&old, &added, lang),
-                    Change::NotApplicable
+                    Change::UnsupportedAddition
                 ));
                 let reordered = format!("export type Mode='recent'|'legacy'|'all'; {suffix}");
                 assert!(matches!(
@@ -545,7 +584,7 @@ mod tests {
         let added = format!("export type Mode='all'|'legacy'|'recent'|'other'; {suffix}");
         assert!(matches!(
             classify_pair(&old, &added, LangId::Tsx),
-            Change::NotApplicable
+            Change::UnsupportedAddition
         ));
     }
 }
