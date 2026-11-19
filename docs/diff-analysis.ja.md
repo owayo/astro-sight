@@ -159,7 +159,7 @@ inventory の上限は TS/TSX 512ファイル、旧新合計8MiB、AST 100,000�
 
 ### TypeScript の型への必須プロパティ追加
 
-export した TS / TSX の interface か object 型の type alias へ、必須プロパティを足した変更を扱う。その型の値を作る箇所と受け取る関数が同じ差分で追随していれば、`modified_closed_in_diff` (`api.mod_closed`) に分ける。型への参照は、それぞれ次のどれかでなければならない。
+export した TS / TSX の interface か object 型の type alias へ、必須プロパティや引数なしの void コールバックを足した変更を扱う。その型の値を作る箇所と受け取る関数が同じ差分で追随していれば、`modified_closed_in_diff` (`api.mod_closed`) に分ける。型への参照は、それぞれ次のどれかでなければならない。
 
 - 関数・メソッドの戻り値の型 (型注釈がちょうどその型)。すべての `return` が、後述の「証明できる値」を返すこと。async 関数は次の限定した形だけを扱い、generator は対象外
 - ファイル直下の通常関数宣言の戻り値が `Row[]`・`Array<Row>`・`readonly Row[]`、または async 関数宣言の戻り値が `Promise<Row[]>`・`Promise<Array<Row>>`・`Promise<readonly Row[]>`・`Promise<Row>`。配列を返す全 `return` は、配列型の必須引数か配列 literal に対する `.map` で、引数1つの無注釈 inline arrow が証明できる値だけを返すこと。callback の式本体とブロック本体を扱い、callback と外側の関数の両方で fallthrough がないことも確かめる。`Promise<Row>` は証明できる値を直接返す形だけを扱う。receiver の別名・書き換え・持ち出し、callback 引数の書き換え、任意オブジェクトの同名メソッド、`filter`・`flatMap`・spread・型アサーション・`await` は証明しない。`Array` / `ReadonlyArray` / `Promise` の宣言・import・prototype への参照や別名への持ち出しが解析範囲内にあっても証明しない。外部コードによる prototype の変更は解決しない
@@ -170,6 +170,8 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 - 別名なしの `export { Row }`。値の名前空間の出現 (同名の変数・JSX のコンポーネント・プロパティ名) は型を指さないので数えない
 
 証明できる値は次の 3 つ。追加した各プロパティを 1 つずつ持ち、そのプロパティが変更行にあり、値の型が追加したメンバーの型に合う object literal。ファイル直下で宣言した関数のうち、戻り値の型がちょうど対象の型であるものの呼び出し (名前空間を通した `rows.toRow()` は数えない)。型注釈がちょうど対象の型の必須引数と変数。object literal のキーに escape を含む名前 (`n\u006fte`) があれば証明しない。表記と違う名前のキーを作るためである。値の型は `string`・`number`・`boolean`・`bigint`・`null`・`undefined`・リテラル型 (bigint のリテラルを含む)・それらの union と配列・`any` / `unknown` で照合する。プロパティの値に使う型注釈の無い変数は、primitive のリテラルで初期化した `const` だけを型付けする。object や配列のリテラルは型が広がる (widening) ため。プロパティの値に `satisfies` や `as const` (primitive のリテラルへのものを除く) を書くと、リテラルの型付けが変わるので証明しない。ファイルの中で `undefined` という名前を束縛し直していれば、値の `undefined` を組み込みの値とみなさない。
+
+新しいメンバーが `reset(): void` や `readonly reset: () => void` の場合、変更行の関数リテラル、短縮メソッド、または同じファイルで束縛を証明できる関数値を確かめる。getter、型アサーション、未解決の関数参照はブロックに残る。
 
 必須追加では、factory が `overrides.newMember ?? []` のように既定値を埋める値も照合する。入力は組み込みの `Partial<Row>`、または明示した省略可能なプロパティを持つ型リテラルで、既定値は `{}` に限る。読み出したメンバーから null / undefined を除き、右辺の型を合わせて追加したプロパティの型と比べる。入力への書き込み・別名への持ち出し・本体の呼び出し・戻り値を返さない経路・未知の式、組み込み `Partial` の隠蔽・宣言の追加では証明しない。観測した呼び出しは、引数の省略か object literal に限り、追加した名前が存在すれば値の型を確認する。`Readonly<Row>`・`Required<Row>` などの型引数や、関数自体の別の契約変更は従来の判定を保つ。
 
@@ -197,7 +199,7 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 この種の変更では、参照の行が変更行にあることを証拠にしない。次の形の必須追加は、参照の行がすべて変わっていても blocking に残す。
 
 - generic な宣言、`extends` や index signature のある宣言
-- 必須メソッド、call / construct signature の追加
+- 引数なしの void 以外の必須メソッド、オーバーロード、call / construct signature の追加
 - 上の一覧にないメンバーの型、文字列名のプロパティ
 - メンバー名の衝突 (同時に足した optional メンバーとの衝突を含む)、表記で比べられない名前 (数値の `1` と `0x1`、escape)、自分自身を参照する型
 

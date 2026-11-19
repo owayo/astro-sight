@@ -27,6 +27,7 @@
 //! これらの union と配列 / any / unknown) だけを扱う。型注釈のない変数は literal の widening が
 //! あるので、const の primitive literal だけを literal 型として扱う。値の中の `satisfies` と、
 //! primitive 以外への `as const` は literal の型付けを変えるので読まない。
+//! 引数なしの void コールバックの追加は、変更行にある関数の構文と束縛から直接証明する。
 //!
 //! 保証するのは「名前で観測した参照がすべて追随済み」まで。型の名前が現れない推論経由の依存
 //! (`const x: { note?: number } = toRow()` のような別の型への構造的な代入) は追えない。
@@ -56,6 +57,7 @@ use super::ref_index::{
 };
 
 mod array_literals;
+mod callbacks;
 pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
@@ -64,6 +66,8 @@ mod removed_uses;
 mod return_producers;
 mod row_array_map;
 mod spread_copy;
+
+pub(crate) use callbacks::is_required_callback;
 
 /// 配列型の入れ子 (`string[][]`) と式の配列 literal の入れ子をたどる上限。
 const MAX_ARRAY_DEPTH: usize = 8;
@@ -100,6 +104,7 @@ pub(crate) enum TypeAtom {
     False,
     /// 要素の型の union。空は要素の無い配列 literal (`[]`)。
     Array(Vec<TypeAtom>),
+    VoidCallback,
     Any,
     Unknown,
 }
@@ -251,6 +256,9 @@ fn number_atom(text: &str, sign: &str) -> TypeAtom {
 
 /// 値の型 `value` が対象の型 `target` へ代入できるか (strictNullChecks を前提にする)。
 pub(crate) fn assignable(value: &[TypeAtom], target: &[TypeAtom]) -> bool {
+    if target == [TypeAtom::VoidCallback] {
+        return value == target;
+    }
     if target
         .iter()
         .any(|atom| matches!(atom, TypeAtom::Any | TypeAtom::Unknown))
@@ -283,7 +291,8 @@ fn atom_assignable(value: &TypeAtom, target: &[TypeAtom]) -> bool {
         | TypeAtom::Number
         | TypeAtom::BigInt
         | TypeAtom::Null
-        | TypeAtom::Undefined => has(value),
+        | TypeAtom::Undefined
+        | TypeAtom::VoidCallback => has(value),
     }
 }
 
@@ -1149,7 +1158,12 @@ impl Prover<'_, '_> {
             };
             Some(changed)
         };
-        let names: HashSet<&str> = self.delta.added.iter().map(|p| p.name.as_str()).collect();
+        let properties: HashMap<_, _> = self
+            .delta
+            .added
+            .iter()
+            .map(|property| (property.name.as_str(), property))
+            .collect();
         // escape を含む名前 (`n\u006fte`・`"n\u006fte"`) は、表記と違う名前のキーを作る。
         // 名前を正規化しないので、どのキーでも比べられない。
         let escaped = |key: Node<'_>| key.utf8_text(source).is_ok_and(|text| text.contains('\\'));
@@ -1176,7 +1190,7 @@ impl Prover<'_, '_> {
                         return false;
                     }
                     if let Some(key) = key
-                        && let Some(name) = names.get(key.as_str())
+                        && let Some((&name, _)) = properties.get_key_value(key.as_str())
                     {
                         found
                             .entry(name)
@@ -1195,10 +1209,10 @@ impl Prover<'_, '_> {
                     {
                         return false;
                     }
-                    if let Some(name) = member
+                    if let Some((&name, _)) = member
                         .utf8_text(source)
                         .ok()
-                        .and_then(|text| names.get(text))
+                        .and_then(|text| properties.get_key_value(text))
                     {
                         found
                             .entry(name)
@@ -1206,8 +1220,6 @@ impl Prover<'_, '_> {
                             .push((member, member.start_position().row));
                     }
                 }
-                // メソッド・getter・setter が追加したキーを作る形と、名前を静的に決められない形は
-                // 値の型を確かめられない。
                 "method_definition" => {
                     if self.delta.audits_uses() {
                         return false;
@@ -1215,12 +1227,19 @@ impl Prover<'_, '_> {
                     let Some(key) = member.child_by_field_name("name") else {
                         return false;
                     };
-                    if key.kind() == "computed_property_name"
-                        || escaped(key)
-                        || super::object_key_text(key, source)
-                            .is_some_and(|key| names.contains(key.as_str()))
-                    {
+                    if key.kind() == "computed_property_name" || escaped(key) {
                         return false;
+                    }
+                    if let Some(key) = super::object_key_text(key, source)
+                        && let Some((&name, property)) = properties.get_key_value(key.as_str())
+                    {
+                        if property.ty != [TypeAtom::VoidCallback] {
+                            return false;
+                        }
+                        found
+                            .entry(name)
+                            .or_default()
+                            .push((member, member.start_position().row));
                     }
                 }
                 // spread はキーと値の型を静的に決められない。
@@ -1231,22 +1250,28 @@ impl Prover<'_, '_> {
             let Some([(value, line)]) = found.get(property.name.as_str()).map(Vec::as_slice) else {
                 return false;
             };
-            (matches!(self.delta.mode, MemberChangeMode::Removal(_))
-                || changed.as_ref().is_some_and(|lines| lines.contains(line)))
-                && (property.accepts_any_value()
-                    || self
-                        .value_type(*value, parsed, 0)
-                        .or_else(|| self.factory_default_type(*value, parsed, path))
-                        .is_some_and(|value_type| {
-                            assignable(&value_type, &property.ty)
-                                && (!self.delta.audits_uses()
-                                    || self.narrowed_value_sources(
-                                        *value,
-                                        parsed,
-                                        0,
-                                        &mut HashSet::new(),
-                                    ))
-                        }))
+            if !matches!(self.delta.mode, MemberChangeMode::Removal(_))
+                && !changed.as_ref().is_some_and(|lines| lines.contains(line))
+            {
+                return false;
+            }
+            if property.ty == [TypeAtom::VoidCallback] {
+                return callbacks::proves_callback(*value, parsed);
+            }
+            property.accepts_any_value()
+                || self
+                    .value_type(*value, parsed, 0)
+                    .or_else(|| self.factory_default_type(*value, parsed, path))
+                    .is_some_and(|value_type| {
+                        assignable(&value_type, &property.ty)
+                            && (!self.delta.audits_uses()
+                                || self.narrowed_value_sources(
+                                    *value,
+                                    parsed,
+                                    0,
+                                    &mut HashSet::new(),
+                                ))
+                    })
         })
     }
 

@@ -2,14 +2,15 @@
 
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
-    MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, RequiredProperty,
+    MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, RequiredProperty, TypeAtom,
+    is_required_callback,
 };
 
 /// interface / object 型の type alias へ必須メンバーを足した変更を分類する (Issue #89)。
 ///
 /// 宣言ヘッダ・フッタが不変で、既存メンバーがトークン一致ですべて残り、追加メンバーに必須の
 /// ものがあるときだけ対象にする (それ以外は `NotApplicable` で従来の判定へ)。証明に対応する形
-/// (generic でも `extends` でもない宣言へ、名前が識別子で型が単純な必須の property_signature を
+/// (generic でも `extends` でもない宣言へ、単純な型のプロパティか引数なしの void コールバックを
 /// 足し、宣言が自分自身を参照しない) なら `Supported`、それ以外の必須メンバー追加は
 /// `Unsupported`。追加された optional メンバーは利用側を壊さないので無視する。
 pub(crate) fn classify_required_member_addition(
@@ -87,7 +88,7 @@ pub(crate) fn classify_required_member_addition(
     if has_index_signature {
         return RequiredMemberChange::Unsupported;
     }
-    if !unique_member_names(new_body, &src.new) {
+    if !unique_member_names(new_body, &src.new, &required) {
         return RequiredMemberChange::Unsupported;
     }
     // 自分自身を参照する型は、値の中の入れ子の値も同じ型になり、最上位のキーだけでは証明できない。
@@ -101,16 +102,20 @@ pub(crate) fn classify_required_member_addition(
     }
     let mut properties = Vec::with_capacity(required.len());
     for member in required {
-        if member.kind() != "property_signature" {
-            return RequiredMemberChange::Unsupported;
-        }
         let Some(Some(name)) = member_name(member, &src.new) else {
             return RequiredMemberChange::Unsupported;
         };
-        let Some(ty) = member
-            .child_by_field_name("type")
-            .and_then(|annotation| simple_annotation_type(annotation, &src.new))
-        else {
+        let ty = if is_required_callback(member, &src.new) && name != "__proto__" {
+            vec![TypeAtom::VoidCallback]
+        } else if member.kind() == "property_signature" {
+            let Some(ty) = member
+                .child_by_field_name("type")
+                .and_then(|annotation| simple_annotation_type(annotation, &src.new))
+            else {
+                return RequiredMemberChange::Unsupported;
+            };
+            ty
+        } else {
             return RequiredMemberChange::Unsupported;
         };
         if old_names.contains(&name) {
@@ -156,11 +161,12 @@ fn added_required_members<'a>(
 }
 
 /// optional メンバーを含めて、プロパティの重複とメソッドとの名前衝突を検査する。
-fn unique_member_names(body: Node<'_>, source: &[u8]) -> bool {
+fn unique_member_names(body: Node<'_>, source: &[u8], required: &[Node<'_>]) -> bool {
     // 新しい宣言のメンバー名が衝突しないこと。同時に足した optional メンバーとの重複も含め、
     // プロパティどうしの重複とプロパティ・メソッドの同名は宣言自体が型エラーになる。
     let mut property_names = HashSet::new();
     let mut method_names = HashSet::new();
+    let mut overloaded_methods = HashSet::new();
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
         let key = || {
@@ -186,7 +192,9 @@ fn unique_member_names(body: Node<'_>, source: &[u8]) -> bool {
             },
             "method_signature" => match key() {
                 Some(name) => {
-                    method_names.insert(name);
+                    if !method_names.insert(name.clone()) {
+                        overloaded_methods.insert(name);
+                    }
                 }
                 None => return false,
             },
@@ -199,5 +207,10 @@ fn unique_member_names(body: Node<'_>, source: &[u8]) -> bool {
     {
         return false;
     }
-    true
+    !required.iter().any(|member| {
+        member.kind() == "method_signature"
+            && member_name(*member, source)
+                .flatten()
+                .is_some_and(|name| overloaded_methods.contains(&name))
+    })
 }
