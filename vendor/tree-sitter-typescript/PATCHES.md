@@ -87,6 +87,19 @@ modes. TypeScript 7.0.2 accepts the reported optional-tail examples in both file
 kinds with strict checking. Regenerating with the pinned CLI reproduces both
 parser C files, grammar JSON and node schemas byte-for-byte.
 
+## Arrays of import types (#433)
+
+Accept the existing import-member alias as an element of `array_type`, so
+`import('./level').Level[]` and `import('./level').Namespace.Level[][]` parse
+with the same `member_expression` as a bare import type. The grammar shares
+this array rule between TypeScript and TSX. The node schemas add
+`member_expression` as a possible child of `array_type`.
+
+Parser regressions cover single and nested array types alongside a bare
+import type. The CLI regression checks that adding an optional property to
+another interface in the same file is compatible, and that adding a required
+property still reports a breaking change when an existing value lacks it.
+
 ## Regenerate
 
 Use tree-sitter CLI **0.26.6**, with grammar ABI **14**, and Node.js/npm:

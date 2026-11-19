@@ -1056,7 +1056,14 @@ module.exports = function defineGrammar(dialect) {
         )),
       ),
 
-      array_type: $ => seq($.primary_type, '[', ']'),
+      array_type: $ => seq(
+        choice(
+          $.primary_type,
+          alias($._type_query_member_expression_in_type_annotation, $.member_expression),
+        ),
+        '[',
+        ']',
+      ),
       tuple_type: $ => seq(
         '[', commaSep($._tuple_type_member), optional(','), ']',
       ),
