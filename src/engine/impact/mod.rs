@@ -34,7 +34,7 @@ use crate::engine::{diff, parser};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::call::CallEdge;
 use crate::models::impact::{AffectedSymbol, DiffFile, FileImpact, HunkInfo, SignatureChange};
-use crate::models::symbol::SymbolKind;
+use crate::models::symbol::symbol_kind_str;
 
 use pass2::{Pass2Evidence, stream_caller_maps_and_defs};
 use pass3::{build_file_impact, decode_caller_map, demote_private_method_local_competitors};
@@ -722,26 +722,6 @@ fn descendant_for_range<'a>(
     root.descendant_for_point_range(start, end)
 }
 
-fn symbol_kind_str(kind: SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Method => "method",
-        SymbolKind::Class => "class",
-        SymbolKind::Struct => "struct",
-        SymbolKind::Enum => "enum",
-        SymbolKind::Union => "union",
-        SymbolKind::Interface => "interface",
-        SymbolKind::Trait => "trait",
-        SymbolKind::Variable => "variable",
-        SymbolKind::Constant => "constant",
-        SymbolKind::Module => "module",
-        SymbolKind::Import => "import",
-        SymbolKind::Type => "type",
-        SymbolKind::Field => "field",
-        SymbolKind::Parameter => "parameter",
-    }
-}
-
 /// impl/class/trait/interface/enum ブロック内のメソッドの親型名を取得する。
 ///
 /// Rust `impl Foo { fn bar() {} }` → `Some("Foo")` を返す
@@ -1050,6 +1030,8 @@ mod tests {
     // SymbolKind → 文字列マッピングの検証
     #[test]
     fn symbol_kind_str_mapping() {
+        use crate::models::symbol::SymbolKind;
+
         assert_eq!(symbol_kind_str(SymbolKind::Function), "function");
         assert_eq!(symbol_kind_str(SymbolKind::Method), "method");
         assert_eq!(symbol_kind_str(SymbolKind::Class), "class");

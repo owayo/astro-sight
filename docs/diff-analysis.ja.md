@@ -25,7 +25,9 @@ unknown または変更箇所が空の known な証拠は通常 JSON と既存�
 | `decorator` | Python の decorator と Rust の宣言属性 |
 | `other_declaration` | 修飾子・束縛種別など、それ以外の宣言トークンすべて |
 
-空白・コメントは比較せず、リテラルの内容は保つ。`annotation_only` が true になるのは、空でない変更が上記の型注釈 3 種類だけの場合。`call_shape_unchanged` は、型注釈・本体を除くソース上の引数構文（既定値の式も含む）の比較で、型検査・実行時の互換性の保証ではない。decorator・属性がある宣言、その他の宣言トークンも変わる場合、呼び出せない宣言では null とする。変更のない decorator も呼び出し形を変える可能性があるため断定しない。引数・既定値の構文が変われば false。`analysis: "unknown"` では両 boolean を明示的な null とし、`unknown_reason` は `source_unavailable`、`parse_error`、`unsupported_language`、`unsupported_syntax`、`declaration_pairing_ambiguous`、`resource_limit` のいずれか。unknown の空の `changed_parts` は「変更なし」の証拠ではない。
+空白・コメントは比較せず、リテラルの内容は保つ。`annotation_only` が true になるのは、空でない変更が上記の型注釈 3 種類だけの場合。`call_shape_unchanged` は、型注釈・本体を除くソース上の引数構文（既定値の式も含む）の比較で、型検査・実行時の互換性の保証ではない。decorator・属性がある宣言、その他の宣言トークンも変わる場合、呼び出せない宣言では null とする。変更のない decorator も呼び出し形を変える可能性があるため断定しない。引数・既定値の構文が変われば false。`analysis: "unknown"` では両 boolean を明示的な null とし、`unknown_reason` は `source_unavailable`、`parse_error`、`unsupported_language`、`unsupported_declaration_kind`、`unsupported_syntax`、`declaration_pairing_ambiguous`、`declaration_pairing_unavailable`、`resource_limit` のいずれか。unknown の空の `changed_parts` は「変更なし」の証拠ではない。
+
+旧側か新側に同名・同種の宣言が複数あれば `declaration_pairing_ambiguous` とする。TypeScript の interface や型別名など、構文比較の対象外の種類には、同名・同種の候補が複数なければ `unsupported_declaration_kind` を返す。対応する宣言を見つけられない比較対象の種類は `declaration_pairing_unavailable`、旧新で一意に対応しても構文を比較できなければ `unsupported_syntax` を返す。
 
 初期の証明範囲は、既存のシンボル抽出器で取得できる Python・JavaScript・TypeScript/TSX・Rust の、一意なファイル直下の関数と単一束縛の変数・定数。入れ子の owner、未対応の構文・言語、同名の複数宣言、ソース取得失敗、parse error のあるファイルは unknown のまま残す。追加 AST 比較は旧新ソースそれぞれ 1 MiB を上限とし、超えた場合は `unknown_reason: "resource_limit"` と明示して既存の解析を保つ。宣言外のコードや import 先の型の意味は比較しない。本体だけ・初期化式だけの変更は API 変更がなくても証拠を持つ。通常 JSON と TOON に同じフィールドを残す。`review --hook` は情報提供を含む API 変更の各要素に同じ証拠を付け、impact の起点はトップレベルの `change_evidence: [{f,n,k,change_evidence}]` に残す。呼び出し側がゼロでも落とさず、この配列のために停止カテゴリを増やすことはない。
 

@@ -190,6 +190,71 @@ fn change_evidence_body_and_initializer_survive_without_api_mod() {
 }
 
 #[test]
+fn change_evidence_reports_types_outside_the_comparison_scope() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "shape.ts",
+        "export type Unit = \"px\" | \"em\";\n\nexport interface Shape {\n    readonly width: number;\n}\n",
+    );
+    repo.commit_all("initial");
+
+    for (variants, categories, exit_code) in [
+        ("\"px\" | \"em\" | \"rem\"", json!(["api.mod"]), 1),
+        ("\"em\" | \"px\"", json!([]), 0),
+    ] {
+        repo.write(
+            "shape.ts",
+            format!("export type Unit = {variants};\n\nexport interface Shape {{\n    readonly width: number;\n    readonly unit?: Unit;\n}}\n"),
+        );
+        let normal = repo.run_json("review", &["--git"]);
+        let (output, code) = hook(&repo, false);
+        assert_eq!(code, exit_code, "{output}");
+        assert_eq!(output["blocking_categories"], categories, "{output}");
+        let expected = json!({
+            "analysis":"unknown",
+            "unknown_reason":"unsupported_declaration_kind",
+            "changed_parts":[],
+            "annotation_only":null,
+            "call_shape_unchanged":null
+        });
+        for (name, kind) in [("Unit", "type"), ("Shape", "trait")] {
+            let symbol = impact_symbol(&normal, "shape.ts", name);
+            assert_eq!(symbol["kind"], kind, "{normal}");
+            assert_eq!(symbol["change_type"], "modified", "{normal}");
+            assert_eq!(symbol["change_evidence"], expected, "{normal}");
+            let evidence = output["change_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["n"] == name && entry["k"] == kind)
+                .unwrap();
+            assert_eq!(evidence["change_evidence"], expected, "{output}");
+        }
+        let compatible = normal["api_changes"]["compatible_modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "Shape")
+            .unwrap();
+        assert_eq!(compatible["reason"], "optional_type_members");
+        assert_eq!(compatible["change_evidence"], expected, "{normal}");
+        let unit_bucket = if exit_code == 0 {
+            "compatible_modified"
+        } else {
+            "modified"
+        };
+        let unit = normal["api_changes"][unit_bucket]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "Unit")
+            .unwrap();
+        assert_eq!(unit["change_evidence"], expected, "{normal}");
+    }
+}
+
+#[test]
 fn change_evidence_parse_error_keeps_unknown_boolean_values() {
     let repo = fixture("def enabled(value -> bool:\n    return value\n");
     repo.write(
@@ -395,7 +460,7 @@ fn change_evidence_added_typescript_bindings_check_the_other_old_declarations() 
         assert_eq!(symbol["change_type"], expected, "{old}: {review}");
         if expected == "modified" {
             assert_eq!(
-                symbol["change_evidence"]["unknown_reason"], "declaration_pairing_ambiguous",
+                symbol["change_evidence"]["unknown_reason"], "declaration_pairing_unavailable",
                 "{review}"
             );
         } else {
@@ -420,7 +485,7 @@ fn change_evidence_added_typescript_bindings_keep_hunkless_moves_unproven() {
     let symbol = impact_symbol(&review, "use.ts", "wide");
     assert_eq!(symbol["change_type"], "modified", "{review}");
     assert_eq!(
-        symbol["change_evidence"]["unknown_reason"], "declaration_pairing_ambiguous",
+        symbol["change_evidence"]["unknown_reason"], "declaration_pairing_unavailable",
         "{review}"
     );
 }
@@ -434,12 +499,12 @@ fn change_evidence_added_typescript_bindings_keep_ambiguous_and_kind_changes() {
         ),
         (
             "function starts() {}\n",
-            Some("declaration_pairing_ambiguous"),
+            Some("declaration_pairing_unavailable"),
         ),
-        ("class starts {}\n", Some("declaration_pairing_ambiguous")),
+        ("class starts {}\n", Some("declaration_pairing_unavailable")),
         (
             "import { starts } from './source';\n",
-            Some("declaration_pairing_ambiguous"),
+            Some("declaration_pairing_unavailable"),
         ),
         ("const { starts } = source;\n", None),
         ("let starts = (", Some("parse_error")),
