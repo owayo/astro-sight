@@ -252,6 +252,12 @@ impl RustScopeIndex {
         if !pattern_position && !is_rust_shadowable_value_identifier(node) {
             return LexicalBinding::Unknown;
         }
+        let typed_let_pattern = pattern_position
+            && node.parent().is_some_and(|statement| {
+                statement.kind() == "let_declaration"
+                    && statement.child_by_field_name("type").is_some()
+                    && statement.child_by_field_name("pattern") == Some(node)
+            });
         let Ok(name) = node.utf8_text(source) else {
             return LexicalBinding::Unknown;
         };
@@ -319,7 +325,8 @@ impl RustScopeIndex {
                     let Some(facts) = self.blocks.get(&parent.id()) else {
                         return LexicalBinding::Unknown;
                     };
-                    if facts.barrier {
+                    // 型付き let の宣言位置は、別の文の巻き上げやマクロに左右されない。
+                    if facts.barrier && !typed_let_pattern {
                         if facts.non_expression_macro_barrier {
                             return LexicalBinding::Unknown;
                         }

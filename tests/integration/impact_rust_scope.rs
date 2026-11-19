@@ -194,6 +194,80 @@ fn impact_rust_external_associated_types_require_binding_proof() {
 }
 
 #[test]
+fn impact_rust_typed_let_pattern_with_local_items_is_not_a_call() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/sentence");
+    repo.create_dir_all("src/server");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = 'sample'\nversion = '0.1.0'\nedition = '2024'\n",
+    );
+    repo.write("src/lib.rs", "mod sentence;\nmod server;\n");
+    repo.write("src/sentence.rs", "mod clause;\nmod client;\n");
+    repo.write("src/server.rs", "mod admin;\n");
+    repo.write(
+        "src/sentence/clause.rs",
+        "pub(super) fn proposal(raw: i32) -> i32 { raw }\n",
+    );
+    repo.write(
+        "src/server/admin.rs",
+        "use super::*;\n\
+         pub fn read(enabled: bool) -> i32 {\n\
+         use std::num::NonZeroU32;\n\
+         match enabled {\n\
+         true => {\n\
+         struct Request { score: NonZeroU32 }\n\
+         let proposal: Request = Request { score: NonZeroU32::MIN };\n\
+         proposal.score.get() as i32\n\
+         }\n\
+         false => 0,\n\
+         }\n\
+         }\n",
+    );
+    repo.write(
+        "src/sentence/client.rs",
+        "use super::clause::proposal;\n\
+         pub fn call() -> i32 {\n\
+         struct Local;\n\
+         let proposal: i32 = proposal(1);\n\
+         proposal\n\
+         }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/sentence/clause.rs",
+        "pub(super) fn proposal(raw: i32, offset: i32) -> i32 { raw + offset }\n",
+    );
+
+    let context = repo.run_json_in(
+        "src",
+        std::iter::empty::<(&str, &str)>(),
+        "context",
+        &["--git"],
+    );
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "sentence/clause.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    assert!(
+        !callers
+            .iter()
+            .any(|caller| caller["path"] == "server/admin.rs" && caller["line"] == 6),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .any(|caller| caller["path"] == "sentence/client.rs" && caller["line"] == 3),
+        "{context}"
+    );
+}
+
+#[test]
 fn impact_rust_distinguishes_registry_calls_from_private_functions() {
     for (stale, shadowed) in [(false, false), (true, false), (false, true)] {
         let outer = TestRepo::new();
