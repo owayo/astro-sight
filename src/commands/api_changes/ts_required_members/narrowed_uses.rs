@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn known_type(atoms: &[TypeAtom]) -> bool {
     atoms.iter().all(|atom| match atom {
         TypeAtom::Any | TypeAtom::Unknown => false,
-        TypeAtom::Array(items) => known_type(items),
+        TypeAtom::Array(items) | TypeAtom::ReadonlyArray(items) => known_type(items),
         _ => true,
     })
 }

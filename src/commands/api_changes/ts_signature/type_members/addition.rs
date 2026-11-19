@@ -1,9 +1,11 @@
 //! interface / object 型への必須プロパティ追加を分類する。
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
     MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, RequiredProperty, TypeAtom,
-    is_required_callback,
+    is_required_callback, required_addition_type,
 };
 
 /// interface / object 型の type alias へ必須メンバーを足した変更を分類する (Issue #89)。
@@ -101,6 +103,7 @@ pub(crate) fn classify_required_member_addition(
         return RequiredMemberChange::Unsupported;
     }
     let mut properties = Vec::with_capacity(required.len());
+    let mut builtin_names = BTreeSet::new();
     for member in required {
         let Some(Some(name)) = member_name(member, &src.new) else {
             return RequiredMemberChange::Unsupported;
@@ -108,10 +111,9 @@ pub(crate) fn classify_required_member_addition(
         let ty = if is_required_callback(member, &src.new) && name != "__proto__" {
             vec![TypeAtom::VoidCallback]
         } else if member.kind() == "property_signature" {
-            let Some(ty) = member
-                .child_by_field_name("type")
-                .and_then(|annotation| simple_annotation_type(annotation, &src.new))
-            else {
+            let Some(ty) = member.child_by_field_name("type").and_then(|annotation| {
+                required_addition_type(annotation, &src.new, &mut builtin_names)
+            }) else {
                 return RequiredMemberChange::Unsupported;
             };
             ty
@@ -126,6 +128,7 @@ pub(crate) fn classify_required_member_addition(
     RequiredMemberChange::Supported(RequiredMemberDelta {
         added: properties,
         mode: MemberChangeMode::Addition,
+        builtin_names,
     })
 }
 

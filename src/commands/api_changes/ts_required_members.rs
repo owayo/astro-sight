@@ -104,6 +104,7 @@ pub(crate) enum TypeAtom {
     False,
     /// 要素の型の union。空は要素の無い配列 literal (`[]`)。
     Array(Vec<TypeAtom>),
+    ReadonlyArray(Vec<TypeAtom>),
     VoidCallback,
     Any,
     Unknown,
@@ -124,6 +125,7 @@ pub(crate) struct RequiredMemberDelta {
     /// 値の検査対象。追加・縮小では対象プロパティ、削除では残る必須プロパティ。
     pub(crate) added: Vec<RequiredProperty>,
     pub(crate) mode: MemberChangeMode,
+    pub(crate) builtin_names: BTreeSet<&'static str>,
 }
 
 pub(crate) enum MemberChangeMode {
@@ -137,7 +139,6 @@ pub(crate) struct RemovedMembers {
     pub(crate) required_additions: HashSet<String>,
     /// 非 scalar の残存メンバーでは、値の型照合に代えて旧新の不変性を証明する。
     pub(crate) invariant_properties: Option<Vec<RetainedProperty>>,
-    pub(crate) builtin_names: BTreeSet<&'static str>,
 }
 
 pub(crate) struct RetainedProperty {
@@ -174,10 +175,28 @@ impl RequiredProperty {
 
 /// 型の構文を単純な型の union として読む。対応しない構文が 1 つでもあれば None。
 pub(crate) fn simple_type(node: Node<'_>, source: &[u8]) -> Option<Vec<TypeAtom>> {
-    simple_type_at(node, source, 0)
+    simple_type_at(node, source, 0, &mut None)
 }
 
-fn simple_type_at(node: Node<'_>, source: &[u8], depth: usize) -> Option<Vec<TypeAtom>> {
+pub(crate) fn required_addition_type(
+    annotation: Node<'_>,
+    source: &[u8],
+    builtin_names: &mut BTreeSet<&'static str>,
+) -> Option<Vec<TypeAtom>> {
+    simple_type_at(
+        only_named_child(annotation)?,
+        source,
+        0,
+        &mut Some(builtin_names),
+    )
+}
+
+fn simple_type_at(
+    node: Node<'_>,
+    source: &[u8],
+    depth: usize,
+    builtin_names: &mut Option<&mut BTreeSet<&'static str>>,
+) -> Option<Vec<TypeAtom>> {
     if depth > MAX_ARRAY_DEPTH {
         return None;
     }
@@ -208,13 +227,47 @@ fn simple_type_at(node: Node<'_>, source: &[u8], depth: usize) -> Option<Vec<Typ
                 only_named_child(node)?,
                 source,
                 depth + 1,
+                builtin_names,
             )?)),
+            "readonly_type" | "generic_type" => {
+                let item = if node.kind() == "readonly_type" {
+                    let array = only_named_child(node).filter(|ty| ty.kind() == "array_type")?;
+                    only_named_child(array)?
+                } else {
+                    builtin_names.as_ref()?;
+                    let item = generic_argument(node, source, "ReadonlyArray")?;
+                    let name = node.child_by_field_name("name")?;
+                    if resolve_binding_scope(name, source, "ReadonlyArray", Namespace::Type)
+                        .is_some()
+                    {
+                        return None;
+                    }
+                    item
+                };
+                if let Some(names) = builtin_names {
+                    names.insert("ReadonlyArray");
+                }
+                atoms.push(TypeAtom::ReadonlyArray(simple_type_at(
+                    item,
+                    source,
+                    depth + 1,
+                    builtin_names,
+                )?));
+            }
             _ => return None,
         }
     }
     atoms.sort();
     atoms.dedup();
     (!atoms.is_empty()).then_some(atoms)
+}
+
+fn generic_argument<'t>(ty: Node<'t>, source: &[u8], name: &str) -> Option<Node<'t>> {
+    (ty.kind() == "generic_type"
+        && ty.child_by_field_name("name")?.kind() == "type_identifier"
+        && ty.child_by_field_name("name")?.utf8_text(source).ok() == Some(name))
+    .then_some(())?;
+    only_named_child(ty.child_by_field_name("type_arguments")?)
 }
 
 /// literal 型・literal 式の 1 要素。
@@ -286,7 +339,10 @@ fn atom_assignable(value: &TypeAtom, target: &[TypeAtom]) -> bool {
         }
         TypeAtom::True | TypeAtom::False => has(&TypeAtom::Boolean) || has(value),
         TypeAtom::Array(elements) => target.iter().any(
-            |atom| matches!(atom, TypeAtom::Array(expected) if assignable(elements, expected)),
+            |atom| matches!(atom, TypeAtom::Array(expected) | TypeAtom::ReadonlyArray(expected) if assignable(elements, expected)),
+        ),
+        TypeAtom::ReadonlyArray(elements) => target.iter().any(
+            |atom| matches!(atom, TypeAtom::ReadonlyArray(expected) if assignable(elements, expected)),
         ),
         TypeAtom::String
         | TypeAtom::Number
@@ -329,6 +385,12 @@ pub(super) fn prove_closure(
         wrapped_producers: Vec::new(),
         sites: 0,
     };
+    if matches!(delta.mode, MemberChangeMode::Addition)
+        && !delta.builtin_names.is_empty()
+        && !prover.property_builtins_are_plain(caches)
+    {
+        return false;
+    }
     for r in refs {
         if !prover.prove_reference(r, diff_files, caches) {
             let site = unproven_reference_site(scope, r, caches);

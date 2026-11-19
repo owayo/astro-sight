@@ -1410,6 +1410,77 @@ fn replaced_properties_close_only_after_all_values_and_uses_follow() {
 }
 
 #[test]
+fn readonly_array_properties_check_all_producers_and_builtin_binding() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let options = "export interface Options { readonly size: number; }\n";
+    let defaults = "import type { Options } from './options';\n\
+        export function defaults(): Options {\n return { size: 1 };\n}\n\
+        export function draft(input: readonly string[]): Options {\n return { size: 2 };\n}\n";
+    repo.write("options.ts", options);
+    repo.write("defaults.ts", defaults);
+    repo.write("ambient.d.ts", "// ambient types\n");
+    repo.write(
+        "app.ts",
+        "import { defaults, draft } from './defaults';\nexport const options = [defaults(), draft(['b'])];\n",
+    );
+    repo.commit_all("initial");
+
+    for annotation in ["readonly string[]", "ReadonlyArray<string>", "string[]"] {
+        repo.write(
+            "options.ts",
+            options.replace("; }", &format!("; readonly tags: {annotation}; }}")),
+        );
+        for (draft, expected) in [
+            (", tags: ['b']", 0),
+            ("", 1),
+            (", tags: [1]", 1),
+            (", tags: input", i32::from(annotation == "string[]")),
+        ] {
+            repo.write(
+                "defaults.ts",
+                defaults
+                    .replace("size: 1", "size: 1, tags: ['a']")
+                    .replace("size: 2", &format!("size: 2{draft}")),
+            );
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{annotation}/{draft}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+        }
+    }
+
+    let added = options.replace("; }", "; readonly tags: ReadonlyArray<string>; }");
+    repo.write(
+        "defaults.ts",
+        defaults
+            .replace("size: 1", "size: 1, tags: ['a']")
+            .replace("size: 2", "size: 2, tags: ['b']"),
+    );
+    repo.write(
+        "options.ts",
+        format!("type ReadonlyArray<T> = {{ value: T }};\n{added}"),
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(json["api"]["mod"][0]["n"], "Options", "{json}");
+
+    repo.write("options.ts", added);
+    repo.write(
+        "ambient.d.ts",
+        "interface ReadonlyArray<T> { requiredExtra: T }\n",
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert!(
+        json["api"]["mod"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|change| change["n"] == "Options")),
+        "{json}"
+    );
+}
+
+#[test]
 fn type_modifications_explain_unverified_proofs_without_changing_classification() {
     for extension in ["ts", "tsx"] {
         for case in [
