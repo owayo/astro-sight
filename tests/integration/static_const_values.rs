@@ -808,6 +808,43 @@ fn static_const_values_unsafe_changes_keep_blocking_api_mod() {
     }
 }
 
+#[test]
+fn static_const_values_classify_literal_binary_expressions() {
+    let repo = TestRepo::new();
+    let before = r#"export const GREETING = "Hello" + ", world";
+export const PROMPTS = { summary: "Summarize." + " Be brief." } as const;
+export const LIMITS = { retries: 3, timeoutMs: 60 * 1000 };
+export const SCALE = [-(1 + 2), 3];
+"#;
+    let after = r#"export const GREETING = "Hello" + ", there";
+export const PROMPTS = { summary: "Summarize." + " Be brief." + " Use plain words." } as const;
+export const LIMITS = { retries: 4, timeoutMs: 60 * 1000 };
+export const SCALE = [-(1 * 2), 3];
+"#;
+    repo.write("config.ts", before);
+    repo.write("view.ts", "import { GREETING, PROMPTS, LIMITS, SCALE } from './config';\nexport function render() { return `${GREETING} ${PROMPTS.summary} ${LIMITS.retries} ${SCALE[0]}`; }\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("config.ts", after);
+
+    for strict in [false, true] {
+        let (output, json) = hook(&repo, strict);
+        assert_eq!(output.status.code(), Some(i32::from(strict)), "{json}");
+        let mut names = json["api"]["const_value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|change| change["n"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["GREETING", "LIMITS", "PROMPTS", "SCALE"], "{json}");
+        assert!(json["api"]["mod"].is_null(), "{json}");
+        if !strict {
+            assert!(json["impacts"].is_null(), "{json}");
+        }
+    }
+}
+
 /// 型注釈のないトップレベルの scalar const で値の種類が変わると、推論される公開型が変わる
 /// (`TIMEOUT * 1000` が TS2362)。静的 container の葉の同じ変更と同じく blocking な api.mod に残し、
 /// 種類が同じ値の変更だけを const_value (非 blocking) に降格する。
@@ -819,6 +856,11 @@ fn static_const_values_top_level_scalar_kind_change_keeps_blocking_api_mod() {
         ("ts", "1", "1n", true),
         ("js", "30", "\"30s\"", true),
         ("tsx", "null", "0", true),
+        ("ts", "'a' + 'b'", "BASE + 'x'", true),
+        ("ts", "'a' + 'b'", "String(1) + 'x'", true),
+        ("tsx", "'a' + 'b'", "1 + 2", true),
+        ("ts", "'a' + 1", "'b' + 2", true),
+        ("ts", "'ab'", "'a' + 'b'", true),
         // 対照: 同じ種類の値の変更は従来どおり const_value
         ("ts", "30", "45", false),
         ("js", "'a'", "'b'", false),

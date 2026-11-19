@@ -36,9 +36,60 @@ pub(super) fn js_scalar_literal_kind(node: Node<'_>, source: &[u8]) -> Option<Sc
     }
 }
 
+/// 同種のリテラルだけからなる数値の算術式か文字列の連結を証明する。値は評価しない。
+pub(super) fn js_static_binary_kind(value: Node<'_>, source: &[u8]) -> Option<ScalarKind> {
+    if value.has_error() || value.is_missing() {
+        return None;
+    }
+    let mut stack = vec![value];
+    let mut kind = None;
+    let mut has_binary_operator = false;
+    let mut needs_number = false;
+    while let Some(node) = stack.pop() {
+        let leaf_kind = match node.kind() {
+            "number" if number_kind(node, source)? == ScalarKind::Number => ScalarKind::Number,
+            "string" => ScalarKind::String,
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment");
+                stack.push(children.next()?);
+                if children.next().is_some() {
+                    return None;
+                }
+                continue;
+            }
+            "unary_expression" if node.child_by_field_name("operator")?.kind() == "-" => {
+                needs_number = true;
+                stack.push(node.child_by_field_name("argument")?);
+                continue;
+            }
+            "binary_expression" => {
+                match node.child_by_field_name("operator")?.kind() {
+                    "+" => {}
+                    "-" | "*" | "/" | "%" | "**" => needs_number = true,
+                    _ => return None,
+                }
+                has_binary_operator = true;
+                stack.push(node.child_by_field_name("left")?);
+                stack.push(node.child_by_field_name("right")?);
+                continue;
+            }
+            _ => return None,
+        };
+        if *kind.get_or_insert(leaf_kind) != leaf_kind {
+            return None;
+        }
+    }
+    kind.filter(|kind| has_binary_operator && (!needs_number || *kind == ScalarKind::Number))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum StaticShape {
     Scalar(ScalarKind),
+    /// `as const` の内側でも演算結果は literal 型にならない。
+    Expression(ScalarKind),
     Object(Vec<(String, StaticShape)>),
     Array(Vec<StaticShape>),
     ConstAssert(Box<StaticShape>),
@@ -124,7 +175,9 @@ fn same_contract(old: &StaticConstContract, new: &StaticConstContract) -> bool {
 
 fn widened_shape(shape: &StaticShape) -> Option<WidenedShape> {
     match shape {
-        StaticShape::Scalar(kind) => Some(WidenedShape::Scalar(*kind)),
+        StaticShape::Scalar(kind) | StaticShape::Expression(kind) => {
+            Some(WidenedShape::Scalar(*kind))
+        }
         StaticShape::Object(properties) => Some(WidenedShape::Object(
             properties
                 .iter()
@@ -176,7 +229,13 @@ fn static_const_contract<'tree>(
     ))
 }
 
-fn primitive_value_tokens(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+#[derive(Debug, PartialEq, Eq)]
+enum ValueToken {
+    Literal(String),
+    Expression(SigTokens),
+}
+
+fn primitive_value_tokens(node: Node<'_>, source: &[u8]) -> Option<Vec<ValueToken>> {
     let mut tokens = Vec::new();
     collect_primitive_value_tokens(node, source, &mut tokens)?;
     Some(tokens)
@@ -186,31 +245,32 @@ fn primitive_value_tokens(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> 
 fn collect_primitive_value_tokens(
     node: Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<ValueToken>,
 ) -> Option<()> {
     match node.kind() {
         "number" | "true" | "false" | "null" => {
-            tokens.push(node.utf8_text(source).ok()?.to_string());
+            tokens.push(ValueToken::Literal(node.utf8_text(source).ok()?.to_owned()));
         }
         "string" => {
-            let text = node.utf8_text(source).ok()?;
-            // escape のない通常文字列だけ、引用符の違いを整形として除く。
-            let value = if text.contains('\\') {
-                text
-            } else {
-                text.strip_prefix('\'')
-                    .and_then(|text| text.strip_suffix('\''))
-                    .or_else(|| {
-                        text.strip_prefix('"')
-                            .and_then(|text| text.strip_suffix('"'))
-                    })
-                    .unwrap_or(text)
-            };
-            tokens.push(value.to_string());
+            tokens.push(ValueToken::Literal(
+                plain_string_value(node.utf8_text(source).ok()?).to_owned(),
+            ));
         }
-        "unary_expression" => {
-            let argument = node.child_by_field_name("argument")?;
-            tokens.push(format!("-{}", argument.utf8_text(source).ok()?));
+        "unary_expression" if node.child_by_field_name("argument")?.kind() == "number" => {
+            let argument = node
+                .child_by_field_name("argument")?
+                .utf8_text(source)
+                .ok()?;
+            tokens.push(ValueToken::Literal(format!("-{argument}")));
+        }
+        "binary_expression" | "unary_expression" => {
+            let mut expression = header_tokens(node, source, node.start_byte(), node.end_byte())?;
+            for (kind, text) in &mut expression.0 {
+                if kind == "string" {
+                    *text = plain_string_value(text).to_owned();
+                }
+            }
+            tokens.push(ValueToken::Expression(expression));
         }
         "object" => {
             let mut cursor = node.walk();
@@ -246,6 +306,20 @@ fn collect_primitive_value_tokens(
     Some(())
 }
 
+/// escape のない通常文字列だけ、引用符の違いを整形として除く。
+fn plain_string_value(text: &str) -> &str {
+    if text.contains('\\') {
+        return text;
+    }
+    text.strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .or_else(|| {
+            text.strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'))
+        })
+        .unwrap_or(text)
+}
+
 fn header_tokens(node: Node<'_>, source: &[u8], start: usize, end: usize) -> Option<SigTokens> {
     let mut tokens = signature_tokens_in_range(node, source, start, end)?;
     tokens.0.retain(|(kind, _)| kind != "comment");
@@ -256,7 +330,7 @@ fn is_container(shape: &StaticShape) -> bool {
     match shape {
         StaticShape::Object(_) | StaticShape::Array(_) => true,
         StaticShape::ConstAssert(inner) => is_container(inner),
-        StaticShape::Scalar(_) => false,
+        StaticShape::Scalar(_) | StaticShape::Expression(_) => false,
     }
 }
 
@@ -318,13 +392,14 @@ fn static_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Op
             static_shape(inner, source, lang, depth + 1)
         }
         "number" => number_shape(node, source),
-        "unary_expression" => {
-            let operator = node.child_by_field_name("operator")?;
-            let argument = node.child_by_field_name("argument")?;
-            if operator.utf8_text(source).ok()? != "-" || argument.kind() != "number" {
-                return None;
-            }
-            number_shape(argument, source)
+        "unary_expression"
+            if node.child_by_field_name("operator")?.kind() == "-"
+                && node.child_by_field_name("argument")?.kind() == "number" =>
+        {
+            number_shape(node.child_by_field_name("argument")?, source)
+        }
+        "binary_expression" | "unary_expression" => {
+            js_static_binary_kind(node, source).map(StaticShape::Expression)
         }
         "string" => Some(StaticShape::Scalar(ScalarKind::String)),
         "true" | "false" => Some(StaticShape::Scalar(ScalarKind::Boolean)),
@@ -346,12 +421,9 @@ fn static_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Op
             {
                 return None;
             }
-            Some(StaticShape::ConstAssert(Box::new(static_shape(
-                expression,
-                source,
-                lang,
-                depth + 1,
-            )?)))
+            let shape = static_shape(expression, source, lang, depth + 1)?;
+            (!matches!(shape, StaticShape::Expression(_)))
+                .then_some(StaticShape::ConstAssert(Box::new(shape)))
         }
         _ => None,
     }
@@ -547,9 +619,18 @@ mod tests {
             };
             let original = "{ a: [- 1, \"a\", true, null], b: { n: 2n } }";
             let formatted = "({ \"a\":[-1,(\"a\"),true,null,], /* ordinary */ \"b\":{n:2n,},})";
-            assert_eq!(values(original), vec!["-1", "a", "true", "null", "2n"]);
+            assert_eq!(
+                values(original),
+                ["-1", "a", "true", "null", "2n"]
+                    .map(|value| ValueToken::Literal(value.to_owned()))
+            );
             assert_eq!(values(original), values(formatted), "{lang:?}");
             assert_eq!(values("['a']"), values("[\"a\"]"), "{lang:?}");
+            assert_eq!(
+                values("['a'+'b']"),
+                values("[\"a\" /* comment */ + 'b']"),
+                "{lang:?}"
+            );
             for (old, new) in [
                 ("[0x10]", "[16]"),
                 ("['a']", "['b']"),
@@ -558,6 +639,8 @@ mod tests {
                 ("[1n]", "[2n]"),
                 ("[true]", "[false]"),
                 ("['a b']", "['a  b']"),
+                ("[2 * 3]", "[2 + 3]"),
+                ("[(1 + 2) * 3]", "[1 + 2 * 3]"),
             ] {
                 assert_ne!(values(old), values(new), "{lang:?}: {old} -> {new}");
             }
@@ -591,7 +674,9 @@ mod tests {
                 "{ a: +1 }",
                 "{ a: -(1) }",
                 "{ a: - -1 }",
-                "{ a: 1 + 2 }",
+                "{ a: '1' + 2 }",
+                "{ a: BASE * 2 }",
+                "{ a: String(1) + 'x' }",
                 "{ a: 1, 'a': 2 }",
                 "{ __proto__: null }",
                 "{ '__proto__': { a: 1 } }",
@@ -617,11 +702,27 @@ mod tests {
                 "({ a: 1 } as const) satisfies Shape",
                 "({ a: 1 })!",
                 "1 as const",
+                "{ a: (1 + 2) as const }",
             ] {
                 assert!(initializer(value, lang).is_none(), "{value}");
             }
         }
         assert!(initializer("<const>{ a: 1 }", LangId::Typescript).is_none());
+    }
+
+    #[test]
+    fn expression_results_widen_like_literals_only_outside_const_assertions() {
+        for (old, new, equal) in [
+            ("{ a: 'x' }", "{ a: 'y' + 'z' }", true),
+            ("[1 + 2]", "[2, 3]", true),
+            ("{ a: 1 + 2 } as const", "{ a: -(2 * 3) } as const", true),
+            ("{ a: 'x' } as const", "{ a: 'y' + 'z' } as const", false),
+            ("{ a: 'x' + 'y' }", "{ a: 1 + 2 }", false),
+        ] {
+            let old = initializer(old, LangId::Typescript).unwrap();
+            let new = initializer(new, LangId::Typescript).unwrap();
+            assert_eq!(same_contract(&old, &new), equal, "{old:?} -> {new:?}");
+        }
     }
 
     #[test]

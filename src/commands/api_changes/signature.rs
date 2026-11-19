@@ -778,8 +778,8 @@ pub(crate) struct BindingShape {
     /// TS/JS の単純リテラルの種類 (Rust では None)。型注釈がないと推論される公開型は
     /// 値の種類で決まるため、種類が変わる変更 (`30` → `"30s"`) を値だけの変更と区別する。
     js_literal_kind: Option<JsConstLiteralKind>,
-    /// 数値リテラルだけの算術式なら true。literal 型との変化は別に扱う。
-    initializer_is_numeric_arithmetic: bool,
+    /// リテラルだけの算術式・文字列連結の結果型。literal 型との変化は別に扱う。
+    js_binary_kind: Option<super::static_const::ScalarKind>,
 }
 
 /// `node` を起点に、指定 kind のいずれかに最初に一致する子孫ノードを深さ優先で探す。
@@ -872,7 +872,7 @@ pub(crate) fn extract_rust_binding_shape(
         has_type_annotation,
         initializer_is_simple_literal,
         js_literal_kind: None,
-        initializer_is_numeric_arithmetic: false,
+        js_binary_kind: None,
     })
 }
 
@@ -932,8 +932,8 @@ pub(crate) fn extract_js_binding_shape(
         has_type_annotation,
         initializer_is_simple_literal: js_literal_kind.is_some(),
         js_literal_kind,
-        initializer_is_numeric_arithmetic: value
-            .is_some_and(|value| js_numeric_arithmetic(value, source)),
+        js_binary_kind: value
+            .and_then(|value| super::static_const::js_static_binary_kind(value, source)),
     })
 }
 
@@ -974,73 +974,11 @@ fn js_const_literal_kind(
     }
 }
 
-/// number の算術式だけを証明し、値や演算結果は評価しない。
-fn js_numeric_arithmetic(value: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    if value.has_error() || value.is_missing() {
-        return false;
-    }
-    let mut stack = vec![value];
-    let mut has_binary_operator = false;
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "number" => {
-                if super::static_const::js_scalar_literal_kind(node, source)
-                    != Some(super::static_const::ScalarKind::Number)
-                {
-                    return false;
-                }
-            }
-            "parenthesized_expression" => {
-                let mut cursor = node.walk();
-                let mut children = node
-                    .named_children(&mut cursor)
-                    .filter(|child| child.kind() != "comment");
-                let Some(child) = children.next() else {
-                    return false;
-                };
-                if children.next().is_some() {
-                    return false;
-                }
-                stack.push(child);
-            }
-            "unary_expression" => {
-                if node
-                    .child_by_field_name("operator")
-                    .is_none_or(|operator| operator.kind() != "-")
-                {
-                    return false;
-                }
-                let Some(argument) = node.child_by_field_name("argument") else {
-                    return false;
-                };
-                stack.push(argument);
-            }
-            "binary_expression" => {
-                if node.child_by_field_name("operator").is_none_or(|operator| {
-                    !matches!(operator.kind(), "+" | "-" | "*" | "/" | "%" | "**")
-                }) {
-                    return false;
-                }
-                let (Some(left), Some(right)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) else {
-                    return false;
-                };
-                has_binary_operator = true;
-                stack.extend([left, right]);
-            }
-            _ => return false,
-        }
-    }
-    has_binary_operator
-}
-
 /// old/new signature が「const / 非 mut static / export const の値のみ変更 (shape 不変)」かを
 /// 判定する。true なら api.mod ではなく const_value_changes (informational) に振り分ける。
 ///
 /// gate: (1) kind が value binding (constant/variable)、(2) 言語が Rust/TS/TSX/JS、
-/// (3) 両者が不変バインディング、(4) shape 一致、(5) TS で型注釈なしなら同種の単純リテラルか数値の算術式。
+/// (3) 両者が不変バインディング、(4) shape 一致、(5) TS で型注釈なしなら同種の単純リテラルか静的な二項式。
 /// いずれか外れる / 抽出失敗時は false を返し、保守的に api.mod へ倒す。
 pub(crate) fn is_const_value_only_change(
     old_sig: &str,
@@ -1076,7 +1014,7 @@ pub(crate) fn is_const_value_only_change(
         return false;
     }
     // TS/JS で型注釈がない場合、関数 / object / array / call initializer は shape 推定が
-    // 危険なため同種の単純リテラルか、数値リテラルだけの算術式同士のときだけ demote する。
+    // 危険なため、同種の単純リテラルか、結果型が同じ静的な二項式のときだけ demote する。
     // 型注釈がないと公開型は値から推論されるため、種類 (number / string / RegExp / ...) が
     // 変わる変更は値だけの変更ではない (`30` → `"30s"` で `TIMEOUT * 1000` が TS2362)。
     // 正規表現の pattern / flags の動作差は既存の strict const policy で扱う。
@@ -1091,9 +1029,9 @@ pub(crate) fn is_const_value_only_change(
             && new.initializer_is_simple_literal
             && old.js_literal_kind.is_some()
             && old.js_literal_kind == new.js_literal_kind;
-        let both_numeric_arithmetic =
-            old.initializer_is_numeric_arithmetic && new.initializer_is_numeric_arithmetic;
-        if !both_typed && !both_literals && !both_numeric_arithmetic {
+        let both_binary_expressions =
+            old.js_binary_kind.is_some() && old.js_binary_kind == new.js_binary_kind;
+        if !both_typed && !both_literals && !both_binary_expressions {
             return false;
         }
     }
