@@ -15,7 +15,7 @@ use super::tree_walk::{Children, Walk, walk_preorder};
 use super::{parser, symbols};
 
 type Parts = BTreeMap<ChangedPart, Vec<(String, String)>>;
-const MAX_EVIDENCE_SOURCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_EVIDENCE_SOURCE_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct ChangeEvidenceIndex {
     entries: BTreeMap<(String, String), ChangeEvidence>,
@@ -158,6 +158,10 @@ impl ChangeEvidenceIndex {
     }
 }
 
+pub(crate) fn has_js_unicode_escape(source: &[u8]) -> bool {
+    source.windows(2).any(|bytes| bytes == b"\\u")
+}
+
 fn proven_added_declarations(
     old_root: Node<'_>,
     old: &[u8],
@@ -171,8 +175,8 @@ fn proven_added_declarations(
     }
     if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
         // JS の Unicode escape は normalize_identifier で同一視できない。
-        || old.windows(2).any(|bytes| bytes == b"\\u")
-        || new.windows(2).any(|bytes| bytes == b"\\u")
+        || has_js_unicode_escape(old)
+        || has_js_unicode_escape(new)
     {
         return BTreeSet::new();
     }

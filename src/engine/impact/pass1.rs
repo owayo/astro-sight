@@ -5,6 +5,7 @@
 //! [`CrossFileSymbolRegistry`] が、ファイルの順・ファイルの中の affected の順に行う。
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -17,6 +18,7 @@ use super::{
     rust_visibility_scope, signature, symbol_kind_str, symbol_overlaps_hunks,
 };
 use crate::commands::log_phase;
+use crate::engine::change_evidence::{MAX_EVIDENCE_SOURCE_BYTES, has_js_unicode_escape};
 use crate::engine::{calls, diff, parser, symbols};
 use crate::language::LangId;
 use crate::models::impact::{AffectedSymbol, DiffFile, HunkInfo};
@@ -37,6 +39,8 @@ pub(super) struct AffectedSymbolCollection {
 /// 変更ファイルごとの解析で共通の入力。
 struct Pass1Inputs<'a> {
     dir: &'a Path,
+    diff_input: &'a str,
+    diff_files: &'a [DiffFile],
     new_side_source: &'a NewSideSource,
     reexport_moves: &'a ReexportMoveIndex,
     derived_contract_changes: &'a BTreeMap<String, BTreeSet<String>>,
@@ -44,9 +48,19 @@ struct Pass1Inputs<'a> {
     /// 区間しか読まないので、diff 全体ではなく区間だけを渡す。diff 全体を渡すとファイル数 ×
     /// diff 長の 2 乗になる (`FileSections` の doc 参照)。結果は diff 全体を渡した場合と同一。
     file_sections: diff::FileSections<'a>,
-    /// diff が同じパスのファイル 1 つだけを変えた。他ファイルからの移動を追加と誤認しないこと、
-    /// 可視性を広げただけの変更を差分だけで確かめることの前提にする。
+    /// hunk を持つ変更が同一パスの 1 ファイルだけ。単一ファイル用の宣言の証明に使う。
     single_in_place_file: bool,
+    /// JS 系の旧側監査は、追加候補を見つけたときに一度だけ実行する。
+    old_js_declarations: OnceCell<Option<HashSet<(String, &'static str)>>>,
+}
+
+impl Pass1Inputs<'_> {
+    fn has_no_matching_old_js_declaration(&self, name: &str, kind: &'static str) -> bool {
+        self.old_js_declarations
+            .get_or_init(|| collect_old_js_declarations(self))
+            .as_ref()
+            .is_some_and(|declarations| !declarations.contains(&(name.to_owned(), kind)))
+    }
 }
 
 /// 変更ファイル 1 つの Pass 1 の結果。
@@ -100,11 +114,14 @@ pub(super) fn collect(
 ) -> AffectedSymbolCollection {
     let inputs = Pass1Inputs {
         dir,
+        diff_input,
+        diff_files,
         new_side_source,
         reexport_moves,
         derived_contract_changes,
         file_sections: diff::FileSections::split(diff_input),
         single_in_place_file: matches!(diff_files, [only] if only.old_path == only.new_path),
+        old_js_declarations: OnceCell::new(),
     };
     let mut file_contexts = Vec::new();
     let mut registry = CrossFileSymbolRegistry::default();
@@ -124,6 +141,146 @@ pub(super) fn collect(
     }
 }
 
+fn is_js_family(lang: LangId) -> bool {
+    matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
+}
+
+/// 証明が必要になったときだけ旧側を走査する。構文木はファイルごとに手放す。
+fn collect_old_js_declarations(
+    inputs: &Pass1Inputs<'_>,
+) -> Option<HashSet<(String, &'static str)>> {
+    if !complete_text_diff(inputs.diff_input, inputs.diff_files.len()) {
+        return None;
+    }
+    let mut declarations = HashSet::new();
+    // 単一の同一パス差分は、このファイルの構文証拠だけで足りる。
+    if inputs.single_in_place_file {
+        return Some(declarations);
+    }
+    for file in inputs.diff_files {
+        if file.old_path == "/dev/null" {
+            if file
+                .hunks
+                .iter()
+                .any(|hunk| hunk.old_count != 0 || hunk.old_start != 0)
+            {
+                return None;
+            }
+            continue;
+        }
+        if !super::is_safe_diff_path(&file.old_path)
+            || (file.new_path != "/dev/null" && !super::is_safe_diff_path(&file.new_path))
+        {
+            return None;
+        }
+        let lang = LangId::from_path(Utf8Path::new(&file.old_path)).ok();
+        if lang.is_some_and(|lang| !is_js_family(lang)) {
+            continue;
+        }
+        let old = old_source_for_js_declarations(inputs, file)?;
+        let Some(lang) = lang
+            .or_else(|| LangId::from_shebang_source(&old))
+            .filter(|lang| is_js_family(*lang))
+        else {
+            continue;
+        };
+        if old.len() > MAX_EVIDENCE_SOURCE_BYTES
+            || std::str::from_utf8(&old).is_err()
+            || has_js_unicode_escape(&old)
+        {
+            return None;
+        }
+        let tree = parser::parse_source(&old, lang).ok()?;
+        let root = tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        let symbols = symbols::extract_symbols_without_complexity(root, &old, lang).ok()?;
+        declarations.extend(
+            symbols
+                .into_iter()
+                .map(|symbol| (ci_key(lang, &symbol.name), symbol_kind_str(symbol.kind))),
+        );
+    }
+    Some(declarations)
+}
+
+fn old_source_for_js_declarations<'a>(
+    inputs: &Pass1Inputs<'_>,
+    file: &'a DiffFile,
+) -> Option<Cow<'a, [u8]>> {
+    if file.new_path == "/dev/null" {
+        let [hunk] = file.hunks.as_slice() else {
+            return None;
+        };
+        let source = file.deleted_old_source.as_deref()?;
+        return (hunk.old_start == 1
+            && hunk.new_start == 0
+            && hunk.new_count == 0
+            && memchr::memchr_iter(b'\n', source).count() == hunk.old_count)
+            .then_some(Cow::Borrowed(source));
+    }
+    let new = inputs
+        .new_side_source
+        .read_checked(inputs.dir, &file.new_path)?;
+    if new.len() > MAX_EVIDENCE_SOURCE_BYTES {
+        return None;
+    }
+    let section = inputs.file_sections.get(&file.new_path);
+    diff::reconstruct_old_source(&section, &file.new_path, &new).map(|old| Cow::Owned(old.source))
+}
+
+/// hunk が無い移動、読めないヘッダ、不完全なパッチを旧宣言の不在とみなさない。
+fn complete_text_diff(input: &str, file_count: usize) -> bool {
+    let mut blocks = 0;
+    let mut old_headers = 0;
+    let mut new_headers = 0;
+    let mut has_move_metadata = false;
+    let mut lines = diff::DiffLines::new(input);
+    while let Some(line) = lines.next() {
+        match line {
+            diff::DiffLine::OldHeader(_) => old_headers += 1,
+            diff::DiffLine::NewHeader(_) => new_headers += 1,
+            diff::DiffLine::Other => {
+                let text = &input[lines.line_start()..];
+                if text.starts_with("diff --git ") {
+                    blocks += 1;
+                    continue;
+                }
+                let old_mode = text.lines().next().and_then(|line| {
+                    let metadata = line
+                        .strip_prefix("index ")
+                        .or_else(|| line.strip_prefix("deleted file mode "))?;
+                    metadata.split_ascii_whitespace().last()
+                });
+                if matches!(old_mode, Some("120000" | "160000"))
+                    || [
+                        "diff --",
+                        "@@",
+                        "Binary files ",
+                        "GIT binary patch",
+                        "old mode ",
+                        "new mode ",
+                    ]
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix))
+                {
+                    return false;
+                }
+                if text.starts_with("rename from ") || text.starts_with("copy from ") {
+                    has_move_metadata = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    old_headers == file_count
+        && new_headers == file_count
+        && (blocks == file_count || (blocks == 0 && !has_move_metadata))
+        && !lines.in_hunk()
+        && !lines.malformed_body()
+}
+
 /// 変更ファイル 1 つを解析する。読めない・構文解析できないファイルは None (解析しない)。
 fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<AnalyzedChangedFile> {
     let &Pass1Inputs {
@@ -133,6 +290,7 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         derived_contract_changes,
         ref file_sections,
         single_in_place_file,
+        ..
     } = inputs;
     // 作業ツリーから読むときは実体の存在とワークスペース境界も確かめる。`--staged` は
     // index から読むので、作業ツリーで消した (移した) ファイルも解析する (`accessible`)。
@@ -269,11 +427,16 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         &source,
         lang_id,
     );
-    // 他ファイルからの移動を追加と誤認しないよう、単一の同一パス差分に限る。
-    if single_in_place_file {
-        for symbol in &mut affected {
+    let js_in_place = df.old_path == df.new_path && is_js_family(lang_id);
+    if single_in_place_file || js_in_place {
+        for (symbol, original) in affected.iter_mut().zip(&originals) {
             if symbol.change_type == "modified"
                 && syntax_evidence.proves_added(&symbol.name, &symbol.kind, lang_id)
+                && (!js_in_place
+                    || inputs.has_no_matching_old_js_declaration(
+                        &symbol.name,
+                        symbol_kind_str(original.kind),
+                    ))
             {
                 symbol.change_type = "added".to_owned();
             }
