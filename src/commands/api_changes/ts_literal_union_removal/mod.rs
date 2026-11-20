@@ -170,6 +170,14 @@ fn ordinary_call(node: Node<'_>) -> bool {
                         .all(|node| node.kind() != "spread_element")
             })
 }
+fn pattern_contains(pattern: Node<'_>, source: &str, name: &str) -> bool {
+    any_node(pattern, Children::Named, |node| {
+        matches!(
+            node.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && text(node, source) == Some(name)
+    })
+}
 fn outer_declaration(node: Node<'_>) -> Option<Node<'_>> {
     let mut outer = node;
     if outer.kind() == "variable_declarator" {

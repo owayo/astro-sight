@@ -56,6 +56,18 @@ fn audit_inner(
         callbacks: Vec::new(),
     };
     let mut used = require_exhaustive && !plan.records.is_empty();
+    let mut ambiguous: HashMap<String, Vec<Span>> = HashMap::new();
+    let mut is_ambiguous = |path: &str, node: Node<'_>| -> Option<bool> {
+        if !ambiguous.contains_key(path) {
+            ambiguous.insert(path.to_owned(), ambiguous_spans(inventory.root(path)?));
+        }
+        let (start, end) = span(node);
+        Some(
+            ambiguous[path]
+                .iter()
+                .any(|&(from, to)| from <= start && end <= to),
+        )
+    };
     let array_names = plan
         .arrays
         .iter()
@@ -69,6 +81,9 @@ fn audit_inner(
             let name = text(node, &file.source)?;
             if !array_names.contains(name) {
                 continue;
+            }
+            if is_ambiguous(path, node)? {
+                return None;
             }
             let owner = slots::value_owner(inventory, path, node, name)?;
             if !plan.arrays.contains(&owner) {
@@ -92,12 +107,36 @@ fn audit_inner(
         .collect::<BTreeSet<_>>();
     for (path, file) in inventory.relevant(&value_names) {
         for node in slots::nodes(inventory.root(path)?) {
+            // 宣言の無い for-in/of の左辺は外側の束縛への書き込み。resolver は新しい束縛として
+            // 返すので、for 文の外側から解決し直す。
+            if node.kind() == "for_in_statement"
+                && node
+                    .child_by_field_name("kind")
+                    .is_none_or(|kind| kind.kind() == "var")
+                && let Some(left) = node.child_by_field_name("left")
+            {
+                for consumer in &plan.consumers {
+                    // 既定値や計算キーの中の名前は読み出しなので、通常の監査に任せる。
+                    if crate::engine::js_scope::pattern_binds_name(
+                        left,
+                        file.source.as_bytes(),
+                        &consumer.site.name,
+                    ) && slots::value_owner(inventory, path, node, &consumer.site.name)?
+                        == consumer.site
+                    {
+                        return None;
+                    }
+                }
+            }
             if !crate::engine::js_occurrence::identifier_kind(node.kind()) {
                 continue;
             }
             let name = text(node, &file.source)?;
             if !value_names.contains(name) {
                 continue;
+            }
+            if is_ambiguous(path, node)? {
+                return None;
             }
             let owner = slots::value_owner(inventory, path, node, name)?;
             if let Some(record) = plan.records.iter().find(|record| record.site == owner) {
@@ -111,8 +150,12 @@ fn audit_inner(
                         return None;
                     }
                 }
-            } else if plan.consumers.iter().any(|consumer| consumer.site == owner)
+            } else if let Some(consumer) = plan
+                .consumers
+                .iter()
+                .find(|consumer| consumer.site == owner)
                 && !neutral(node, &owner)
+                && !consumer.declares(node)
             {
                 let call = node.parent().filter(|call| {
                     call.kind() == "call_expression"
@@ -191,6 +234,9 @@ fn audit_inner(
             {
                 continue;
             }
+            if is_ambiguous(&binding.path, node)? {
+                return None;
+            }
             if !proof.binding_owns(binding, &binding.path, node)? {
                 continue;
             }
@@ -202,6 +248,33 @@ fn audit_inner(
     }
     used.then_some(())?;
     builtin_and_transport_audit(inventory, plan, &proof.callbacks, require_exhaustive)
+}
+
+/// 名前の解決 (`resolve_binding_scope`) が束縛を取り違えうる位置。メソッドの計算名とデコレータは
+/// 外側で評価されるのにメソッドの引数を先に探し、for の見出し・for-of の右辺・catch の引数・
+/// 引数の型注釈と既定値は、本体や関数の中の宣言まで探す。ここに追跡中の名前があれば、解決の
+/// 結果に頼らず保留する。
+fn ambiguous_spans(root: Node<'_>) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for node in slots::nodes(root) {
+        let fields: &[&str] = match node.kind() {
+            "computed_property_name" | "decorator" => {
+                spans.push(span(node));
+                &[]
+            }
+            "for_statement" => &["initializer", "condition", "increment"],
+            "for_in_statement" => &["right", "value"],
+            "catch_clause" => &["parameter"],
+            "required_parameter" | "optional_parameter" => &["type", "value"],
+            _ => &[],
+        };
+        spans.extend(
+            fields
+                .iter()
+                .filter_map(|field| node.child_by_field_name(field).map(span)),
+        );
+    }
+    spans
 }
 
 fn neutral(node: Node<'_>, site: &Site) -> bool {
@@ -511,14 +584,6 @@ fn callback_parts<'t>(callback: Node<'t>, source: &str) -> Option<(String, Span,
         return None;
     }
     Some((text(parameter, source)?.to_owned(), span(parameter), body))
-}
-fn pattern_contains(pattern: Node<'_>, source: &str, name: &str) -> bool {
-    any_node(pattern, Children::Named, |node| {
-        matches!(
-            node.kind(),
-            "identifier" | "shorthand_property_identifier_pattern"
-        ) && text(node, source) == Some(name)
-    })
 }
 fn read_only(mut node: Node<'_>) -> bool {
     for _ in 0..MAX_DEPTH {

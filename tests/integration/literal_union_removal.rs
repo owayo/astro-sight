@@ -336,6 +336,332 @@ fn literal_union_addition_proves_never_from_an_exhaustive_switch() {
     }
 }
 
+const IMPORT_MODE: &str = "import type { Mode } from \"./mode\";\n";
+const SEEN_CASE: &str = "case \"seen\": return \"already seen\";";
+const ROOT_ARROW: &str = "export const describe = (mode: Mode): string => {\n    switch (mode) {\n        case \"early\": return \"before the start\";\n        case \"seen\": return \"already seen\";\n    }\n};\n";
+const LOCAL_FUNCTION: &str = "export function label(mode: Mode): string {\n    function describe(value: Mode): string {\n        switch (value) {\n            case \"early\": return \"before the start\";\n            case \"seen\": return \"already seen\";\n        }\n    }\n    return describe(mode);\n}\n";
+const LOCAL_ARROW: &str = "export function label(mode: Mode): string {\n    const describe = (value: Mode): string => {\n        switch (value) {\n            case \"early\": return \"before the start\";\n            case \"seen\": return \"already seen\";\n        }\n    };\n    return describe(mode);\n}\n";
+
+/// `src/describe.ts` を `reader` にしてコミットし、union に要素を足す。`complete` なら読む関数の
+/// switch にも同じ差分で case を足す。`app` があれば `src/app.ts` として置く。
+fn reader_hook(reader: &str, complete: bool, app: Option<&str>) -> (i32, serde_json::Value) {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write("src/describe.ts", reader);
+    if let Some(app) = app {
+        repo.write("src/app.ts", app);
+    }
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    if complete {
+        repo.write(
+            "src/describe.ts",
+            reader.replace(
+                SEEN_CASE,
+                &format!("{SEEN_CASE} case \"filtered\": return \"filtered out\";"),
+            ),
+        );
+    }
+    union_hook(&repo, false, false)
+}
+
+#[test]
+fn literal_union_addition_accepts_arrow_and_local_readers() {
+    let hoisted = "export function label(mode: Mode): string {\n    return describe(mode);\n    function describe(value: Mode): string {\n        switch (value) {\n            case \"early\": return \"before the start\";\n            case \"seen\": return \"already seen\";\n        }\n    }\n}\n";
+    let two_scopes = format!(
+        "{LOCAL_FUNCTION}{}",
+        LOCAL_FUNCTION.replace("label(", "caption(")
+    );
+    let literal_only = "export function make(fallback: string): string {\n    function describe(value: Mode): string {\n        switch (value) {\n            case \"early\": return \"before the start\";\n            case \"seen\": return \"already seen\";\n        }\n    }\n    return describe(\"seen\") + fallback;\n}\n";
+    let imported =
+        "import { describe } from \"./describe\";\nexport const caption = describe(\"early\");\n";
+    let own_arguments = "export function describe(mode: Mode): string {\n    function first(): unknown {\n        return arguments[0];\n    }\n    void first;\n    switch (mode) {\n        case \"early\": return \"before the start\";\n        case \"seen\": return \"already seen\";\n    }\n}\n";
+    let computed_literal = ROOT_ARROW.replace(
+        "    switch (mode) {",
+        "    const handlers = { [publish(\"early\")](mode: number) { return mode; } };\n    void handlers;\n    switch (mode) {",
+    ) + "function publish(value: \"early\" | \"seen\"): string {\n    return value;\n}\n";
+    // for-of の左辺の既定値の呼び出しは読み出しで、受け口への書き込みではない。
+    let for_of_default = LOCAL_FUNCTION.replace(
+        "    return describe(mode);",
+        "    let value = \"\";\n    const rows: [string?][] = [[]];\n    for ([value = describe(\"seen\")] of rows) {}\n    void value;\n    return describe(mode);",
+    );
+    for (case, body, app, check_missing) in [
+        ("root const arrow", ROOT_ARROW, None, true),
+        (
+            "root const arrow imported",
+            ROOT_ARROW,
+            Some(imported),
+            false,
+        ),
+        ("local function", LOCAL_FUNCTION, None, true),
+        ("local const arrow", LOCAL_ARROW, None, true),
+        (
+            "local function called before its declaration",
+            hoisted,
+            None,
+            false,
+        ),
+        (
+            "same local name in two functions",
+            two_scopes.as_str(),
+            None,
+            true,
+        ),
+        (
+            "local function called with a literal",
+            literal_only,
+            None,
+            false,
+        ),
+        (
+            "inner function reading its own arguments",
+            own_arguments,
+            None,
+            false,
+        ),
+        (
+            "computed method name without the value",
+            computed_literal.as_str(),
+            None,
+            false,
+        ),
+        (
+            "reader called in a for-of default",
+            for_of_default.as_str(),
+            None,
+            false,
+        ),
+    ] {
+        let reader = format!("{IMPORT_MODE}{body}");
+        let (code, json) = reader_hook(&reader, true, app);
+        union_category(code, &json, 0, true, case);
+        if check_missing {
+            let (code, json) = reader_hook(&reader, false, app);
+            union_category(
+                code,
+                &json,
+                1,
+                false,
+                &format!("{case} without the new case"),
+            );
+        }
+    }
+}
+
+#[test]
+fn literal_union_addition_keeps_unproven_arrow_and_local_readers_blocking() {
+    let complete_cases = "            case \"early\": return \"before the start\";\n            case \"seen\": return \"already seen\";\n";
+    let root_function = "export function describe(mode: Mode): string {\n    const first: unknown = arguments[0];\n    switch (mode) {\n        case \"early\": return \"before the start\";\n        case \"seen\": return \"already seen\";\n    }\n}\n".to_owned();
+    for (case, body) in [
+        (
+            "let arrow",
+            ROOT_ARROW.replace("export const describe", "export let describe"),
+        ),
+        (
+            "escaped arrow",
+            format!("{ROOT_ARROW}export const alias = describe;\n"),
+        ),
+        (
+            "returned local function",
+            format!(
+                "export function getReader() {{\n    function describe(value: Mode): string {{\n        const describe = 0;\n        switch (value) {{\n{complete_cases}        }}\n    }}\n    return describe;\n}}\n"
+            ),
+        ),
+        (
+            "reassigned local function",
+            LOCAL_FUNCTION.replace(
+                "    return describe(mode);",
+                "    describe = undefined!;\n    return describe(mode);",
+            ),
+        ),
+        ("arguments of a root function", root_function.clone()),
+        (
+            "arguments read by an inner arrow without the type",
+            root_function.replace(
+                "    const first: unknown = arguments[0];\n",
+                "    const first = (): unknown => arguments[0];\n    void first;\n",
+            ),
+        ),
+        (
+            "shorthand arguments",
+            root_function.replace("arguments[0]", "({ arguments }).arguments[0]"),
+        ),
+        (
+            "arguments in a computed method name",
+            root_function.replace(
+                "    const first: unknown = arguments[0];\n",
+                "    const keys = { [String(arguments[0])]() { return 0; } };\n    void keys;\n",
+            ),
+        ),
+        (
+            "outer arguments read by a local arrow",
+            LOCAL_ARROW.replace(
+                "        switch (value)",
+                "        const first: unknown = arguments[0];\n        switch (value)",
+            ),
+        ),
+        (
+            "var of the same name",
+            LOCAL_FUNCTION
+                .replace("label(mode: Mode)", "label(mode: Mode, flag: boolean)")
+                .replace(
+                    "    return describe(mode);",
+                    "    if (flag) { var describe = 0; }\n    return describe(mode);",
+                ),
+        ),
+        (
+            "value passed through a computed method name",
+            ROOT_ARROW.replace(
+                "    switch (mode) {",
+                "    const handlers = { [publish(mode)](mode: number) { return mode; } };\n    void handlers;\n    switch (mode) {",
+            ) + "function publish(value: \"early\" | \"seen\"): string {\n    return value;\n}\n",
+        ),
+        (
+            "value passed through a for header",
+            ROOT_ARROW.replace(
+                "    switch (mode) {",
+                "    for (; publish(mode);) { const mode = 0; void mode; break; }\n    switch (mode) {",
+            ) + "function publish(value: \"early\" | \"seen\"): boolean {\n    return value === \"early\";\n}\n",
+        ),
+        (
+            "value passed through a parameter decorator",
+            ROOT_ARROW.replace(
+                "    switch (mode) {",
+                "    class Handler { run(@mark(mode) mode: number) { return mode; } }\n    void Handler;\n    switch (mode) {",
+            ) + "declare function mark(value: \"early\" | \"seen\"): ParameterDecorator;\n",
+        ),
+        (
+            "arguments in a parameter decorator",
+            root_function.replace(
+                "    const first: unknown = arguments[0];\n",
+                "    class Handler { run(@mark(arguments[0]) value: number) { return value; } }\n    void Handler;\n",
+            ) + "declare function mark(value: unknown): ParameterDecorator;\n",
+        ),
+        (
+            "local function captured by an inner parameter initializer",
+            format!(
+                "export function makeReader() {{\n    function describe(value: Mode): string {{\n        switch (value) {{\n{complete_cases}        }}\n    }}\n    function capture(saved = describe) {{\n        const describe = 0;\n        void describe;\n        return saved;\n    }}\n    return capture();\n}}\n"
+            ),
+        ),
+        (
+            "name in a parameter initializer",
+            format!(
+                "export function make(fallback: string = describe(\"early\")): string {{\n    function describe(value: Mode): string {{\n        switch (value) {{\n{complete_cases}        }}\n    }}\n    return describe(\"seen\") + fallback;\n}}\n"
+            ),
+        ),
+        (
+            "for-of write to a local function from an inner function",
+            LOCAL_FUNCTION.replace(
+                "    return describe(mode);",
+                "    function reset(): void {\n        const replacements: never[] = [];\n        for (describe of replacements) {}\n    }\n    reset();\n    return describe(mode);",
+            ),
+        ),
+        (
+            "for-of write to a root function",
+            format!(
+                "{}const replacements: never[] = [];\nfor (describe of replacements) {{}}\n",
+                INCOMPLETE_SWITCH.replace("import type { Mode } from \"./mode\";\n", "")
+            ),
+        ),
+        (
+            "function expression",
+            ROOT_ARROW.replace(
+                "(mode: Mode): string => {",
+                "function (mode: Mode): string {",
+            ),
+        ),
+        (
+            "type parameters",
+            ROOT_ARROW.replace("= (mode: Mode)", "= <T,>(mode: Mode)"),
+        ),
+    ] {
+        let reader = format!("{IMPORT_MODE}{body}");
+        let (code, json) = reader_hook(&reader, true, None);
+        union_category(code, &json, 1, false, case);
+    }
+}
+
+/// 判別 union の要素削除でも、`const` に代入した矢印関数を受け口として扱う。
+#[test]
+fn discriminated_union_removal_accepts_arrow_consumers() {
+    let before = "import type { Message } from './messages';\nexport const handle = (message: Message): string => {\n if (message.type === 'open') return 'opened';\n switch (message.type) { case 'close': return 'closed'; default: return 'other'; }\n};\n";
+    for (argument, expected) in [
+        ("{ type: 'close', text: 'value' }", 0),
+        ("{ type: 'open' }", 1),
+        // 削除した判別値は残っていないが、残る要素の型に合わない。
+        ("{ type: 'close', text: 123 }", 1),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write(
+            "src/messages.ts",
+            "export type Message = { type: 'open' } | { type: 'close'; text: string };\n",
+        );
+        repo.write("src/handler.ts", before);
+        repo.write(
+            "src/sender.ts",
+            format!(
+                "import {{ handle }} from './handler';\nexport const result = handle({argument});\n"
+            ),
+        );
+        repo.commit_all("initial");
+        repo.write(
+            "src/messages.ts",
+            "export type Message = { type: 'close'; text: string };\n",
+        );
+        repo.write(
+            "src/handler.ts",
+            before.replace(" if (message.type === 'open') return 'opened';\n", ""),
+        );
+        let (code, json) = union_hook(&repo, false, false);
+        assert_eq!(code, expected, "{argument}: {json}");
+        let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+        assert!(
+            json["api"][bucket]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["n"] == "Message")),
+            "{argument}: {json}"
+        );
+    }
+}
+
+/// 要素の削除でも、`const` に代入した矢印関数を受け口として扱う。
+#[test]
+fn literal_union_removal_accepts_arrow_readers() {
+    let mode = "export type Mode = \"all\" | \"legacy\" | \"recent\";\nexport const matches = (mode: Mode, age: number): boolean => {\n    switch (mode) {\n        case \"all\": return true;\n        case \"legacy\": return age > 30;\n        case \"recent\": return age <= 7;\n    }\n};\n";
+    let view = "import { matches } from \"./mode\";\nexport function visible(age: number): boolean {\n    return matches(\"all\", age);\n}\n";
+    // 2 つ目は削除した値が残る形、3 つ目は残っていないが値の由来が分からない形。
+    for (argument, expected) in [
+        ("\"all\"", 0),
+        ("\"legacy\"", 1),
+        ("JSON.parse(\"\\\"all\\\"\")", 1),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write("src/mode.ts", mode);
+        repo.write("src/view.ts", view);
+        repo.commit_all("initial");
+        repo.write(
+            "src/mode.ts",
+            mode.replace(" | \"legacy\"", "")
+                .replace("        case \"legacy\": return age > 30;\n", ""),
+        );
+        repo.write(
+            "src/view.ts",
+            view.replace(
+                "matches(\"all\", age)",
+                &format!("matches({argument}, age)"),
+            ),
+        );
+        let (code, json) = union_hook(&repo, false, false);
+        union_category(code, &json, expected, expected == 0, argument);
+    }
+}
+
 #[test]
 fn literal_union_addition_requires_complete_static_record_keys() {
     let repo = TestRepo::new();

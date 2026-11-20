@@ -57,10 +57,23 @@ pub(super) struct Record {
     pub(super) primitive: Primitive,
 }
 pub(super) struct Consumer {
+    /// 呼び出し側の名前が `value_owner` で解決される先。関数の中の関数宣言は、宣言のある
+    /// 関数の本体の範囲になる。
     pub(super) site: Site,
+    /// 宣言そのもの (`function_declaration` か、矢印関数を値に持つ `variable_declarator`)。
+    pub(super) declaration: Span,
     pub(super) positions: BTreeSet<usize>,
     pub(super) arity: usize,
     pub(super) result: Primitive,
+}
+impl Consumer {
+    /// `node` が受け口の宣言の名前か (利用ではない)。
+    pub(super) fn declares(&self, node: Node<'_>) -> bool {
+        node.parent().is_some_and(|parent| {
+            span(parent) == self.declaration
+                && parent.child_by_field_name("name").map(span) == Some(span(node))
+        })
+    }
 }
 pub(super) struct Plan {
     pub(super) target: Site,
@@ -646,19 +659,32 @@ fn consumer_slot(
         .parent()
         .filter(|parent| parent.kind() == "formal_parameters")?
         .parent()?;
-    if function.kind() != "function_declaration"
-        || function.child_by_field_name("type_parameters").is_some()
+    if function.child_by_field_name("type_parameters").is_some()
         || token(function, "async")
         || token(function, "*")
         || function.child_by_field_name("body").is_none()
-        || function
-            .parent()
-            .is_some_and(|parent| parent.kind() == "export_statement" && token(parent, "default"))
     {
         return None;
     }
+    // 対象の型の引数が複数ある関数は、最初の引数で全引数を登録済み。走査をやり直さない。
+    let declaration = if function.kind() == "arrow_function" {
+        function.parent()?
+    } else {
+        function
+    };
+    if plan
+        .consumers
+        .iter()
+        .any(|consumer| consumer.site.path == path && consumer.declaration == span(declaration))
+    {
+        return Some(());
+    }
     let source = inventory.source(path)?;
-    let site = declared_site(inventory, path, function)?;
+    let (site, declaration) = consumer_site(inventory, path, function, source)?;
+    // `arguments` は、追跡する引数の名前を使わずにその値を読み出せる。
+    if reads_arguments(function, source) {
+        return None;
+    }
     let result = Primitive::read(only(function.child_by_field_name("return_type")?)?, source)?;
     let parameters = children(function.child_by_field_name("parameters")?);
     let mut names = BTreeSet::new();
@@ -700,12 +726,206 @@ fn consumer_slot(
     if !plan.consumers.iter().any(|consumer| consumer.site == site) {
         plan.consumers.push(Consumer {
             site,
+            declaration: span(declaration),
             positions,
             arity: parameters.len(),
             result,
         });
     }
     Some(())
+}
+
+const FUNCTION_LIKE_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "arrow_function",
+    "method_definition",
+    "generator_function_declaration",
+    "generator_function",
+];
+
+/// 受け口の関数の宣言と、呼び出し側の名前が `value_owner` で解決される先。ファイル直下の
+/// 関数宣言と `const` に直接代入した矢印関数、関数の本体の直下にある同じ 2 つの形を扱う。
+fn consumer_site<'t>(
+    inventory: &inventory::Inventory,
+    path: &str,
+    function: Node<'t>,
+    source: &str,
+) -> Option<(Site, Node<'t>)> {
+    match function.kind() {
+        "function_declaration" => {
+            if function.parent().is_some_and(|parent| {
+                parent.kind() == "export_statement" && token(parent, "default")
+            }) {
+                return None;
+            }
+            if outer_declaration(function).is_some() {
+                return Some((declared_site(inventory, path, function)?, function));
+            }
+            // 関数の中の関数宣言への参照は、宣言のある本体のブロックへ解決される。
+            let block = function
+                .parent()
+                .filter(|parent| parent.kind() == "statement_block")?;
+            let owner = function_body_owner(block)?;
+            let name = text(function.child_by_field_name("name")?, source)?;
+            if !plain_name(name) || !local_function_is_unique(owner, function, name, source) {
+                return None;
+            }
+            let site = Site {
+                path: path.to_owned(),
+                name: name.to_owned(),
+                span: span(block),
+            };
+            Some((site, function))
+        }
+        "arrow_function" => {
+            let declarator = function.parent().filter(|parent| {
+                parent.kind() == "variable_declarator"
+                    && parent.child_by_field_name("value").map(span) == Some(span(function))
+            })?;
+            let name = declarator
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier")?;
+            // 変数の型注釈は、呼び出し側から見える引数の型を矢印関数の注釈から変えうる。
+            if !is_const(declarator) || declarator.child_by_field_name("type").is_some() {
+                return None;
+            }
+            if outer_declaration(declarator).is_some() {
+                return Some((declared_site(inventory, path, declarator)?, declarator));
+            }
+            let block = declarator
+                .parent()?
+                .parent()
+                .filter(|parent| parent.kind() == "statement_block")?;
+            function_body_owner(block)?;
+            let name = text(name, source)?;
+            plain_name(name).then(|| {
+                let site = Site {
+                    path: path.to_owned(),
+                    name: name.to_owned(),
+                    span: span(declarator),
+                };
+                (site, declarator)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `block` を本体に持つ関数。
+fn function_body_owner(block: Node<'_>) -> Option<Node<'_>> {
+    block.parent().filter(|owner| {
+        FUNCTION_LIKE_KINDS.contains(&owner.kind())
+            && owner.child_by_field_name("body").map(span) == Some(span(block))
+    })
+}
+
+/// 関数の本体の直下の関数宣言 `declaration` が、`owner` の中で `name` の唯一の束縛か。
+/// 引数 (既定値の式の中の出現を含む。既定値の式から本体の宣言は見えない)、巻き上げられる
+/// `var`、ほかの宣言と overload、ループと catch の束縛があれば、参照の解決を確かめられない。
+fn local_function_is_unique(
+    owner: Node<'_>,
+    declaration: Node<'_>,
+    name: &str,
+    source: &str,
+) -> bool {
+    let in_parameters = ["parameters", "parameter"].iter().any(|field| {
+        owner.child_by_field_name(field).is_some_and(|parameters| {
+            any_node(parameters, Children::Named, |node| {
+                crate::engine::js_occurrence::identifier_kind(node.kind())
+                    && text(node, source) == Some(name)
+            })
+        })
+    });
+    let Some(body) = owner.child_by_field_name("body") else {
+        return false;
+    };
+    let conflict = crate::engine::tree_walk::walk_preorder(body, Children::Named, |node, _| {
+        if node.id() == declaration.id() {
+            return std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip);
+        }
+        let declares = match node.kind() {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "enum_declaration"
+            | "internal_module" => node
+                .child_by_field_name("name")
+                .is_some_and(|declared| text(declared, source) == Some(name)),
+            // 分割代入の既定値の式 (`{ a = describe() }`) は束縛ではないので数えない。
+            "variable_declarator" => node.child_by_field_name("name").is_some_and(|pattern| {
+                crate::engine::js_scope::pattern_binds_name(pattern, source.as_bytes(), name)
+            }),
+            "for_in_statement" => node.child_by_field_name("left").is_some_and(|pattern| {
+                crate::engine::js_scope::pattern_binds_name(pattern, source.as_bytes(), name)
+            }),
+            "catch_clause" => node
+                .child_by_field_name("parameter")
+                .is_some_and(|pattern| {
+                    crate::engine::js_scope::pattern_binds_name(pattern, source.as_bytes(), name)
+                }),
+            _ => false,
+        };
+        if declares {
+            return std::ops::ControlFlow::Break(());
+        }
+        // 入れ子の関数の内側の束縛は、その関数のもの。
+        if node.id() != body.id() && FUNCTION_LIKE_KINDS.contains(&node.kind()) {
+            return std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip);
+        }
+        std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+    });
+    !in_parameters && conflict.is_continue()
+}
+
+/// 関数 (その中の矢印関数を含む) が `arguments` を読むか。矢印関数の `arguments` は外側の
+/// 関数のものなので、入れ子の通常の関数の内側だけを除く。メソッドの計算名は外側で評価される
+/// ので、メソッドを除くときも計算名は調べる。
+fn reads_arguments(function: Node<'_>, source: &str) -> bool {
+    let Some(body) = function.child_by_field_name("body") else {
+        return true;
+    };
+    let names_arguments = |node: Node<'_>| {
+        matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+            && text(node, source).is_some_and(|name| {
+                name == "arguments"
+                    || (name.contains('\\')
+                        && decode::identifier(name).as_deref() == Some("arguments"))
+            })
+    };
+    crate::engine::tree_walk::walk_preorder(body, Children::Named, |node, _| {
+        if names_arguments(node) {
+            return std::ops::ControlFlow::Break(());
+        }
+        if node.id() != body.id()
+            && FUNCTION_LIKE_KINDS.contains(&node.kind())
+            && node.kind() != "arrow_function"
+        {
+            // 計算名と引数のデコレータは、入れ子の関数の外 (この関数の中) で評価される。
+            let computed_name = node
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "computed_property_name");
+            let decorated = node
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| {
+                    any_node(parameters, Children::Named, |inner| {
+                        inner.kind() == "decorator"
+                            && any_node(inner, Children::Named, names_arguments)
+                    })
+                });
+            if decorated
+                || computed_name
+                    .is_some_and(|name| any_node(name, Children::Named, names_arguments))
+            {
+                return std::ops::ControlFlow::Break(());
+            }
+            return std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip);
+        }
+        std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+    })
+    .is_break()
 }
 
 #[cfg(test)]
