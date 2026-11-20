@@ -1480,6 +1480,66 @@ fn readonly_array_properties_check_all_producers_and_builtin_binding() {
     );
 }
 
+/// `readonly` は union の先頭の配列型だけに掛かる (`readonly string[] | undefined` は
+/// `(readonly string[]) | undefined`)。必須プロパティの追加と、残るメンバーの削除の両方で証明する。
+#[test]
+fn readonly_array_unions_close_required_additions_and_removals() {
+    let options =
+        "export interface Options {\n readonly size: number;\n readonly label: string;\n}\n";
+    let defaults = "import type { Options } from './options';\n\
+        export function defaults(): Options {\n return { size: 1, label: 'a' };\n}\n";
+    for annotation in [
+        "readonly string[] | undefined",
+        "readonly string[] | null",
+        "readonly string[] | undefined | null",
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("options.ts", options);
+        repo.write("defaults.ts", defaults);
+        repo.commit_all("initial");
+        let added = options.replace("}\n", &format!(" readonly tags: {annotation};\n}}\n"));
+        repo.write("options.ts", &added);
+        for (value, expected) in [(", tags: ['x']", 0), ("", 1), (", tags: [1]", 1)] {
+            repo.write(
+                "defaults.ts",
+                defaults.replace("label: 'a'", &format!("label: 'a'{value}")),
+            );
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{annotation}/{value}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+        }
+
+        // 残る `tags` の型を読めれば、`label` の削除も同じ差分の値の直しで閉じる。
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("options.ts", &added);
+        repo.write(
+            "defaults.ts",
+            defaults.replace("label: 'a'", "label: 'a', tags: ['x']"),
+        );
+        repo.commit_all("initial");
+        repo.write(
+            "options.ts",
+            added.replace(" readonly label: string;\n", ""),
+        );
+        for (value, expected) in [
+            ("tags: ['x']", 0),
+            ("label: 'a', tags: ['x']", 1),
+            // 残る配列のメンバーは値の不変性で証明するので、型の合う値でも変えれば閉じない。
+            ("tags: ['y']", 1),
+            ("tags: [1]", 1),
+        ] {
+            repo.write("defaults.ts", defaults.replace("label: 'a'", value));
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{annotation}/removal {value}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Options", "{json}");
+        }
+    }
+}
+
 #[test]
 fn type_modifications_explain_unverified_proofs_without_changing_classification() {
     for extension in ["ts", "tsx"] {

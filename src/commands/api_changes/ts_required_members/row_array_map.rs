@@ -215,7 +215,11 @@ fn primitive_result(ty: Node<'_>, source: &[u8]) -> bool {
             atoms.iter().all(|atom| {
                 !matches!(
                     atom,
-                    TypeAtom::Array(_) | TypeAtom::Any | TypeAtom::Unknown | TypeAtom::StrLit(None)
+                    TypeAtom::Array(_)
+                        | TypeAtom::ReadonlyArray(_)
+                        | TypeAtom::Any
+                        | TypeAtom::Unknown
+                        | TypeAtom::StrLit(None)
                 )
             })
         })
@@ -358,6 +362,8 @@ mod tests {
                 ("boolean", true),
                 ("void", true),
                 ("string[]", false),
+                ("readonly string[]", false),
+                ("readonly number[] | undefined", false),
                 ("any", false),
                 ("unknown", false),
                 ("Row", false),

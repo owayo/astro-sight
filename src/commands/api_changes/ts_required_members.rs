@@ -231,8 +231,28 @@ fn simple_type_at(
             )?)),
             "readonly_type" | "generic_type" => {
                 let item = if node.kind() == "readonly_type" {
-                    let array = only_named_child(node).filter(|ty| ty.kind() == "array_type")?;
-                    only_named_child(array)?
+                    // TypeScript の `readonly` は直後の配列型・タプル型にだけ掛かり、
+                    // `readonly string[] | undefined` は `(readonly string[]) | undefined` になる。文法は
+                    // 後ろの union 全体を子に取るので、括弧をまたがずに union の左端を辿り、残りの要素は
+                    // 通常の型として読む。この証明はタプル型を扱わない。
+                    let mut operand = only_named_child(node)?;
+                    while operand.kind() == "union_type" {
+                        let mut cursor = operand.walk();
+                        let mut members = operand
+                            .named_children(&mut cursor)
+                            .filter(|child| child.kind() != "comment");
+                        let (Some(left), Some(right), None) =
+                            (members.next(), members.next(), members.next())
+                        else {
+                            return None;
+                        };
+                        stack.push(right);
+                        operand = left;
+                    }
+                    if operand.kind() != "array_type" {
+                        return None;
+                    }
+                    only_named_child(operand)?
                 } else {
                     builtin_names.as_ref()?;
                     let item = generic_argument(node, source, "ReadonlyArray")?;
@@ -2708,6 +2728,78 @@ mod tests {
         assert_eq!(type_of("Array<string>"), None);
         assert_eq!(type_of("() => void"), None);
         assert_eq!(type_of("\"a\\\"b\""), Some(vec![StrLit(None)]));
+    }
+
+    /// `readonly string[] | undefined` の `readonly` は先頭の `string[]` だけに掛かる。文法は後ろの
+    /// union 全体を `readonly_type` の子に取るので、読み取り専用の配列と `undefined` の union として読む。
+    #[test]
+    fn simple_type_applies_readonly_to_the_leading_array_of_a_union() {
+        use TypeAtom::*;
+        let sorted = |mut atoms: Vec<TypeAtom>| {
+            atoms.sort();
+            atoms
+        };
+        for (ty, expected) in [
+            (
+                "readonly string[] | undefined",
+                vec![ReadonlyArray(vec![String]), Undefined],
+            ),
+            (
+                "readonly string[] | null",
+                vec![ReadonlyArray(vec![String]), Null],
+            ),
+            (
+                "readonly string[] | undefined | null",
+                vec![ReadonlyArray(vec![String]), Undefined, Null],
+            ),
+            (
+                "readonly string[] | number[]",
+                vec![ReadonlyArray(vec![String]), Array(vec![Number])],
+            ),
+            (
+                "readonly string[] | readonly number[] | undefined",
+                vec![
+                    ReadonlyArray(vec![String]),
+                    ReadonlyArray(vec![Number]),
+                    Undefined,
+                ],
+            ),
+            (
+                "readonly (string | number)[] | undefined",
+                vec![ReadonlyArray(vec![String, Number]), Undefined],
+            ),
+            (
+                "readonly string[][] | undefined",
+                vec![ReadonlyArray(vec![Array(vec![String])]), Undefined],
+            ),
+            (
+                "undefined | readonly string[]",
+                vec![ReadonlyArray(vec![String]), Undefined],
+            ),
+            (
+                "| readonly string[] | undefined",
+                vec![ReadonlyArray(vec![String]), Undefined],
+            ),
+            (
+                "readonly string[] | (| undefined)",
+                vec![ReadonlyArray(vec![String]), Undefined],
+            ),
+        ] {
+            assert_eq!(type_of(ty), Some(sorted(expected)), "{ty}");
+        }
+        // 括弧の中の union・タプル・型の参照に掛かる `readonly` は読まない (タプルは扱わない)。
+        for ty in [
+            "readonly (string[] | undefined)",
+            "readonly (string[]) | undefined",
+            "readonly [string] | undefined",
+            "readonly Note | undefined",
+        ] {
+            assert_eq!(type_of(ty), None, "{ty}");
+        }
+        let members: Vec<std::string::String> = (0..20_000).map(|i| format!("\"v{i}\"")).collect();
+        let atoms = type_of(&format!("readonly string[] | {}", members.join(" | ")))
+            .expect("long readonly union");
+        assert_eq!(atoms.len(), 20_001);
     }
 
     #[test]
