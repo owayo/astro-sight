@@ -75,6 +75,7 @@ mod integration {
     mod property_removal_arrays;
     mod python_added_declarations;
     mod python_compatible_method_impacts;
+    mod python_free_function_removal;
     mod python_import_rebinding;
     mod python_inherited_members;
     mod python_member_removal;
