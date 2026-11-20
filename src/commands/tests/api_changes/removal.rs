@@ -3299,6 +3299,63 @@ fn removed_free_function_keeps_unproven_python_origins_blocking() {
     }
 }
 
+/// 名前を文字列リテラルで渡す `getattr` は、同じ名前の属性アクセスと同じく読むだけなので、
+/// 同名の定義と呼び出しの証明を止めない。
+#[test]
+fn removed_free_function_treats_literal_python_getattr_as_attribute_read() {
+    for extras in [
+        vec![(
+            "tools/report.py",
+            "import os\ndef abort(message):\n    uid = getattr(os, \"getuid\", None)\n    print(message, uid)\nabort('failed')\n",
+        )],
+        vec![
+            (
+                "tools/report.py",
+                "import os\ndef abort(message):\n    return getattr(os, 'sep', '/')\n",
+            ),
+            ("tools/notify.py", "def abort(message):\n    return 2\n"),
+        ],
+        vec![(
+            "tools/report.py",
+            "import os\ndef abort(message):\n    return getattr(\n        os,  # 区切り文字\n        r'sep',\n    )\nabort('failed')\n",
+        )],
+    ] {
+        let api = removal_scope_fixture("tools/util.py", &extras);
+        assert!(api.removed.is_empty(), "{extras:?}\n{:?}", api.removed);
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == "abort"),
+            "{extras:?}"
+        );
+    }
+}
+
+/// 取り出す名前が決まらない `getattr`、削除した関数名や名前空間に届く `getattr`、値として使う
+/// `getattr`、NFKC で綴りが変わる識別子は、ファイル単位で証明をやめる。構文の境界と一覧の網羅は
+/// `removed_scope` の単体テストで確かめる。
+#[test]
+fn removed_free_function_keeps_dynamic_python_getattr_blocking() {
+    for statement in [
+        "getattr(os, NAME, None)",
+        "getattr(os, 'exec')('from tools.util import abort')",
+        // 属性アクセスの `util.abort` と違い、文字列の名前は参照として数えられない。
+        "import tools.util as util\ngetattr(util, 'abort')('failed')",
+        "g = getattr",
+        "getattr(locals(), 'update')({'abort': replacement})",
+        "getattr(helper, '__globals__')['abort'] = replacement",
+        "ａｂｏｒｔ = replacement",
+    ] {
+        let source = format!(
+            "import os\ndef abort(message):\n    print(message)\n{statement}\nabort('failed')\n"
+        );
+        let api = removal_scope_fixture("tools/util.py", &[("tools/report.py", &source)]);
+        assert!(
+            api.removed.iter().any(|s| s.name == "abort"),
+            "{statement}\n{:?}",
+            api.removed_dead
+        );
+    }
+}
+
 #[test]
 fn removed_free_function_rust_scope_proof_stays_inside_value_bindings() {
     for source in [
