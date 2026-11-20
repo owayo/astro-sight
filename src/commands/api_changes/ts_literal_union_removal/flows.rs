@@ -10,6 +10,10 @@ struct Proof<'a> {
     require_exhaustive: bool,
     objects: Option<&'a shape::ObjectShape>,
     callbacks: Vec<Binding>,
+    /// 生成関数の呼び出しの最後の `.map(describe)` で、受け口を値として渡してよいと確かめた出現。
+    passed_consumers: Vec<(String, Span)>,
+    /// 生成関数の呼び出しから辿った `.filter(cb)` のコールバック。本体の比較を網羅性の証明でも許す。
+    filter_callbacks: Vec<(String, Span)>,
 }
 
 pub(super) fn audit(
@@ -54,8 +58,12 @@ fn audit_inner(
         require_exhaustive,
         objects,
         callbacks: Vec::new(),
+        passed_consumers: Vec::new(),
+        filter_callbacks: Vec::new(),
     };
     let mut used = require_exhaustive && !plan.records.is_empty();
+    // 使い方を受理した呼び出し側のファイル。型検査の抑制も監査する。
+    let mut observed: BTreeSet<String> = BTreeSet::new();
     let mut ambiguous: HashMap<String, Vec<Span>> = HashMap::new();
     let mut is_ambiguous = |path: &str, node: Node<'_>| -> Option<bool> {
         if !ambiguous.contains_key(path) {
@@ -89,10 +97,60 @@ fn audit_inner(
             if !plan.arrays.contains(&owner) {
                 continue;
             }
-            if !neutral(node, &owner) {
+            if !neutral(node, path, &owner) {
                 proof.array_chain(path, node)?;
+                observed.insert(path.to_owned());
                 used = true;
             }
+        }
+    }
+    // 生成関数 (`Alias[]` を返す) の結果は推論で呼び出し側へ広がるので、直接の呼び出しの結果を
+    // `.length` の読み出しか `.filter(...)` の連鎖と最後の `.map(...)` で使う形だけを許す。
+    // 受け口の監査で `.map(describe)` の出現を照合するので、受け口の前に調べる。
+    let producer_names = plan
+        .producers
+        .iter()
+        .map(|site| site.name.clone())
+        .collect::<BTreeSet<_>>();
+    for (path, file) in inventory.relevant(&producer_names) {
+        for node in slots::nodes(inventory.root(path)?) {
+            if node.kind() == "for_in_statement"
+                && node
+                    .child_by_field_name("kind")
+                    .is_none_or(|kind| kind.kind() == "var")
+                && let Some(left) = node.child_by_field_name("left")
+            {
+                for producer in &plan.producers {
+                    if crate::engine::js_scope::pattern_binds_name(
+                        left,
+                        file.source.as_bytes(),
+                        &producer.name,
+                    ) && slots::value_owner(inventory, path, node, &producer.name)? == *producer
+                    {
+                        return None;
+                    }
+                }
+            }
+            if !crate::engine::js_occurrence::identifier_kind(node.kind()) {
+                continue;
+            }
+            let name = text(node, &file.source)?;
+            if !producer_names.contains(name) {
+                continue;
+            }
+            if is_ambiguous(path, node)? {
+                return None;
+            }
+            let owner = slots::value_owner(inventory, path, node, name)?;
+            if !plan.producers.contains(&owner) || neutral(node, path, &owner) {
+                continue;
+            }
+            let call = node.parent().filter(|call| {
+                ordinary_call(*call)
+                    && call.child_by_field_name("function").map(span) == Some(span(node))
+            })?;
+            proof.array_chain(path, call)?;
+            observed.insert(path.to_owned());
         }
     }
     let value_names = plan
@@ -140,12 +198,13 @@ fn audit_inner(
             }
             let owner = slots::value_owner(inventory, path, node, name)?;
             if let Some(record) = plan.records.iter().find(|record| record.site == owner) {
-                if !neutral(node, &owner) {
+                if !neutral(node, path, &owner) {
                     let subscript = node.parent().filter(|parent| {
                         parent.kind() == "subscript_expression"
                             && parent.child_by_field_name("object").map(span) == Some(span(node))
                     })?;
                     used = true;
+                    observed.insert(path.to_owned());
                     if proof.record_read(path, subscript) != Some(record.primitive) {
                         return None;
                     }
@@ -154,14 +213,22 @@ fn audit_inner(
                 .consumers
                 .iter()
                 .find(|consumer| consumer.site == owner)
-                && !neutral(node, &owner)
-                && !consumer.declares(node)
+                && !neutral(node, path, &owner)
+                && !consumer.declares(node, path)
             {
+                if proof
+                    .passed_consumers
+                    .iter()
+                    .any(|(passed, at)| passed == path && *at == span(node))
+                {
+                    continue;
+                }
                 let call = node.parent().filter(|call| {
                     call.kind() == "call_expression"
                         && call.child_by_field_name("function").map(span) == Some(span(node))
                 })?;
                 proof.consumer_call(path, call)?;
+                observed.insert(path.to_owned());
                 used = true;
             }
         }
@@ -241,13 +308,19 @@ fn audit_inner(
                 continue;
             }
             if span(node) != binding.declaration {
-                proof.binding_use(&binding.path, node)?;
+                proof.binding_use(&binding.path, node, binding.scope)?;
                 used = true;
             }
         }
     }
     used.then_some(())?;
-    builtin_and_transport_audit(inventory, plan, &proof.callbacks, require_exhaustive)
+    builtin_and_transport_audit(
+        inventory,
+        plan,
+        &proof.callbacks,
+        require_exhaustive,
+        &observed,
+    )
 }
 
 /// 名前の解決 (`resolve_binding_scope`) が束縛を取り違えうる位置。メソッドの計算名とデコレータは
@@ -263,7 +336,8 @@ fn ambiguous_spans(root: Node<'_>) -> Vec<Span> {
                 &[]
             }
             "for_statement" => &["initializer", "condition", "increment"],
-            "for_in_statement" => &["right", "value"],
+            // for-of の左辺の既定値・計算キーも、本体の宣言まで探して解決される。
+            "for_in_statement" => &["left", "right", "value"],
             "catch_clause" => &["parameter"],
             "required_parameter" | "optional_parameter" => &["type", "value"],
             _ => &[],
@@ -277,11 +351,14 @@ fn ambiguous_spans(root: Node<'_>) -> Vec<Span> {
     spans
 }
 
-fn neutral(node: Node<'_>, site: &Site) -> bool {
-    if node.parent().is_some_and(|parent| {
-        span(parent) == site.span
-            && parent.child_by_field_name("name").map(span) == Some(span(node))
-    }) {
+fn neutral(node: Node<'_>, path: &str, site: &Site) -> bool {
+    // 宣言の名前。範囲だけで比べると、別のファイルの同じ範囲のノードを宣言と取り違える。
+    if path == site.path
+        && node.parent().is_some_and(|parent| {
+            span(parent) == site.span
+                && parent.child_by_field_name("name").map(span) == Some(span(node))
+        })
+    {
         return true;
     }
     if slots::enclosing_import(node).is_some() {
@@ -430,7 +507,29 @@ impl Proof<'_> {
                 .child_by_field_name("object")
                 .is_some_and(|object| self.known_mode(path, object))
     }
-    fn binding_use(&self, path: &str, node: Node<'_>) -> Option<()> {
+    /// `expression` が、生成関数の呼び出しから辿った `.filter(cb)` のコールバックの本体で、
+    /// 比べている束縛 (範囲 `scope`) がそのコールバック自身の引数か。外側の引数は除く。
+    fn filter_body(&self, path: &str, mut expression: Node<'_>, scope: Span) -> bool {
+        for _ in 0..MAX_DEPTH {
+            let Some(parent) = expression.parent() else {
+                return false;
+            };
+            if parent.kind() == "parenthesized_expression" {
+                expression = parent;
+                continue;
+            }
+            return parent.kind() == "arrow_function"
+                && span(parent) == scope
+                && parent.child_by_field_name("body").map(span) == Some(span(expression))
+                && self
+                    .filter_callbacks
+                    .iter()
+                    .any(|(at, callback)| at == path && *callback == scope);
+        }
+        false
+    }
+    /// 束縛 (範囲 `scope`) の出現 `node` が、許した使い方のどれかに当たるか。
+    fn binding_use(&self, path: &str, node: Node<'_>, scope: Span) -> Option<()> {
         let mut current = node;
         let mut projected = false;
         for _ in 0..MAX_DEPTH {
@@ -448,7 +547,11 @@ impl Proof<'_> {
                 continue;
             }
             return match parent.kind() {
-                "binary_expression" if !self.require_exhaustive => {
+                // 網羅性の証明では、比較は生成関数の呼び出しの `.filter(cb)` の本体に限る
+                // (絞り込んでも後の受け口には全要素の case を求める)。
+                "binary_expression"
+                    if !self.require_exhaustive || self.filter_body(path, parent, scope) =>
+                {
                     self.comparison(path, parent).then_some(())
                 }
                 "variable_declarator" if self.require_exhaustive => {
@@ -497,11 +600,16 @@ impl Proof<'_> {
         }
         None
     }
+    /// 配列の名前か、生成関数の直接の呼び出し (`reasonsOf(n)`) から、`.filter(cb)` の連鎖と
+    /// 最後の `.map(cb)` を辿る。生成関数の呼び出しからは、その結果の直接の `.length` の読み出しと、
+    /// 引数が 1 つの受け口をそのまま渡す最後の `.map(describe)` も許す。`filter` と `map` の
+    /// 引数は 1 つ (thisArg なし)。
     fn array_chain(&mut self, path: &str, mut current: Node<'_>) -> Option<()> {
-        if current.kind() != "identifier" {
+        let from_producer = current.kind() == "call_expression";
+        if current.kind() != "identifier" && !from_producer {
             return None;
         }
-        for _ in 0..32 {
+        for step in 0..32 {
             let member = current.parent().filter(|member| {
                 member.kind() == "member_expression"
                     && member.child_by_field_name("object").map(span) == Some(span(current))
@@ -511,6 +619,9 @@ impl Proof<'_> {
                 return None;
             }
             let method = text(member.child_by_field_name("property")?, source)?.to_owned();
+            if from_producer && step == 0 && method == "length" {
+                return read_only(member).then_some(());
+            }
             if !matches!(method.as_str(), "filter" | "map") {
                 return None;
             }
@@ -519,6 +630,20 @@ impl Proof<'_> {
                     && call.child_by_field_name("function").map(span) == Some(span(member))
             })?;
             let callback = only(call.child_by_field_name("arguments")?)?;
+            if from_producer && method == "map" && callback.kind() == "identifier" {
+                // `map` は要素・添字・配列を渡すので、引数が 1 つで対象の型を受ける受け口に限る。
+                // 受け口は `arguments` を読まず、overload も持たない (受け口の登録で確かめ済み)。
+                let owner =
+                    slots::value_owner(self.inventory, path, callback, text(callback, source)?)?;
+                self.plan.consumers.iter().find(|consumer| {
+                    consumer.site == owner
+                        && consumer.arity == 1
+                        && consumer.positions == BTreeSet::from([0])
+                })?;
+                self.passed_consumers
+                    .push((path.to_owned(), span(callback)));
+                return Some(());
+            }
             let (name, declaration, body) = callback_parts(callback, source)?;
             let binding = Binding {
                 path: path.to_owned(),
@@ -545,6 +670,10 @@ impl Proof<'_> {
             if method == "filter" {
                 if primitive != Some(Primitive::Boolean) {
                     return None;
+                }
+                if from_producer {
+                    self.filter_callbacks
+                        .push((path.to_owned(), span(callback)));
                 }
                 current = call;
             } else {
@@ -661,6 +790,7 @@ fn builtin_and_transport_audit(
     plan: &Plan,
     callbacks: &[Binding],
     require_exhaustive: bool,
+    observed: &BTreeSet<String>,
 ) -> Option<()> {
     let mut names = BTreeSet::from([plan.target.name.clone()]);
     names.extend(plan.records.iter().map(|record| record.site.name.clone()));
@@ -686,7 +816,10 @@ fn builtin_and_transport_audit(
     if !plan.arrays.is_empty() || !plan.producers.is_empty() {
         builtins.extend(["Array", "ReadonlyArray"]);
     }
+    // 宣言のファイルに加え、使い方を受理した呼び出し側のファイルでも型検査の抑制を見る。
+    // 要素を足すと、抑制していた診断が消えて、未使用の @ts-expect-error が型エラーになりうる。
     let owned = std::iter::once(plan.target.path.as_str())
+        .chain(observed.iter().map(String::as_str))
         .chain(plan.records.iter().map(|record| record.site.path.as_str()))
         .chain(plan.arrays.iter().map(|site| site.path.as_str()))
         .chain(plan.producers.iter().map(|site| site.path.as_str()))
