@@ -61,6 +61,7 @@ mod callbacks;
 pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
+mod parameter_properties;
 mod partial_factory;
 mod removed_uses;
 mod return_producers;
@@ -1349,6 +1350,7 @@ impl Prover<'_, '_> {
                 || self
                     .value_type(*value, parsed, 0)
                     .or_else(|| self.factory_default_type(*value, parsed, path))
+                    .or_else(|| self.parameter_property_type(*value, parsed, path, caches))
                     .is_some_and(|value_type| {
                         assignable(&value_type, &property.ty)
                             && (!self.delta.audits_uses()
@@ -1664,8 +1666,9 @@ impl Prover<'_, '_> {
     }
 
     /// 相対 import の束縛 `name` の解決先を 1 ファイルに決める。別名・default・namespace の
-    /// import、存在する解決候補が複数か 0、解決を変える設定 (rootDirs / moduleSuffixes) が
-    /// あり得る場合は None。
+    /// import、存在する解決候補が複数か 0、解決を変える設定 (rootDirs / moduleSuffixes。
+    /// `extends` の先を含む) や、指定子が指すディレクトリの package.json (`types` の先へ解く)
+    /// があり得る場合は None。
     fn import_target(
         &self,
         statement: Node<'_>,
@@ -1682,6 +1685,13 @@ impl Prover<'_, '_> {
             return None;
         }
         let spec = super::static_js_string_text(statement.child_by_field_name("source")?, source)?;
+        if super::removed_attribution::relative_directory_has_manifest(
+            self.scope.dir,
+            from_path,
+            spec,
+        ) {
+            return None;
+        }
         let candidates = super::removed_attribution::relative_import_candidates(from_path, spec)?;
         let mut existing: Vec<&String> = candidates
             .iter()
@@ -2641,6 +2651,10 @@ fn directory_configs_are_plain(dir: &str, relative: &str) -> bool {
         match crate::engine::bounded_read::read_utf8_file_limited(&entry.path(), MAX_CONFIG_BYTES) {
             Some(text) if !text.contains("rootDirs") && !text.contains("moduleSuffixes") => {}
             _ => return false,
+        }
+        // `extends` で継いだ設定も相対の探索を変えうる。
+        if !super::ts_alias_resolution::config_keeps_relative_resolution(dir, &entry.path()) {
+            return false;
         }
     }
     true

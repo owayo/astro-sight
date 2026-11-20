@@ -1171,8 +1171,9 @@ impl ConfigLoader {
     /// `canonical` の設定と `extends` の先のどれも、相対の指定子の探索を変えないか
     /// ([`changes_relative_resolution`])。[`Self::chain`] と違い、途中の設定を解釈できなくても
     /// 辿れる先は全て見る。読めない・解けない設定は、字面に `moduleSuffixes` も `rootDirs` も
-    /// 無いときだけ変えないとみなす。辿れない `extends` の先 (入っていないパッケージの設定) は、
-    /// 変えないと仮定する (信頼の境界)。
+    /// `extends` も無いときだけ変えないとみなす。辿れない `extends` の先のうち、入っていない
+    /// パッケージの設定と `area` の外のパスは、変えないと仮定する (信頼の境界)。`area` の中を
+    /// 指すのに読めない先 (symlink・無いファイル) は、変えないとは言えない。
     fn relative_unchanged(
         &mut self,
         canonical: &Path,
@@ -1188,7 +1189,9 @@ impl ConfigLoader {
         }
         let Some(raw) = self.read(canonical) else {
             return read_utf8_file_limited(canonical, MAX_FILE_BYTES).is_some_and(|text| {
-                !text.contains("moduleSuffixes") && !text.contains("rootDirs")
+                !text.contains("moduleSuffixes")
+                    && !text.contains("rootDirs")
+                    && !text.contains("extends")
             });
         };
         if changes_relative_resolution(&raw) {
@@ -1205,10 +1208,12 @@ impl ConfigLoader {
                 .collect(),
             _ => Vec::new(),
         };
-        parents.iter().all(|parent| {
-            self.extended_path(&directory, parent, area)
-                .is_none_or(|path| self.relative_unchanged(&path, area, depth + 1, visited))
-        })
+        parents.iter().all(
+            |parent| match self.extended_path(&directory, parent, area) {
+                Some(path) => self.relative_unchanged(&path, area, depth + 1, visited),
+                None => !points_inside(&directory, parent, area),
+            },
+        )
     }
 
     /// `canonical` の設定の `compilerOptions` を、`extends` の先から順に上書きして合わせる。
@@ -1352,6 +1357,71 @@ impl ConfigLoader {
         }
         None
     }
+}
+
+/// `extends` の先 `parent` が、`area` の中を指すパスか。形を決められないパス (`\` を含む) も
+/// 中を指しうるとみなす。
+fn points_inside(directory: &Path, parent: &str, area: &Path) -> bool {
+    if parent.contains('\\') {
+        return true;
+    }
+    (parent.starts_with("./") || parent.starts_with("../") || parent.starts_with('/'))
+        && normalize_lexically(&directory.join(parent))
+            .is_none_or(|target| target.starts_with(area))
+}
+
+/// 設定ファイル `config` と、`extends`・`references` で辿れる先のどれも、相対の指定子の探索を
+/// 変えないか。[`TsAliasResolver`] と同じ規則で読み、辿る範囲は `dir` (解析 root) の中に限る。
+/// `references` の先は独立したプロジェクトとしてファイルに効くので、同じように確かめる。辿れない
+/// `references` があれば、変えないとは言えない。
+pub(crate) fn config_keeps_relative_resolution(dir: &str, config: &Path) -> bool {
+    let Some(root) = std::path::absolute(Path::new(dir))
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return false;
+    };
+    let Some(canonical) = regular_file(config) else {
+        return false;
+    };
+    let mut loader = ConfigLoader::default();
+    let mut pending = vec![canonical];
+    let mut seen = HashSet::new();
+    while let Some(path) = pending.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if !loader.relative_unchanged(&path, &root, 0, &mut HashSet::new()) {
+            return false;
+        }
+        let Some(raw) = loader.read(&path) else {
+            // 解けない設定の `references` は辿れない。
+            if read_utf8_file_limited(&path, MAX_FILE_BYTES)
+                .is_none_or(|text| text.contains("references"))
+            {
+                return false;
+            }
+            continue;
+        };
+        let Some(references) = raw.get("references") else {
+            continue;
+        };
+        let (Some(references), Some(leaf)) = (references.as_array(), path.parent()) else {
+            return false;
+        };
+        for reference in references {
+            let Some(referenced) = reference
+                .as_object()
+                .and_then(|reference| reference.get("path"))
+                .and_then(Value::as_str)
+                .and_then(|referenced| referenced_path(leaf, referenced, &root))
+            else {
+                return false;
+            };
+            pending.push(referenced);
+        }
+    }
+    true
 }
 
 /// symlink でない通常のファイルなら、その正規化したパス。

@@ -1480,6 +1480,434 @@ fn readonly_array_properties_check_all_producers_and_builtin_binding() {
     );
 }
 
+/// 型注釈付きの必須引数のプロパティの読み出し (`source.tags`) の 1 ケース。
+#[derive(Default)]
+struct ParameterRead {
+    name: &'static str,
+    /// `Options` に足す `tags` の型。
+    member: &'static str,
+    /// options.ts と defaults.ts のほかに置くファイル。
+    files: Vec<(&'static str, &'static str)>,
+    /// defaults.ts。`{TAGS}` に `tags` のプロパティが入る。
+    defaults: String,
+    /// `tags` の値。
+    value: &'static str,
+    closed: bool,
+}
+
+const PARAMETER_READ_OPTIONS: &str =
+    "export interface Options {\n readonly size: number;\n readonly label: string;\n}\n";
+const PARAMETER_READ_INLINE: &str = "{ readonly size: number; readonly tags: readonly string[] }";
+const PARAMETER_READ_IMPORT: &str = "import type { Source } from './source';\n";
+const PARAMETER_READ_SOURCE: &str =
+    "export interface Source { readonly size: number; readonly tags: readonly string[] }\n";
+const PARAMETER_READ_NUMBER_SOURCE: &str =
+    "export interface Source { readonly size: number; readonly tags: number }\n";
+
+/// `source` を受けて `Options` を返す関数。
+fn parameter_read_defaults(prelude: &str, parameter: &str) -> String {
+    format!(
+        "import type {{ Options }} from './options';\n{prelude}export function defaults(source: {parameter}): Options {{\n return {{ size: source.size, label: 'a'{{TAGS}} }};\n}}\n"
+    )
+}
+
+/// インラインの object 型の引数から `source.tags` を `readonly string[]` に渡し、閉じるケース。
+fn parameter_read_closed(name: &'static str) -> ParameterRead {
+    ParameterRead {
+        name,
+        member: "readonly string[]",
+        defaults: parameter_read_defaults("", PARAMETER_READ_INLINE),
+        value: "source.tags",
+        closed: true,
+        ..ParameterRead::default()
+    }
+}
+
+fn parameter_read_blocking(name: &'static str) -> ParameterRead {
+    ParameterRead {
+        closed: false,
+        ..parameter_read_closed(name)
+    }
+}
+
+/// 変更前をコミットし、`Options` に `tags` を、`defaults` の戻り値に `tags` を足した差分を
+/// hook で確かめる。blocking なら、値を作る箇所の証明で止まったこと (理由) まで確かめる。
+fn check_parameter_read(case: &ParameterRead) {
+    check_parameter_read_with(case, |_| {});
+}
+
+/// [`check_parameter_read`] で、ファイルを置いた後・コミットの前に `setup` を呼ぶ。
+fn check_parameter_read_with(case: &ParameterRead, setup: impl FnOnce(&TestRepo)) {
+    let name = case.name;
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("options.ts", PARAMETER_READ_OPTIONS);
+    repo.write("defaults.ts", case.defaults.replace("{TAGS}", ""));
+    for (path, text) in &case.files {
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            repo.create_dir_all(parent);
+        }
+        repo.write(path, text);
+    }
+    setup(&repo);
+    repo.commit_all("initial");
+    repo.write(
+        "options.ts",
+        PARAMETER_READ_OPTIONS.replace("}\n", &format!(" readonly tags: {};\n}}\n", case.member)),
+    );
+    repo.write(
+        "defaults.ts",
+        case.defaults
+            .replace("{TAGS}", &format!(", tags: {}", case.value)),
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, if case.closed { 0 } else { 1 }, "{name}: {json}");
+    let bucket = if case.closed { "mod_closed" } else { "mod" };
+    let entry = json["api"][bucket]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["n"] == "Options"))
+        .unwrap_or_else(|| panic!("{name}: {json}"));
+    if !case.closed {
+        assert_eq!(
+            entry["unverified"]["reason"], "type_member_proof_failed",
+            "{name}: {json}"
+        );
+    }
+}
+
+/// 型注釈付きの必須引数のプロパティの読み出し (`source.tags`) を、宣言された型で型付けする。
+/// 注釈はインラインの object 型か、ファイル直下の interface・object 型の別名 (相対 import を含む)。
+#[test]
+fn typed_parameter_reads_close_declared_member_types() {
+    let cases = [
+        // Issue の 2 例。optional のメンバーには undefined が足される。
+        parameter_read_closed("inline object type"),
+        ParameterRead {
+            member: "string[] | undefined",
+            files: vec![(
+                "source.ts",
+                "export interface Source { readonly size: number; readonly tags?: string[] }\n",
+            )],
+            defaults: parameter_read_defaults(PARAMETER_READ_IMPORT, "Source"),
+            ..parameter_read_closed("imported interface with an optional member")
+        },
+        ParameterRead {
+            defaults: parameter_read_defaults(
+                "type Source = { readonly size: number; readonly tags: readonly string[] };\n",
+                "Source",
+            ),
+            ..parameter_read_closed("type alias in the same file")
+        },
+    ];
+    cases.iter().for_each(check_parameter_read);
+}
+
+/// 宣言された型が追加したメンバーの型に合わない・型を決められない読み出しは、blocking のまま。
+#[test]
+fn typed_parameter_reads_keep_unproven_types_blocking() {
+    let inline = |parameter: &str| parameter_read_defaults("", parameter);
+    let cases = [
+        ParameterRead {
+            files: vec![(
+                "source.ts",
+                "export interface Source { readonly size: number; readonly tags?: readonly string[] }\n",
+            )],
+            defaults: parameter_read_defaults(PARAMETER_READ_IMPORT, "Source"),
+            ..parameter_read_blocking("optional member to a required type")
+        },
+        ParameterRead {
+            value: "source.size",
+            ..parameter_read_blocking("number to an array")
+        },
+        ParameterRead {
+            member: "string[]",
+            ..parameter_read_blocking("readonly array to a mutable array")
+        },
+        ParameterRead {
+            defaults: inline("{ readonly size: number; readonly tags: any[] }"),
+            ..parameter_read_blocking("any elements")
+        },
+        ParameterRead {
+            defaults: inline("Missing"),
+            ..parameter_read_blocking("unresolved type")
+        },
+        ParameterRead {
+            defaults: parameter_read_defaults(
+                "interface Base { readonly size: number }\ninterface Source extends Base { readonly tags: readonly string[] }\n",
+                "Source",
+            ),
+            ..parameter_read_blocking("interface with extends")
+        },
+        ParameterRead {
+            defaults: inline(
+                "{ readonly size: number; readonly [key: string]: readonly string[] | number }",
+            ),
+            ..parameter_read_blocking("index signature only")
+        },
+        ParameterRead {
+            defaults: inline("{ readonly size: number; get tags(): readonly string[] }"),
+            ..parameter_read_blocking("getter in the type")
+        },
+        ParameterRead {
+            defaults: parameter_read_defaults(
+                "interface Source { readonly size: number; readonly tags: readonly string[] }\ninterface Source { readonly label: string }\n",
+                "Source",
+            ),
+            ..parameter_read_blocking("merged interface")
+        },
+        ParameterRead {
+            defaults: inline(
+                "{ readonly size: number; readonly tags: readonly string[]; readonly \"tags\": readonly string[] }",
+            ),
+            ..parameter_read_blocking("quoted duplicate key")
+        },
+        ParameterRead {
+            defaults: inline("{ readonly size: number; readonly toString: readonly string[] }"),
+            value: "source.toString",
+            ..parameter_read_blocking("name inherited from Object.prototype")
+        },
+        ParameterRead {
+            value: "source?.tags",
+            ..parameter_read_blocking("optional chain")
+        },
+        ParameterRead {
+            value: "source[\"tags\"]",
+            ..parameter_read_blocking("bracket access")
+        },
+        ParameterRead {
+            defaults: inline(
+                "{ readonly size: number; readonly inner: { readonly tags: readonly string[] } }",
+            ),
+            value: "source.inner.tags",
+            ..parameter_read_blocking("two levels")
+        },
+    ];
+    cases.iter().for_each(check_parameter_read);
+}
+
+/// 型の名前が内側の型引数やクラス式の名前に、引数の名前がクラス式の名前や escape で綴った束縛に
+/// 隠れるときは、外側の宣言で型付けしない。外側の宣言を互換、実際に使われる側を非互換にし、
+/// 対照は原因だけを取り除いたもの。
+#[test]
+fn typed_parameter_reads_do_not_fall_back_to_shadowed_declarations() {
+    let outer = "interface Source { readonly size: number; readonly tags: readonly string[] }\n";
+    let function = |parameters: &str| {
+        format!(
+            "import type {{ Options }} from './options';\n{outer}export function defaults{parameters}(source: Source): Options {{\n return {{ size: source.size, label: 'a'{{TAGS}} }};\n}}\n"
+        )
+    };
+    let class = |parameters: &str| {
+        format!(
+            "import type {{ Options }} from './options';\n{outer}export class Builder{parameters} {{\n build(source: Source): number {{\n  const result: Options = {{ size: source.size, label: 'a'{{TAGS}} }};\n  return result.size;\n }}\n}}\n"
+        )
+    };
+    let inner = "<Source extends { readonly size: number; readonly tags: number }>";
+    let renamed = "<T extends { readonly size: number; readonly tags: number }>";
+    // クラス式の中では、その名前がクラス自身 (型と値) を指す。export した const の初期化子を
+    // 変えると const 自体の変更にもなるので、export しない。
+    let class_expression = |name: &str| {
+        format!(
+            "import type {{ Options }} from './options';\n{outer}const Builder = class {name} {{\n readonly size = 1;\n readonly tags = 42;\n build(source: Source): number {{\n  const result: Options = {{ size: source.size, label: 'a'{{TAGS}} }};\n  return result.size;\n }}\n}};\n"
+        )
+    };
+    let class_value = |name: &str| {
+        format!(
+            "import type {{ Options }} from './options';\nexport function defaults(source: {PARAMETER_READ_INLINE}): Options {{\n const Reader = class {name} {{\n  static readonly tags = 42;\n  static build(): number {{\n   const result: Options = {{ size: 1, label: 'a'{{TAGS}} }};\n   return result.size;\n  }}\n }};\n return {{ size: Reader.build(), label: 'a'{{TAGS}} }};\n}}\n"
+        )
+    };
+    let block = |binding: &str| {
+        format!(
+            "import type {{ Options }} from './options';\nexport function defaults(source: {PARAMETER_READ_INLINE}): Options {{\n {{\n  const {binding} = {{ size: 1, tags: 42 }};\n  return {{ size: source.size, label: 'a'{{TAGS}} }};\n }}\n}}\n"
+        )
+    };
+    // `o` を Unicode escape で綴った名前で、`source` と同じ名前の束縛になる。
+    let escaped = format!("s{}u006furce", '\\');
+    let cases = [
+        ParameterRead {
+            defaults: function(inner),
+            ..parameter_read_blocking("function type parameter")
+        },
+        ParameterRead {
+            defaults: function(renamed),
+            ..parameter_read_closed("function type parameter renamed")
+        },
+        ParameterRead {
+            defaults: class(inner),
+            ..parameter_read_blocking("class type parameter")
+        },
+        ParameterRead {
+            defaults: class(renamed),
+            ..parameter_read_closed("class type parameter renamed")
+        },
+        ParameterRead {
+            defaults: class_expression("Source"),
+            ..parameter_read_blocking("class expression named like the type")
+        },
+        ParameterRead {
+            defaults: class_expression("Named"),
+            ..parameter_read_closed("class expression with another name")
+        },
+        ParameterRead {
+            defaults: class_value("source"),
+            ..parameter_read_blocking("class expression named like the parameter")
+        },
+        ParameterRead {
+            defaults: class_value("Named"),
+            ..parameter_read_closed("class expression beside the parameter")
+        },
+        ParameterRead {
+            defaults: block(&escaped),
+            ..parameter_read_blocking("escaped binding")
+        },
+        ParameterRead {
+            defaults: block("other"),
+            ..parameter_read_closed("plain binding")
+        },
+    ];
+    cases.iter().for_each(check_parameter_read);
+}
+
+/// import の先が、package.json・継いだ設定・`references` の先の設定で別のファイルに解けうるとき、
+/// 宣言したファイルに同じ名前の別の書き出しがあるときは、宣言で型付けしない。対照は原因だけを
+/// 取り除いたもの。
+#[test]
+fn typed_parameter_reads_do_not_use_redirected_imports() {
+    let directory = vec![
+        ("source/index.ts", PARAMETER_READ_SOURCE),
+        ("source/actual.d.ts", PARAMETER_READ_NUMBER_SOURCE),
+    ];
+    let manifest = [
+        directory.clone(),
+        vec![("source/package.json", "{ \"types\": \"./actual.d.ts\" }\n")],
+    ]
+    .concat();
+    let suffixed = |base: &'static str| {
+        vec![
+            ("source.ts", PARAMETER_READ_SOURCE),
+            ("source.native.ts", PARAMETER_READ_NUMBER_SOURCE),
+            ("tsconfig.json", "{ \"extends\": \"./base.json\" }\n"),
+            ("base.json", base),
+        ]
+    };
+    // ルートの tsconfig.json は `references` の先のプロジェクトに任せる (先の設定がファイルに効く)。
+    let referenced = |app: &'static str| {
+        vec![
+            ("source.ts", PARAMETER_READ_SOURCE),
+            ("source.native.ts", PARAMETER_READ_NUMBER_SOURCE),
+            (
+                "tsconfig.json",
+                "{ \"files\": [], \"references\": [{ \"path\": \"./config/app.json\" }] }\n",
+            ),
+            ("config/app.json", app),
+        ]
+    };
+    // 同じ名前の書き出しが別にあると、import の先が直接の宣言に決まらない (どれも型エラー)。
+    let exported_twice = |other: &'static str| {
+        vec![
+            ("source.ts", other),
+            (
+                "other.ts",
+                "export interface Other { readonly size: number; readonly tags: number }\n",
+            ),
+        ]
+    };
+    let imported = parameter_read_defaults(PARAMETER_READ_IMPORT, "Source");
+    let cases = [
+        ParameterRead {
+            files: vec![("source.ts", PARAMETER_READ_SOURCE)],
+            defaults: imported.clone(),
+            ..parameter_read_closed("plain import")
+        },
+        ParameterRead {
+            files: exported_twice(
+                "export interface Source { readonly size: number; readonly tags: readonly string[] }\nexport { Other as \"Source\" } from './other';\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("quoted re-export of the name")
+        },
+        ParameterRead {
+            files: exported_twice(
+                "export interface Source { readonly size: number; readonly tags: readonly string[] }\nexport * as \"Source\" from './other';\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("quoted namespace export of the name")
+        },
+        ParameterRead {
+            files: exported_twice(
+                "export interface Source { readonly size: number; readonly tags: readonly string[] }\nconst value = 1;\nexport = value;\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("export assignment")
+        },
+        ParameterRead {
+            files: exported_twice(
+                "export interface Source { readonly size: number; readonly tags: readonly string[] }\nexport default interface Source { readonly label: string }\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("default interface of the same name")
+        },
+        ParameterRead {
+            files: manifest,
+            defaults: imported.clone(),
+            ..parameter_read_blocking("package.json in the directory")
+        },
+        ParameterRead {
+            files: directory,
+            defaults: imported.clone(),
+            ..parameter_read_closed("directory without package.json")
+        },
+        ParameterRead {
+            files: suffixed(
+                "{ \"compilerOptions\": { \"moduleSuffixes\": [\".native\", \"\"] } }\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("moduleSuffixes through extends")
+        },
+        ParameterRead {
+            files: suffixed("{ \"compilerOptions\": { \"strict\": true } }\n"),
+            defaults: imported.clone(),
+            ..parameter_read_closed("extends without moduleSuffixes")
+        },
+        ParameterRead {
+            files: referenced(
+                "{ \"include\": [\"../*.ts\"], \"compilerOptions\": { \"moduleSuffixes\": [\".native\", \"\"] } }\n",
+            ),
+            defaults: imported.clone(),
+            ..parameter_read_blocking("moduleSuffixes in a referenced project")
+        },
+        ParameterRead {
+            files: referenced("{ \"include\": [\"../*.ts\"] }\n"),
+            defaults: imported,
+            ..parameter_read_closed("referenced project without moduleSuffixes")
+        },
+    ];
+    cases.iter().for_each(check_parameter_read);
+}
+
+/// `extends` の先が解析 root の中の symlink なら、読めない設定として型付けしない。対照は
+/// `typed_parameter_reads_do_not_use_redirected_imports` の「extends without moduleSuffixes」
+/// (同じ設定を通常のファイルで置いたもの)。
+#[test]
+#[cfg(unix)]
+fn typed_parameter_reads_do_not_trust_symlinked_configs() {
+    let case = ParameterRead {
+        files: vec![
+            ("source.ts", PARAMETER_READ_SOURCE),
+            ("source.native.ts", PARAMETER_READ_NUMBER_SOURCE),
+            ("tsconfig.json", "{ \"extends\": \"./base.json\" }\n"),
+            (
+                "shared/base.json",
+                "{ \"compilerOptions\": { \"moduleSuffixes\": [\".native\", \"\"] } }\n",
+            ),
+        ],
+        defaults: parameter_read_defaults(PARAMETER_READ_IMPORT, "Source"),
+        ..parameter_read_blocking("symlinked base config")
+    };
+    check_parameter_read_with(&case, |repo| {
+        std::os::unix::fs::symlink("shared/base.json", repo.path("base.json")).unwrap();
+    });
+}
+
 /// `readonly` は union の先頭の配列型だけに掛かる (`readonly string[] | undefined` は
 /// `(readonly string[]) | undefined`)。必須プロパティの追加と、残るメンバーの削除の両方で証明する。
 #[test]
