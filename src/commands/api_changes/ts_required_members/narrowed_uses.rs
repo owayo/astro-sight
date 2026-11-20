@@ -11,13 +11,16 @@ pub(super) fn known_type(atoms: &[TypeAtom]) -> bool {
 }
 
 impl Prover<'_, '_> {
-    /// 型注釈だけで初期化子の any / assertion を隠さない。先行 const の直接の連鎖だけを追う。
+    /// 型注釈だけで初期化子の any / assertion を隠さない。先行 const の直接の連鎖と、配列の
+    /// 要素の出どころを追う。`seen` は (宣言, 深さ) ごとの結果で、同じ深さの同じ宣言
+    /// (`[item, item]`) は 1 度だけ辿る。結果は残りの深さで変わるので、深さもキーに含め、
+    /// 配列の要素の順で判定が変わらないようにする。循環は深さの上限で止まる。
     pub(super) fn narrowed_value_sources(
         &self,
         expr: Node<'_>,
         parsed: &ParsedRefFile,
         depth: usize,
-        seen: &mut HashSet<usize>,
+        seen: &mut HashMap<(usize, usize), bool>,
     ) -> bool {
         if depth >= 16
             || any_node(expr, Children::Named, |n| {
@@ -35,6 +38,17 @@ impl Prover<'_, '_> {
         let Some(value) = unwrap_parens(expr) else {
             return false;
         };
+        // 配列の要素も、それぞれの出どころまで辿る (`[item]` の `item` の初期化子が any を隠しうる)。
+        if value.kind() == "array" {
+            let mut cursor = value.walk();
+            return value
+                .named_children(&mut cursor)
+                .filter(|element| element.kind() != "comment")
+                .all(|element| {
+                    element.kind() != "spread_element"
+                        && self.narrowed_value_sources(element, parsed, depth + 1, seen)
+                });
+        }
         if !matches!(value.kind(), "identifier" | "shorthand_property_identifier") {
             return true;
         }
@@ -45,17 +59,23 @@ impl Prover<'_, '_> {
             Some((_, ScopeBinding::Variable(declaration))) => {
                 if !super::super::ts_const_arg::declarator_is_const(declaration)
                     || declaration.end_byte() > expr.start_byte()
-                    || !seen.insert(declaration.id())
                 {
                     return false;
                 }
-                declaration
+                let key = (declaration.id(), depth);
+                if let Some(&proven) = seen.get(&key) {
+                    return proven;
+                }
+                seen.insert(key, false);
+                let proven = declaration
                     .child_by_field_name("value")
                     .is_some_and(|init| {
                         self.value_type(init, parsed, 0)
                             .is_some_and(|ty| assignable(&ty, &value_type))
                             && self.narrowed_value_sources(init, parsed, depth + 1, seen)
-                    })
+                    });
+                seen.insert(key, proven);
+                proven
             }
             Some((scope, ScopeBinding::Other)) => {
                 if self.removal_map_parameter_is_known(scope, name, parsed) {

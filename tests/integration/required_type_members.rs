@@ -679,6 +679,466 @@ fn partial_factory_case(
     );
 }
 
+/// `Partial<T>` の factory が既定値を並べた後ろに `...overrides` を置く形の 1 ケース。
+struct PartialSpread {
+    name: &'static str,
+    /// factory.ts。`{TAGS}` に `, tags: <tags>` が入る。
+    factory: String,
+    /// 差分で足す `tags` の値。
+    tags: &'static str,
+    /// app.ts の変更後の呼び出し。変更前は `makeOptions();`。
+    call: String,
+    /// 変更の前後で置くほかのファイル (app.ts と違い、`makeOptions` を import しない)。
+    files: Vec<(&'static str, String)>,
+    closed: bool,
+}
+
+const PARTIAL_SPREAD_OPTIONS: &str =
+    "export interface Options {\n readonly size: number;\n readonly label: string;\n}\n";
+const PARTIAL_SPREAD_PARAMETER: &str = "overrides: Partial<Options> = {}";
+
+/// 関数宣言の factory。
+fn partial_spread_function(parameter: &str, body: &str) -> String {
+    format!(
+        "import type {{ Options }} from './options';\nexport function makeOptions({parameter}): Options {{\n {body}\n}}\n"
+    )
+}
+
+/// `const` の矢印関数の factory。宣言の行が差分に入らないよう、本体は次の行から書く。
+fn partial_spread_arrow(head: &str, parameter: &str, body: &str) -> String {
+    format!(
+        "import type {{ Options }} from './options';\n{head} = ({parameter}): Options => (\n {body}\n);\n"
+    )
+}
+
+fn partial_spread_closed(name: &'static str, factory: String) -> PartialSpread {
+    PartialSpread {
+        name,
+        factory,
+        tags: "['x']",
+        call: "makeOptions()".to_string(),
+        files: Vec::new(),
+        closed: true,
+    }
+}
+
+fn partial_spread_blocking(name: &'static str, factory: String) -> PartialSpread {
+    PartialSpread {
+        closed: false,
+        ..partial_spread_closed(name, factory)
+    }
+}
+
+/// 変更前をコミットし、`Options` に `tags` を、factory の既定値に `tags` を足した差分を hook で
+/// 確かめる。blocking なら、値を作る箇所の証明で止まったこと (理由) まで確かめる。
+fn check_partial_spread(case: &PartialSpread) {
+    let name = case.name;
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("options.ts", PARTIAL_SPREAD_OPTIONS);
+    repo.write("factory.ts", case.factory.replace("{TAGS}", ""));
+    repo.write(
+        "app.ts",
+        "import { makeOptions } from './factory';\nmakeOptions();\n",
+    );
+    for (path, text) in &case.files {
+        repo.write(path, text);
+    }
+    repo.commit_all("initial");
+    repo.write(
+        "options.ts",
+        PARTIAL_SPREAD_OPTIONS.replace("}\n", " readonly tags: readonly string[];\n}\n"),
+    );
+    repo.write(
+        "factory.ts",
+        case.factory
+            .replace("{TAGS}", &format!(", tags: {}", case.tags)),
+    );
+    repo.write(
+        "app.ts",
+        format!(
+            "import {{ makeOptions }} from './factory';\n{};\n",
+            case.call
+        ),
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, if case.closed { 0 } else { 1 }, "{name}: {json}");
+    let bucket = if case.closed { "mod_closed" } else { "mod" };
+    let entry = json["api"][bucket]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["n"] == "Options"))
+        .unwrap_or_else(|| panic!("{name}: {json}"));
+    if !case.closed {
+        assert_eq!(
+            entry["unverified"]["reason"], "type_member_proof_failed",
+            "{name}: {json}"
+        );
+    }
+}
+
+/// 既定値を並べた object literal で組み込み `Partial<T>` の引数を 1 つだけ spread する factory を、
+/// 関数宣言と `const` の矢印関数で閉じる (Issue #463)。spread は追加したメンバーを宣言どおりの
+/// 型でしか上書きせず、呼び出し側の実引数は `??` の形と同じく確かめる。
+#[test]
+fn partial_factories_close_partial_spreads() {
+    let spread = "{ size: 1, label: 'a'{TAGS}, ...overrides }";
+    let returned = format!("return {spread};");
+    // 本体の中の束縛の名前に escape が無い対照 (escape のある方は blocking のテスト)。
+    let plain_block = format!(" {{\n  const other = {{ tags: 1 }};\n  {returned}\n }}");
+    // 文字列の escape は束縛にも呼び出しにも関わらない。
+    let string_escape = format!("const marker = '{}u0061';\nexport function", '\\');
+    // 呼び出し側の文字列の添字の escape は、解くと関係する名前にならない。
+    let caller_string_escape = format!(
+        "const labels: Record<string, number> = {{}};\nlabels['{b}u0061'];\nlabels['{b}x61'];\nmakeOptions({{ tags: ['y'] }})",
+        b = '\\'
+    );
+    // 呼び出し側の無関係な escape の識別子は、追加した値の解決に関わらない。
+    let caller_identifier_escape = format!("const n{}u006fte = 1;\nmakeOptions({{}})", '\\');
+    let arrow = partial_spread_arrow("export const makeOptions", PARTIAL_SPREAD_PARAMETER, spread);
+    let cases = [
+        partial_spread_closed(
+            "explicit value after the spread",
+            partial_spread_function(
+                PARTIAL_SPREAD_PARAMETER,
+                "return { size: 1, label: 'a', ...overrides{TAGS} };",
+            ),
+        ),
+        partial_spread_closed(
+            "escape only in a string",
+            partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned)
+                .replace("export function", &string_escape),
+        ),
+        partial_spread_closed(
+            "other parameter with a plain default",
+            partial_spread_function(&format!("{PARTIAL_SPREAD_PARAMETER}, size = 1"), &returned),
+        ),
+        partial_spread_closed(
+            "same-file caller passes tags",
+            format!("{arrow}makeOptions({{ tags: ['y'] }});\n"),
+        ),
+        PartialSpread {
+            call: "const item = 'y';\nmakeOptions({ tags: [item, item] })".to_string(),
+            ..partial_spread_closed(
+                "caller repeats one const in an array",
+                partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: caller_string_escape,
+            ..partial_spread_closed(
+                "caller with an escape only in a string key",
+                partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: caller_identifier_escape,
+            ..partial_spread_closed(
+                "caller with an unrelated escaped identifier passes no added value",
+                partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        // `??` の形 (#228) の対照。呼び出し側の `__proto__` の負例と同じ factory。
+        PartialSpread {
+            tags: "overrides.tags ?? ['x']",
+            call: "makeOptions({ tags: ['y'] })".to_string(),
+            ..partial_spread_closed(
+                "coalescing factory with a plain caller",
+                partial_spread_function(
+                    PARTIAL_SPREAD_PARAMETER,
+                    "return { size: 1, label: 'a'{TAGS} };",
+                ),
+            )
+        },
+        partial_spread_closed(
+            "function declaration",
+            partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned),
+        ),
+        partial_spread_closed(
+            "arrow with an expression body",
+            partial_spread_arrow("export const makeOptions", PARTIAL_SPREAD_PARAMETER, spread),
+        ),
+        partial_spread_closed(
+            "arrow with a block body",
+            partial_spread_arrow(
+                "export const makeOptions",
+                PARTIAL_SPREAD_PARAMETER,
+                &format!("{{\n {returned}\n}}"),
+            )
+            .replace("=> (\n", "=> ")
+            .replace("\n);\n", ";\n"),
+        ),
+        partial_spread_closed(
+            "binding without an escape in the body",
+            partial_spread_function(PARTIAL_SPREAD_PARAMETER, &plain_block),
+        ),
+        PartialSpread {
+            call: "makeOptions({})".to_string(),
+            ..partial_spread_closed(
+                "caller passes an empty object",
+                partial_spread_function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: "makeOptions({ tags: ['y'] })".to_string(),
+            ..partial_spread_closed(
+                "caller passes tags",
+                partial_spread_arrow("export const makeOptions", PARTIAL_SPREAD_PARAMETER, spread),
+            )
+        },
+    ];
+    cases.iter().for_each(check_partial_spread);
+}
+
+/// 既定値の足し忘れ・spread の後ろの型の合わない上書き・`Partial<Options>` でない spread の元・
+/// 入力を書き換えうる形・証明できない呼び出しや宣言の形は、blocking のまま残る。
+#[test]
+fn partial_factories_keep_unproven_partial_spreads_blocking() {
+    let spread = "{ size: 1, label: 'a'{TAGS}, ...overrides }";
+    let returned = format!("return {spread};");
+    let function = |parameter: &str, body: &str| partial_spread_function(parameter, body);
+    let arrow = partial_spread_arrow("export const makeOptions", PARTIAL_SPREAD_PARAMETER, spread);
+    // `e` を Unicode escape で綴った名前で、`overrides` と同じ名前の束縛になる。
+    let escaped = format!("overrid{}u0065s", '\\');
+    let shadowed = format!(" {{\n  const {escaped} = {{ tags: 1 }};\n  {returned}\n }}");
+    // `O` を Unicode escape で綴った呼び出しで、`refs` の名前の照合に現れない。
+    let escaped_call = format!("make{}u004fptions({{ tags: undefined }})", '\\');
+    // `i` を Unicode escape で綴った内側の束縛が、実引数の `items` を隠す。
+    let escaped_binding_call = format!(
+        "const items: readonly string[] = ['x'];\n{{\n const {}u0069tems: any = undefined;\n makeOptions({{ tags: items }});\n}}",
+        '\\'
+    );
+    // `O` を `\x` で綴った文字列のキーで、名前空間から factory を取り出して呼ぶ。
+    // 名前を字面に書かないファイルに置き、escape を解いて読む前段の判定まで確かめる。
+    let escaped_key_call = format!(
+        "import * as rows from './factory';\nrows['make{}x4fptions']({{ tags: undefined }});\n",
+        '\\'
+    );
+    // 値の出どころの連鎖が深さの上限 (16) に届く。配列の要素の順によらず同じ判定になる。
+    let chain: String = (1..15)
+        .map(|index| format!("const a{index}: string = a{};\n", index - 1))
+        .collect();
+    let deep_chain =
+        |elements: &str| format!("const a0 = 'y';\n{chain}makeOptions({{ tags: [{elements}] }})");
+    let cases = [
+        partial_spread_blocking(
+            "arguments rewrites the input",
+            function(
+                PARTIAL_SPREAD_PARAMETER,
+                &format!("for (arguments[0].tags of [undefined]) {{}}\n {returned}"),
+            ),
+        ),
+        PartialSpread {
+            files: vec![("rows.ts", escaped_key_call)],
+            ..partial_spread_blocking(
+                "escaped string key call through a namespace",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            tags: "overrides.tags ?? ['x']",
+            call: "makeOptions({ __proto__: { tags: 1 } })".to_string(),
+            ..partial_spread_blocking(
+                "caller sets the prototype of the input",
+                function(
+                    PARTIAL_SPREAD_PARAMETER,
+                    "return { size: 1, label: 'a'{TAGS} };",
+                ),
+            )
+        },
+        PartialSpread {
+            call: deep_chain("a0, a14"),
+            ..partial_spread_blocking(
+                "chain at the depth limit after a short element",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: deep_chain("a14, a0"),
+            ..partial_spread_blocking(
+                "chain at the depth limit before a short element",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        partial_spread_blocking(
+            "missing default",
+            function(
+                PARTIAL_SPREAD_PARAMETER,
+                "return { size: 1, label: 'a', ...overrides };",
+            ),
+        ),
+        // 閉じる側の「explicit value after the spread」と同じ形で、足す値の型だけが違う。
+        PartialSpread {
+            tags: "1",
+            ..partial_spread_blocking(
+                "mismatched value after the spread",
+                function(
+                    PARTIAL_SPREAD_PARAMETER,
+                    "return { size: 1, label: 'a', ...overrides{TAGS} };",
+                ),
+            )
+        },
+        PartialSpread {
+            call: "const item: string = undefined as any;\nmakeOptions({ tags: [item] })"
+                .to_string(),
+            ..partial_spread_blocking(
+                "caller hides any in an array element",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        partial_spread_blocking(
+            "other parameter default reads a member",
+            function(
+                &format!("{PARTIAL_SPREAD_PARAMETER}, _ = defaults.flag"),
+                &returned,
+            )
+            .replace(
+                "export function",
+                "const defaults = { flag: 0 };\nexport function",
+            ),
+        ),
+        PartialSpread {
+            call: escaped_binding_call,
+            ..partial_spread_blocking(
+                "escaped binding shadows the argument at the call site",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        partial_spread_blocking(
+            "other parameter default rewrites the input",
+            function(
+                &format!(
+                    "{PARTIAL_SPREAD_PARAMETER}, _ = Object.assign(overrides, {{ tags: undefined }})"
+                ),
+                &returned,
+            ),
+        ),
+        partial_spread_blocking(
+            "same-file caller passes undefined",
+            format!("{arrow}makeOptions({{ tags: undefined }});\n"),
+        ),
+        PartialSpread {
+            call: "const value: any = undefined;\nmakeOptions({ tags: value })".to_string(),
+            ..partial_spread_blocking(
+                "caller passes an any value",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call:
+                "const value: readonly string[] = undefined as any;\nmakeOptions({ tags: value })"
+                    .to_string(),
+            ..partial_spread_blocking(
+                "caller hides any behind an annotation",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: escaped_call,
+            ..partial_spread_blocking(
+                "escaped call in another file",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        partial_spread_blocking(
+            "spread source is not Partial<Options>",
+            function("overrides: { size?: number } = {}", &returned),
+        ),
+        partial_spread_blocking(
+            "Partial of another type",
+            function("overrides: Partial<Other> = {}", &returned).replace(
+                "export function",
+                "interface Other { readonly tags?: number }\nexport function",
+            ),
+        ),
+        partial_spread_blocking(
+            "parameter without a default",
+            function("overrides: Partial<Options>", &returned),
+        ),
+        partial_spread_blocking(
+            "returned through a variable",
+            function(
+                PARTIAL_SPREAD_PARAMETER,
+                "const merged = { size: 1, label: 'a'{TAGS}, ...overrides };\n return merged;",
+            ),
+        ),
+        partial_spread_blocking(
+            "escaped binding in the body",
+            function(PARTIAL_SPREAD_PARAMETER, &shadowed),
+        ),
+        partial_spread_blocking(
+            "let arrow",
+            partial_spread_arrow("export let makeOptions", PARTIAL_SPREAD_PARAMETER, spread),
+        ),
+        partial_spread_blocking(
+            "const with a type annotation",
+            partial_spread_arrow(
+                "export const makeOptions: () => unknown",
+                PARTIAL_SPREAD_PARAMETER,
+                spread,
+            ),
+        ),
+        PartialSpread {
+            call: "makeOptions({ tags: undefined })".to_string(),
+            ..partial_spread_blocking(
+                "caller passes undefined",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: "const input = { size: 2 };\nmakeOptions(input)".to_string(),
+            ..partial_spread_blocking(
+                "caller passes a variable",
+                function(PARTIAL_SPREAD_PARAMETER, &returned),
+            )
+        },
+        PartialSpread {
+            call: "makeOptions.apply(null, [])".to_string(),
+            ..partial_spread_blocking(
+                "factory called through apply",
+                partial_spread_arrow("export const makeOptions", PARTIAL_SPREAD_PARAMETER, spread),
+            )
+        },
+    ];
+    cases.iter().for_each(check_partial_spread);
+}
+
+/// object literal の `__proto__: 値` はプロトタイプを決めるだけで、自分のプロパティを作らない。
+/// 必須の `__proto__` を足しても、その書き方の値では閉じない。短縮形 (`{ __proto__ }`) は自分の
+/// プロパティを作るので閉じる (対照)。
+#[test]
+fn required_additions_do_not_count_proto_setters() {
+    let options = "export interface Options {\n readonly size: number;\n}\n";
+    let factory = |value: &str| {
+        format!(
+            "import type {{ Options }} from './options';\nexport function makeOptions(): Options {{\n const __proto__ = 1;\n return {value};\n}}\n"
+        )
+    };
+    for (case, value, closed) in [
+        ("proto setter", "{ size: 1, __proto__: 1 }", false),
+        ("shorthand proto property", "{ size: 1, __proto__ }", true),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("options.ts", options);
+        repo.write("factory.ts", factory("{ size: 1 }"));
+        repo.commit_all("initial");
+        repo.write(
+            "options.ts",
+            options.replace("}\n", " readonly __proto__: number;\n}\n"),
+        );
+        repo.write("factory.ts", factory(value));
+        let (code, json) = hook(&repo);
+        assert_eq!(code, if closed { 0 } else { 1 }, "{case}: {json}");
+        let bucket = if closed { "mod_closed" } else { "mod" };
+        assert!(
+            json["api"][bucket]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["n"] == "Options")),
+            "{case}: {json}"
+        );
+    }
+}
+
 #[test]
 fn partial_factory_fallthrough_stays_blocking() {
     let repo = TestRepo::new();

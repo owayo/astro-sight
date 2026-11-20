@@ -83,6 +83,10 @@ impl Prover<'_, '_> {
             let Some(key) = super::super::object_key_text(key, source) else {
                 return false;
             };
+            // `__proto__: 値` はプロトタイプを決めるだけで、自分のプロパティを作らない。
+            if member.kind() == "pair" && key == "__proto__" {
+                continue;
+            }
             if let Some(&index) = names.get(key.as_str()) {
                 if explicit[index].is_some() {
                     return false;
@@ -183,18 +187,30 @@ pub(super) fn is_typed_copy_source(node: Node<'_>, source: &[u8], type_name: &st
             while let Some(function) = parent {
                 // 最も近い callable で止める。参照ごとの関数本体の再走査を避ける。
                 if COPY_RETURN_BOUNDARIES.contains(&function.kind()) {
-                    return function.kind() == "function_declaration"
-                        && is_top_level_declaration(function)
-                        && function
-                            .child_by_field_name("return_type")
-                            .is_some_and(target);
+                    return typed_top_level_function(function, target);
                 }
                 parent = function.parent();
             }
             false
         }
+        // 矢印関数の式の本体 (`(): Row => ({ ...row })`)。
+        "arrow_function" => {
+            destination
+                .child_by_field_name("body")
+                .is_some_and(|body| body.id() == value.id())
+                && typed_top_level_function(destination, target)
+        }
         _ => false,
     }
+}
+
+/// ファイル直下の関数宣言か `const` の矢印関数で、戻り値の型の注釈が `target` を満たすか。
+fn typed_top_level_function(function: Node<'_>, target: impl Fn(Node<'_>) -> bool) -> bool {
+    (function.kind() == "function_declaration" && is_top_level_declaration(function)
+        || top_level_const_arrow(function).is_some())
+        && function
+            .child_by_field_name("return_type")
+            .is_some_and(target)
 }
 
 fn wrapped_parent(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
