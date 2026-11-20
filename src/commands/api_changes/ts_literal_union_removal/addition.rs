@@ -179,8 +179,18 @@ pub(super) fn exhaustive_switch(
         .filter(|node| node.kind() == "statement_block")?;
     let function = block
         .parent()
-        .filter(|node| node.kind() == "function_declaration")?;
+        .filter(|node| matches!(node.kind(), "function_declaration" | "arrow_function"))?;
     if name.kind() != "identifier" || function.child_by_field_name("body") != Some(block) {
+        return None;
+    }
+    // 判別するのは、switch を本体の直下に持つ関数自身の引数に限る。
+    let (scope, binding) = resolve_binding_scope(
+        name,
+        source.as_bytes(),
+        text(name, source)?,
+        Namespace::Value,
+    )?;
+    if scope.id() != function.id() || !matches!(binding, ScopeBinding::Other) {
         return None;
     }
     let result = Primitive::read(only(function.child_by_field_name("return_type")?)?, source)?;
