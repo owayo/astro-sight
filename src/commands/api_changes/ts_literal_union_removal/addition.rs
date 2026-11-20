@@ -9,7 +9,6 @@ pub(super) fn audit(
     values: &BTreeSet<String>,
 ) -> Option<()> {
     let plan = slots::collect_addition(inventory, site, values)?;
-    producers_are_unreferenced(inventory, &plan.producers)?;
     flows::audit_addition(inventory, &plan, values)
 }
 
@@ -137,35 +136,6 @@ fn append(
             .iter()
             .all(|node| decode::string(*node, source).is_some_and(|value| values.contains(&value))))
     .then_some(())
-}
-
-fn producers_are_unreferenced(inventory: &inventory::Inventory, sites: &[Site]) -> Option<()> {
-    if sites.is_empty() {
-        return Some(());
-    }
-    let names = sites.iter().map(|site| site.name.clone()).collect();
-    for (path, file) in inventory.relevant(&names) {
-        for node in slots::nodes(inventory.root(path)?) {
-            if !crate::engine::js_occurrence::identifier_kind(node.kind()) {
-                continue;
-            }
-            let raw = text(node, &file.source)?;
-            if names.contains(raw)
-                && !sites.iter().any(|site| {
-                    site.path == path
-                        && site.name == raw
-                        && node.parent().is_some_and(|parent| {
-                            span(parent) == site.span
-                                && parent.child_by_field_name("name") == Some(node)
-                        })
-                })
-            {
-                // 戻り値の型は、別名への明示的な参照がない呼び出しにも伝わる。
-                return None;
-            }
-        }
-    }
-    Some(())
 }
 
 pub(super) fn exhaustive_switch(

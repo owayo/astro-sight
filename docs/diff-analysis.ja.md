@@ -249,7 +249,7 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 
 ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。並べ替えだけの変更と、後述の判別 union 以外で旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
 
-型の参照は、直下の `const X: Record<Mode, primitive>`、`const X: Mode[]` / `readonly Mode[]`、明示した primitive/void 戻り型を持つ関数の必須 `Mode` 引数に限る。関数は、ファイル直下の関数宣言と、ファイル直下の `const` に直接代入した矢印関数、関数の本体の直下にある同じ 2 つの形を扱う。呼び出しは字句の束縛でその関数に解決できるものだけを数え、関数の再代入・持ち出し・`arguments` の読み出し・関数名への `for` ループの書き込み、関数の中の関数名と同名の束縛 (引数とその既定値の式を含む) があれば保留する。メソッドの計算名・デコレータ・`for` の見出しと `for-of` の右辺・catch の引数・引数の型注釈と既定値に追跡中の名前があるときも、ここで使う名前の解決がそのスコープを区別しないので保留する。primitive は `string`・`number`・`boolean`・`bigint` の keyword とし、戻り型だけ `void` も扱う。ほかの引数も型付きの必須 primitive 引数に限り、optional・既定値・rest・分割代入・generic は扱わない。Record のキーは残る集合と一致し、配列の要素は残る文字列 literal だけとする。直接の相対 named import は別名なしで一意に対象へ到達する場合だけ扱う。同名の別型は束縛で区別し、解析や所属が不明なら保留する。許可した受け口と値の実利用が少なくとも1件必要で、無参照・型位置だけの利用では閉じない。
+型の参照は、直下の `const X: Record<Mode, primitive>`、`const X: Mode[]` / `readonly Mode[]`、明示した primitive/void 戻り型を持つ関数の必須 `Mode` 引数に限る。関数は、ファイル直下の関数宣言と、ファイル直下の `const` に直接代入した矢印関数、関数の本体の直下にある同じ 2 つの形を扱う。呼び出しは字句の束縛でその関数に解決できるものだけを数え、関数の再代入・持ち出し・`arguments` の読み出し・関数名への `for` ループの書き込み、関数の中の関数名と同名の束縛 (引数とその既定値の式を含む) があれば保留する。メソッドの計算名・デコレータ・`for` の見出し・`for-of` の左辺と右辺・catch の引数・引数の型注釈と既定値に追跡中の名前があるときも、ここで使う名前の解決がそのスコープを区別しないので保留する。primitive は `string`・`number`・`boolean`・`bigint` の keyword とし、戻り型だけ `void` も扱う。ほかの引数も型付きの必須 primitive 引数に限り、optional・既定値・rest・分割代入・generic は扱わない。Record のキーは残る集合と一致し、配列の要素は残る文字列 literal だけとする。直接の相対 named import は別名なしで一意に対象へ到達する場合だけ扱う。同名の別型は束縛で区別し、解析や所属が不明なら保留する。許可した受け口と値の実利用が少なくとも1件必要で、無参照・型位置だけの利用では閉じない。
 
 配列は単一引数の inline arrow による `.filter(...)` の連鎖と終端 `.map(...)` に限る。filter は既知の boolean consumer 呼出しか残る literal との比較、map はこの比較・既知の primitive consumer 呼出し・Record の添字読出しのいずれかを証明する。consumer 引数と添字へ入る値は、残る文字列 literal、証明済み consumer 引数、配列 callback 引数だけ。Mode の値の利用も、その呼出し・添字・既知 literal との比較・switch の判別に限る。別名・持出し・書込み・typeof/keyof・再 export・未知の引数・assertion・optional/spread/type-argument/thisArg は保留する。
 
@@ -267,7 +267,7 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 
 型を指定した関数引数の `switch` は、要素ごとに一つの `case` があり、それぞれ宣言した primitive 型の値を返す場合に扱う。`default` での `const exhaustive: never = value; return exhaustive;` も網羅性検査として扱う。`Record<Alias, primitive>` の型注釈または `satisfies Record<Alias, primitive>` がある直下の `const` には、全要素と一致する静的キーと、宣言した型の literal 値が必要。case やキーの不足、所属判定、型アサーション、対象ファイルでの型検査の抑制、値の流れが分からない利用は blocking に残す。
 
-戻り型が `Alias[]` の関数は、literal 配列を返す形か、既知の要素を `.push()` で加えたローカルの `const` 配列を返す形を扱う。push は型付きの primitive 引数と literal の比較で条件付きにできる。呼び出し側にも推論で広がった型が伝わるため、この形は観測範囲に生成関数の参照がない場合に限る。
+戻り型が `Alias[]` の関数は、literal 配列を返す形か、既知の要素を `.push()` で加えたローカルの `const` 配列を返す形を扱う。push は型付きの primitive 引数と literal の比較で条件付きにできる。呼び出し側にも推論で広がった型が伝わるため、観測した生成関数の参照は、宣言・別名なしの import とローカルの export、直接の呼び出しに限る。呼び出しの結果は、直接の `.length` の読み出しか、引数 1 つのコールバックによる `.filter(...)` の連鎖と最後の `.map(...)` にだけ使える。最後の `.map(...)` には、引数で証明済みの読む関数を呼ぶ・証明済みの Record を引く・literal と比べる矢印関数か、引数が 1 つの証明済みの読む関数をそのまま渡す (`filter` と `map` に thisArg は渡さない)。`filter` のコールバックは引数と literal を比較してよいが、読む関数には全要素の case を求める。読む関数をほかの場所で値として渡せば保留する。標準の配列の動作を前提にする。
 
 ### TypeScript の判別 union の要素削除
 

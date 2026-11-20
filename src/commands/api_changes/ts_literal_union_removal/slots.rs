@@ -67,12 +67,13 @@ pub(super) struct Consumer {
     pub(super) result: Primitive,
 }
 impl Consumer {
-    /// `node` が受け口の宣言の名前か (利用ではない)。
-    pub(super) fn declares(&self, node: Node<'_>) -> bool {
-        node.parent().is_some_and(|parent| {
-            span(parent) == self.declaration
-                && parent.child_by_field_name("name").map(span) == Some(span(node))
-        })
+    /// `path` の `node` が受け口の宣言の名前か (利用ではない)。
+    pub(super) fn declares(&self, node: Node<'_>, path: &str) -> bool {
+        path == self.site.path
+            && node.parent().is_some_and(|parent| {
+                span(parent) == self.declaration
+                    && parent.child_by_field_name("name").map(span) == Some(span(node))
+            })
     }
 }
 pub(super) struct Plan {

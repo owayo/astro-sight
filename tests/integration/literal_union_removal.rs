@@ -382,11 +382,6 @@ fn literal_union_addition_accepts_arrow_and_local_readers() {
         "    switch (mode) {",
         "    const handlers = { [publish(\"early\")](mode: number) { return mode; } };\n    void handlers;\n    switch (mode) {",
     ) + "function publish(value: \"early\" | \"seen\"): string {\n    return value;\n}\n";
-    // for-of の左辺の既定値の呼び出しは読み出しで、受け口への書き込みではない。
-    let for_of_default = LOCAL_FUNCTION.replace(
-        "    return describe(mode);",
-        "    let value = \"\";\n    const rows: [string?][] = [[]];\n    for ([value = describe(\"seen\")] of rows) {}\n    void value;\n    return describe(mode);",
-    );
     for (case, body, app, check_missing) in [
         ("root const arrow", ROOT_ARROW, None, true),
         (
@@ -424,12 +419,6 @@ fn literal_union_addition_accepts_arrow_and_local_readers() {
         (
             "computed method name without the value",
             computed_literal.as_str(),
-            None,
-            false,
-        ),
-        (
-            "reader called in a for-of default",
-            for_of_default.as_str(),
             None,
             false,
         ),
@@ -540,6 +529,14 @@ fn literal_union_addition_keeps_unproven_arrow_and_local_readers_blocking() {
             ) + "declare function mark(value: unknown): ParameterDecorator;\n",
         ),
         (
+            // for-of の左辺の既定値の名前は、ループ本体の宣言へ解決されうるので確かめられない。
+            "reader called in a for-of default",
+            LOCAL_FUNCTION.replace(
+                "    return describe(mode);",
+                "    let value = \"\";\n    const rows: [string?][] = [[]];\n    for ([value = describe(\"seen\")] of rows) {}\n    void value;\n    return describe(mode);",
+            ),
+        ),
+        (
             "local function captured by an inner parameter initializer",
             format!(
                 "export function makeReader() {{\n    function describe(value: Mode): string {{\n        switch (value) {{\n{complete_cases}        }}\n    }}\n    function capture(saved = describe) {{\n        const describe = 0;\n        void describe;\n        return saved;\n    }}\n    return capture();\n}}\n"
@@ -581,6 +578,205 @@ fn literal_union_addition_keeps_unproven_arrow_and_local_readers_blocking() {
         let (code, json) = reader_hook(&reader, true, None);
         union_category(code, &json, 1, false, case);
     }
+}
+
+/// `src/report.ts` を `report` にしてコミットし、union に要素を足す。`complete` なら
+/// `src/describe.ts` の switch にも case を足す。`describe` があれば読む関数をそれにする。
+fn producer_hook(report: &str, complete: bool, describe: Option<&str>) -> (i32, serde_json::Value) {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    let reader = describe.unwrap_or(INCOMPLETE_SWITCH);
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write("src/describe.ts", reader);
+    repo.write("src/report.ts", report);
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    if complete {
+        repo.write(
+            "src/describe.ts",
+            reader.replace(SEEN_CASE, &format!("{SEEN_CASE}\n{NEW_CASE}")),
+        );
+    }
+    union_hook(&repo, false, false)
+}
+
+/// 生成関数の直接の呼び出しは、結果を `.length` で読むか、`.filter(...)` の連鎖と最後の
+/// `.map(...)` で証明済みの受け口へ渡す形だけを許す。
+#[test]
+fn literal_union_addition_accepts_closed_producer_calls() {
+    let imports = "import { modesOf } from \"./mode\";\nimport { describe } from \"./describe\";\n";
+    for (case, body, expected) in [
+        (
+            "map with the reader",
+            "export function report(n: number): string {\n    return modesOf(n).map(describe).join(\", \");\n}\n",
+            0,
+        ),
+        (
+            "map with an arrow",
+            "export function report(n: number): string[] {\n    return modesOf(n).map((mode) => describe(mode));\n}\n",
+            0,
+        ),
+        ("length", "export const count = modesOf(1).length;\n", 0),
+        (
+            "filter then map",
+            "export function report(n: number): string[] {\n    return modesOf(n).filter((mode) => mode !== \"early\").map(describe);\n}\n",
+            0,
+        ),
+        (
+            "array kept in a variable",
+            "export function report(n: number): number {\n    const modes = modesOf(n);\n    return modes.length;\n}\n",
+            1,
+        ),
+        (
+            "array returned",
+            "export function report(n: number) {\n    return modesOf(n);\n}\n",
+            1,
+        ),
+        (
+            "array passed to an unknown function",
+            "declare function keep(value: unknown): void;\nexport function report(n: number): void {\n    keep(modesOf(n));\n}\n",
+            1,
+        ),
+        (
+            "map with a function that is not a reader",
+            "export function report(n: number): string[] {\n    return modesOf(n).map(String);\n}\n",
+            1,
+        ),
+        (
+            "map returning the element",
+            "export function report(n: number) {\n    return modesOf(n).map((mode) => mode);\n}\n",
+            1,
+        ),
+        (
+            "map with thisArg",
+            "export function report(n: number): string[] {\n    return modesOf(n).map(describe, null);\n}\n",
+            1,
+        ),
+        (
+            "filter result returned",
+            "export function report(n: number) {\n    return modesOf(n).filter((mode) => mode !== \"early\");\n}\n",
+            1,
+        ),
+        (
+            "length written",
+            "export function report(n: number): void {\n    modesOf(n).length++;\n}\n",
+            1,
+        ),
+        ("type query", "export type Producer = typeof modesOf;\n", 1),
+        (
+            "reader passed to an unknown array as well",
+            "export function report(n: number): string[] {\n    return modesOf(n).map(describe);\n}\nexport const others = JSON.parse(\"[]\").map(describe);\n",
+            1,
+        ),
+    ] {
+        let (code, json) = producer_hook(&format!("{imports}{body}"), true, None);
+        union_category(code, &json, expected, expected == 0, case);
+    }
+
+    // 同じ呼び出し形で、読む関数の条件だけを変える。絞り込んでも、読む関数には全要素の case を求める。
+    let mapped = format!(
+        "{imports}export function report(n: number): string[] {{\n    return modesOf(n).filter((mode) => mode !== \"early\").map(describe);\n}}\n"
+    );
+    let overloaded = INCOMPLETE_SWITCH.replace(
+        "export function describe(mode: Mode): string {",
+        "export function describe(mode: Mode): string;\nexport function describe(mode: Mode): string {",
+    );
+    let reads_arguments = INCOMPLETE_SWITCH.replace(
+        "    switch (mode) {",
+        "    const first: unknown = arguments[0];\n    void first;\n    switch (mode) {",
+    );
+    for (case, complete, reader, expected) in [
+        ("reader with every case", true, None, 0),
+        ("reader without the new case", false, None, 1),
+        ("overloaded reader", true, Some(overloaded.as_str()), 1),
+        (
+            "reader reading arguments",
+            true,
+            Some(reads_arguments.as_str()),
+            1,
+        ),
+    ] {
+        let (code, json) = producer_hook(&mapped, complete, reader);
+        union_category(code, &json, expected, expected == 0, case);
+    }
+
+    let typed_imports = "import { type Mode, modesOf } from \"./mode\";\nimport { describe } from \"./describe\";\n";
+    for (case, report) in [
+        (
+            "aliased producer import",
+            "import { modesOf as reasons } from \"./mode\";\nimport { describe } from \"./describe\";\nexport function report(n: number): string[] {\n    return reasons(n).map(describe);\n}\n".to_owned(),
+        ),
+        (
+            "length after a filter",
+            format!("{imports}export const count = modesOf(1).filter((mode) => mode !== \"early\").length;\n"),
+        ),
+        (
+            "outer parameter compared in a filter",
+            format!("{typed_imports}export function report(mode: Mode): string {{\n    return modesOf(1).filter((_value) => mode === \"early\").map(describe).join(\",\");\n}}\n"),
+        ),
+        (
+            "producer called in a for-of default",
+            format!("{imports}export function report(): (\"early\" | \"seen\")[] {{\n    let result: (\"early\" | \"seen\")[] = [];\n    const rows: [undefined][] = [[undefined]];\n    for ([result = modesOf(101)] of rows) {{\n        const modesOf = (): never[] => [];\n        void modesOf;\n    }}\n    return result;\n}}\n"),
+        ),
+        (
+            "type-check suppression in the caller",
+            format!("{imports}// @ts-expect-error \"filtered\" は旧 union にない\nexport const report = modesOf(101).filter((mode) => mode !== \"filtered\").map(describe);\n"),
+        ),
+    ] {
+        let (code, json) = producer_hook(&report, true, None);
+        union_category(code, &json, 1, false, case);
+    }
+}
+
+/// 別のファイルの別名の export の範囲が生成関数の宣言と同じでも、宣言とみなさない。
+#[test]
+fn literal_union_addition_does_not_match_declarations_across_files() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/mode.ts", BEFORE_EXPANSION);
+    repo.write("src/describe.ts", INCOMPLETE_SWITCH);
+    repo.write(
+        "src/bridge.ts",
+        "import { modesOf } from \"./mode\";\nexport { modesOf as forwarded };\n",
+    );
+    repo.write(
+        "src/caller.ts",
+        "import { forwarded } from \"./bridge\";\nexport const old: (\"early\" | \"seen\")[] = forwarded(101);\n",
+    );
+    repo.commit_all("initial");
+    expand_modes(&repo);
+    repo.write("src/describe.ts", complete_switch());
+    // export specifier `modesOf as <alias>` の範囲を、生成関数の宣言の範囲にそろえる。
+    let mode = std::fs::read_to_string(repo.root().join("src/mode.ts")).unwrap();
+    let start = mode.find("function modesOf").unwrap();
+    let end = mode.rfind('}').unwrap() + 1;
+    let import = "import { modesOf } from \"./mode\";\n";
+    let alias = "a".repeat(end - start - "modesOf as ".len());
+    let padding = " ".repeat(start - import.len() - "export { ".len());
+    repo.write(
+        "src/bridge.ts",
+        format!("{import}{padding}export {{ modesOf as {alias} }};\n"),
+    );
+    repo.write(
+        "src/caller.ts",
+        format!("import {{ {alias} }} from \"./bridge\";\nexport const old: (\"early\" | \"seen\")[] = {alias}(101);\n"),
+    );
+    let bridge = std::fs::read_to_string(repo.root().join("src/bridge.ts")).unwrap();
+    assert_eq!(
+        &bridge[start..end],
+        format!("modesOf as {alias}"),
+        "specifier range"
+    );
+    let (code, json) = union_hook(&repo, false, false);
+    union_category(
+        code,
+        &json,
+        1,
+        false,
+        "aliased export with the declaration range",
+    );
 }
 
 /// 判別 union の要素削除でも、`const` に代入した矢印関数を受け口として扱う。
