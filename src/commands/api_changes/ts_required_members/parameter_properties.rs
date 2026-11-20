@@ -1,7 +1,6 @@
 //! 型注釈付きの必須引数のプロパティの読み出し (`source.tags`) を、宣言された型で型付けする。
 
 use super::*;
-use crate::engine::change_evidence::has_js_unicode_escape;
 
 /// 読み出すと `Object.prototype` から継承した値を返しうる名前。宣言の型だけでは値を決められない。
 const INHERITED_NAMES: &[&str] = &[
@@ -31,8 +30,8 @@ impl Prover<'_, '_> {
         caches: &mut ApiClosureCaches,
     ) -> Option<Vec<TypeAtom>> {
         let source: &[u8] = &parsed.source;
-        // 束縛の解決は名前を表記のまま比べるので、escape で綴った束縛 (`source`) の影を見落とす。
-        if has_js_unicode_escape(source) {
+        // 束縛の解決は名前を表記のまま比べるので、escape で綴った束縛の影を見落とす。
+        if parsed.has_escaped_identifier() {
             return None;
         }
         let member = unwrap_parens(member)?;
@@ -95,7 +94,7 @@ impl Prover<'_, '_> {
                             caches,
                         )?;
                         let declared = parsed_ref_file_shared(self.scope.dir, &target, caches)?;
-                        if has_js_unicode_escape(&declared.source) {
+                        if declared.has_escaped_identifier() {
                             return None;
                         }
                         let members = root_object_members(&declared, type_name, true)?;

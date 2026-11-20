@@ -836,13 +836,30 @@ impl Prover<'_, '_> {
         let Some(formal) = param.parent().filter(|p| p.kind() == "formal_parameters") else {
             return false;
         };
-        let Some(function) = formal
-            .parent()
-            .filter(|f| f.kind() == "function_declaration" && is_top_level_declaration(*f))
-        else {
+        let Some(function) = formal.parent() else {
             return false;
         };
-        let Some(name_node) = function.child_by_field_name("name") else {
+        // 本体の読み方は名前を表記のまま比べるので、escape で綴った束縛の影を見落とす。影に
+        // なりうる束縛は関数の中にしか無いので、関数の中の識別子を見る。
+        if partial
+            && parsed.has_escaped_identifier()
+            && any_node(function, Children::Named, |node| {
+                super::ref_index::escaped_identifier(node, source)
+            })
+        {
+            return false;
+        }
+        // ファイル直下の関数宣言。省略可能な入力の factory は、`const` の矢印関数も扱う。
+        let name_node =
+            if function.kind() == "function_declaration" && is_top_level_declaration(function) {
+                function.child_by_field_name("name")
+            } else if partial {
+                top_level_const_arrow(function)
+                    .and_then(|declarator| declarator.child_by_field_name("name"))
+            } else {
+                None
+            };
+        let Some(name_node) = name_node else {
             return false;
         };
         if self.delta.audits_uses() && function.child_by_field_name("return_type").is_none() {
@@ -887,7 +904,10 @@ impl Prover<'_, '_> {
         if body_rebinds_or_queries(body, source, param_name, copy_type) {
             return false;
         }
-        if partial && !partial_factory::parameter_reads_are_plain(body, source, param_name) {
+        if partial
+            && (!partial_factory::parameter_reads_are_plain(body, source, param_name)
+                || !partial_factory::other_parameters_are_plain(formal, param, source, param_name))
+        {
             return false;
         }
         if self.consumers.iter().any(|site| {
@@ -1144,6 +1164,17 @@ impl Prover<'_, '_> {
             Some((scope, ScopeBinding::FunctionDeclaration)) => {
                 scope.kind() == "program" && self.same_path(&consumer.path, path)
             }
+            // `const` の矢印関数の factory。宣言子の値がちょうど受け取る関数のとき。
+            Some((scope, ScopeBinding::Variable(declarator))) => {
+                scope.kind() == "program"
+                    && self.same_path(&consumer.path, path)
+                    && declarator
+                        .child_by_field_name("value")
+                        .is_some_and(|value| {
+                            value.start_byte() == consumer.function_start
+                                && value.end_byte() == consumer.function_end
+                        })
+            }
             Some((_, ScopeBinding::Import(statement))) => self
                 .import_target(
                     statement,
@@ -1219,13 +1250,21 @@ impl Prover<'_, '_> {
         {
             return self.prove_invariant_object(object, parsed, path, properties, caches);
         }
+        // `...overrides` (組み込み `Partial<Target>` の factory の引数) は、追加したプロパティを
+        // 宣言どおりの型でしか上書きしない。明示の値を通常どおり確かめ、その spread だけを飛ばす。
+        let mut partial_spread = None;
         if matches!(self.delta.mode, MemberChangeMode::Addition) {
             let mut cursor = object.walk();
             if object
                 .named_children(&mut cursor)
                 .any(|member| member.kind() == "spread_element")
             {
-                return self.prove_spread_object(object, parsed, path, diff_files, caches);
+                partial_spread = self
+                    .partial_spread(object, parsed, path, caches)
+                    .map(|spread| spread.id());
+                if partial_spread.is_none() {
+                    return self.prove_spread_object(object, parsed, path, diff_files, caches);
+                }
             }
         }
         let additions_with_removal = match &self.delta.mode {
@@ -1277,7 +1316,9 @@ impl Prover<'_, '_> {
                     {
                         return false;
                     }
+                    // `__proto__: 値` はプロトタイプを決めるだけで、自分のプロパティを作らない。
                     if let Some(key) = key
+                        && key != "__proto__"
                         && let Some((&name, _)) = properties.get_key_value(key.as_str())
                     {
                         found
@@ -1330,6 +1371,7 @@ impl Prover<'_, '_> {
                             .push((member, member.start_position().row));
                     }
                 }
+                "spread_element" if partial_spread == Some(member.id()) => {}
                 // spread はキーと値の型を静的に決められない。
                 _ => return false,
             }
@@ -1358,7 +1400,7 @@ impl Prover<'_, '_> {
                                     *value,
                                     parsed,
                                     0,
-                                    &mut HashSet::new(),
+                                    &mut HashMap::new(),
                                 ))
                     })
         })
@@ -2026,6 +2068,36 @@ fn is_top_level_declaration(function: Node<'_>) -> bool {
     }
 }
 
+/// ファイル直下の `const name = (…) => …` の矢印関数なら、その宣言子。宣言子が 1 つで、変数に
+/// 型注釈が無く、名前が単純な識別子のものに限る (`let` / `var` は再代入で関数が入れ替わりうる)。
+fn top_level_const_arrow(function: Node<'_>) -> Option<Node<'_>> {
+    if function.kind() != "arrow_function" {
+        return None;
+    }
+    let declarator = function.parent().filter(|parent| {
+        parent.kind() == "variable_declarator"
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == function.id())
+            && parent.child_by_field_name("type").is_none()
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.kind() == "identifier")
+    })?;
+    let declaration = declarator
+        .parent()
+        .filter(|parent| parent.kind() == "lexical_declaration")?;
+    let mut cursor = declaration.walk();
+    let declarators = declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "variable_declarator")
+        .count();
+    (declarators == 1
+        && super::ts_const_arg::declarator_is_const(declarator)
+        && is_top_level_declaration(declaration))
+    .then_some(declarator)
+}
+
 /// 値を作る箇所 (関数・変数の宣言・`satisfies` 式) の値を束縛する名前。
 enum ProducerName {
     /// これらの名前の `typeof` を確かめる。値を入れた外側のオブジェクト・配列の束縛名も含む
@@ -2490,6 +2562,9 @@ fn name_refs(caches: &ApiClosureCaches, name: &str) -> Option<Rc<Vec<SymbolRefer
 ///   単語として現れる。checkJs では JSDoc も型として検査されるが、コメントは参照に現れない
 /// - `string_names` と同じ文字列で、名前空間オブジェクトや入れ物から値・型を取り出す
 ///   (`rows["toRow"]`・`const { "item": picked } = box`・`(typeof rows)["toRow"]`)
+/// - escape で綴った識別子が、解くと `comment_names` のどれかと同じ名前になる。`refs` は
+///   escape を解かないので、そうした呼び出しや型の参照は義務の確認から漏れる。解けない
+///   escape は同じ名前になり得るとみなす
 fn sources_may_mention_outside_identifiers(
     dir: &str,
     comment_names: &[&str],
@@ -2532,7 +2607,11 @@ fn sources_may_mention_outside_identifiers(
         // tsc が型として読むコメントは、JS 系のファイルの JSDoc だけ (TS のファイルの JSDoc は
         // 型に使わない)。
         let check_comments = lang == LangId::Javascript && mentions(&text, comment_names);
-        if !check_comments && !mentions(&text, string_names) {
+        // escape で綴った名前 (識別子の `\u`、文字列の `\x` や恒等の escape) は本文の字面に
+        // 現れない。おおまかに解いた本文に名前が現れるか、解けない escape があれば解析する。
+        let escaped = text.contains('\\')
+            && loosely_unescaped(&text).is_none_or(|decoded| mentions(&decoded, comment_names));
+        if !check_comments && !escaped && !mentions(&text, string_names) {
             return false;
         }
         let Ok(tree) = crate::engine::parser::parse_source(text.as_bytes(), lang) else {
@@ -2550,9 +2629,18 @@ fn sources_may_mention_outside_identifiers(
                         })
                 }
                 "string" | "template_string" | "template_literal_type" => {
-                    is_string_access_key(node) && string_may_equal(node, source, string_names)
+                    is_string_access_key(node)
+                        && decoded_string_may_equal(node, &text, string_names)
                 }
-                _ => false,
+                _ => {
+                    escaped
+                        && super::ref_index::escaped_identifier(node, source)
+                        && node
+                            .utf8_text(source)
+                            .ok()
+                            .and_then(super::ts_literal_union_removal::decode_identifier)
+                            .is_none_or(|name| comment_names.iter().any(|known| *known == name))
+                }
             }
         })
     })
@@ -2595,6 +2683,69 @@ fn is_string_access_key(node: Node<'_>) -> bool {
 
 /// 置換の無い文字列の中身が、`names` のどれかと同じ名前になり得るか。escape を含む文字列は
 /// 名前を比べられないので、同じ名前になり得るとみなす。
+/// 文字列と識別子の escape (`\u`・`\u{…}`・`\x`・恒等の escape・行の継続) を、場所を問わず
+/// おおまかに解いた本文。escape で綴った名前を構文解析の前に拾うための上位集合で、解けない
+/// escape (不正な `\u` / `\x`・8 進の escape・サロゲート) があれば None。
+fn loosely_unescaped(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let hex = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>, count: usize| {
+        (0..count).try_fold(0u32, |value, _| {
+            Some(value * 16 + chars.next()?.to_digit(16)?)
+        })
+    };
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            break;
+        };
+        match next {
+            'u' if chars.next_if_eq(&'{').is_some() => {
+                let mut value = 0u32;
+                let mut digits = 0;
+                loop {
+                    let digit = chars.next()?;
+                    if digit == '}' {
+                        break;
+                    }
+                    digits += 1;
+                    if digits > 6 {
+                        return None;
+                    }
+                    value = value * 16 + digit.to_digit(16)?;
+                }
+                if digits == 0 {
+                    return None;
+                }
+                out.push(char::from_u32(value)?);
+            }
+            'u' => out.push(char::from_u32(hex(&mut chars, 4)?)?),
+            'x' => out.push(char::from_u32(hex(&mut chars, 2)?)?),
+            '1'..='9' => return None,
+            '0' if chars.peek().is_some_and(char::is_ascii_digit) => return None,
+            '\n' | '\u{2028}' | '\u{2029}' => {}
+            '\r' => {
+                chars.next_if_eq(&'\n');
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// [`string_may_equal`] と同じだが、escape を含む文字列は解いて比べる。解けなければ同じ名前に
+/// なり得るとみなす。無関係な escape の添字 (`labels["\x61"]` の類) で止めないため。
+fn decoded_string_may_equal(node: Node<'_>, source: &str, names: &[&str]) -> bool {
+    string_may_equal(node, source.as_bytes(), names)
+        && (super::static_js_string_text(node, source.as_bytes())
+            .is_some_and(|text| names.contains(&text))
+            || super::ts_literal_union_removal::decode_string(node, source)
+                .is_none_or(|decoded| names.iter().any(|name| *name == decoded)))
+}
+
 fn string_may_equal(node: Node<'_>, source: &[u8], names: &[&str]) -> bool {
     if matches!(node.kind(), "template_string" | "template_literal_type") {
         let mut cursor = node.walk();
@@ -2666,6 +2817,36 @@ mod tests {
 
     fn parse(source: &str) -> tree_sitter::Tree {
         crate::engine::parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap()
+    }
+
+    /// escape をおおまかに解いた本文は、識別子と文字列のどの escape でも名前を表し、解けない
+    /// escape は None にする。`\\` の後ろは escape として読まない。
+    #[test]
+    fn loosely_unescaped_reveals_names_spelled_with_escapes() {
+        let b = '\\';
+        for (raw, decoded) in [
+            (format!("make{b}u004fptions"), "makeOptions"),
+            (format!("make{b}u{{4f}}ptions"), "makeOptions"),
+            (format!("rows['make{b}x4fptions']"), "rows['makeOptions']"),
+            (format!("rows['m{b}akeOptions']"), "rows['makeOptions']"),
+            (format!("rows['make{b}\nOptions']"), "rows['makeOptions']"),
+            (format!("rows['make{b}\r\nOptions']"), "rows['makeOptions']"),
+            (format!("'{b}{b}u0041'"), "'\\u0041'"),
+            ("plain".to_string(), "plain"),
+        ] {
+            assert_eq!(loosely_unescaped(&raw).as_deref(), Some(decoded), "{raw:?}");
+        }
+        for raw in [
+            format!("make{b}u00"),
+            format!("make{b}xZZ"),
+            format!("'make{b}62'"),
+            format!("'{b}01'"),
+            format!("{b}uD83D{b}uDE00"),
+            format!("{b}u{{}}"),
+            format!("{b}u{{1234567}}"),
+        ] {
+            assert_eq!(loosely_unescaped(&raw), None, "{raw:?}");
+        }
     }
 
     /// `type T = <ty>;` の右辺を単純な型として読む。

@@ -1253,6 +1253,37 @@ pub(super) struct ParsedRefFile {
     pub(super) tree: tree_sitter::Tree,
     pub(super) lang_id: crate::language::LangId,
     js_occurrences: std::cell::OnceCell<crate::engine::js_occurrence::JsOccurrenceIndex>,
+    escaped_identifiers: std::cell::OnceCell<bool>,
+}
+
+impl ParsedRefFile {
+    /// escape で綴った識別子があるか。束縛の解決は名前を表記のまま比べるので、そうした束縛の
+    /// 影を見落とす。文字列やコメントの escape は数えない。ファイルごとに 1 回だけ数える。
+    pub(super) fn has_escaped_identifier(&self) -> bool {
+        *self.escaped_identifiers.get_or_init(|| {
+            let source: &[u8] = &self.source;
+            crate::engine::change_evidence::has_js_unicode_escape(source)
+                && crate::engine::tree_walk::any_node(
+                    self.tree.root_node(),
+                    crate::engine::tree_walk::Children::Named,
+                    |node| escaped_identifier(node, source),
+                )
+        })
+    }
+}
+
+/// 識別子の位置のノードで、表記に escape を含むか。
+pub(super) fn escaped_identifier(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    matches!(
+        node.kind(),
+        "identifier"
+            | "type_identifier"
+            | "property_identifier"
+            | "private_property_identifier"
+            | "shorthand_property_identifier"
+            | "shorthand_property_identifier_pattern"
+            | "statement_identifier"
+    ) && node.utf8_text(source).is_ok_and(|text| text.contains('\\'))
 }
 
 /// 参照ファイルの parse 結果 (キャッシュ付き) を返す。読み込みは `parser::read_file`
@@ -1301,6 +1332,7 @@ fn parse_ref_file(dir: &str, ref_path: &str) -> Option<ParsedRefFile> {
         tree,
         lang_id: lang,
         js_occurrences: std::cell::OnceCell::new(),
+        escaped_identifiers: std::cell::OnceCell::new(),
     })
 }
 
@@ -2134,6 +2166,7 @@ mod tests {
             tree,
             lang_id: lang,
             js_occurrences: std::cell::OnceCell::new(),
+            escaped_identifiers: std::cell::OnceCell::new(),
         };
         let node = ref_name_node(&parsed, bare, line, column)?;
         Some(import_role_at(node, &parsed.source, bare))
@@ -2250,6 +2283,7 @@ mod tests {
             tree,
             lang_id: LangId::Tsx,
             js_occurrences: std::cell::OnceCell::new(),
+            escaped_identifiers: std::cell::OnceCell::new(),
         };
         let node = ref_name_node(&parsed, "ScheduleItem", line, column).expect("node");
         js_reference_is_non_value(node, &parsed.source, "ScheduleItem")

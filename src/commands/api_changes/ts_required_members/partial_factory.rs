@@ -59,7 +59,95 @@ fn optional_properties(ty: Node<'_>, source: &[u8]) -> Option<BTreeMap<String, V
     Some(properties)
 }
 
-/// 新しい証明は呼び出し・書き込み・入力の持ち出しを含まない factory に限定する。
+/// `return` が属する関数の種類。
+const FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "generator_function_declaration",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+];
+
+/// 関数 `function` が `object` をそのまま返すか (return の式か、矢印関数の式の本体。括弧は外す)。
+/// 本体を走査し直さず、`object` から祖先へ辿って確かめる。
+fn returned_by(function: Node<'_>, object: Node<'_>) -> bool {
+    let mut value = object;
+    while let Some(parent) = value
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_expression")
+    {
+        value = parent;
+    }
+    let Some(parent) = value.parent() else {
+        return false;
+    };
+    if parent.id() == function.id() {
+        return function
+            .child_by_field_name("body")
+            .is_some_and(|body| body.id() == value.id());
+    }
+    if parent.kind() != "return_statement"
+        || only_named_child(parent).is_none_or(|returned| returned.id() != value.id())
+    {
+        return false;
+    }
+    let mut current = parent.parent();
+    while let Some(ancestor) = current {
+        if FUNCTION_KINDS.contains(&ancestor.kind()) {
+            return ancestor.id() == function.id();
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+/// 関数がそのまま返す値 (return の式と、矢印関数の式の本体)。
+fn returned_values(function: Node<'_>) -> Vec<Node<'_>> {
+    match function.child_by_field_name("body") {
+        Some(body) if body.kind() == "statement_block" => function_returns(body)
+            .into_iter()
+            .filter_map(only_named_child)
+            .collect(),
+        Some(body) => vec![body],
+        None => Vec::new(),
+    }
+}
+
+/// 省略可能な入力 `parameter` のほかの引数が、本体より先に入力を書き換えうるコードを持たないか。
+/// 引数の既定値と分割代入は本体より先に評価され、メンバーの読み出しも getter を動かしうるので、
+/// ほかの引数は単純な名前に限り、既定値は副作用の無い literal (primitive と空の `{}` / `[]`)
+/// だけを許す。
+pub(super) fn other_parameters_are_plain(
+    formal: Node<'_>,
+    parameter: Node<'_>,
+    source: &[u8],
+    name: &str,
+) -> bool {
+    let mut cursor = formal.walk();
+    formal
+        .named_children(&mut cursor)
+        .filter(|other| other.kind() != "comment" && other.id() != parameter.id())
+        .all(|other| {
+            other.child_by_field_name("decorator").is_none()
+                && other.child_by_field_name("pattern").is_some_and(|pattern| {
+                    pattern.kind() == "identifier" && pattern.utf8_text(source).ok() != Some(name)
+                })
+                && other.child_by_field_name("value").is_none_or(|value| {
+                    unwrap_parens(value).is_some_and(|value| {
+                        is_primitive_literal(value)
+                            || (matches!(value.kind(), "object" | "array")
+                                && value
+                                    .named_children(&mut value.walk())
+                                    .all(|child| child.kind() == "comment"))
+                    })
+                })
+        })
+}
+
+/// 新しい証明は呼び出し・書き込み・入力の持ち出しを含まない factory に限定する。入力は
+/// `name.member ?? 既定値` で読むか、関数がそのまま返す object literal の直下で `...name` と
+/// 広げる (宣言どおりの型で上書きするだけ) ものに限る。
 pub(super) fn parameter_reads_are_plain(body: Node<'_>, source: &[u8], name: &str) -> bool {
     !any_node(body, Children::Named, |node| {
         if matches!(
@@ -75,9 +163,25 @@ pub(super) fn parameter_reads_are_plain(body: Node<'_>, source: &[u8], name: &st
         ) {
             return true;
         }
+        // `arguments[0]` は引数の名前を使わずに入力を指す (`for (arguments[0].tags of …)` で書き換えうる)。
+        if node.kind() == "identifier" && node.utf8_text(source).ok() == Some("arguments") {
+            return true;
+        }
         if !matches!(node.kind(), "identifier" | "shorthand_property_identifier")
             || node.utf8_text(source).ok() != Some(name)
             || is_binding_name(node)
+        {
+            return false;
+        }
+        if node.kind() == "identifier"
+            && let Some(object) = node
+                .parent()
+                .filter(|parent| parent.kind() == "spread_element")
+                .and_then(|spread| spread.parent())
+                .filter(|parent| parent.kind() == "object")
+            && body
+                .parent()
+                .is_some_and(|function| returned_by(function, object))
         {
             return false;
         }
@@ -113,14 +217,8 @@ fn has_added_default_read(
     else {
         return false;
     };
-    let Some(body) = function.child_by_field_name("body") else {
-        return false;
-    };
-    function_returns(body).into_iter().any(|ret| {
-        let Some(object) = only_named_child(ret)
-            .and_then(unwrap_parens)
-            .filter(|value| value.kind() == "object")
-        else {
+    returned_values(function).into_iter().any(|value| {
+        let Some(object) = unwrap_parens(value).filter(|value| value.kind() == "object") else {
             return false;
         };
         object.named_children(&mut object.walk()).any(|member| {
@@ -205,8 +303,8 @@ impl Prover<'_, '_> {
         else {
             return false;
         };
-        function.kind() == "function_declaration"
-            && is_top_level_declaration(function)
+        (function.kind() == "function_declaration" && is_top_level_declaration(function)
+            || top_level_const_arrow(function).is_some())
             && empty_default(parameter)
             && function
                 .child_by_field_name("return_type")
@@ -265,16 +363,75 @@ impl Prover<'_, '_> {
             } else {
                 continue;
             };
+            // 矢印関数の式の本体は、その値を必ず返す。
             if function.child_by_field_name("type_parameters").is_some()
-                || function
-                    .child_by_field_name("body")
-                    .is_none_or(|body| !return_producers::definitely_exits(body, 0))
+                || function.child_by_field_name("body").is_none_or(|body| {
+                    body.kind() == "statement_block" && !return_producers::definitely_exits(body, 0)
+                })
                 || !self.record_consumer(parameter, parsed, path, Some(properties))
             {
                 return false;
             }
         }
         true
+    }
+
+    /// object literal のただ 1 つの spread が、この object literal をそのまま返す factory の
+    /// 組み込み `Partial<Target>` の引数 (呼び出し側の確認を登録済み) を広げるなら、その spread。
+    /// 部分の spread は追加したプロパティを宣言どおりの型 (`Target[K]`) でしか上書きしないので、
+    /// 追加したプロパティを明示の値で持てば、値が spread の前でも後ろでも証明は壊れない。
+    pub(super) fn partial_spread<'t>(
+        &self,
+        object: Node<'t>,
+        parsed: &ParsedRefFile,
+        path: &str,
+        caches: &mut ApiClosureCaches,
+    ) -> Option<Node<'t>> {
+        if !matches!(self.delta.mode, MemberChangeMode::Addition) {
+            return None;
+        }
+        let source: &[u8] = &parsed.source;
+        let mut cursor = object.walk();
+        let spreads: Vec<Node<'t>> = object
+            .named_children(&mut cursor)
+            .filter(|member| member.kind() == "spread_element")
+            .collect();
+        let [spread] = spreads.as_slice() else {
+            return None;
+        };
+        let value = only_named_child(*spread).filter(|value| value.kind() == "identifier")?;
+        let name = value.utf8_text(source).ok()?;
+        let (function, ScopeBinding::Other) =
+            resolve_binding_scope(value, source, name, Namespace::Value)?
+        else {
+            return None;
+        };
+        if !returned_by(function, object) {
+            return None;
+        }
+        let parameter = parameter_named(function, source, name)?;
+        let ty = parameter
+            .child_by_field_name("type")
+            .and_then(only_named_child)?;
+        if !self.partial_annotation_is_target(ty, parsed, path, caches) {
+            return None;
+        }
+        let parameters = function.child_by_field_name("parameters")?;
+        let mut cursor = parameters.walk();
+        let index = parameters
+            .named_children(&mut cursor)
+            .filter(|p| p.kind() != "comment")
+            .position(|p| p.id() == parameter.id())?;
+        self.consumers
+            .iter()
+            .any(|consumer| {
+                consumer.path == path
+                    && consumer.function_start == function.start_byte()
+                    && consumer.function_end == function.end_byte()
+                    && consumer.index == index
+                    && consumer.optional_members.is_some()
+            })
+            .then_some(*spread)
     }
 
     pub(super) fn factory_default_type(
@@ -373,14 +530,24 @@ impl Prover<'_, '_> {
             let Some(name) = super::super::object_key_text(key, source) else {
                 return false;
             };
-            if !seen.insert(name.clone()) {
+            // `__proto__: 値` は入力のプロトタイプを決め、`overrides.tags ?? …` に継承した値を
+            // 読ませうる。
+            if !seen.insert(name.clone()) || name == "__proto__" {
                 return false;
             }
+            // 値の出どころまで追い、型注釈や `any` で隠した値 (`undefined` を含む) を通さない。
+            // 値の中の名前は表記のまま解決するので、escape で綴った束縛の影も見落とさない。
             if let Some(expected) = properties.get(&name)
-                && !member
-                    .child_by_field_name("value")
-                    .and_then(|v| self.value_type(v, parsed, 0))
-                    .is_some_and(|actual| assignable(&actual, expected))
+                && !member.child_by_field_name("value").is_some_and(|value| {
+                    !(parsed.has_escaped_identifier()
+                        && any_node(value, Children::Named, |node| {
+                            matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+                        }))
+                        && self
+                            .value_type(value, parsed, 0)
+                            .is_some_and(|actual| assignable(&actual, expected))
+                        && self.narrowed_value_sources(value, parsed, 0, &mut HashMap::new())
+                })
             {
                 return false;
             }

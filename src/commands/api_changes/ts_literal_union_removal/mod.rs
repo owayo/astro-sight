@@ -21,6 +21,16 @@ mod residue;
 mod shape;
 mod slots;
 
+/// escape を含む識別子の表記を、名前へ戻す。必須メンバーの証明でも使う。
+pub(super) fn decode_identifier(raw: &str) -> Option<String> {
+    decode::identifier(raw)
+}
+
+/// 置換の無い文字列の値を、escape を解いて返す。必須メンバーの証明でも使う。
+pub(super) fn decode_string(node: Node<'_>, source: &str) -> Option<String> {
+    decode::string(node, source)
+}
+
 const MAX_DEPTH: usize = 128;
 type Span = (usize, usize);
 
