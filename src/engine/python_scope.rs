@@ -48,9 +48,20 @@ impl PythonScopeIndex {
         }
         let mut scopes = HashMap::new();
         let mut parameter_positions = HashSet::new();
+        // 前順の走査で開いている class の終わりの位置。関数が class の中かを、祖先をたどらずに知る。
+        let mut classes: Vec<usize> = Vec::new();
         let mut cursor = root.walk();
         loop {
             let node = cursor.node();
+            // Python は識別子を NFKC で正規化するので (`global ｔｏｔａｌ` は `global total`)、
+            // 綴りで束縛を照合できない識別子があればファイル全体を証明しない。
+            if node.kind() == "identifier"
+                && !node
+                    .utf8_text(source)
+                    .is_ok_and(|name| name.is_ascii() || unicode_normalization::is_nfkc(name))
+            {
+                return None;
+            }
             // walrus は内包表記から外側へ束縛が漏れる。型パラメータも独自の scope を持つ。
             // これらの名前解決を証明できるまではファイル全体で従来の判定を保つ。
             let is_type_parameter_declaration = node.kind() == "type_parameter"
@@ -66,10 +77,16 @@ impl PythonScopeIndex {
             {
                 return None;
             }
+            while classes.last().is_some_and(|&end| end <= node.start_byte()) {
+                classes.pop();
+            }
+            if node.kind() == "class_definition" {
+                classes.push(node.end_byte());
+            }
             if node.kind() == "function_definition" {
                 scopes.insert(
                     node.id(),
-                    collect_bindings(node, source, &mut parameter_positions),
+                    collect_bindings(node, source, &mut parameter_positions, !classes.is_empty()),
                 );
             }
             if cursor.goto_first_child() {
@@ -119,8 +136,9 @@ impl PythonScopeIndex {
                     return LexicalBinding::Unknown;
                 }
                 "class_definition" if field_contains(parent, "body", node) => {
-                    // メソッドの自由変数は class の名前空間を見ない。
-                    if !crossed_function_body {
+                    // メソッドの自由変数は class の名前空間を見ない。class の中の `__x` は
+                    // `_Class__x` に名前修飾され、class の外の `__x` の束縛とは別の名前になる。
+                    if !crossed_function_body || is_mangled_name(name) {
                         return LexicalBinding::Unknown;
                     }
                 }
@@ -150,10 +168,12 @@ fn field_contains(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
     })
 }
 
+/// `in_class` は関数が class の中にあるか (名前修飾の対象の名前を照合できない)。
 fn collect_bindings(
     function: Node<'_>,
     source: &[u8],
     parameter_positions: &mut HashSet<usize>,
+    in_class: bool,
 ) -> Bindings {
     let mut bindings = Bindings::default();
     if let Some(parameters) = function.child_by_field_name("parameters") {
@@ -186,6 +206,11 @@ fn collect_bindings(
             "global_statement" | "nonlocal_statement" => {
                 let mut cursor = node.walk();
                 for name in node.named_children(&mut cursor) {
+                    // class の中の `global __x` は `global _Class__x` を意味し、綴りの違う
+                    // `_Class__x` の束縛を隠す。名前修飾までは解かずに関数ごと保留する。
+                    if in_class && name.utf8_text(source).is_ok_and(is_mangled_name) {
+                        bindings.ambiguous = true;
+                    }
                     collect_targets(name, source, &mut bindings.blocked);
                 }
             }
@@ -194,7 +219,13 @@ fn collect_bindings(
                 bindings.ambiguous = true;
             }
             "assignment" | "augmented_assignment" | "for_statement" => {
-                if let Some(target) = node.child_by_field_name("left") {
+                // 右辺の無い注釈は裸の名前だけを束縛する (`x: int` は束縛し、`(x): int` は
+                // 注釈を評価するだけで束縛しない。PEP 526)。
+                let annotation_only =
+                    node.kind() == "assignment" && node.child_by_field_name("right").is_none();
+                if let Some(target) = node.child_by_field_name("left")
+                    && (!annotation_only || target.kind() == "identifier")
+                {
                     collect_targets(target, source, &mut bindings.local);
                 }
             }
@@ -208,7 +239,26 @@ fn collect_bindings(
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
     }
+    // class の中の関数は `__x` を `_Class__x` として束縛する。`global _Class__x` の宣言で
+    // 修飾後の名前がモジュールへ届くことがあるので、修飾される名前はローカルと証明しない。
+    if in_class {
+        let mangled: Vec<String> = bindings
+            .local
+            .iter()
+            .filter(|name| is_mangled_name(name))
+            .cloned()
+            .collect();
+        for name in mangled {
+            bindings.local.remove(&name);
+            bindings.blocked.insert(name);
+        }
+    }
     bindings
+}
+
+/// class の中で名前修飾される名前 (`__x`。終わりが `__` のものは除く)。
+fn is_mangled_name(name: &str) -> bool {
+    name.starts_with("__") && !name.ends_with("__")
 }
 
 fn collect_targets(node: Node<'_>, source: &[u8], names: &mut HashSet<String>) {
@@ -278,6 +328,8 @@ mod tests {
             "def outer(collect_items):\n    class C:\n        def inner(self):\n            return collect_items\n",
             "def outer(collect_items):\n    def inner(value=collect_items):\n        pass\n",
             "def main():\n    collect_items = collect_items(3)\n",
+            // 右辺のある括弧付きの注釈は代入なので束縛する。
+            "def main():\n    (collect_items): list = []\n    return collect_items\n",
         ] {
             assert_eq!(
                 resolve_last(source),
@@ -308,6 +360,18 @@ mod tests {
             "def main[T]():\n    collect_items = []\n    return collect_items\n",
             "type Alias[V] = list[V]\ndef main():\n    collect_items = []\n    return collect_items\n",
             "def main(collect_items):\n    broken = (\n    return collect_items\n",
+            // 右辺の無い括弧付きの注釈は名前を束縛しない (PEP 526)。
+            "def main():\n    (collect_items): int\n    return collect_items(3)\n",
+            // NFKC で同じ名前になる宣言は、綴りで照合できない。
+            "def main(collect_items):\n    def inner():\n        global ｃｏｌｌｅｃｔ_ｉｔｅｍｓ\n        return collect_items(3)\n    return inner()\n",
+            // クラスの中では `global __x` が `global _C__x` を意味する (名前修飾)。
+            "class C:\n    def run(self):\n        global __collect_items\n        _C__collect_items = None\n        return _C__collect_items()\n",
+            // 逆に `global _C__x` の後の `__x = None` はモジュールの `_C__x` へ代入する。
+            "class C:\n    def run(self, override):\n        global _C__collect_items\n        if override:\n            __collect_items = None\n        return __collect_items()\n",
+            // class の中の `__x` は `_C__x` を指し、class の外の関数の `__x` の束縛とは別の名前。
+            "def outer(__collect_items):\n    class C:\n        def run(self):\n            return __collect_items()\n    return C().run()\n",
+            // 修飾の綴りがそろう束縛も、上の宣言と区別できないので証明しない。
+            "class C:\n    def run(self):\n        __collect_items = 1\n        return __collect_items\n",
         ] {
             assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
         }

@@ -63,3 +63,199 @@ fn python_free_function_removal_reads_literal_getattr_like_attribute_access() {
         assert!(hook["api"].get(dropped).is_none(), "{extras:?}\n{stderr}");
     }
 }
+
+const UTIL_OLD: &str = "def total(x):\n    return x\n\n\ndef keep():\n    return 1\n";
+const UTIL_NEW: &str = "def keep():\n    return 1\n";
+/// 削除元と同じモジュールの、引数とローカルの代入で同じ名前を隠す関数 (変更の前後とも置く)。
+const SHADOWS: &str = "\n\ndef use_param(total):\n    return total\n\n\ndef use_local():\n    total = 2\n    return total\n";
+
+/// `tools/util.py` の `total` を消して (変更後の内容を `util_new` にして) `review --git --hook` を
+/// 流し、`api.rm` に残るか (`rm_dead` に入るか) と終了コードを確かめる。ほかのファイルは
+/// `extras` の内容でコミットしておき、変えない。
+fn assert_total_removal(util_new: &str, extras: &[(&str, &str)], should_block: bool) {
+    assert_total_removal_from(UTIL_OLD, util_new, extras, should_block);
+}
+
+fn assert_total_removal_from(
+    util_old: &str,
+    util_new: &str,
+    extras: &[(&str, &str)],
+    should_block: bool,
+) {
+    let mut files = vec![("tools/util.py", util_old)];
+    files.extend_from_slice(extras);
+    let output = a3_review_hook(
+        |root| std::fs::write(root.join("tools/util.py"), util_new).unwrap(),
+        &files,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("{util_new}\n{extras:?}\n{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(should_block)),
+        "{context}"
+    );
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let (kept, dropped) = if should_block {
+        ("rm", "rm_dead")
+    } else {
+        ("rm_dead", "rm")
+    };
+    let removed = serde_json::json!([{"f": "tools/util.py", "n": "total"}]);
+    assert_eq!(hook["api"][kept], removed, "{context}");
+    assert!(hook["api"].get(dropped).is_none(), "{context}");
+}
+
+/// 関数の中で `global`・`nonlocal` の宣言なしに束縛した同じ名前は、消したモジュール関数を
+/// 指さない (Issue #471)。
+#[test]
+fn python_free_function_removal_ignores_function_local_bindings() {
+    for (util_new, report) in [
+        // Issue の再現と、名前を変えた対照。
+        (UTIL_NEW, "def run():\n    total = 3\n    return total\n"),
+        (UTIL_NEW, "def run():\n    count = 3\n    return count\n"),
+        // 引数・`for`・`with`・`except` の束縛 (それぞれ単独で) と、束縛し直さない内側の関数と、
+        // async・ジェネレータ。
+        (UTIL_NEW, "def run(total):\n    return total\n"),
+        (
+            UTIL_NEW,
+            "def run():\n    for total in range(3):\n        pass\n    return total\n",
+        ),
+        (
+            UTIL_NEW,
+            "def run():\n    with open(__file__) as total:\n        return total\n",
+        ),
+        (
+            UTIL_NEW,
+            "def run():\n    try:\n        pass\n    except Exception as total:\n        return total\n",
+        ),
+        (
+            UTIL_NEW,
+            "def run(total):\n    def inner():\n        return total\n    return inner()\n",
+        ),
+        (
+            UTIL_NEW,
+            "async def run():\n    total = 3\n    return total\n\n\ndef gen():\n    total = 3\n    yield total\n",
+        ),
+        // 同じ名前の裸の引数を持つ別々の関数 (引数の宣言の位置も参照に数えない)。
+        (
+            UTIL_NEW,
+            "def one(total):\n    return total\n\n\ndef two(total):\n    return total + 1\n",
+        ),
+        // 名前を識別子として含まない文字列 (部分一致) は、証明を止めない。
+        (
+            UTIL_NEW,
+            "from typing import Literal\n\n\ndef run(total: Literal[\"subtotal\"]):\n    return total\n",
+        ),
+    ] {
+        assert_total_removal(util_new, &[("tools/report.py", report)], false);
+    }
+    // 削除元と同じモジュールの別の関数の引数とローカルの代入 (`tools/report.py` は無関係)。
+    assert_total_removal_from(
+        &format!("{UTIL_OLD}{SHADOWS}"),
+        &format!("{UTIL_NEW}{SHADOWS}"),
+        &[("tools/report.py", "def run():\n    return 1\n")],
+        false,
+    );
+}
+
+/// 関数のローカル束縛でない同じ名前、宣言のある名前、モジュールの関数に届く経路は、今のとおり
+/// 残る参照に数える (Issue #471)。
+#[test]
+fn python_free_function_removal_keeps_references_that_reach_the_module_function() {
+    let local = "def run():\n    total = 3\n    return total\n";
+    for (util_new, report) in [
+        // 削除元と同じモジュールに、束縛されていない呼び出しが残る。
+        ("def keep():\n    return total(1)\n", local),
+        // 別モジュールの import (呼ばないものを含む) と、別名のモジュールの属性アクセス。
+        (UTIL_NEW, "from tools.util import total as t\n"),
+        (
+            UTIL_NEW,
+            "import tools.util as u\n\n\ndef run():\n    return u.total(1)\n",
+        ),
+        // `global` の宣言と、束縛の無い関数の呼び出しが同じファイルにある。
+        (
+            UTIL_NEW,
+            "def run():\n    global total\n    total = 3\n    return total\n",
+        ),
+        // 右辺の無い括弧付きの注釈は束縛しない (Python では `(total): int` は名前を束縛しない)。
+        (
+            "def keep():\n    (total): int\n    return total(1)\n",
+            local,
+        ),
+        // 既定値・デコレータ・引数の注釈は関数の外で評価される (同じ行の引数とも区別する)。
+        ("def keep(total=total(1)):\n    return total\n", local),
+        (
+            "@total\ndef keep():\n    total = 1\n    return total\n",
+            local,
+        ),
+        (
+            "def keep(x: total(1)):\n    total = 1\n    return total\n",
+            local,
+        ),
+        // 内側の関数の `global` と、関数の中のクラス本体 (先に読む名前はモジュールへ届く)。
+        (
+            "def keep(total):\n    def inner():\n        global total\n        return total(1)\n    return inner()\n",
+            local,
+        ),
+        (
+            "def keep(total):\n    class Holder:\n        saved = total(1)\n        total = 0\n    return Holder\n",
+            local,
+        ),
+        // 文字列の名前で引く経路と、評価されうる文字列の注釈と、f-string の補間の中の呼び出し。
+        (
+            "def keep():\n    total = globals()[\"total\"]\n    return total(1)\n",
+            local,
+        ),
+        ("def keep(total: \"total(1)\"):\n    return total\n", local),
+        ("def keep():\n    return f\"{total(1)}\"\n", local),
+        // 関数の globals の辞書を計算した名前で引く (文字列に名前が現れない)。
+        (
+            "def keep(total):\n    return keep.__globals__[KEY](1)\n\n\nKEY = \"to\" + \"tal\"\n",
+            local,
+        ),
+        // 暗黙の連結・エスケープで綴る文字列の注釈と、`__annotations__` に入れた文字列。
+        (
+            "def keep(total: \"to\" \"tal(1)\"):\n    return total\n",
+            local,
+        ),
+        (
+            "def keep(total: \"\\x74otal(1)\"):\n    return total\n",
+            local,
+        ),
+        (
+            "def keep(total):\n    return total\n\n\nkeep.__annotations__[\"return\"] = \"total(1)\"\n",
+            local,
+        ),
+        // 内包表記と lambda の束縛は証明しない。
+        (
+            UTIL_NEW,
+            "def run():\n    return [total for total in range(3)]\n",
+        ),
+        (UTIL_NEW, "def run():\n    return lambda total: total\n"),
+    ] {
+        assert_total_removal(util_new, &[("tools/report.py", report)], true);
+    }
+}
+
+/// decorator で登録した関数 (pytest の fixture) は引数の名前で要求されるので、同じ名前の引数を
+/// 関数のローカルの束縛として除かない。decorator の無い同じ関数なら除く (対照、Issue #471)。
+#[test]
+fn python_free_function_removal_keeps_parameters_that_request_fixtures() {
+    let fixture_old = "import pytest\n\n\n@pytest.fixture\ndef total():\n    return 1\n\n\ndef keep():\n    return 1\n";
+    let fixture_new = "import pytest\n\n\ndef keep():\n    return 1\n";
+    let extras = [
+        ("conftest.py", "pytest_plugins = (\"tools.util\",)\n"),
+        (
+            "tests/test_report.py",
+            "def test_value(total):\n    assert total == 1\n",
+        ),
+    ];
+    assert_total_removal_from(fixture_old, fixture_new, &extras, true);
+    assert_total_removal_from(
+        &fixture_old.replace("@pytest.fixture\n", ""),
+        fixture_new,
+        &extras,
+        false,
+    );
+}

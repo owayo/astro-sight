@@ -90,6 +90,10 @@ pub(crate) struct RemovedCandidateRef<'a> {
     pub(crate) kind: &'a str,
     pub(super) rust_module_function: Option<super::rust_ref_sites::ModuleFunctionProof>,
     pub(super) rust_member_owner: Option<super::removed_rust_members::RemovedOwnerProof>,
+    /// Python の削除した関数が、削除前のファイルで decorator の無い `def` だけだったか。
+    /// decorator で登録した関数 (pytest の fixture など) は引数の名前で要求されるので
+    /// (`def test_x(total)`)、関数のローカルの束縛も削除した関数を指しうる。
+    pub(super) python_undecorated: bool,
 }
 
 /// `attr` が「削除ファイル `candidate.old_path` のシンボルではなく残存シンボル由来」と
@@ -142,7 +146,12 @@ pub(crate) fn proves_survivor_origin_with_ffi(
                 && super::removed_scope::module_key(path)
                     != super::removed_scope::module_key(candidate.old_path)
         }
-        RefOrigin::LocalValue => candidate.kind == "function" && !candidate.name.contains('.'),
+        RefOrigin::LocalValue => {
+            candidate.kind == "function"
+                && !candidate.name.contains('.')
+                && (path_lang(candidate.old_path) != Some(LangId::Python)
+                    || candidate.python_undecorated)
+        }
         RefOrigin::RustAssociatedMember => {
             attr.ref_lang == Some(LangId::Rust) && candidate.rust_module_function.is_some()
         }
@@ -510,6 +519,7 @@ fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttribution
         independent_positions: super::removed_scope::python_independent_positions(
             root, &source, symbol,
         ),
+        local_positions: super::removed_scope::python_local_positions(root, &source, symbol),
         ..RefAttributionFacts::opaque()
     };
     let aliases = collect_python_import_aliases(root, &source);
@@ -616,7 +626,8 @@ fn collect_python_attribute_receivers(
     // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
     // 証明できない出現を見つけた時点で打ち切る (再帰版の `all` と同じ)。
     let walk = walk_preorder(node, Children::Named, |node, _| {
-        if matches!(node.kind(), "string" | "comment") {
+        // 文字列の中の識別子は f-string の補間 (`f"{search()}"`) の式だけなので、文字列は飛ばさない。
+        if node.kind() == "comment" {
             return ControlFlow::Continue(Walk::Skip);
         }
         if node.kind() != "identifier" || node.utf8_text(source).ok() != Some(symbol) {
@@ -1077,6 +1088,7 @@ mod tests {
                     kind: "method",
                     rust_module_function: None,
                     rust_member_owner: None,
+                    python_undecorated: false,
                 },
             ));
         }
@@ -1088,6 +1100,7 @@ mod tests {
                 kind: "method",
                 rust_module_function: None,
                 rust_member_owner: None,
+                python_undecorated: false,
             },
         ));
     }
@@ -1183,6 +1196,7 @@ mod tests {
             kind,
             rust_module_function: None,
             rust_member_owner: None,
+            python_undecorated: false,
         }
     }
 
@@ -1543,7 +1557,7 @@ mod tests {
         import_only: &mut HashMap<String, bool>,
         out: &mut HashSet<String>,
     ) -> bool {
-        if matches!(node.kind(), "string" | "comment") {
+        if node.kind() == "comment" {
             return true;
         }
         if node.kind() == "identifier" && node.utf8_text(source).ok() == Some(symbol) {
