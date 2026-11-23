@@ -88,6 +88,10 @@ pub(super) struct RefEventMini {
     pub(super) rust_method_syntax: bool,
     /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
     pub(super) rust_explicit_method_owner_id: u32,
+    /// 呼び出し側で確認した具体型名。依存先の名前は空文字、所有元が不明なら u32::MAX。
+    pub(super) rust_call_owner_id: u32,
+    /// マクロ展開先のスコープに移り得る参照には、ファイルの可視性を適用しない。
+    pub(super) rust_private_type_site: bool,
     /// AST and project evidence identify this Rust reference as a standard crate name.
     pub(super) rust_std_origin: bool,
     /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
@@ -358,12 +362,22 @@ pub(super) struct ImpactCollector<'a> {
     /// 標準のマクロの呼び出しを普通の式に書き換えた写し (`rust_path_owner::MacroCopy`)。
     /// 引数の中の参照の所有元の証明だけに使う。
     pub(super) rust_macro_copy: std::cell::OnceCell<Option<super::rust_path_owner::MacroCopy>>,
+    /// 参照ファイルの token tree の範囲。非公開型の参照がマクロの引数の中かを引く (Issue #470)。
+    pub(super) rust_token_trees:
+        std::cell::OnceCell<crate::engine::rust_macro_name::TokenTreeSpans>,
     pub(super) rust_path_owner_project: &'a super::rust_path_owner::RustPathOwnerProjectProof,
     pub(super) rust_source_paths: &'a [Option<PathBuf>],
     pub(super) rust_path_owner_enabled: bool,
     pub(super) rust_std_project_allowed: std::cell::OnceCell<bool>,
     pub(super) rust_std_project: &'a super::rust_std_origin::RustStdProjectProof,
     pub(super) rust_cargo_reachability: &'a super::rust_cargo_reachability::RustCargoReachability,
+    pub(super) rust_owner_sources: &'a [super::rust_path_owner::OwnerSource],
+    pub(super) rust_ref_module:
+        std::cell::OnceCell<Option<std::sync::Arc<super::rust_path_owner::PrivateModule>>>,
+    /// [`Self::owner_layout_proved`] の結果 (参照ファイルごと)。
+    pub(super) rust_ref_unrelocated: std::cell::OnceCell<bool>,
+    pub(super) rust_method_bindings:
+        std::cell::OnceCell<Option<super::rust_owner_alias::MethodBindings>>,
     pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
     pub(super) python_changed_names: &'a std::collections::HashMap<String, usize>,
     pub(super) sym_to_fc: &'a [Vec<u32>],
@@ -638,6 +652,81 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         } else {
             u32::MAX
         };
+        // 変更した inherent メソッドの参照だけ、パスの修飾が指す型の名前を確かめる (Issue #470)。
+        let rust_call_owner_id = if self.ref_lang == Some(LangId::Rust)
+            && !is_import
+            && rust_macro_site.is_none()
+            && self.sym_to_fc[ix].iter().any(|&fc| {
+                self.file_contexts[fc as usize]
+                    .rust_inherent_method_owners
+                    .contains_key(&self.all_symbol_names[ix])
+                    && self.same_owner_package(fc as usize)
+            }) {
+            node.and_then(|node| {
+                let bindings = self
+                    .rust_method_bindings
+                    .get_or_init(|| {
+                        let methods: std::collections::HashSet<_> = self
+                            .file_contexts
+                            .iter()
+                            .enumerate()
+                            .filter(|(fc, ctx)| {
+                                !ctx.rust_inherent_method_owners.is_empty()
+                                    && self.same_owner_package(*fc)
+                            })
+                            .flat_map(|(_, ctx)| {
+                                ctx.rust_inherent_method_owners.keys().map(String::as_str)
+                            })
+                            .collect();
+                        // 別のワーカーが門の失敗を確定させ、対象のメソッドが残らなければ索引を作らない。
+                        if methods.is_empty() {
+                            return None;
+                        }
+                        super::rust_owner_alias::MethodBindings::build(
+                            node,
+                            source,
+                            self.path_str,
+                            self.reference_module()?,
+                            self.rust_path_owner_project,
+                            |name| methods.contains(name),
+                        )
+                    })
+                    .as_ref()?;
+                bindings.call_owner(node)
+            })
+            .map_or(u32::MAX, |owner| {
+                self.pool
+                    .lock()
+                    .expect("string pool mutex poisoned")
+                    .intern(owner)
+            })
+        } else {
+            u32::MAX
+        };
+        let rust_private_type_site = self.ref_lang == Some(LangId::Rust)
+            && self.sym_to_fc.get(ix).is_some_and(|contexts| {
+                contexts.iter().any(|&fc_ix| {
+                    self.file_contexts[fc_ix as usize]
+                        .rust_private_types
+                        .contains(&self.all_symbol_names[ix])
+                })
+            })
+            && match rust_macro_site {
+                // 写しに対応した参照は、書き換えていない token tree の外にある (`MacroCopy::site`)。
+                Some(_) => true,
+                None => node.is_some_and(|node| {
+                    !self
+                        .rust_token_trees
+                        .get_or_init(|| {
+                            let mut root = node;
+                            while let Some(parent) = root.parent() {
+                                root = parent;
+                            }
+                            crate::engine::rust_macro_name::TokenTreeSpans::build(root)
+                        })
+                        .has_ancestor(node)
+                }),
+            };
         let rust_std_origin = self.ref_lang == Some(LangId::Rust)
             && node.is_some_and(|node| {
                 self.rust_std_origin
@@ -927,6 +1016,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_receiver_member,
             rust_method_syntax,
             rust_explicit_method_owner_id,
+            rust_call_owner_id,
+            rust_private_type_site,
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
@@ -1101,6 +1192,47 @@ struct ScopeEvidence {
 }
 
 impl<'a> ImpactCollector<'a> {
+    fn owner_source(&self, fc: usize) -> Option<&super::rust_path_owner::PrivateModule> {
+        self.rust_owner_sources[fc]
+            .get_or_init(|| {
+                self.rust_path_owner_project
+                    .owner_source(&self.file_contexts[fc])
+            })
+            .as_deref()
+    }
+
+    fn reference_module(&self) -> Option<&super::rust_path_owner::PrivateModule> {
+        self.rust_ref_module
+            .get_or_init(|| {
+                self.rust_path_owner_project
+                    .ordinary_private_module(Path::new(self.path_str))
+            })
+            .as_deref()
+    }
+
+    fn same_owner_package(&self, fc: usize) -> bool {
+        !self
+            .rust_path_owner_project
+            .owner_proof_refuted(&self.file_contexts[fc])
+            && self.owner_source(fc).is_some_and(|source| {
+                Path::new(self.path_str).starts_with(&source.src)
+                    && self
+                        .reference_module()
+                        .is_some_and(|reference| reference.src == source.src)
+            })
+    }
+
+    /// 変更元・参照元と差分のほかの Rust ソースを、`#[path]` や `include!` で別のモジュールに
+    /// 入れ得ないか。プロジェクト全体の走査を使うので、所有元で参照を除く直前にだけ確かめる。
+    fn owner_layout_proved(&self) -> bool {
+        *self.rust_ref_unrelocated.get_or_init(|| {
+            self.rust_path_owner_project.changed_sources_unrelocated()
+                && self
+                    .rust_path_owner_project
+                    .unrelocated(Path::new(self.path_str))
+        })
+    }
+
     /// ファイル走査完了時に呼ぶ。buffered events に対して参照位置ごとの
     /// filter を適用し、`local_maps` / `local_def_paths` に push する。バッファは clear して
     /// 次ファイルで再利用する。
@@ -1318,6 +1450,25 @@ impl<'a> ImpactCollector<'a> {
         if e.rust_std_origin && ctx.lang_id == LangId::Rust {
             return true;
         }
+        // 同じクレート内で、呼び出し先が変更した inherent メソッドの所有型から外れる。
+        if e.rust_call_owner_id != u32::MAX
+            && ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && let Some(owners) = ctx.rust_inherent_method_owners.get(name)
+        {
+            let other_owner = {
+                let pool = self.pool.lock().expect("string pool mutex poisoned");
+                let qualifier = pool.get(e.rust_call_owner_id);
+                !owners.iter().any(|owner| owner == qualifier)
+            };
+            if other_owner
+                && self.same_owner_package(fc_ix)
+                && self.owner_layout_proved()
+                && self.rust_path_owner_project.owner_derive_proved(ctx)
+            {
+                return true;
+            }
+        }
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && ctx.rust_free_function_names.contains(name)
@@ -1369,6 +1520,21 @@ impl<'a> ImpactCollector<'a> {
         let name = &all_symbol_names[sym_ix_usize];
         let filter_disabled = evidence.filter_disabled;
         let source_path = &ctx.new_path;
+        if e.rust_private_type_site
+            && !filter_disabled
+            && ctx.rust_private_types.contains(name)
+            && source_path != self.path_str
+            && self
+                .owner_source(fc_ix)
+                .zip(self.reference_module())
+                .is_some_and(|(source, reference)| {
+                    reference.src != source.src || !reference.path.starts_with(&source.path)
+                })
+            && self.owner_layout_proved()
+            && self.rust_path_owner_project.owner_derive_proved(ctx)
+        {
+            return None;
+        }
         let visibility_only_widening = ctx.lang_id == LangId::Rust
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)
@@ -1704,6 +1870,8 @@ mod tests {
             rust_receiver_member: false,
             rust_method_syntax: false,
             rust_explicit_method_owner_id: u32::MAX,
+            rust_call_owner_id: u32::MAX,
+            rust_private_type_site: false,
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
@@ -1859,6 +2027,9 @@ mod tests {
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
             rust_private_method_owners: Default::default(),
+            rust_inherent_method_owners: Default::default(),
+            rust_private_types: Default::default(),
+            rust_owner_derive: false,
             rust_private_widening_names: Default::default(),
             rust_explicit_widenings: Default::default(),
             rust_value_only_constants: Default::default(),

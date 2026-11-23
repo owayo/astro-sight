@@ -395,7 +395,7 @@ pub(super) fn stream_caller_maps_and_defs(
     let string_pool = std::sync::Mutex::new(StringPool::new());
     let python_import_cache = super::python_imports::PythonImportCache::default();
     let rust_std_project = super::rust_std_origin::RustStdProjectProof::new(dir);
-    let rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
+    let mut rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
         dir,
         rust_module_wiring_unchanged,
         rust_private_scope_wiring_unchanged,
@@ -403,6 +403,15 @@ pub(super) fn stream_caller_maps_and_defs(
         rust_diff_files,
         rust_diff_input,
     );
+    for ctx in file_contexts
+        .iter()
+        .filter(|ctx| !ctx.rust_inherent_method_owners.is_empty())
+    {
+        rust_path_owner_project
+            .alias_cache
+            .track_method_source(dir, Path::new(&ctx.new_path));
+    }
+    let rust_owner_sources: Vec<_> = (0..n_fc).map(|_| Default::default()).collect();
     let rust_source_paths = file_contexts
         .iter()
         .map(|context| {
@@ -413,7 +422,6 @@ pub(super) fn stream_caller_maps_and_defs(
         .collect::<Vec<_>>();
     let rust_cargo_reachability =
         super::rust_cargo_reachability::RustCargoReachability::new(dir, cargo_graph_enabled);
-
     let init_state = || new_worker_state(n_fc, n_sym);
 
     let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
@@ -472,6 +480,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
                             rust_macro_copy: std::cell::OnceCell::new(),
+                            rust_token_trees: std::cell::OnceCell::new(),
                             rust_path_owner_project: &rust_path_owner_project,
                             rust_source_paths: &rust_source_paths,
                             rust_path_owner_enabled: options.new_side
@@ -479,6 +488,10 @@ pub(super) fn stream_caller_maps_and_defs(
                             rust_std_project_allowed: std::cell::OnceCell::new(),
                             rust_std_project: &rust_std_project,
                             rust_cargo_reachability: &rust_cargo_reachability,
+                            rust_owner_sources: &rust_owner_sources,
+                            rust_ref_module: Default::default(),
+                            rust_ref_unrelocated: Default::default(),
+                            rust_method_bindings: Default::default(),
                             python_import_cache: &python_import_cache,
                             python_changed_names: sym_ix,
                             sym_to_fc: &sym_to_fc,
@@ -601,6 +614,9 @@ mod tests {
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
             rust_private_method_owners: Default::default(),
+            rust_inherent_method_owners: Default::default(),
+            rust_private_types: Default::default(),
+            rust_owner_derive: false,
             rust_private_widening_names: Default::default(),
             rust_explicit_widenings: Default::default(),
             rust_value_only_constants: Default::default(),

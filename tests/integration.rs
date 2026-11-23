@@ -48,11 +48,13 @@ mod integration {
     mod impact_rust_cargo_reachability;
     mod impact_rust_line_endings;
     mod impact_rust_macro_arguments;
+    mod impact_rust_owner_paths;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
     mod impact_rust_replaced_types;
     mod impact_rust_same_named_constants;
     mod impact_rust_scope;
+    mod impact_rust_type_namespace;
     mod impact_rust_visibility_widening;
     mod impact_ts_barrels;
     mod js_signature_sites;
