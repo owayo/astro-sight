@@ -124,6 +124,8 @@ pub(crate) fn partition_removed_dead_candidates(
         HashMap::new();
     let mut old_rust_members: HashMap<String, Option<super::removed_rust_members::RemovedOwners>> =
         HashMap::new();
+    // 削除前の Python のファイルごとの、decorator の付いた関数の名前 (構文エラーなら None)。
+    let mut python_decorated: HashMap<String, Option<HashSet<String>>> = HashMap::new();
     let mut rust_paths = super::removed_rust_paths::RustPathResolver::new(dir);
     let python_old_paths: HashSet<String> = candidates
         .iter()
@@ -260,6 +262,17 @@ pub(crate) fn partition_removed_dead_candidates(
                     .and_then(|owners| owners.prove(&c.name))
             })
             .flatten(),
+            python_undecorated: c.kind == "function"
+                && !c.name.contains('.')
+                && super::removed_attribution::path_lang(&c.file)
+                    == Some(crate::language::LangId::Python)
+                && python_decorated
+                    .entry(c.file.clone())
+                    .or_insert_with(|| {
+                        super::removed_scope::python_decorated_functions(&base_blobs.read(&c.file)?)
+                    })
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(c.name.as_str())),
         };
         if python_input_complete
             && private_owners.proves_closed_removal(

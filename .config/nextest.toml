@@ -38,6 +38,12 @@ filter = 'binary_id(astro-sight::integration) & test(integration::python_method_
 priority = 50
 threads-required = 2
 
+# Python の自由関数の削除を、関数ローカルの束縛と、モジュールの関数に届く経路の対照で確認する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::python_free_function_removal::)'
+priority = 50
+threads-required = 2
+
 # Python の継承による公開メソッド維持を、削除・未証明・index の対照で確認する。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & test(integration::python_inherited_members::)'

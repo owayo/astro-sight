@@ -3,6 +3,9 @@
 use std::collections::HashSet;
 use tree_sitter::Node;
 
+use crate::engine::lexical_binding::LexicalBinding;
+use crate::engine::python_scope::PythonScopeIndex;
+
 use crate::engine::refs::is_rust_struct_field_non_callable;
 
 pub(super) type Positions = HashSet<(usize, usize)>;
@@ -39,48 +42,7 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
         return Positions::new();
     }
     let all = nodes(root);
-    // 文字列リテラルの名前で属性を読む getattr の呼び出しの、関数名の識別子。識別子から親を
-    // 根から探し直さないよう、call の側から function の子を見る。
-    let literal_getattr: HashSet<usize> = all
-        .iter()
-        .filter(|n| n.kind() == "call")
-        .filter_map(|call| {
-            let function = call.child_by_field_name("function")?;
-            (function.kind() == "identifier"
-                && function.utf8_text(source).ok() == Some("getattr")
-                && python_getattr_reads_literal(*call, source, name))
-            .then(|| function.id())
-        })
-        .collect();
-    for n in &all {
-        if n.is_missing() || n.kind() == "wildcard_import" {
-            return Positions::new();
-        }
-        if n.kind() != "identifier" {
-            continue;
-        }
-        let Ok(s) = n.utf8_text(source) else {
-            continue;
-        };
-        // Python は識別子を NFKC 正規化するので、`ｅｘｅｃ` は `exec` と同じ名前になる。
-        if !s.is_ascii() && !unicode_normalization::is_nfkc(s) {
-            return Positions::new();
-        }
-        if PYTHON_DYNAMIC_NAMES.contains(&s)
-            && !(s == "getattr" && literal_getattr.contains(&n.id()))
-        {
-            return Positions::new();
-        }
-    }
-    // getattr を許したファイルでは、名前空間の辞書や名前で引く属性に届く経路がほかに無いことも
-    // 確かめる。`getattr(locals(), "update")` のように、取り出した値で束縛を書き換えられるため。
-    if !literal_getattr.is_empty()
-        && all.iter().any(|n| {
-            n.kind() == "identifier"
-                && n.utf8_text(source)
-                    .is_ok_and(|s| PYTHON_REFLECTIVE_NAMES.contains(&s))
-        })
-    {
+    if !python_names_are_static(&all, source, name) {
         return Positions::new();
     }
     let definitions: Vec<_> = all
@@ -126,6 +88,239 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
         out.insert(position(node));
     }
     out
+}
+
+/// Python の関数の中で、`global`・`nonlocal` の宣言なしに束縛した名前の出現 (関数のローカル
+/// 束縛に解決する位置)。関数の中の代入・引数・`for` の対象・`with ... as`・`except ... as` で
+/// 束縛した名前は、その関数 (と、名前を束縛し直さない内側の関数) の中ではモジュールの関数を
+/// 指さない。束縛を確かめられない構文 (lambda・内包表記・関数の中の import・`match` など) は
+/// refs と同じ [`PythonScopeIndex`] が証明しない。
+///
+/// 名前でコードや属性を引く経路 (`globals()["x"]`・`keep.__globals__["x"]`・
+/// `operator.methodcaller("x")` など) と、名前を値に含む文字列 (`typing.get_type_hints` が
+/// モジュールで評価する文字列の注釈、`__annotations__` に入れた文字列を含む) は、ローカルの束縛を
+/// 通さずにモジュールの関数へ届くので、あればファイルごと証明しない。
+pub(super) fn python_local_positions(root: Node<'_>, source: &[u8], name: &str) -> Positions {
+    if root.has_error() {
+        return Positions::new();
+    }
+    let all = nodes(root);
+    if !python_names_are_static(&all, source, name)
+        || python_mentions_reflective_name(&all, source)
+        || python_strings_mention(&all, source, name)
+    {
+        return Positions::new();
+    }
+    let Some(index) = PythonScopeIndex::build(root, source) else {
+        return Positions::new();
+    };
+    all.into_iter()
+        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(name))
+        .filter(|n| index.resolve(*n, source) == LexicalBinding::FunctionLocal)
+        .map(position)
+        .collect()
+}
+
+/// 削除前の Python のファイルで、decorator の付いた `def` の名前 (入れ子の `def` を含む)。
+/// decorator で登録した関数 (pytest の fixture など) は、引数の名前で要求されうる
+/// (`def test_x(total)`)。構文エラーなら `None` (どの関数も decorator 付きとみなす)。
+pub(super) fn python_decorated_functions(source: &[u8]) -> Option<HashSet<String>> {
+    let tree = crate::engine::parser::parse_source(source, crate::language::LangId::Python).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    Some(
+        nodes(root)
+            .into_iter()
+            .filter(|n| n.kind() == "decorated_definition")
+            .filter_map(|n| n.child_by_field_name("definition"))
+            .filter(|n| n.kind() == "function_definition")
+            .filter_map(|n| {
+                n.child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()
+                    .map(str::to_owned)
+            })
+            .collect(),
+    )
+}
+
+/// 名前空間の辞書や名前で引く属性に届く名前 ([`PYTHON_REFLECTIVE_NAMES`]) が識別子
+/// (属性名を含む) として現れるか。
+fn python_mentions_reflective_name(all: &[Node<'_>], source: &[u8]) -> bool {
+    all.iter().any(|n| {
+        n.kind() == "identifier"
+            && n.utf8_text(source)
+                .is_ok_and(|s| PYTHON_REFLECTIVE_NAMES.contains(&s))
+    })
+}
+
+/// 文字列リテラル (隣り合う文字列の暗黙の連結は連結した値) が、`name` を識別子として含むか。
+/// 値はエスケープを解き、Python が識別子に施す NFKC で正規化してから比べる (`"\x74otal"`・
+/// `"to" "tal(int)"`・全角の綴り)。解けないエスケープ (`\N{...}`) は含むとみなす。f-string の
+/// 補間は区切りとして扱う (補間の中のコードは識別子として別に数えられる)。
+fn python_strings_mention(all: &[Node<'_>], source: &[u8], name: &str) -> bool {
+    all.iter().any(|n| match n.kind() {
+        "string" | "concatenated_string" => {
+            python_string_value(*n, source).is_none_or(|value| mentions_identifier(&value, name))
+        }
+        _ => false,
+    })
+}
+
+/// `string` / `concatenated_string` の値。エスケープを解けないときは `None`。
+fn python_string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut value = String::new();
+    let mut cursor = node.walk();
+    if node.kind() == "concatenated_string" {
+        for part in node.named_children(&mut cursor) {
+            if part.kind() == "string" {
+                value.push_str(&python_string_value(part, source)?);
+            }
+        }
+        return Some(value);
+    }
+    let mut raw = false;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_start" => {
+                raw = child
+                    .utf8_text(source)
+                    .ok()?
+                    .chars()
+                    .any(|c| matches!(c, 'r' | 'R'));
+            }
+            "string_content" => {
+                value.push_str(&python_unescape(child.utf8_text(source).ok()?, raw)?);
+            }
+            // 補間の値は分からない。名前の一部としてつながらないよう区切る。
+            "interpolation" => value.push('\0'),
+            _ => {}
+        }
+    }
+    Some(value)
+}
+
+/// Python の文字列リテラルのエスケープを解く。`\N{...}` (文字の名前) は解かずに `None`。
+/// bytes リテラルの `\u` も解く (値を広く取るほど、名前を含むとみなす側に倒れる)。
+fn python_unescape(text: &str, raw: bool) -> Option<String> {
+    if raw || !text.contains('\\') {
+        return Some(text.to_owned());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(escape) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        let mut code = |digits: usize, radix: u32, first: Option<char>| -> Option<char> {
+            let mut text: String = first.into_iter().collect();
+            while text.len() < digits {
+                match chars.peek() {
+                    Some(c) if c.is_digit(radix) => text.push(chars.next()?),
+                    _ if radix == 8 && !text.is_empty() => break,
+                    _ => return None,
+                }
+            }
+            char::from_u32(u32::from_str_radix(&text, radix).ok()?)
+        };
+        match escape {
+            '\n' => {}
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\\' | '\'' | '"' => out.push(escape),
+            'a' => out.push('\x07'),
+            'b' => out.push('\x08'),
+            'f' => out.push('\x0c'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\x0b'),
+            '0'..='7' => out.push(code(3, 8, Some(escape))?),
+            'x' => out.push(code(2, 16, None)?),
+            'u' => out.push(code(4, 16, None)?),
+            'U' => out.push(code(8, 16, None)?),
+            'N' => return None,
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// NFKC で正規化した `value` に、`name` が識別子の区切り (英数字と `_` 以外) で囲まれて現れるか。
+fn mentions_identifier(value: &str, name: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let value: String = value.nfkc().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    value.match_indices(name).any(|(start, matched)| {
+        value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident(c))
+            && value[start + matched.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_ident(c))
+    })
+}
+
+/// 未知の束縛を作る・名前でコードや属性を引く経路が無く、識別子を綴りで照合できるか
+/// (`all` はファイルの全ノード)。`getattr` は、文字列リテラルで `name` 以外の名前を渡す呼び出し
+/// だけを許す。
+fn python_names_are_static(all: &[Node<'_>], source: &[u8], name: &str) -> bool {
+    // 文字列リテラルの名前で属性を読む getattr の呼び出しの、関数名の識別子。識別子から親を
+    // 根から探し直さないよう、call の側から function の子を見る。
+    let literal_getattr: HashSet<usize> = all
+        .iter()
+        .filter(|n| n.kind() == "call")
+        .filter_map(|call| {
+            let function = call.child_by_field_name("function")?;
+            (function.kind() == "identifier"
+                && function.utf8_text(source).ok() == Some("getattr")
+                && python_getattr_reads_literal(*call, source, name))
+            .then(|| function.id())
+        })
+        .collect();
+    for n in all {
+        if n.is_missing() || n.kind() == "wildcard_import" {
+            return false;
+        }
+        if n.kind() != "identifier" {
+            continue;
+        }
+        let Ok(s) = n.utf8_text(source) else {
+            continue;
+        };
+        // Python は識別子を NFKC 正規化するので、`ｅｘｅｃ` は `exec` と同じ名前になる。
+        if !s.is_ascii() && !unicode_normalization::is_nfkc(s) {
+            return false;
+        }
+        if PYTHON_DYNAMIC_NAMES.contains(&s)
+            && !(s == "getattr" && literal_getattr.contains(&n.id()))
+        {
+            return false;
+        }
+    }
+    // getattr を許したファイルでは、名前空間の辞書や名前で引く属性に届く経路がほかに無いことも
+    // 確かめる。`getattr(locals(), "update")` のように、取り出した値で束縛を書き換えられるため。
+    literal_getattr.is_empty()
+        || !all.iter().any(|n| {
+            n.kind() == "identifier"
+                && n.utf8_text(source)
+                    .is_ok_and(|s| PYTHON_REFLECTIVE_NAMES.contains(&s))
+        })
 }
 
 /// 未知の束縛を作る・名前でコードや属性を引く経路の名前。識別子として現れたら、どのファイルでも
@@ -538,6 +733,60 @@ mod tests {
             );
             assert!(abort_positions(&src).is_empty(), "{src}");
         }
+    }
+
+    /// 文字列の値に名前が識別子として現れるか。エスケープ・暗黙の連結・NFKC を解いて比べ、
+    /// 計算して作る名前 (`'to' + 'tal'`) と補間をはさむ綴りは今回の範囲の外。
+    #[test]
+    fn python_strings_mention_reads_literal_values() {
+        let mentions = |body: &str| {
+            let src = format!("def keep(total):\n    {body}\n");
+            let tree = crate::engine::parser::parse_source(
+                src.as_bytes(),
+                crate::language::LangId::Python,
+            )
+            .unwrap();
+            assert!(!tree.root_node().has_error(), "{src}");
+            python_strings_mention(&nodes(tree.root_node()), src.as_bytes(), "total")
+        };
+        for body in [
+            "return 'total'",
+            "return \"total(1)\"",
+            "return 'to' 'tal(1)'",
+            "return '\\x74otal'",
+            "return '\\164otal'",
+            "return '\\u0074otal'",
+            "return '\\N{LATIN SMALL LETTER T}otal'",
+            "return 'ｔｏｔａｌ'",
+            "return 'tools.util.total'",
+            "return f'{x}total'",
+            "return f'{\"total\"}'",
+            "return b'total'",
+        ] {
+            assert!(mentions(body), "{body}");
+        }
+        for body in [
+            "return 'subtotal'",
+            "return 'totally'",
+            "return r'\\x74otal'",
+            "return 'tot' 'al_x'",
+            "return 'to' + 'tal'",
+            "return f'to{x}tal'",
+        ] {
+            assert!(!mentions(body), "{body}");
+        }
+    }
+
+    /// decorator の付いた `def` は、入れ子・メソッドも含めて名前を返す。構文エラーなら返さない。
+    #[test]
+    fn python_decorated_functions_lists_registered_defs() {
+        let src = "import pytest\n\n@pytest.fixture\ndef total():\n    return 1\n\ndef keep():\n    @cache\n    def inner():\n        pass\n    return inner\n\nclass C:\n    @staticmethod\n    def method():\n        pass\n";
+        let names = python_decorated_functions(src.as_bytes()).unwrap();
+        assert_eq!(
+            names,
+            HashSet::from(["total", "inner", "method"].map(String::from))
+        );
+        assert!(python_decorated_functions(b"def broken(:\n").is_none());
     }
 
     /// ループ版が、浅い入力のすべてのノードで再帰版と同じ判定を返す。
