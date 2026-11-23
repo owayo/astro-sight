@@ -15,6 +15,7 @@ pub(crate) mod rust_cargo_reachability;
 mod rust_const_value;
 mod rust_impl_owner;
 mod rust_line_endings;
+mod rust_owner_alias;
 mod rust_path_owner;
 mod rust_reexport_owner;
 pub(crate) mod rust_std_origin;
@@ -212,6 +213,13 @@ struct FileContext {
     rust_private_root_names: HashSet<String>,
     /// Private inherent method candidates; a value proves the same owner on both sides.
     rust_private_method_owners: HashMap<String, String>,
+    /// 新旧とも定義モジュールの外に公開していない型。
+    rust_private_types: HashSet<String>,
+    rust_owner_derive: bool,
+    /// 変更したメソッドの名前 (`ci_key` 正規化済み) ごとの、inherent メソッドの所有型の名前 (旧新の
+    /// 和集合)。旧新とも同名の宣言がすべて inherent メソッドのときだけ持つ (`pass1`)。所有型と違う型の
+    /// パスの呼び出し (`Other::new()`) を外す証明に使う (`rust_owner_alias`)。
+    rust_inherent_method_owners: HashMap<String, Vec<String>>,
     /// Names whose entire source edit only widens a direct private Rust item.
     rust_private_widening_names: HashSet<String>,
     rust_explicit_widenings: HashMap<String, rust_visibility_scope::ExplicitWidening>,

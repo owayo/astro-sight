@@ -518,6 +518,49 @@ pub(super) fn rust_private_inherent_method(
         .flatten()
 }
 
+/// inherent impl (trait の無い `impl`) の直下のメソッドなら、所有型の名前
+/// を返す。修飾した型や別名は所有元を確定できない。
+pub(super) fn rust_inherent_method_owner<'a>(
+    root: Node<'_>,
+    source: &'a [u8],
+    symbol: &Symbol,
+) -> Option<&'a str> {
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return None;
+    }
+    let method = super::descendant_for_range(root, &symbol.range)?;
+    if method.kind() != "function_item"
+        || method
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            != Some(symbol.name.as_str())
+    {
+        return None;
+    }
+    let body = method
+        .parent()
+        .filter(|node| node.kind() == "declaration_list")?;
+    let implementation = body.parent().filter(|node| node.kind() == "impl_item")?;
+    if implementation.child_by_field_name("trait").is_some() {
+        return None;
+    }
+    if implementation.parent()? != root
+        || super::rust_path_owner::has_attribute_prefix(implementation)
+        || super::rust_path_owner::has_attribute_prefix(method)
+    {
+        return None;
+    }
+    let owner = implementation.child_by_field_name("type")?;
+    let owner = if owner.kind() == "generic_type" {
+        owner.child_by_field_name("type")?
+    } else {
+        owner
+    };
+    (owner.kind() == "type_identifier")
+        .then(|| owner.utf8_text(source).ok())
+        .flatten()
+}
+
 /// ファイル直下の inherent impl に直接属する、実体のあるメソッドだけを追加候補にする。
 /// owner の綴りから型の同一性は証明しない。旧側の同名項目は別途すべて保留する。
 fn rust_is_root_inherent_method(root: Node<'_>, source: &[u8], symbol: &Symbol) -> bool {

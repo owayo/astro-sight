@@ -559,13 +559,34 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         t.elapsed().as_millis(),
     );
 
-    let (rust_private_root_names, rust_private_method_owners) = if lang_id == LangId::Rust {
-        let old =
-            collect_old_rust_private_symbols(file_diff, &df.new_path, &source).unwrap_or_default();
-        rust_private_symbols_of_changes(&old, df, root, &source, &syms, &affected)
-    } else {
-        (HashSet::new(), HashMap::new())
-    };
+    let in_place = df.old_path == df.new_path && !root.has_error();
+    let old = (lang_id == LangId::Rust)
+        .then(|| collect_old_rust_private_symbols(file_diff, &df.new_path, &source, in_place))
+        .flatten();
+    let new_bindings = old
+        .as_ref()
+        .filter(|old| old.closed_root)
+        .and_then(|_| ordinary_private_bindings(root, &source));
+    let (rust_private_types, rust_inherent_method_owners, rust_owner_derive) = old
+        .as_ref()
+        .zip(new_bindings)
+        .map(|(old, mut bindings)| {
+            bindings.variants.extend(old.variant_names.iter().cloned());
+            let private = private_nominal_changes(old, root, &source, &syms, &affected, &bindings);
+            let mut owners =
+                rust_inherent_method_owners(old, root, &source, &syms, &affected, &bindings);
+            let derive = old.derive || bindings.derive;
+            if derive {
+                // Debug の derive が生成する trait メソッドも同名の宣言になり得る。
+                owners.remove("fmt");
+            }
+            (private, owners, derive)
+        })
+        .unwrap_or_default();
+    let (rust_private_root_names, rust_private_method_owners) = old
+        .as_ref()
+        .map(|old| rust_private_symbols_of_changes(old, df, root, &source, &syms, &affected))
+        .unwrap_or_default();
 
     // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
     // ループの外で 1 度だけ組み立てる。
@@ -670,6 +691,9 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
             rust_kind_changes: declaration_proof.rust_kind_changes,
             rust_private_root_names,
             rust_private_method_owners,
+            rust_inherent_method_owners,
+            rust_private_types,
+            rust_owner_derive,
             rust_private_widening_names,
             rust_explicit_widenings,
             rust_value_only_constants: declaration_proof
@@ -759,8 +783,80 @@ fn add_derived_contract_declarations<'s>(
 /// どちらも旧い版のファイルで名前が 1 つだけのもの (impl の所有者の合成シンボルは数えない)。
 #[derive(Default)]
 struct OldRustPrivateSymbols {
+    explicit_names: HashSet<String>,
+    closed_root: bool,
+    derive: bool,
+    variant_names: HashSet<String>,
     root_names: HashSet<String>,
     method_owners: HashMap<String, String>,
+    /// 旧い版の名前ごとの inherent メソッドの所有型 ([`rust_inherent_owners_by_name`])。
+    inherent_owners: HashMap<String, Option<BTreeSet<String>>>,
+}
+
+/// 名前 (`r#` を外して正規化) ごとの、inherent メソッドの所有型の名前の集合。その名前の宣言に
+/// inherent メソッドでないもの (自由関数、trait の宣言・実装のメソッド、型、定数など) が 1 つでも
+/// あれば `None`。ブロック内の impl もブロック外から呼べるので、入れ子の同名宣言も保留する。
+fn rust_inherent_owners_by_name(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    syms: &[Symbol],
+    nominal: &HashSet<&str>,
+) -> HashMap<String, Option<BTreeSet<String>>> {
+    let mut owners_by_name: HashMap<String, Option<BTreeSet<String>>> = HashMap::new();
+    for symbol in syms {
+        let owner = declaration::rust_inherent_method_owner(root, source, symbol)
+            .filter(|name| nominal.contains(name));
+        let slot = owners_by_name
+            .entry(ci_key(LangId::Rust, &symbol.name))
+            .or_insert_with(|| Some(BTreeSet::new()));
+        match (slot.as_mut(), owner) {
+            (Some(owners), Some(owner)) => {
+                owners.insert(ci_key(LangId::Rust, owner));
+            }
+            _ => *slot = None,
+        }
+    }
+    owners_by_name
+}
+
+/// 変更したメソッドの名前ごとの、inherent メソッドの所有型の名前 (旧新の和集合、昇順)。
+///
+/// 旧い版と新しい版のどちらでも、その名前の宣言がすべて inherent メソッドのときだけ持つ。自由関数や
+/// trait のメソッドが同じ名前にあれば、所有型と違う修飾のパスがそれを指し得るので持たない。
+/// 旧い版の所有型も入れるのは、impl の所有型を書き換えた変更で、旧い所有型のパスの呼び出しを
+/// 残すため。
+fn rust_inherent_method_owners(
+    old: &OldRustPrivateSymbols,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    syms: &[Symbol],
+    affected: &[AffectedSymbol],
+    bindings: &RootBindings<'_>,
+) -> HashMap<String, Vec<String>> {
+    let new_owners = rust_inherent_owners_by_name(root, source, syms, &bindings.nominal);
+    let mut result = HashMap::new();
+    for change in affected {
+        if !matches!(change.kind.as_str(), "function" | "method") {
+            continue;
+        }
+        let key = ci_key(LangId::Rust, &change.name);
+        if result.contains_key(&key) || bindings.variants.contains(&key) {
+            continue;
+        }
+        let Some(Some(new)) = new_owners.get(&key) else {
+            continue;
+        };
+        let mut owners = new.clone();
+        match old.inherent_owners.get(&key) {
+            Some(Some(old)) => owners.extend(old.iter().cloned()),
+            Some(None) => continue,
+            None => {}
+        }
+        if !owners.is_empty() {
+            result.insert(key, owners.into_iter().collect());
+        }
+    }
+    result
 }
 
 /// 差分を new 側へ逆適用して旧い版を復元し、非公開の名前と所有元を集める。復元・構文解析・
@@ -769,6 +865,7 @@ fn collect_old_rust_private_symbols(
     file_diff: &str,
     new_path: &str,
     source: &[u8],
+    in_place: bool,
 ) -> Option<OldRustPrivateSymbols> {
     let old = diff::reconstruct_old_source(file_diff, new_path, source)?;
     let tree = parser::parse_source(&old.source, LangId::Rust).ok()?;
@@ -807,10 +904,142 @@ fn collect_old_rust_private_symbols(
                 .map(|owner| (symbol.name.clone(), owner))
         })
         .collect();
-    Some(OldRustPrivateSymbols {
+    let mut old_symbols = OldRustPrivateSymbols {
         root_names,
         method_owners,
+        ..Default::default()
+    };
+    if in_place && let Some(bindings) = ordinary_private_bindings(old_root, &old.source) {
+        old_symbols.derive = bindings.derive;
+        old_symbols.variant_names = bindings.variants;
+        old_symbols.closed_root = true;
+        old_symbols.explicit_names = counts
+            .keys()
+            .map(|name| ci_key(LangId::Rust, name))
+            .collect();
+        old_symbols.inherent_owners =
+            rust_inherent_owners_by_name(old_root, &old.source, &old_syms, &bindings.nominal);
+    }
+    Some(old_symbols)
+}
+
+struct RootBindings<'a> {
+    nominal: HashSet<&'a str>,
+    variants: HashSet<String>,
+    derive: bool,
+}
+
+/// 非公開の glob は外部向けの名前を作らない。公開の再エクスポートや項目を生成する構文は保留する。
+fn ordinary_private_bindings<'a>(
+    root: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<RootBindings<'a>> {
+    if (memchr::memmem::find(source, b"path").is_some()
+        || memchr::memmem::find(source, b"include").is_some())
+        && crate::engine::rust_dynamic_source::tree_includes_external_source(root, source)
+    {
+        return None;
+    }
+    let mut cursor = root.walk();
+    let mut nominal = HashSet::new();
+    let mut derive = false;
+    let mut unconditional = true;
+    for item in root.named_children(&mut cursor) {
+        match item.kind() {
+            "attribute_item" | "inner_attribute_item" => {
+                let names = super::rust_std_origin::safe_attribute(item, source)?;
+                if names == ["Debug", "derive"] {
+                    derive = true;
+                } else if names.is_empty() {
+                    unconditional = false;
+                } else {
+                    return None;
+                }
+                continue;
+            }
+            "line_comment" | "block_comment" => continue,
+            "use_declaration" => {
+                let mut children = item.walk();
+                if item
+                    .named_children(&mut children)
+                    .any(|child| child.kind() == "visibility_modifier")
+                {
+                    return None;
+                }
+            }
+            "struct_item" | "enum_item" | "union_item" => {
+                if unconditional {
+                    nominal.insert(item.child_by_field_name("name")?.utf8_text(source).ok()?);
+                }
+            }
+            "impl_item" | "function_item" | "type_item" | "const_item" | "static_item"
+            | "trait_item" | "mod_item" => {}
+            _ => return None,
+        }
+        unconditional = true;
+    }
+    Some(RootBindings {
+        nominal,
+        variants: variant_names(root, source),
+        derive,
     })
+}
+
+fn variant_names(root: tree_sitter::Node<'_>, source: &[u8]) -> HashSet<String> {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    let mut names = HashSet::new();
+    let _: std::ops::ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        if node.kind() == "enum_variant"
+            && let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+        {
+            names.insert(ci_key(LangId::Rust, name));
+        }
+        std::ops::ControlFlow::Continue(Walk::Descend)
+    });
+    names
+}
+
+/// 新側の一意な非公開型と、旧側で同名の外部向け宣言が無かったことを照合する。
+fn private_nominal_changes(
+    old: &OldRustPrivateSymbols,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    symbols: &[Symbol],
+    affected: &[AffectedSymbol],
+    bindings: &RootBindings<'_>,
+) -> HashSet<String> {
+    let mut private = HashSet::new();
+    for change in affected
+        .iter()
+        .filter(|change| matches!(change.kind.as_str(), "struct" | "enum" | "union"))
+    {
+        let key = ci_key(LangId::Rust, &change.name);
+        if bindings.variants.contains(&key) {
+            continue;
+        }
+        if old.explicit_names.contains(&key) && !old.root_names.contains(&change.name) {
+            continue;
+        }
+        let mut named = symbols.iter().filter(|sym| {
+            ci_key(LangId::Rust, &sym.name) == key && !rust_impl_owner::is_impl_owner(root, sym)
+        });
+        if let Some(sym) = named.next()
+            && named.next().is_none()
+            && let Some(item) = super::descendant_for_range(root, &sym.range)
+            && item.parent() == Some(root)
+            && matches!(item.kind(), "struct_item" | "enum_item" | "union_item")
+            && item
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .is_some_and(|name| bindings.nominal.contains(name))
+            && !symbols::is_symbol_exported(root, source, LangId::Rust, sym.identity_range())
+        {
+            private.insert(key);
+        }
+    }
+    private
 }
 
 /// 変更したシンボルのうち、旧新とも非公開のファイル直下の宣言 (名前が新しい版で 1 つだけ) の
@@ -933,5 +1162,56 @@ fn revoke_value_only_constants_with_changed_types(file_contexts: &mut [FileConte
                 })
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(source: &str) -> (tree_sitter::Tree, Vec<Symbol>) {
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error(), "{source}");
+        let syms =
+            symbols::extract_symbols(tree.root_node(), source.as_bytes(), LangId::Rust).unwrap();
+        (tree, syms)
+    }
+
+    /// 所有型の集合を持つのは、同じ名前の宣言がすべて inherent メソッドの名前だけ (Issue #470)。
+    #[test]
+    fn inherent_owners_need_every_same_named_declaration_to_be_an_inherent_method() {
+        let source = "struct A;\nstruct B;\nstruct W<T>(T);\nimpl A {\n    fn new() -> Self { A }\n    fn only_a(&self) {}\n}\nimpl B {\n    fn new() -> Self { B }\n}\nimpl<T> W<T> {\n    fn generic(&self) {}\n}\nimpl m::Scoped {\n    fn scoped(&self) {}\n}\ntrait T {\n    fn in_trait(&self);\n    fn provided(&self) {}\n}\nimpl T for A {\n    fn in_trait(&self) {}\n}\nfn free() {}\nimpl A {\n    fn free(&self) {}\n}\nimpl <Vec<A> as IntoIterator>::Item {\n    fn projected(&self) {}\n}\nimpl dyn T {\n    fn on_object(&self) {}\n}\nimpl &A {\n    fn on_reference(&self) {}\n}\nfn outer() {\n    fn only_a() {}\n}\n";
+        let (tree, syms) = parsed(source);
+        let bindings = ordinary_private_bindings(tree.root_node(), source.as_bytes()).unwrap();
+        let owners = rust_inherent_owners_by_name(
+            tree.root_node(),
+            source.as_bytes(),
+            &syms,
+            &bindings.nominal,
+        );
+        let expect = |name: &str, expected: Option<&[&str]>| {
+            let expected = expected.map(|names| {
+                names
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<BTreeSet<_>>()
+            });
+            assert_eq!(owners.get(name), Some(&expected), "{name}");
+        };
+        expect("new", Some(&["A", "B"]));
+        expect("only_a", None);
+        expect("generic", Some(&["W"]));
+        expect("scoped", None);
+        // trait の宣言・実装のメソッド、同じ名前の自由関数、名前 1 つで表せない型の impl。
+        for name in [
+            "in_trait",
+            "provided",
+            "free",
+            "projected",
+            "on_object",
+            "on_reference",
+        ] {
+            expect(name, None);
+        }
     }
 }

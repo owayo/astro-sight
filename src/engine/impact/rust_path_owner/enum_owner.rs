@@ -3,10 +3,13 @@
 use super::*;
 use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_use_tree_edges_ast};
 
+/// 配置を変え得るディレクトリの一覧と、`literal_includes` で受け入れた `include!` があったか。
+/// `literal_includes` が偽なら `include!` を 1 つでも見つけた時点で `None`。
 pub(super) fn static_layout(
     root: &Path,
     project: &RustPathOwnerProjectProof,
-) -> Option<Vec<PathBuf>> {
+    literal_includes: bool,
+) -> Option<(Vec<PathBuf>, bool)> {
     let root = root.canonicalize().ok()?;
     if root
         .ancestors()
@@ -48,6 +51,7 @@ pub(super) fn static_layout(
     }
     let mut pending = vec![root.clone()];
     let mut relocated = Vec::new();
+    let mut included = false;
     let mut candidates = Vec::new();
     let mut candidate_bytes = 0usize;
     while let Some(directory) = pending.pop() {
@@ -78,8 +82,9 @@ pub(super) fn static_layout(
                     .to_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
             {
-                let manifest = read_input_text_file(&file)?;
-                let targets = RustTargets::parse(&manifest, directory.strip_prefix(&root).ok()?)?;
+                let package = directory.strip_prefix(&root).ok()?;
+                let manifest = project.alias_cache.manifest(&root, package)?;
+                let targets = RustTargets::from_manifest(&manifest, package)?;
                 if !targets.roots_complete {
                     return None;
                 }
@@ -121,6 +126,20 @@ pub(super) fn static_layout(
                                 node, &source,
                             )
                         {
+                            if literal_includes
+                                && let Some(target) = literal_include(node, &source, &file, &root)
+                                && let Some(base) = file
+                                    .ancestors()
+                                    .skip(1)
+                                    .find(|base| target.starts_with(base))
+                            {
+                                // 取り込み先と元の両方のモジュール配置を保留する。
+                                relocated.push(base.to_owned());
+                                included = true;
+                                return std::ops::ControlFlow::Continue(
+                                    crate::engine::tree_walk::Walk::Skip,
+                                );
+                            }
                             return std::ops::ControlFlow::Break(());
                         }
                         if matches!(node.kind(), "attribute" | "token_tree")
@@ -140,14 +159,18 @@ pub(super) fn static_layout(
                             let Some(parent) = target.parent() else {
                                 return std::ops::ControlFlow::Break(());
                             };
+                            // `#[path]` で読んだファイルは名前によらず mod.rs と同じく、子の `mod` を
+                            // 自分のディレクトリから探す (`bridge.rs` の `mod calls;` は隣の
+                            // `calls.rs`)。子の `mod` を持ち得るなら、取り込み先のディレクトリごと
+                            // 保留する。
+                            let children = target.file_name().is_some_and(|name| name == "mod.rs")
+                                || may_declare_child_modules(&target);
                             relocated.push(target.clone());
-                            relocated.push(
-                                if target.file_name().is_some_and(|name| name == "mod.rs") {
-                                    parent.to_owned()
-                                } else {
-                                    target.with_extension("")
-                                },
-                            );
+                            relocated.push(if children {
+                                parent.to_owned()
+                            } else {
+                                target.with_extension("")
+                            });
                         }
                         if node.kind() == "identifier"
                             && name(node, &source) == Some("include")
@@ -188,7 +211,77 @@ pub(super) fn static_layout(
             }
         }
     }
-    Some(relocated)
+    Some((relocated, included))
+}
+
+/// `#[path]` で読んだファイルが子の `mod` を宣言し得るか。外部の `mod x;` か、マクロの引数や定義の
+/// 中に `mod` の綴りがある (展開で子の `mod` を作り得る) とき。読めなければ真。
+fn may_declare_child_modules(target: &Path) -> bool {
+    let Some(source) = read_input_file(target) else {
+        return true;
+    };
+    let Ok(tree) = parser::parse_source(&source, LangId::Rust) else {
+        return true;
+    };
+    let root = tree.root_node();
+    root.has_error()
+        || crate::engine::tree_walk::any_node(
+            root,
+            crate::engine::tree_walk::Children::Named,
+            |node| {
+                (node.kind() == "mod_item" && node.child_by_field_name("body").is_none())
+                    || (node.kind() == "token_tree"
+                        && node.utf8_text(&source).is_ok_and(|text| {
+                            text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|word| word == "mod")
+                        }))
+            },
+        )
+}
+
+fn literal_include(node: Node<'_>, source: &[u8], file: &Path, root_dir: &Path) -> Option<PathBuf> {
+    if node.kind() != "macro_invocation" || last_macro_identifier(node, source)? != "include" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let arguments = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")?;
+    let mut cursor = arguments.walk();
+    let mut tokens = arguments.named_children(&mut cursor);
+    let literal = tokens.next()?;
+    if literal.kind() != "string_literal" || tokens.next().is_some() {
+        return None;
+    }
+    let raw = literal
+        .utf8_text(source)
+        .ok()?
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    if raw.contains('\\') || Path::new(raw).is_absolute() || !raw.ends_with(".rs") {
+        return None;
+    }
+    let target = file.parent()?.join(raw).canonicalize().ok()?;
+    // ネストした取り込みや外部 mod の基準ディレクトリは、元ファイルだけでは決まらない。
+    if super::under_root_git_or_target(target.strip_prefix(root_dir).ok()?) {
+        return None;
+    }
+    let data = read_input_file(&target)?;
+    let tree = parser::parse_source(&data, LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error()
+        || crate::engine::tree_walk::any_node(
+            root,
+            crate::engine::tree_walk::Children::Named,
+            |n| {
+                n.kind() == "mod_item" && n.child_by_field_name("body").is_none()
+                    || crate::engine::rust_dynamic_source::node_includes_external_source(n, &data)
+            },
+        )
+    {
+        return None;
+    }
+    Some(target)
 }
 
 fn path_target(attribute: Node<'_>, source: &[u8], file: &Path) -> Option<PathBuf> {

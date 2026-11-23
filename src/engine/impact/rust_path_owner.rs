@@ -166,6 +166,14 @@ pub(super) enum ImportNamespace {
     Type,
 }
 
+pub(super) type OwnerSource = OnceLock<Option<Arc<PrivateModule>>>;
+
+pub(super) struct PrivateModule {
+    pub(super) src: PathBuf,
+    pub(super) path: Vec<String>,
+    pub(super) library_only: bool,
+}
+
 pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
     pub(super) canonical_root: Option<PathBuf>,
@@ -179,7 +187,17 @@ pub(super) struct RustPathOwnerProjectProof {
     macro_definitions: OnceLock<Option<HashSet<String>>>,
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
+    /// `include!` を 1 つも許さない配置 ([`enum_owner::static_layout`])。
     static_source_layout: OnceLock<Option<Vec<PathBuf>>>,
+    /// 文字列リテラルの `include!` の取り込み先と元を保留して許す配置と、それを受け入れたか。
+    /// 片方の結果からもう片方を導けるときは、走査をやり直さない ([`Self::static_layout`])。
+    private_layout: OnceLock<Option<(Vec<PathBuf>, bool)>>,
+    private_modules: Mutex<HashMap<PathBuf, Option<Arc<PrivateModule>>>>,
+    relocation: Mutex<HashMap<PathBuf, bool>>,
+    changed_sources_unrelocated: OnceLock<bool>,
+    pub(super) alias_cache: super::rust_owner_alias::PackageCache,
+    owner_changes: OnceLock<Vec<PathBuf>>,
+    owner_derive_safe: OnceLock<bool>,
     no_glob_imports: OnceLock<bool>,
     widening_glob_imports: OnceLock<Option<HashSet<String>>>,
     parent_glob_widening_sources: OnceLock<bool>,
@@ -237,6 +255,13 @@ impl RustPathOwnerProjectProof {
             safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             static_source_layout: OnceLock::new(),
+            private_layout: OnceLock::new(),
+            private_modules: Mutex::new(HashMap::new()),
+            relocation: Mutex::new(HashMap::new()),
+            changed_sources_unrelocated: OnceLock::new(),
+            alias_cache: Default::default(),
+            owner_changes: OnceLock::new(),
+            owner_derive_safe: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
             widening_glob_imports: OnceLock::new(),
             parent_glob_widening_sources: OnceLock::new(),
@@ -262,12 +287,246 @@ impl RustPathOwnerProjectProof {
                 .get_or_init(|| scan_ordinary_sources(&self.root))
     }
 
-    fn allows_static_source_path(&self, path: &Path) -> bool {
-        let Some(relocated) = self
-            .static_source_layout
-            .get_or_init(|| enum_owner::static_layout(&self.root, self))
+    /// 変更元と参照元を、manifest と mod の宣言だけで通常の Cargo ソースのモジュールに結び付ける。
+    /// `#[path]` や `include!` で別のモジュールにも入るファイルかは [`Self::unrelocated`] で
+    /// 別に確かめる (プロジェクト全体の走査なので、除外を決める直前にだけ使う)。
+    pub(super) fn ordinary_private_module(&self, file: &Path) -> Option<Arc<PrivateModule>> {
+        if let Some(found) = self
+            .private_modules
+            .lock()
+            .expect("private module cache poisoned")
+            .get(file)
+        {
+            return found.clone();
+        }
+        let result = (|| {
+            let package = file
+                .ancestors()
+                .find(|ancestor| self.root.join(ancestor).join("Cargo.toml").is_file())?;
+            let manifest = self.alias_cache.manifest(&self.root, package)?;
+            let metadata = manifest.get("package")?;
+            if metadata.get("autolib").and_then(toml::Value::as_bool) == Some(false)
+                || manifest
+                    .get("lib")
+                    .and_then(|lib| lib.get("path"))
+                    .is_some()
+            {
+                return None;
+            }
+            // 入れ子の package では外側の通常の mod から内側のソースに到達し得る。
+            for ancestor in package.ancestors().skip(1) {
+                let manifest = self.root.join(ancestor).join("Cargo.toml");
+                if manifest.exists() {
+                    let value = self.alias_cache.manifest(&self.root, ancestor)?;
+                    if value.get("package").is_some() || value.get("project").is_some() {
+                        return None;
+                    }
+                }
+            }
+            let src = package.join("src");
+            let root_name = file.strip_prefix(&src).ok()?;
+            let mut modules = root_name
+                .iter()
+                .map(|part| part.to_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            let filename = modules.pop()?;
+            let stem = filename.strip_suffix(".rs")?;
+            if modules.first().is_some_and(|part| part == "bin")
+                || modules.is_empty() && stem == "mod"
+            {
+                return None;
+            }
+            if stem != "mod" && (!modules.is_empty() || !matches!(stem, "lib" | "main")) {
+                modules.push(stem.to_owned());
+            }
+            let library_only = self.module_roots(file, &src, &modules)?;
+            Some(Arc::new(PrivateModule {
+                src,
+                path: modules,
+                library_only,
+            }))
+        })();
+        self.private_modules
+            .lock()
+            .expect("private module cache poisoned")
+            .insert(file.to_owned(), result.clone());
+        result
+    }
+
+    /// `file` が、ほかのソースの `#[path]` や `include!` で別のモジュールにも入り得ないか。
+    pub(super) fn unrelocated(&self, file: &Path) -> bool {
+        if let Some(&found) = self
+            .relocation
+            .lock()
+            .expect("relocation cache poisoned")
+            .get(file)
+        {
+            return found;
+        }
+        let result = self.static_layout(true).is_some_and(|relocated| {
+            self.root
+                .join(file)
+                .canonicalize()
+                .is_ok_and(|absolute| !relocated.iter().any(|path| absolute.starts_with(path)))
+        });
+        self.relocation
+            .lock()
+            .expect("relocation cache poisoned")
+            .insert(file.to_owned(), result);
+        result
+    }
+
+    /// 差分の Rust ソース (変更元と、[`Self::owner_source`] が許した本体だけの変更) のどれも、
+    /// 別のモジュールに入り得ないか。
+    pub(super) fn changed_sources_unrelocated(&self) -> bool {
+        *self.changed_sources_unrelocated.get_or_init(|| {
+            self.reexport_old_sources
+                .keys()
+                .all(|path| self.unrelocated(path))
+        })
+    }
+
+    /// lib と main の最初の mod が同じファイルを指したら、以降の宣言列は共有する。
+    fn module_roots(&self, file: &Path, src: &Path, modules: &[String]) -> Option<bool> {
+        let lib = src.join("lib.rs");
+        let main = src.join("main.rs");
+        let declares = |path: &Path, name: &str| -> Option<bool> {
+            if !checked_is_file(&self.root, path)? {
+                return Some(false);
+            }
+            match self
+                .alias_cache
+                .module(&self.root, path)?
+                .external_modules
+                .get(name)
+            {
+                None => Some(false),
+                Some(1) => Some(true),
+                _ => None,
+            }
+        };
+        let Some(first) = modules.first() else {
+            let name = file.file_stem()?.to_str()?;
+            if declares(&lib, name)? || declares(&main, name)? {
+                return None;
+            }
+            return Some(file == lib);
+        };
+        let library = declares(&lib, first)?;
+        let binary = declares(&main, first)?;
+        if !library && !binary {
+            return None;
+        }
+        let mut directory = src.to_owned();
+        let mut parent: Option<PathBuf> = None;
+        for module in modules {
+            if let Some(path) = &parent
+                && !declares(path, module)?
+            {
+                return None;
+            }
+            directory.push(module);
+            let normal = directory.with_extension("rs");
+            let nested = directory.join("mod.rs");
+            parent = Some(
+                match (
+                    checked_is_file(&self.root, &normal)?,
+                    checked_is_file(&self.root, &nested)?,
+                ) {
+                    (true, false) => normal,
+                    (false, true) => nested,
+                    _ => return None,
+                },
+            );
+        }
+        (parent.as_deref() == Some(file)).then_some(library && !binary)
+    }
+
+    pub(super) fn owner_source(&self, ctx: &super::FileContext) -> Option<Arc<PrivateModule>> {
+        let file = Path::new(&ctx.new_path);
+        if !self.reexport_cargo_enabled
+            || (ctx.rust_inherent_method_owners.is_empty() && ctx.rust_private_types.is_empty())
+        {
+            return None;
+        }
+        if self.reexport_old_sources.len() > 1
+            && self
+                .owner_changes
+                .get_or_init(|| {
+                    self.reexport_old_sources
+                        .iter()
+                        .filter(|(path, old)| {
+                            !old.as_deref()
+                                .zip(read_input_file(&self.root.join(path)))
+                                .is_some_and(|(old, new)| {
+                                    super::rust_owner_alias::plain_function_body_edit(old, &new)
+                                        && self.ordinary_private_module(path).is_some()
+                                })
+                        })
+                        .map(|(p, _)| p.clone())
+                        .collect()
+                })
+                .iter()
+                .any(|changed| changed != file)
+        {
+            return None;
+        }
+        if ctx.rust_owner_derive && !self.private_scope_wiring_unchanged {
+            return None;
+        }
+        self.ordinary_private_module(file)
+    }
+
+    /// 除外の直前に確かめる配置 ([`Self::changed_sources_unrelocated`]) か derive
+    /// ([`Self::owner_derive_proved`]) が、すでに失敗と分かっているか。分かっていれば、以降の参照
+    /// ファイルで呼び出しの索引を作らない (まだ確かめていないものは確かめない)。
+    pub(super) fn owner_proof_refuted(&self, ctx: &super::FileContext) -> bool {
+        self.changed_sources_unrelocated.get() == Some(&false)
+            || (ctx.rust_owner_derive && self.owner_derive_safe.get() == Some(&false))
+    }
+
+    /// 変更元の `#[derive(Debug)]` を、どのソースも import・マクロ定義・外部の glob で差し替えて
+    /// いないか (derive が無ければ真)。プロジェクト全体の走査なので、除外を決める直前にだけ使う。
+    pub(super) fn owner_derive_proved(&self, ctx: &super::FileContext) -> bool {
+        !ctx.rust_owner_derive
+            || *self
+                .owner_derive_safe
+                .get_or_init(|| static_placement_bindings(&self.root, false).is_some())
+    }
+
+    /// プロジェクトのソースの配置 (配置を変え得るディレクトリの一覧)。`literal_includes` なら
+    /// 文字列リテラルの `include!` を、取り込み先と元のディレクトリを保留して許す。
+    ///
+    /// 2 つの走査は `include!` を見つけたときだけ分かれる。許す側の結果で 1 つも受け入れて
+    /// いなければ、許さない側も同じ一覧になり、受け入れていれば許さない側は `None` になる。
+    /// 許さない側の結果が `Some` なら `include!` は無く、許す側も同じ一覧になる。先に計算した側の
+    /// 結果から導けるときは、プロジェクト全体の走査をやり直さない。
+    fn static_layout(&self, literal_includes: bool) -> Option<&Vec<PathBuf>> {
+        if literal_includes {
+            if let Some(Some(plain)) = self.static_source_layout.get() {
+                return Some(plain);
+            }
+            return self
+                .private_layout
+                .get_or_init(|| enum_owner::static_layout(&self.root, self, true))
+                .as_ref()
+                .map(|(relocated, _)| relocated);
+        }
+        if let Some(layout) = self.private_layout.get() {
+            return match layout {
+                Some((relocated, false)) => Some(relocated),
+                _ => None,
+            };
+        }
+        self.static_source_layout
+            .get_or_init(|| {
+                enum_owner::static_layout(&self.root, self, false).map(|(relocated, _)| relocated)
+            })
             .as_ref()
-        else {
+    }
+
+    fn allows_static_source_path(&self, path: &Path) -> bool {
+        let Some(relocated) = self.static_layout(false) else {
             return false;
         };
         let Some(file) = self.root.join(path).canonicalize().ok() else {
@@ -2074,12 +2333,16 @@ fn scan_safe_private_import_environment(root: &Path) -> bool {
 /// ことも確かめる (差し替えた derive は任意の item を作れる)。配置を変えられないときは、関数の
 /// 本体の外の `use` が束縛する名前を返す (import のパスの module 名の別名を見つけるため)。
 fn scan_static_module_placement(root: &Path) -> Option<HashSet<String>> {
+    static_placement_bindings(root, true)
+}
+
+fn static_placement_bindings(root: &Path, check_manifests: bool) -> Option<HashSet<String>> {
     let mut shadowable_names = HashSet::new();
     let mut defined_macros = HashSet::new();
     let mut imported_names = HashSet::new();
     let mut module_bindings = HashSet::new();
     let mut external_glob = false;
-    let placed = scan_safe_source_environment(root, |source| {
+    let placed = scan_project_sources(root, check_manifests, |source| {
         // 属性とマクロは `#` か `!` を含む。`use` と `extern crate` は綴りで見つける。
         if memchr::memchr2(b'#', b'!', source).is_none()
             && memchr::memmem::find(source, b"use").is_none()
@@ -3991,5 +4254,110 @@ mod tests {
             resolved += usize::from(iterative.is_some_and(|segments| segments.len() > 1));
         }
         assert!(resolved >= 8, "修飾パスを含む: {resolved}");
+    }
+
+    /// `include!` を許す配置と許さない配置は、どちらを先に計算しても、それぞれを単独で走査した
+    /// 結果と同じになる (Issue #470)。
+    #[test]
+    fn static_layouts_agree_in_either_order() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/a.rs"), "pub fn helper() {}\n").unwrap();
+        // (lib.rs, 許さない側が Some か, 許す側が Some か)
+        for (lib, plain_some, literal_some) in [
+            ("#[path = \"a.rs\"]\nmod moved;\n", true, true),
+            ("mod copy {\n    include!(\"a.rs\");\n}\n", false, true),
+            ("include!(concat!(\"a\", \".rs\"));\n", false, false),
+        ] {
+            std::fs::write(root.path().join("src/lib.rs"), lib).unwrap();
+            let fresh =
+                || RustPathOwnerProjectProof::new(root.path(), false, false, false, &[], "");
+            let plain = super::enum_owner::static_layout(root.path(), &fresh(), false)
+                .map(|(relocated, _)| relocated);
+            let literal = super::enum_owner::static_layout(root.path(), &fresh(), true)
+                .map(|(relocated, _)| relocated);
+            assert_eq!(
+                (plain.is_some(), literal.is_some()),
+                (plain_some, literal_some),
+                "{lib}"
+            );
+            if plain_some {
+                assert!(plain.as_ref().is_some_and(|list| !list.is_empty()), "{lib}");
+            }
+            for plain_first in [true, false] {
+                let project = fresh();
+                let (first, second) = if plain_first {
+                    (project.static_layout(false), project.static_layout(true))
+                } else {
+                    (project.static_layout(true), project.static_layout(false))
+                };
+                let (got_plain, got_literal) = if plain_first {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                assert_eq!(got_plain, plain.as_ref(), "{lib} plain_first={plain_first}");
+                assert_eq!(
+                    got_literal,
+                    literal.as_ref(),
+                    "{lib} plain_first={plain_first}"
+                );
+            }
+        }
+    }
+
+    /// `#[path]` で読んだファイルが子の `mod` を宣言し得るなら、そのディレクトリごと配置を保留する
+    /// (mod.rs と同じく、子を自分のディレクトリから探すため)。子の無いファイルはファイルだけ。
+    #[test]
+    fn static_layout_holds_the_directory_of_a_path_target_with_child_modules() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join("shared")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "#[path = \"../shared/bridge.rs\"]\nmod bridge;\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("shared/calls.rs"), "pub fn call() {}\n").unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let shared = canonical.join("shared");
+        for (bridge, holds_directory) in [
+            ("mod calls;\n", true),
+            (
+                "macro_rules! child { () => { mod calls; }; }\nchild!();\n",
+                true,
+            ),
+            ("pub fn bridge() { calls(); }\nfn calls() {}\n", false),
+        ] {
+            std::fs::write(root.path().join("shared/bridge.rs"), bridge).unwrap();
+            let project = RustPathOwnerProjectProof::new(root.path(), false, false, false, &[], "");
+            let relocated = project.static_layout(true).unwrap().clone();
+            assert_eq!(
+                relocated.contains(&shared),
+                holds_directory,
+                "{bridge}: {relocated:?}"
+            );
+            assert!(
+                relocated
+                    .iter()
+                    .any(|path| shared.join("bridge.rs").starts_with(path)),
+                "{bridge}: {relocated:?}"
+            );
+            assert_eq!(
+                project.unrelocated(std::path::Path::new("shared/calls.rs")),
+                !holds_directory,
+                "{bridge}"
+            );
+        }
     }
 }

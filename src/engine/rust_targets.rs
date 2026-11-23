@@ -19,6 +19,10 @@ impl RustTargets {
     /// not the analysis root.
     pub(crate) fn parse(text: &str, package_dir: &Path) -> Option<Self> {
         let manifest = toml::from_str::<toml::Value>(text).ok()?;
+        Self::from_manifest(&manifest, package_dir)
+    }
+
+    pub(crate) fn from_manifest(manifest: &toml::Value, package_dir: &Path) -> Option<Self> {
         let table = manifest.as_table()?;
         let package_value = table.get("package").or_else(|| table.get("project"));
         let package = package_value.and_then(toml::Value::as_table);

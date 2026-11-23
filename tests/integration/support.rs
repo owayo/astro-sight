@@ -26,6 +26,20 @@ impl TestRepo {
         self.root().join(relative)
     }
 
+    pub(super) fn caller_source_line(&self, caller: &serde_json::Value) -> String {
+        let path = self.path(caller["path"].as_str().unwrap());
+        let path = camino::Utf8Path::from_path(&path).unwrap();
+        let source = astro_sight::engine::parser::read_file(path).unwrap();
+        let line = usize::try_from(caller["line"].as_u64().unwrap()).unwrap();
+        std::str::from_utf8(source.as_bytes())
+            .unwrap()
+            .lines()
+            .nth(line)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
     pub(super) fn create_dir_all(&self, relative: impl AsRef<Path>) {
         std::fs::create_dir_all(self.path(relative)).expect("failed to create fixture directory");
     }
