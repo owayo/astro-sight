@@ -92,6 +92,9 @@ pub(super) struct RefEventMini {
     pub(super) rust_call_owner_id: u32,
     /// マクロ展開先のスコープに移り得る参照には、ファイルの可視性を適用しない。
     pub(super) rust_private_type_site: bool,
+    /// Rust: 参照の名前を、参照元のクレートのそのモジュールで解決すると構文から言えるか
+    /// ([`super::rust_macro_site::macro_site`])。言えなければ別のクレートの参照として除かない。
+    pub(super) rust_name_site: super::rust_macro_site::MacroSite,
     /// AST and project evidence identify this Rust reference as a standard crate name.
     pub(super) rust_std_origin: bool,
     /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
@@ -703,6 +706,33 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         } else {
             u32::MAX
         };
+        // マクロの位置は、非公開の自由関数の除外の候補 (`rust_private_root_functions`) の参照でだけ
+        // 求める (ほかでは使わない。参照ごとに根までの内側の属性を読み直さない)。
+        let rust_private_function_candidate = self.sym_to_fc.get(ix).is_some_and(|contexts| {
+            contexts.iter().any(|&fc_ix| {
+                self.file_contexts[fc_ix as usize]
+                    .rust_private_root_functions
+                    .contains(&self.all_symbol_names[ix])
+            })
+        });
+        let rust_name_site = match (node, rust_format_capture) {
+            (Some(node), _)
+                if self.ref_lang == Some(LangId::Rust) && rust_private_function_candidate =>
+            {
+                super::rust_macro_site::macro_site(node, source)
+            }
+            (Some(_), _) if self.ref_lang == Some(LangId::Rust) => {
+                super::rust_macro_site::MacroSite::Unknown
+            }
+            // 書式の暗黙キャプチャは書式のマクロの引数の中にある。文字列から読んだ参照
+            // (`#[serde(default = "crate::translate")]`) は、属性の文字列が公開マクロの本体で別の
+            // クレートへ運ばれ得るので、名前を解決する場所を決めない。
+            (None, _) if self.ref_lang == Some(LangId::Rust) => {
+                super::rust_macro_site::MacroSite::Unknown
+            }
+            (None, Some(_)) => super::rust_macro_site::MacroSite::Unknown,
+            _ => super::rust_macro_site::MacroSite::Plain,
+        };
         let rust_private_type_site = self.ref_lang == Some(LangId::Rust)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
                 contexts.iter().any(|&fc_ix| {
@@ -1018,6 +1048,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_explicit_method_owner_id,
             rust_call_owner_id,
             rust_private_type_site,
+            rust_name_site,
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
@@ -1171,6 +1202,11 @@ struct RefFileEvidence<'a> {
     /// 変更元 × シンボル × 名前空間ごとの、直接 import が別の所有元を指すかの証明。
     rust_private_import_owners:
         HashMap<(usize, usize, super::rust_path_owner::ImportNamespace), bool>,
+    /// 変更元ごとの、参照ファイルが変更元の非公開の関数を名指せない別のクレートにあるか
+    /// ([`ImpactCollector::private_function_unreachable`])。
+    rust_private_function_unreachable: HashMap<usize, bool>,
+    /// 参照ファイルの `define_class!` が objc2 0.6 のものか ([`ImpactCollector::define_class_verified`])。
+    rust_define_class: std::cell::OnceCell<bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
 }
 
@@ -1220,6 +1256,60 @@ impl<'a> ImpactCollector<'a> {
                         .reference_module()
                         .is_some_and(|reference| reference.src == source.src)
             })
+    }
+
+    /// 参照ファイルが、変更元 `fc` の非公開の関数を名指せない別のクレートにあるか (Issue #472)。
+    /// 参照ファイルが変更元と別の package (proc-macro のクレートでない) にあり、参照元から変更元へ
+    /// Cargo の path の依存でたどり着けないこと、どのファイルも `#[path]`・`include!` で別のモジュールに
+    /// 入らないことを確かめる。参照の名前を参照元のクレートで解決すること (マクロで別のクレートへ
+    /// 運ばれないこと) は、参照ごとに [`super::rust_macro_site::macro_site`] で確かめる。参照元が
+    /// 変更元に依存すると、変更元の公開の別名 (`pub const CALL: fn(u8) = super::translate; pub use
+    /// CALL as translate;`) や `#[macro_export]` のマクロを経て、参照元の `translate(..)` が変更した
+    /// 関数に着き得る。
+    fn private_function_unreachable(&self, fc: usize) -> bool {
+        self.owner_source(fc)
+            .zip(self.reference_module())
+            .is_some_and(|(source, reference)| {
+                reference.src != source.src
+                    && source.src.parent().zip(reference.src.parent()).is_some_and(
+                        |(owner, referrer)| {
+                            // proc-macro のクレートのコードは、使う側のクレートで展開される。
+                            self.rust_path_owner_project.is_proc_macro_package(referrer)
+                                == Some(false)
+                                && self
+                                    .rust_path_owner_project
+                                    .package_reaches(referrer, owner)
+                                    == Some(false)
+                        },
+                    )
+            })
+            && self.owner_layout_proved()
+            // 木の中の `macro_rules!` は、字句を組み立てて変更元のファイルを参照元のクレートに
+            // 取り込み得る (`include!`・`#[path]`・子の `mod`)。木の中に 1 つも無いときだけ除く。
+            && self.rust_path_owner_project.macro_free()
+            && self
+                .rust_path_owner_project
+                .owner_derive_proved(&self.file_contexts[fc])
+    }
+
+    /// 参照ファイルの `define_class!` が objc2 0.6 のものか: ファイルの裸の `define_class!` が
+    /// `objc2` から import した名前だけを指し ([`super::rust_macro_site::define_class_imported`])、
+    /// 参照元の package が registry の `objc2` 0.6 に依存し、木のどこにも `macro_rules!
+    /// define_class` が無い。
+    fn define_class_verified(&self, source: &[u8]) -> bool {
+        let Some(reference) = self.reference_module() else {
+            return false;
+        };
+        let Some(package) = reference.src.parent() else {
+            return false;
+        };
+        crate::engine::parser::parse_source(source, LangId::Rust)
+            .ok()
+            .is_some_and(|tree| {
+                !tree.root_node().has_error()
+                    && super::rust_macro_site::define_class_imported(tree.root_node(), source)
+            })
+            && self.rust_path_owner_project.objc2_define_class(package) == Some(true)
     }
 
     /// 変更元・参照元と差分のほかの Rust ソースを、`#[path]` や `include!` で別のモジュールに
@@ -1356,6 +1446,8 @@ impl<'a> ImpactCollector<'a> {
             rust_private_widening_child: HashMap::new(),
             rust_explicit_widening_scope: HashMap::new(),
             rust_private_import_owners: HashMap::new(),
+            rust_private_function_unreachable: HashMap::new(),
+            rust_define_class: std::cell::OnceCell::new(),
             rust_ref_source: std::cell::OnceCell::new(),
         }
     }
@@ -1597,6 +1689,30 @@ impl<'a> ImpactCollector<'a> {
         let visibility_only_informational = private_visibility_informational
             || explicit_visibility_informational
             || parent_glob_visibility_informational;
+        if ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && !filters::is_same_source_file(self.path_str, source_path)
+            && ctx.rust_private_root_functions.contains(name)
+            && *evidence
+                .rust_private_function_unreachable
+                .entry(fc_ix)
+                .or_insert_with(|| self.private_function_unreachable(fc_ix))
+            && (e.rust_name_site == super::rust_macro_site::MacroSite::Plain
+                || (e.rust_name_site == super::rust_macro_site::MacroSite::DefineClassBody
+                    && *evidence.rust_define_class.get_or_init(|| {
+                        evidence
+                            .rust_ref_source
+                            .get_or_init(|| {
+                                crate::engine::bounded_read::read_input_file(
+                                    &Path::new(self.dir).join(self.path_str),
+                                )
+                            })
+                            .as_ref()
+                            .is_some_and(|source| self.define_class_verified(source))
+                    })))
+        {
+            return None;
+        }
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)
@@ -1872,6 +1988,7 @@ mod tests {
             rust_explicit_method_owner_id: u32::MAX,
             rust_call_owner_id: u32::MAX,
             rust_private_type_site: false,
+            rust_name_site: super::super::rust_macro_site::MacroSite::Plain,
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
@@ -2026,6 +2143,7 @@ mod tests {
             jsx_prop_changes: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
+            rust_private_root_functions: Default::default(),
             rust_private_method_owners: Default::default(),
             rust_inherent_method_owners: Default::default(),
             rust_private_types: Default::default(),

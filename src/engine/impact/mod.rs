@@ -15,6 +15,7 @@ pub(crate) mod rust_cargo_reachability;
 mod rust_const_value;
 mod rust_impl_owner;
 mod rust_line_endings;
+mod rust_macro_site;
 mod rust_owner_alias;
 mod rust_path_owner;
 mod rust_reexport_owner;
@@ -211,6 +212,9 @@ struct FileContext {
     /// Direct file-root Rust declarations whose current visibility is private.
     /// Ambiguous same-name declarations are excluded from this proof.
     rust_private_root_names: HashSet<String>,
+    /// `rust_private_root_names` のうち、旧新とも名前を束縛し直さない組み込みの属性だけの
+    /// ファイル直下の関数 (別のクレートからは名指せない。Issue #472)。
+    rust_private_root_functions: HashSet<String>,
     /// Private inherent method candidates; a value proves the same owner on both sides.
     rust_private_method_owners: HashMap<String, String>,
     /// 新旧とも定義モジュールの外に公開していない型。

@@ -191,7 +191,7 @@ impl Eq for HidesCache {}
 /// inode で表す。Windows の `canonicalize` (GetFinalPathNameByHandleW) は、保存された綴りの長い名前を
 /// 返すので、そのパスで表す。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EntryId(
+pub(crate) struct EntryId(
     #[cfg(unix)] (u64, u64),
     #[cfg(not(unix))] std::path::PathBuf,
 );
@@ -212,7 +212,7 @@ fn entry_id(path: &std::path::Path, metadata: &std::fs::Metadata) -> Option<Entr
 }
 
 /// `path` を開いた [`EntryId`]。
-fn open_entry_id(path: &std::path::Path) -> Option<EntryId> {
+pub(crate) fn open_entry_id(path: &std::path::Path) -> Option<EntryId> {
     entry_id(path, &std::fs::metadata(path).ok()?)
 }
 

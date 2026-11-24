@@ -613,6 +613,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
+            rust_private_root_functions: Default::default(),
             rust_private_method_owners: Default::default(),
             rust_inherent_method_owners: Default::default(),
             rust_private_types: Default::default(),

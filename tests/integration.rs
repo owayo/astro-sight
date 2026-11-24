@@ -49,6 +49,7 @@ mod integration {
     mod impact_rust_line_endings;
     mod impact_rust_macro_arguments;
     mod impact_rust_owner_paths;
+    mod impact_rust_private_cross_crate;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
     mod impact_rust_replaced_types;

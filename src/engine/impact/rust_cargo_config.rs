@@ -51,6 +51,9 @@ const BUILD_KEYS: &[&str] = &[
     "warnings",
 ];
 
+/// `[resolver]` で許すキー。lockfile の置き場所を変える `lockfile-path` は許さない。
+const RESOLVER_KEYS: &[&str] = &["incompatible-rust-versions", "feature-unification"];
+
 /// `[target.<triple>]`・`[target.<cfg>]` で許すキー。build script の出力の上書き
 /// (`[target.<triple>.<links>]`) は許さない。
 const TARGET_KEYS: &[&str] = &["linker", "runner", "rustdocflags", "rustflags"];
@@ -102,13 +105,7 @@ impl CargoConfigProof {
         let observable = !crate::git_support::is_inside_index_snapshot(root)
             && environment_keeps_compilation(std::env::vars_os());
         let home = observable
-            .then(|| {
-                cargo_home(
-                    std::env::var_os("CARGO_HOME"),
-                    || std::env::current_dir().ok(),
-                    std::env::home_dir,
-                )
-            })
+            .then(|| cargo_home(std::env::var_os("CARGO_HOME"), std::env::home_dir))
             .flatten();
         // cargo-util の `paths::ancestors` と同じく `env::var` で読む (UTF-8 でなければ止めない)。
         Self::new(
@@ -134,6 +131,11 @@ impl CargoConfigProof {
             stopped = stopped || self.stop.as_deref() == Some(*ancestor);
             take
         })
+    }
+
+    /// `$CARGO_HOME` (環境を観測できないときは `None`)。
+    pub(crate) fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
     }
 
     /// Cargo が `package_root` で読む設定が、どれも依存の取得元とコンパイラを変えないと
@@ -178,21 +180,17 @@ pub(super) fn absolute_package_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Cargo (`home` クレート) と同じ規則の `$CARGO_HOME`。空でない `CARGO_HOME` (相対なら
-/// カレントディレクトリから)、無ければホームの `.cargo`。
+/// Cargo (`home` クレート) と同じ規則の `$CARGO_HOME`。空でない `CARGO_HOME`、無ければホームの
+/// `.cargo`。相対の `CARGO_HOME` は Cargo を起動するディレクトリから解く (解析と別のディレクトリから
+/// 起動した Cargo は別の home を読む) ので、決めない (`None`)。
 fn cargo_home(
     variable: Option<OsString>,
-    current_dir: impl FnOnce() -> Option<PathBuf>,
     home_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     match variable.filter(|home| !home.is_empty()) {
         Some(home) => {
             let home = PathBuf::from(home);
-            if home.is_absolute() {
-                Some(home)
-            } else {
-                Some(current_dir()?.join(home))
-            }
+            home.is_absolute().then_some(home)
         }
         None => Some(home_dir()?.join(".cargo")),
     }
@@ -219,8 +217,16 @@ fn variable_keeps_compilation(name: &str, value: Option<&str>) -> bool {
     };
     if COMPILER_VARIABLES.contains(&name.as_str()) {
         value == Some("")
-    } else if name.starts_with("CARGO_UNSTABLE_") {
+    } else if name.starts_with("CARGO_UNSTABLE_")
+        // 取得元を差し替える設定 (`source`・`patch`・`replace` の表) を環境変数で与えるもの。
+        || name.starts_with("CARGO_SOURCE_")
+        || name.starts_with("CARGO_PATCH_")
+        || name.starts_with("CARGO_REPLACE_")
+    {
         false
+    } else if name.starts_with("CARGO_ALIAS_") {
+        // alias の引数の `--config` は、起動した Cargo の `patch`・`source` を上書きする。
+        value.is_some_and(|alias| !alias.contains("--config"))
     } else if name == "RUSTFLAGS" || (name.starts_with("CARGO_") && name.ends_with("_RUSTFLAGS")) {
         // `CARGO_ENCODED_RUSTFLAGS` は 0x1f 区切り
         value.is_some_and(|flags| {
@@ -267,8 +273,10 @@ fn config_keeps_sources(text: &str) -> bool {
     let Ok(config) = toml::from_str::<toml::Table>(text) else {
         return false;
     };
-    // 文字列のエスケープ (`"--ex\u0074ern"`) を解いた後の値で調べる
+    // 文字列のエスケープ (`"--ex\u0074ern"`) を解いた後の値で調べる。`--config` (`[alias]` の
+    // 引数) は、起動した Cargo の設定 (`patch`・`source`) を上書きする。
     !table_mentions_extern(&config)
+        && !mentions_text(&toml::Value::Table(config.clone()), "--config")
         && config.iter().all(|(key, value)| match key.as_str() {
             "env" => env_table_keeps_compilation(value),
             "build" => {
@@ -284,6 +292,8 @@ fn config_keeps_sources(text: &str) -> bool {
             "profile" => value
                 .as_table()
                 .is_some_and(|profiles| profiles.values().all(profile_keeps_sources)),
+            // `lockfile-path` は Cargo が読む lockfile (依存の解決の結果) を差し替える。
+            "resolver" => keys_within(value, RESOLVER_KEYS),
             key => TOP_LEVEL_KEYS.contains(&key),
         })
 }
@@ -299,6 +309,18 @@ fn mentions_extern(value: &toml::Value) -> bool {
         toml::Value::String(text) => text.contains("--extern"),
         toml::Value::Array(items) => items.iter().any(mentions_extern),
         toml::Value::Table(table) => table_mentions_extern(table),
+        _ => false,
+    }
+}
+
+/// 設定のキーか値 (文字列) のどこかに `needle` があるか。
+fn mentions_text(value: &toml::Value, needle: &str) -> bool {
+    match value {
+        toml::Value::String(text) => text.contains(needle),
+        toml::Value::Array(items) => items.iter().any(|item| mentions_text(item, needle)),
+        toml::Value::Table(table) => table
+            .iter()
+            .any(|(key, value)| key.contains(needle) || mentions_text(value, needle)),
         _ => false,
     }
 }
@@ -366,6 +388,9 @@ mod tests {
             "[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+https://mirror.example.com/index/\"\n",
             "paths = [\"../anyhow\"]\n",
             "include = [\"shared.toml\"]\n",
+            // `[alias]` の引数の `--config` は、起動した Cargo の `patch`・`source` を上書きする
+            "[alias]\ncheck-local = [\"check\", \"-p\", \"b\", \"--config\", \"patch.crates-io.c.path='c'\"]\n",
+            "[alias]\nlocal = \"check --config=patch.crates-io.c.path='c'\"\n",
             "[unstable]\nbuild-std = [\"std\"]\n",
             "[host]\nlinker = \"cc\"\n",
             "[made-up]\nkey = 1\n",
@@ -647,29 +672,22 @@ mod tests {
     fn cargo_home_follows_the_cargo_rules() {
         let absolute = tempfile::tempdir().unwrap();
         let absolute = absolute.path().join("cargo-home");
-        let cwd = || Some(PathBuf::from("cwd"));
         let home = || Some(PathBuf::from("user"));
         assert_eq!(
-            cargo_home(Some(absolute.clone().into_os_string()), cwd, home),
+            cargo_home(Some(absolute.clone().into_os_string()), home),
             Some(absolute)
         );
+        // 相対の `CARGO_HOME` は、Cargo を起動するディレクトリで変わるので決めない。
+        assert_eq!(cargo_home(Some(OsString::from("relative")), home), None);
         assert_eq!(
-            cargo_home(Some(OsString::from("relative")), cwd, home),
-            Some(Path::new("cwd").join("relative"))
-        );
-        assert_eq!(
-            cargo_home(Some(OsString::new()), cwd, home),
+            cargo_home(Some(OsString::new()), home),
             Some(Path::new("user").join(".cargo"))
         );
         assert_eq!(
-            cargo_home(None, cwd, home),
+            cargo_home(None, home),
             Some(Path::new("user").join(".cargo"))
         );
-        assert_eq!(cargo_home(None, cwd, || None), None);
-        assert_eq!(
-            cargo_home(Some(OsString::from("relative")), || None, home),
-            None
-        );
+        assert_eq!(cargo_home(None, || None), None);
     }
 
     #[test]
@@ -692,6 +710,7 @@ mod tests {
             // toolchain の選択とライブラリの検索パスは、コンパイラの差し替えとして扱わない
             ("RUSTUP_TOOLCHAIN", "1.99.0"),
             ("LD_LIBRARY_PATH", "/opt/lib"),
+            ("CARGO_ALIAS_B", "build"),
         ]));
         for variables in [
             [("RUSTC_WRAPPER", "sccache")],
@@ -702,6 +721,12 @@ mod tests {
             [("DYLD_INSERT_LIBRARIES", "/tmp/shim.dylib")],
             [("CARGO_BUILD_RUSTC_WRAPPER", "sccache")],
             [("CARGO_UNSTABLE_BUILD_STD", "std")],
+            [(
+                "CARGO_ALIAS_LOCALCHECK",
+                "check -p b --config patch.crates-io.c.path='c'",
+            )],
+            [("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "mirror")],
+            [("CARGO_PATCH_CRATES_IO_C_PATH", "c")],
             [("RUSTFLAGS", "--extern anyhow=/tmp/libanyhow.rlib")],
             [("CARGO_BUILD_RUSTFLAGS", "-C opt-level=1 @flags.txt")],
             [(
