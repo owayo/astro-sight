@@ -189,12 +189,19 @@ pub(super) struct RustPathOwnerProjectProof {
     no_source_inclusion: OnceLock<bool>,
     /// `include!` を 1 つも許さない配置 ([`enum_owner::static_layout`])。
     static_source_layout: OnceLock<Option<Vec<PathBuf>>>,
-    /// 文字列リテラルの `include!` の取り込み先と元を保留して許す配置と、それを受け入れたか。
-    /// 片方の結果からもう片方を導けるときは、走査をやり直さない ([`Self::static_layout`])。
-    private_layout: OnceLock<Option<(Vec<PathBuf>, bool)>>,
+    /// 文字列リテラルの `include!` の取り込み先と元を保留して許す配置と、それを受け入れたか、
+    /// 木の中に `macro_rules!` の定義があったか。片方の結果からもう片方を導けるときは、走査を
+    /// やり直さない ([`Self::static_layout`])。
+    private_layout: OnceLock<Option<(Vec<PathBuf>, bool, bool)>>,
     private_modules: Mutex<HashMap<PathBuf, Option<Arc<PrivateModule>>>>,
     relocation: Mutex<HashMap<PathBuf, bool>>,
     changed_sources_unrelocated: OnceLock<bool>,
+    /// [`Self::dependency_closure`] の結果 (`from` の package のディレクトリごと)。
+    dependency_closures: Mutex<HashMap<PathBuf, Option<Arc<DependencyClosure>>>>,
+    /// 木のどこかに `macro_rules! define_class` があるか ([`Self::objc2_define_class`])。
+    in_tree_define_class: OnceLock<bool>,
+    /// [`RustPathOwnerProjectProof::scan_dependency_sources`] の結果。
+    dependency_sources_fixed: OnceLock<bool>,
     pub(super) alias_cache: super::rust_owner_alias::PackageCache,
     owner_changes: OnceLock<Vec<PathBuf>>,
     owner_derive_safe: OnceLock<bool>,
@@ -259,6 +266,9 @@ impl RustPathOwnerProjectProof {
             private_modules: Mutex::new(HashMap::new()),
             relocation: Mutex::new(HashMap::new()),
             changed_sources_unrelocated: OnceLock::new(),
+            dependency_closures: Mutex::new(HashMap::new()),
+            in_tree_define_class: OnceLock::new(),
+            dependency_sources_fixed: OnceLock::new(),
             alias_cache: Default::default(),
             owner_changes: OnceLock::new(),
             owner_derive_safe: OnceLock::new(),
@@ -445,7 +455,9 @@ impl RustPathOwnerProjectProof {
     pub(super) fn owner_source(&self, ctx: &super::FileContext) -> Option<Arc<PrivateModule>> {
         let file = Path::new(&ctx.new_path);
         if !self.reexport_cargo_enabled
-            || (ctx.rust_inherent_method_owners.is_empty() && ctx.rust_private_types.is_empty())
+            || (ctx.rust_inherent_method_owners.is_empty()
+                && ctx.rust_private_types.is_empty()
+                && ctx.rust_private_root_functions.is_empty())
         {
             return None;
         }
@@ -485,6 +497,618 @@ impl RustPathOwnerProjectProof {
             || (ctx.rust_owner_derive && self.owner_derive_safe.get() == Some(&false))
     }
 
+    /// package (`from`・`to` は package のディレクトリ、root 相対) の path の依存 (通常・開発・build と
+    /// target 別、`workspace = true` の継承を含む) の閉包が `to` を含み得るか。registry の依存は lock で
+    /// 固定した別の写しで、作業ツリーの変更が届かないのでたどらない。git の依存は、その先の manifest の
+    /// `path` (絶対パスなど) が作業ツリーへ戻り得るので決めない。
+    ///
+    /// Cargo が依存の取得元を差し替え得る (木のどこかの manifest の `[patch]`・`[replace]`、木の
+    /// どこか (Cargo を起動し得るディレクトリ) と祖先と `$CARGO_HOME` の設定、`$CARGO_HOME` と木の
+    /// どちらかがもう一方の中にある)、たどる package の workspace が root でない、root の外を指す path や
+    /// `base` がある、git の依存がある、manifest を読めない・形が違うときは `None`。
+    pub(super) fn package_reaches(&self, from: &Path, to: &Path) -> Option<bool> {
+        if !*self
+            .dependency_sources_fixed
+            .get_or_init(|| self.scan_dependency_sources())
+        {
+            return None;
+        }
+        let closure = {
+            let cached = self
+                .dependency_closures
+                .lock()
+                .expect("dependency closure cache poisoned")
+                .get(from)
+                .cloned();
+            match cached {
+                Some(closure) => closure,
+                None => {
+                    let closure = self.dependency_closure(from).map(Arc::new);
+                    self.dependency_closures
+                        .lock()
+                        .expect("dependency closure cache poisoned")
+                        .insert(from.to_owned(), closure.clone());
+                    closure
+                }
+            }
+        }?;
+        Some(closure.packages.contains(&self.package_identity(to)?))
+    }
+
+    /// `directory` (root 相対) の package が proc-macro のクレート (`[lib] proc-macro = true` か、
+    /// `crate-type` に `proc-macro`) か。manifest を読めなければ `None`。
+    pub(super) fn is_proc_macro_package(&self, directory: &Path) -> Option<bool> {
+        let manifest = self.alias_cache.manifest(&self.root, directory)?;
+        let lib = manifest.get("lib");
+        Some(
+            lib.and_then(|lib| lib.get("proc-macro").or_else(|| lib.get("proc_macro")))
+                .is_some_and(|value| value.as_bool() != Some(false))
+                || lib
+                    .and_then(|lib| lib.get("crate-type").or_else(|| lib.get("crate_type")))
+                    .is_some_and(|types| {
+                        types.as_array().is_none_or(|types| {
+                            types
+                                .iter()
+                                .any(|kind| kind.as_str().is_none_or(|kind| kind == "proc-macro"))
+                        })
+                    }),
+        )
+    }
+
+    /// `directory` (root 相対) の package が、edition 2018 以降で、registry の `objc2` の 0.6
+    /// (`define_class!` のメソッドの本体を、呼び出したモジュールに生成するメソッドで評価する版) に依存し、
+    /// 木のどこにも `define_class`・`objc2` を束縛し直す綴りが無いか
+    /// ([`super::rust_macro_site::rebinds_objc2_names`])。名前を付け替えた依存 (`package = ..`)・path・
+    /// git・別の registry の `objc2`、読めない manifest は `None`。edition 2018 以降の `use objc2::..` の
+    /// `objc2` は、同じ名前のローカルの束縛 (glob の import を含む) があれば曖昧さのエラーになる。
+    pub(super) fn objc2_define_class(&self, directory: &Path) -> Option<bool> {
+        if !self.edition_2018_or_later(directory)? {
+            return None;
+        }
+        let manifest = self.alias_cache.manifest(&self.root, directory)?;
+        // 通常の依存の表だけを見る (`[build-dependencies]`・`[dev-dependencies]` の `objc2` は
+        // ライブラリ・バイナリに渡らず、`use objc2::..` が曖昧さのエラーにならずに別の束縛を指し得る)。
+        let mut tables = Vec::new();
+        tables.extend(manifest.get("dependencies"));
+        if let Some(targets) = manifest.get("target") {
+            for platform in targets.as_table()?.values() {
+                tables.extend(platform.as_table()?.get("dependencies"));
+            }
+        }
+        let mut found = false;
+        for table in tables {
+            for (name, spec) in table.as_table()? {
+                let renamed_to_objc2 = spec
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| package == "objc2");
+                if name != "objc2" && !renamed_to_objc2 {
+                    continue;
+                }
+                let version = match spec {
+                    toml::Value::String(version) => version.as_str(),
+                    toml::Value::Table(fields)
+                        if !renamed_to_objc2
+                            && [
+                                "path",
+                                "git",
+                                "registry",
+                                "registry-index",
+                                "base",
+                                "workspace",
+                                "package",
+                            ]
+                            .iter()
+                            .all(|key| !fields.contains_key(*key))
+                            // `optional = false` は常に有効な通常の依存。
+                            && fields
+                                .get("optional")
+                                .is_none_or(|optional| optional.as_bool() == Some(false)) =>
+                    {
+                        fields.get("version")?.as_str()?
+                    }
+                    _ => return None,
+                };
+                let version = version.trim().trim_start_matches(['^', '=', '~']).trim();
+                let minor = version.strip_prefix("0.6")?;
+                if !(minor.is_empty() || minor.starts_with('.')) {
+                    return None;
+                }
+                found = true;
+            }
+        }
+        Some(
+            found
+                && !*self
+                    .in_tree_define_class
+                    .get_or_init(|| self.defines_define_class()),
+        )
+    }
+
+    /// `directory` の package の edition が 2018 以降か。`edition.workspace = true` は、root の workspace の
+    /// member なら root の `[workspace.package]` から読む。書いていない (2015) ・読めないときは `None`。
+    /// target ごとの `edition` (`[lib] edition = "2015"`) も 2018 以降であることを求める。
+    fn edition_2018_or_later(&self, directory: &Path) -> Option<bool> {
+        let manifest = self.alias_cache.manifest(&self.root, directory)?;
+        for kind in ["lib", "bin", "example", "test", "bench"] {
+            let targets = match manifest.get(kind) {
+                None => continue,
+                Some(toml::Value::Array(targets)) => targets.iter().collect::<Vec<_>>(),
+                Some(target) => vec![target],
+            };
+            for target in targets {
+                if let Some(edition) = target.get("edition")
+                    && !matches!(edition.as_str(), Some("2018" | "2021" | "2024"))
+                {
+                    return None;
+                }
+            }
+        }
+        let edition = match manifest.get("package")?.get("edition")? {
+            toml::Value::String(edition) => edition.clone(),
+            toml::Value::Table(fields)
+                if fields.len() == 1
+                    && fields.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+            {
+                if !self.in_root_workspace(directory)? {
+                    return None;
+                }
+                let root = self.alias_cache.manifest(&self.root, Path::new(""))?;
+                root.get("workspace")?
+                    .get("package")?
+                    .get("edition")?
+                    .as_str()?
+                    .to_owned()
+            }
+            _ => return None,
+        };
+        Some(matches!(edition.as_str(), "2018" | "2021" | "2024"))
+    }
+
+    /// 木の中 (root の直下の `.git`・`target` を除く) のどれかの `.rs` に、`define_class`・`objc2` を
+    /// 束縛し直し得る綴りがあるか ([`super::rust_macro_site::rebinds_objc2_names`]。どちらかの単語を
+    /// 含むファイルだけを構文解析する)。`#[macro_use]`・`#[no_implicit_prelude]` の属性があれば真
+    /// ([`super::rust_macro_site::changes_name_resolution`])。読めなければ真。
+    ///
+    /// 走査が読まないソースがあり得るときも真: symlink のディレクトリ、木の中の proc-macro のクレート
+    /// (文字列から束縛・属性を作り得る)、明示の target が `.rs` でない・root の直下の `.git`・`target`
+    /// にある・木の外にある package、`include!`・`#[path]` が字面のパスで木の中の `.rs` を指さない
+    /// もの (`.rs` でないファイル・生成物の `include!(concat!(env!("OUT_DIR"), ..))` など)、`include!` で
+    /// 読む `.rs` の中の `#[path]` (取り込んだモジュールから解くので、ファイルの場所から決められない)。
+    fn defines_define_class(&self) -> bool {
+        let mut pending = vec![self.root.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                return true;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return true;
+                };
+                let Ok(kind) = entry.file_type() else {
+                    return true;
+                };
+                let path = entry.path();
+                // symlink のディレクトリは辿らない (中の `.rs` を読めない)。
+                if kind.is_symlink()
+                    && std::fs::metadata(&path).map_or(true, |metadata| metadata.is_dir())
+                {
+                    return true;
+                }
+                if kind.is_dir() {
+                    if directory == self.root
+                        && matches!(entry.file_name().to_str(), Some(".git" | "target"))
+                    {
+                        continue;
+                    }
+                    pending.push(path);
+                } else if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
+                {
+                    let Ok(package) = directory.strip_prefix(&self.root) else {
+                        return true;
+                    };
+                    if !self.package_sources_scanned(package) {
+                        return true;
+                    }
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+                    && self.source_may_rebind_objc2(&path)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `package` (root 相対) の package のソースを、[`Self::defines_define_class`] の走査が読むか:
+    /// proc-macro のクレートでなく、明示の target がどれも木の中 (root の直下の `.git`・`target` を除く)
+    /// の `.rs`。読めない manifest は偽。
+    fn package_sources_scanned(&self, package: &Path) -> bool {
+        if self.is_proc_macro_package(package) != Some(false) {
+            return false;
+        }
+        let Some(manifest) = self.alias_cache.manifest(&self.root, package) else {
+            return false;
+        };
+        let Some(targets) = RustTargets::from_manifest(&manifest, package) else {
+            return false;
+        };
+        targets.roots_complete
+            && targets.explicit_roots().all(|target| {
+                !under_root_git_or_target(target)
+                    && target
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+            })
+    }
+
+    /// 木の中の `.rs` の `file` に、`define_class`・`objc2` を束縛し直し得る綴り・名前の解決を変える
+    /// 属性・走査が読まないソースの取り込みがあるか ([`Self::defines_define_class`])。読めなければ真。
+    fn source_may_rebind_objc2(&self, file: &Path) -> bool {
+        let Some(source) = read_input_file(file) else {
+            return true;
+        };
+        let attributes = memchr::memmem::find(&source, b"macro_use").is_some()
+            || memchr::memmem::find(&source, b"no_implicit_prelude").is_some();
+        let names = memchr::memmem::find(&source, b"define_class").is_some()
+            || memchr::memmem::find(&source, b"objc2").is_some();
+        let sources = memchr::memmem::find(&source, b"include").is_some()
+            || memchr::memmem::find(&source, b"path").is_some();
+        if !attributes && !names && !sources {
+            return false;
+        }
+        let Ok(tree) = parser::parse_source(&source, LangId::Rust) else {
+            return true;
+        };
+        let root = tree.root_node();
+        if (attributes && super::rust_macro_site::changes_name_resolution(root, &source))
+            || (names && super::rust_macro_site::rebinds_objc2_names(root, &source))
+        {
+            return true;
+        }
+        if !sources {
+            return false;
+        }
+        let Some(directory) = file.strip_prefix(&self.root).ok().and_then(Path::parent) else {
+            return true;
+        };
+        crate::engine::tree_walk::walk_preorder(
+            root,
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                if !crate::engine::rust_dynamic_source::node_includes_external_source(node, &source)
+                {
+                    return std::ops::ControlFlow::Continue(
+                        crate::engine::tree_walk::Walk::Descend,
+                    );
+                }
+                // 字面のパスで木の中の `.rs` を指す `include!("..")`・`#[path = ".."]` だけを許す。
+                let Some((include, literal)) = literal_source_path(node, &source) else {
+                    return std::ops::ControlFlow::Break(());
+                };
+                let Some(target) = lexical_join(directory, Path::new(&literal)) else {
+                    return std::ops::ControlFlow::Break(());
+                };
+                if under_root_git_or_target(&target)
+                    || !target
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+                    || (include && included_file_has_path_attribute(&self.root.join(&target)))
+                {
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip)
+            },
+        )
+        .is_break()
+    }
+
+    fn package_identity(&self, directory: &Path) -> Option<crate::git_support::EntryId> {
+        crate::git_support::open_entry_id(&self.root.join(directory))
+    }
+
+    /// `directory` (root 相対の package) の workspace が root の manifest か (Cargo は package から
+    /// 祖先へ `[workspace]` を探し、`exclude` された workspace は飛ばす。`exclude` は manifest のパスと
+    /// 照合するので、`e/Cargo.toml` も `e` を除く)。`package.workspace` は、root を指せば root の
+    /// member (member でなければ Cargo が拒む)。root に `[workspace]` が無い、`package.workspace` が
+    /// root 以外を指す、manifest を読めないときは `None`。
+    fn in_root_workspace(&self, directory: &Path) -> Option<bool> {
+        let manifest = self.alias_cache.manifest(&self.root, directory)?;
+        if let Some(pointer) = manifest
+            .get("package")
+            .and_then(|package| package.get("workspace"))
+        {
+            let workspace = lexical_join(directory, Path::new(pointer.as_str()?))?;
+            return workspace.as_os_str().is_empty().then_some(true);
+        }
+        if directory.as_os_str().is_empty() {
+            return Some(true);
+        }
+        let workspace = self.alias_cache.manifest(&self.root, Path::new(""))?;
+        let workspace = workspace.get("workspace")?;
+        for ancestor in directory.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if self.root.join(ancestor).join("Cargo.toml").exists()
+                && self
+                    .alias_cache
+                    .manifest(&self.root, ancestor)?
+                    .get("workspace")
+                    .is_some()
+            {
+                return Some(false);
+            }
+        }
+        if let Some(excluded) = workspace.get("exclude") {
+            for path in excluded.as_array()? {
+                let excluded = lexical_join(Path::new(""), Path::new(path.as_str()?))?;
+                if directory.join("Cargo.toml").starts_with(&excluded) {
+                    return Some(false);
+                }
+            }
+        }
+        Some(true)
+    }
+
+    /// 木の中の manifest がどれも `[patch]`・`[replace]` を持たず、木の中の `.cargo` の設定が取得元を
+    /// 差し替えず、`$CARGO_HOME` と木のどちらももう一方の中に無いか (root の直下の `.git`・`target` は
+    /// 読まない。symlink のディレクトリは中を確かめられないので偽)。Cargo はどのディレクトリからも
+    /// 起動され得る。木が `$CARGO_HOME` の中 (git の依存の checkout) なら、git の依存がこの木を指し得る。
+    fn scan_dependency_sources(&self) -> bool {
+        let Ok(root) = self.root.canonicalize() else {
+            return false;
+        };
+        let Some(home) = self.cargo_configs.home() else {
+            return false;
+        };
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_owned());
+        if home.starts_with(&root) || root.starts_with(&home) {
+            return false;
+        }
+        // root の直下の `.git`・`target` は配置の走査が読まないが、その下のディレクトリから Cargo を
+        // 起動すると、そこの `.cargo` の設定を読む (Cargo の作るディレクトリと Git の object は除く)。
+        if !self.unscanned_cargo_configs_keep_sources(".git", &[])
+            || !self.unscanned_cargo_configs_keep_sources("target", &CARGO_OUTPUTS)
+        {
+            return false;
+        }
+        let mut pending = vec![PathBuf::new()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(self.root.join(&directory)) else {
+                return false;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let Ok(kind) = entry.file_type() else {
+                    return false;
+                };
+                let name = entry.file_name();
+                let path = directory.join(&name);
+                if kind.is_dir() {
+                    if directory.as_os_str().is_empty()
+                        && matches!(name.to_str(), Some(".git" | "target"))
+                    {
+                        continue;
+                    }
+                    if name
+                        .to_str()
+                        .is_none_or(|name| name.eq_ignore_ascii_case(".cargo"))
+                        && !self
+                            .cargo_configs
+                            .keeps_dependency_sources(&self.root.join(&directory))
+                    {
+                        return false;
+                    }
+                    pending.push(path);
+                } else if kind.is_symlink() {
+                    if std::fs::metadata(self.root.join(&path)).is_ok_and(|meta| meta.is_dir()) {
+                        return false;
+                    }
+                } else if name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
+                {
+                    let Some(manifest) = self.alias_cache.manifest(&self.root, &directory) else {
+                        return false;
+                    };
+                    // root の直下の `target`・`.git` を指す path の依存は、そこの package を workspace
+                    // の member にする (配置の走査が読まない package が別のクレートのファイルを取り込み得る)。
+                    if manifest.get("patch").is_some() || manifest.get("replace").is_some() {
+                        return false;
+                    }
+                    let Some(dependencies) =
+                        manifest_path_dependencies(&root, &manifest, &directory)
+                    else {
+                        return false;
+                    };
+                    if dependencies
+                        .iter()
+                        .flatten()
+                        .any(|path| under_root_git_or_target(path))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// root の直下の `top` (`target`・`.git`) の下の `.cargo` の設定が取得元を差し替えないか。Cargo と
+    /// Git が作るディレクトリは読まない: `top` の直下の `skipped_children`、Cargo の profile
+    /// (`.cargo-lock` を持つ) の中の `PROFILE_OUTPUTS`、Git のディレクトリ ([`git_directory_shape`]) の
+    /// 中の `objects`・`lfs`。symlink のディレクトリと、たどる要素が多すぎるときは偽。
+    fn unscanned_cargo_configs_keep_sources(&self, top: &str, skipped_children: &[&str]) -> bool {
+        const PROFILE_OUTPUTS: [&str; 5] =
+            ["build", "deps", "incremental", ".fingerprint", "examples"];
+        let mut pending = vec![PathBuf::from(top)];
+        let mut budget = 100_000usize;
+        while let Some(directory) = pending.pop() {
+            let full = self.root.join(&directory);
+            // Cargo の profile の `.cargo-lock` はファイル (同じ名前のディレクトリは目印にしない)。
+            let profile = full.join(".cargo-lock").is_file();
+            let git_directory = git_directory_shape(&full);
+            let entries = match std::fs::read_dir(&full) {
+                Ok(entries) => entries,
+                // 無いもの (`target` を作る前)・ディレクトリでないもの (worktree の `.git` のファイル) の
+                // 中に設定は無い。
+                Err(_)
+                    if std::fs::metadata(&full).map_or_else(
+                        |error| error.kind() == std::io::ErrorKind::NotFound,
+                        |metadata| !metadata.is_dir(),
+                    ) =>
+                {
+                    continue;
+                }
+                // 列挙できないディレクトリ (検索だけ許すもの) の中の設定は、既知の名前で開け得る。
+                Err(_) => return false,
+            };
+            for entry in entries {
+                let Some(left) = budget.checked_sub(1) else {
+                    return false;
+                };
+                budget = left;
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let Ok(kind) = entry.file_type() else {
+                    return false;
+                };
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    return false;
+                };
+                if name.eq_ignore_ascii_case(".cargo") {
+                    if !self.cargo_configs.keeps_dependency_sources(&full) {
+                        return false;
+                    }
+                    // `.cargo` の中のディレクトリから起動した Cargo も、その下の `.cargo` を読む。
+                    pending.push(directory.join(name));
+                    continue;
+                }
+                // 走査が読まないディレクトリの manifest・lockfile は、走査が読まない package や別の
+                // workspace (別の lockfile の解決) になり得る (Cargo の profile の直下にも無い)。
+                // Cargo は symlink の manifest もたどって読む。
+                if !kind.is_dir()
+                    && (name.eq_ignore_ascii_case("Cargo.toml")
+                        || name.eq_ignore_ascii_case("Cargo.lock"))
+                {
+                    return false;
+                }
+                if (profile && PROFILE_OUTPUTS.contains(&name))
+                    || (git_directory && matches!(name, "objects" | "lfs"))
+                    || (directory.as_os_str() == top && skipped_children.contains(&name))
+                {
+                    continue;
+                }
+                if kind.is_symlink() {
+                    if std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()) {
+                        return false;
+                    }
+                    continue;
+                }
+                if kind.is_dir() {
+                    pending.push(directory.join(name));
+                }
+            }
+        }
+        true
+    }
+
+    /// [`Self::package_reaches`] の、`from` から path でたどれる package (自身を含む) の実体と、
+    /// たどった package の registry・git の依存の package 名。
+    fn dependency_closure(&self, from: &Path) -> Option<DependencyClosure> {
+        if !self
+            .cargo_configs
+            .keeps_dependency_sources(&self.root.join(from))
+        {
+            return None;
+        }
+        let workspace = self.alias_cache.manifest(&self.root, Path::new(""))?;
+        let mut pending = vec![from.to_owned()];
+        let mut closure = DependencyClosure::default();
+        while let Some(directory) = pending.pop() {
+            if !closure.packages.insert(self.package_identity(&directory)?) {
+                continue;
+            }
+            if !self.in_root_workspace(&directory)? {
+                return None;
+            }
+            let manifest = self.alias_cache.manifest(&self.root, &directory)?;
+            let mut tables = Vec::new();
+            for kind in DEPENDENCY_TABLES {
+                tables.extend(manifest.get(kind));
+            }
+            if let Some(targets) = manifest.get("target") {
+                for platform in targets.as_table()?.values() {
+                    for kind in DEPENDENCY_TABLES {
+                        tables.extend(platform.as_table()?.get(kind));
+                    }
+                }
+            }
+            for table in tables {
+                for (name, spec) in table.as_table()? {
+                    let mut names = vec![name.as_str()];
+                    let (base, spec) = match spec {
+                        toml::Value::String(_) => (directory.clone(), spec),
+                        toml::Value::Table(fields) => {
+                            if fields.get("base").is_some() {
+                                return None;
+                            }
+                            names.extend(fields.get("package").and_then(toml::Value::as_str));
+                            if fields.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+                            {
+                                let inherited = workspace
+                                    .get("workspace")?
+                                    .get("dependencies")?
+                                    .get(name.as_str())?;
+                                (PathBuf::new(), inherited)
+                            } else {
+                                (directory.clone(), spec)
+                            }
+                        }
+                        _ => return None,
+                    };
+                    let path = match spec {
+                        toml::Value::String(_) => None,
+                        toml::Value::Table(fields) => {
+                            if fields.get("base").is_some() {
+                                return None;
+                            }
+                            names.extend(fields.get("package").and_then(toml::Value::as_str));
+                            fields.get("path")
+                        }
+                        _ => return None,
+                    };
+                    let Some(path) = path else {
+                        // registry の依存は lock で固定した写しで、作業ツリーの変更は届かない。git の
+                        // 依存は、その先の manifest の `path` が作業ツリーへ戻り得るので決めない。
+                        if spec.get("git").is_some() {
+                            return None;
+                        }
+                        continue;
+                    };
+                    let joined = lexical_join(&base, Path::new(path.as_str()?))?;
+                    // root の直下の `target`・`.git` は配置の走査が読まないので、そこの package は
+                    // 別のクレートのファイルを取り込み得る。
+                    if under_root_git_or_target(&joined) {
+                        return None;
+                    }
+                    pending.push(joined);
+                }
+            }
+        }
+        Some(closure)
+    }
+
     /// 変更元の `#[derive(Debug)]` を、どのソースも import・マクロ定義・外部の glob で差し替えて
     /// いないか (derive が無ければ真)。プロジェクト全体の走査なので、除外を決める直前にだけ使う。
     pub(super) fn owner_derive_proved(&self, ctx: &super::FileContext) -> bool {
@@ -510,19 +1134,31 @@ impl RustPathOwnerProjectProof {
                 .private_layout
                 .get_or_init(|| enum_owner::static_layout(&self.root, self, true))
                 .as_ref()
-                .map(|(relocated, _)| relocated);
+                .map(|(relocated, _, _)| relocated);
         }
         if let Some(layout) = self.private_layout.get() {
             return match layout {
-                Some((relocated, false)) => Some(relocated),
+                Some((relocated, false, _)) => Some(relocated),
                 _ => None,
             };
         }
         self.static_source_layout
             .get_or_init(|| {
-                enum_owner::static_layout(&self.root, self, false).map(|(relocated, _)| relocated)
+                enum_owner::static_layout(&self.root, self, false)
+                    .map(|(relocated, _, _)| relocated)
             })
             .as_ref()
+    }
+
+    /// 木の中に `macro_rules!` の定義 (マクロの本体・引数の中の `macro_rules` も) と、走査で読み
+    /// 切れない入力 (先頭行の `#! [..]`・root の外を指す path の依存) が無く、配置を決められたか
+    /// ([`enum_owner::static_layout`])。木の外のマクロは `include!`・`#[path]`・子の `mod` を
+    /// 組み立てない (前提) ので、これが真なら、字句を組み立てて別のモジュールへ取り込む経路は無い。
+    pub(super) fn macro_free(&self) -> bool {
+        self.private_layout
+            .get_or_init(|| enum_owner::static_layout(&self.root, self, true))
+            .as_ref()
+            .is_some_and(|(_, _, macros)| !macros)
     }
 
     fn allows_static_source_path(&self, path: &Path) -> bool {
@@ -2067,11 +2703,335 @@ fn checked_is_file(dir: &Path, path: &Path) -> Option<bool> {
     (!crate::git_support::tree_view(dir).hides(path)).then(|| dir.join(path).is_file())
 }
 
+/// Cargo の manifest の依存の表 (古い綴りの `_` を含む)。
+/// [`RustPathOwnerProjectProof::package_reaches`] の、path でたどれる package の実体。
+#[derive(Default)]
+struct DependencyClosure {
+    packages: HashSet<crate::git_support::EntryId>,
+}
+
+/// root の直下の `target` の、Cargo が作るディレクトリ (中に Cargo の設定を置かない)。
+const CARGO_OUTPUTS: [&str; 6] = [
+    "doc",
+    "tmp",
+    "package",
+    "nextest",
+    "llvm-cov-target",
+    "criterion",
+];
+
+/// manifest の依存の表 (`[dependencies]` などと `[target.<cfg>.dependencies]` など)。
+fn dependency_tables(manifest: &toml::Value) -> Option<Vec<&toml::Value>> {
+    let mut tables = Vec::new();
+    for kind in DEPENDENCY_TABLES {
+        tables.extend(manifest.get(kind));
+    }
+    if let Some(targets) = manifest.get("target") {
+        for platform in targets.as_table()?.values() {
+            for kind in DEPENDENCY_TABLES {
+                tables.extend(platform.as_table()?.get(kind));
+            }
+        }
+    }
+    Some(tables)
+}
+
+/// manifest (`directory` は root 相対の置き場所) の path の依存 (依存の表・`[workspace.dependencies]`・
+/// `[patch.*]`・`[replace]`) の行き先 (root 相対。root の外は `None`)。`root` は絶対パスで、行き先は
+/// root の外を回る (`../../ws/target/probe`) パスや絶対パスも字面で畳む。`base` の付いた path は解け
+/// ないので、読めない形と同じく全体を `None` にする。
+pub(super) fn manifest_path_dependencies(
+    root: &Path,
+    manifest: &toml::Value,
+    directory: &Path,
+) -> Option<Vec<Option<PathBuf>>> {
+    Some(
+        manifest_path_dependency_targets(root, manifest, directory)?
+            .into_iter()
+            .map(|target| target.and_then(|target| relative_to_root(root, &target)))
+            .collect(),
+    )
+}
+
+/// manifest の path の依存 ([`manifest_path_dependencies`]) のどれかが、root の外を指すか。実体の
+/// パス (在れば symlink・`\\?\` を解いたもの) が root (実体) で始まるかを、大文字小文字を区別して
+/// 比べる (大文字小文字を区別するファイルシステムの `../../WS/probe` は root の `ws` と別)。行き先を
+/// 決められなければ真。
+pub(super) fn path_dependencies_leave_root(
+    root: &Path,
+    manifest: &toml::Value,
+    directory: &Path,
+) -> Option<bool> {
+    Some(
+        manifest_path_dependency_targets(root, manifest, directory)?
+            .iter()
+            .any(|target| {
+                target
+                    .as_ref()
+                    .is_none_or(|target| !target.starts_with(root))
+            }),
+    )
+}
+
+/// `directory` が Git のディレクトリの形か: `HEAD` が `ref: refs/` か 16 進のコミット (40 か 64 桁) で
+/// 始まり、`config` のファイルと `refs`・`objects` のディレクトリがある (`HEAD` という名前のファイルが
+/// あるだけの普通のディレクトリの下を読み飛ばさない)。
+fn git_directory_shape(directory: &Path) -> bool {
+    let head = directory.join("HEAD");
+    let Ok(metadata) = std::fs::symlink_metadata(&head) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&head) else {
+        return false;
+    };
+    let text = text.trim();
+    let commit = |text: &str| {
+        matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    (text.starts_with("ref: refs/") || commit(text))
+        && directory.join("config").is_file()
+        && directory.join("refs").is_dir()
+        && directory.join("objects").is_dir()
+}
+
+/// package (`directory` の manifest) が `package.workspace` で、走査が読まない workspace (root の外か、
+/// root の直下の `target`・`.git` の下) を名指すか (継承する依存 `probe.workspace = true` の先を、
+/// その workspace の manifest から読む)。古い `[project]` の表 (`[package]` と同じく読まれる。依存の
+/// たどり方 (`in_root_workspace`) は `[project]` の `workspace` を読まない) と、形が違うものも真。
+pub(super) fn package_workspace_outside_root(
+    root: &Path,
+    manifest: &toml::Value,
+    directory: &Path,
+) -> bool {
+    if manifest.get("project").is_some() {
+        return true;
+    }
+    let Some(workspace) = manifest
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+    else {
+        return false;
+    };
+    let Some(workspace) = workspace.as_str() else {
+        return true;
+    };
+    absolute_lexical(&root.join(directory), Path::new(workspace)).is_none_or(|joined| {
+        let resolved = joined.canonicalize().unwrap_or(joined);
+        resolved
+            .strip_prefix(root)
+            .ok()
+            .is_none_or(under_root_git_or_target)
+    })
+}
+
+/// manifest の path の依存の行き先 (root を絶対パスにして字面で畳み、在れば実体にしたもの)。
+/// 字面で畳めなければ `None` の要素。
+fn manifest_path_dependency_targets(
+    root: &Path,
+    manifest: &toml::Value,
+    directory: &Path,
+) -> Option<Vec<Option<PathBuf>>> {
+    let mut specs = Vec::new();
+    for table in dependency_tables(manifest)?.into_iter().chain(
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+    ) {
+        specs.extend(table.as_table()?.values());
+    }
+    if let Some(patches) = manifest.get("patch") {
+        for registry in patches.as_table()?.values() {
+            specs.extend(registry.as_table()?.values());
+        }
+    }
+    if let Some(replace) = manifest.get("replace") {
+        specs.extend(replace.as_table()?.values());
+    }
+    let mut out = Vec::new();
+    for spec in specs {
+        let toml::Value::Table(fields) = spec else {
+            continue;
+        };
+        if fields.get("base").is_some() {
+            return None;
+        }
+        let Some(path) = fields.get("path") else {
+            continue;
+        };
+        // Cargo と同じく字面で畳んだ行き先を、在れば実体 (symlink・`\\?\`・`/private/var` の別名を
+        // 解いたもの) にする。
+        let joined = absolute_lexical(&root.join(directory), Path::new(path.as_str()?));
+        out.push(joined.map(|joined| joined.canonicalize().unwrap_or(joined)));
+    }
+    Some(out)
+}
+
+/// manifest の path の依存 ([`manifest_path_dependencies`]) が root の直下の `target`・`.git` を指すか。
+pub(super) fn path_dependencies_reach_unscanned(
+    root: &Path,
+    manifest: &toml::Value,
+    directory: &Path,
+) -> Option<bool> {
+    Some(
+        manifest_path_dependencies(root, manifest, directory)?
+            .iter()
+            .flatten()
+            .any(|path| under_root_git_or_target(path)),
+    )
+}
+
+/// `base` (絶対パス) に `path` をつないで、`.`・`..` を字面で畳む (root より上にも出られる)。
+/// ファイルシステムの根より上に出るなら `None`。
+fn absolute_lexical(base: &Path, path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in base.join(path).components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                out.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => out.push(part),
+        }
+    }
+    Some(out)
+}
+
+/// 絶対パス `path` が `root` の下なら、root 相対のパス (要素は大文字小文字を区別せずに比べる)。
+/// Windows の `canonicalize` が付ける `\\?\` の有無は区別しない (`\\?\C:\x` と `C:\x` は同じ)。
+fn relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    let key = |component: std::path::Component<'_>| match component {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(disk) | std::path::Prefix::Disk(disk) => {
+                format!("{}:", char::from(disk))
+            }
+            std::path::Prefix::VerbatimUNC(server, share)
+            | std::path::Prefix::UNC(server, share) => {
+                format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                )
+            }
+            _ => component.as_os_str().to_string_lossy().into_owned(),
+        },
+        component => component.as_os_str().to_string_lossy().into_owned(),
+    };
+    let mut parts = path.components();
+    for expected in root.components() {
+        let actual = parts.next()?;
+        if !key(actual).eq_ignore_ascii_case(&key(expected)) {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
+const DEPENDENCY_TABLES: [&str; 5] = [
+    "dependencies",
+    "dev-dependencies",
+    "dev_dependencies",
+    "build-dependencies",
+    "build_dependencies",
+];
+
+/// root 相対の `base` に相対パス `path` をつなぎ、`.` と `..` を字句の上で畳む。絶対パスと、root の
+/// 外へ出るパスは `None`。
+fn lexical_join(base: &Path, path: &Path) -> Option<PathBuf> {
+    let mut joined = Vec::new();
+    for component in base.components().chain(path.components()) {
+        match component {
+            std::path::Component::Normal(part) => joined.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                joined.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(joined.into_iter().collect())
+}
+
+/// `include!("..")` (真) か `#[path = ".."]` (偽) の字面のパス。ほかの形 (`cfg_attr` の中・マクロの
+/// token tree の中・escape を含む文字列・字面でない引数) は `None`。
+fn literal_source_path(node: Node<'_>, source: &[u8]) -> Option<(bool, String)> {
+    let (include, literal) = match node.kind() {
+        "macro_invocation" => {
+            if last_macro_identifier(node, source)? != "include" {
+                return None;
+            }
+            let mut cursor = node.walk();
+            let arguments = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "token_tree")?;
+            let mut cursor = arguments.walk();
+            let tokens: Vec<_> = arguments
+                .named_children(&mut cursor)
+                .filter(|token| !token.is_extra())
+                .collect();
+            let [literal] = tokens.as_slice() else {
+                return None;
+            };
+            (true, *literal)
+        }
+        "attribute" => {
+            let name = node.named_child(0)?;
+            if name.kind() != "identifier" || name.utf8_text(source).ok()? != "path" {
+                return None;
+            }
+            (false, node.child_by_field_name("value")?)
+        }
+        _ => return None,
+    };
+    if literal.kind() != "string_literal" {
+        return None;
+    }
+    let text = literal
+        .utf8_text(source)
+        .ok()?
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    if text.contains('\\') {
+        return None;
+    }
+    Some((include, text.to_owned()))
+}
+
+/// `include!` で読む `.rs` に `#[path]` (かそれを作り得る形) があるか。読めなければ真。
+fn included_file_has_path_attribute(file: &Path) -> bool {
+    let Some(source) = read_input_file(file) else {
+        return true;
+    };
+    if memchr::memmem::find(&source, b"path").is_none() {
+        return false;
+    }
+    let Ok(tree) = parser::parse_source(&source, LangId::Rust) else {
+        return true;
+    };
+    crate::engine::tree_walk::any_node(
+        tree.root_node(),
+        crate::engine::tree_walk::Children::All,
+        |node| {
+            matches!(node.kind(), "attribute" | "token_tree" | "token_repetition")
+                && crate::engine::rust_dynamic_source::node_includes_external_source(node, &source)
+        },
+    )
+}
+
 /// root の直下の `.git`・`target` (かその下) のパスか。
 fn under_root_git_or_target(path: &Path) -> bool {
-    path.components()
-        .next()
-        .is_some_and(|first| matches!(first.as_os_str().to_str(), Some(".git" | "target")))
+    path.components().next().is_some_and(|first| {
+        first.as_os_str().to_str().is_some_and(|first| {
+            first.eq_ignore_ascii_case(".git") || first.eq_ignore_ascii_case("target")
+        })
+    })
 }
 
 /// snapshot が書き出さなかった要素を、型を見てから root の直下の `.git`・`target` のディレクトリを
@@ -3258,6 +4218,38 @@ mod tests {
     use crate::engine::parser;
     use crate::language::LangId;
 
+    /// `HEAD` という名前のファイルがあるだけの普通のディレクトリ (`target/tools/HEAD`) は、Git の
+    /// ディレクトリの形にしない (その `objects` の下の package を読み飛ばさない)。
+    #[test]
+    fn git_directory_shape_requires_head_config_and_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path();
+        std::fs::write(directory.join("HEAD"), "").unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::write(directory.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(!super::git_directory_shape(directory));
+        // `config`・`refs`・`objects` のどれが欠けても形にしない。
+        std::fs::write(directory.join("config"), "[core]\n").unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::create_dir(directory.join("refs")).unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::create_dir(directory.join("objects")).unwrap();
+        assert!(super::git_directory_shape(directory));
+        std::fs::remove_file(directory.join("config")).unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::write(directory.join("config"), "[core]\n").unwrap();
+        std::fs::remove_dir(directory.join("refs")).unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::create_dir(directory.join("refs")).unwrap();
+        assert!(super::git_directory_shape(directory));
+        std::fs::write(directory.join("HEAD"), "ref: not a ref\n").unwrap();
+        assert!(!super::git_directory_shape(directory));
+        std::fs::write(directory.join("HEAD"), format!("{}\n", "a".repeat(40))).unwrap();
+        assert!(super::git_directory_shape(directory));
+        std::fs::write(directory.join("HEAD"), "not a ref\n").unwrap();
+        assert!(!super::git_directory_shape(directory));
+    }
+
     #[test]
     fn rust_private_function_inline_test_wiring_ignores_call_updates() {
         let before = b"fn exists(_: &str) {} #[cfg(test)] mod tests { use super::*; #[test] fn sample() { assert!(exists(\"x\")); } }";
@@ -4278,9 +5270,9 @@ mod tests {
             let fresh =
                 || RustPathOwnerProjectProof::new(root.path(), false, false, false, &[], "");
             let plain = super::enum_owner::static_layout(root.path(), &fresh(), false)
-                .map(|(relocated, _)| relocated);
+                .map(|(relocated, _, _)| relocated);
             let literal = super::enum_owner::static_layout(root.path(), &fresh(), true)
-                .map(|(relocated, _)| relocated);
+                .map(|(relocated, _, _)| relocated);
             assert_eq!(
                 (plain.is_some(), literal.is_some()),
                 (plain_some, literal_some),
@@ -4357,6 +5349,36 @@ mod tests {
                 project.unrelocated(std::path::Path::new("shared/calls.rs")),
                 !holds_directory,
                 "{bridge}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_to_root_ignores_the_verbatim_prefix() {
+        use std::path::{Path, PathBuf};
+        for (root, path, expected) in [
+            (
+                r"\\?\C:\work\repo",
+                r"C:\work\repo\target\probe",
+                Some(PathBuf::from(r"target\probe")),
+            ),
+            (
+                r"C:\work\repo",
+                r"\\?\c:\WORK\repo\target",
+                Some(PathBuf::from("target")),
+            ),
+            (
+                r"\\?\UNC\server\share\repo",
+                r"\\server\share\repo\target",
+                Some(PathBuf::from("target")),
+            ),
+            (r"\\?\C:\work\repo", r"D:\work\repo\target", None),
+        ] {
+            assert_eq!(
+                super::relative_to_root(Path::new(root), Path::new(path)),
+                expected,
+                "{root} {path}"
             );
         }
     }

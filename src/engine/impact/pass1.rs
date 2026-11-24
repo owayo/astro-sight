@@ -587,6 +587,11 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         .as_ref()
         .map(|old| rust_private_symbols_of_changes(old, df, root, &source, &syms, &affected))
         .unwrap_or_default();
+    let rust_private_root_functions = old
+        .as_ref()
+        .filter(|_| in_place)
+        .map(|old| private_root_functions(old, &rust_private_root_names, root, &source, &syms))
+        .unwrap_or_default();
 
     // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
     // ループの外で 1 度だけ組み立てる。
@@ -690,6 +695,7 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
             rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,
             rust_private_root_names,
+            rust_private_root_functions,
             rust_private_method_owners,
             rust_inherent_method_owners,
             rust_private_types,
@@ -788,6 +794,9 @@ struct OldRustPrivateSymbols {
     derive: bool,
     variant_names: HashSet<String>,
     root_names: HashSet<String>,
+    /// `root_names` のうち、名前を束縛し直さない組み込みの属性だけの関数と、その属性の綴り
+    /// ([`plain_root_function_attributes`])。
+    plain_functions: HashMap<String, Vec<String>>,
     method_owners: HashMap<String, String>,
     /// 旧い版の名前ごとの inherent メソッドの所有型 ([`rust_inherent_owners_by_name`])。
     inherent_owners: HashMap<String, Option<BTreeSet<String>>>,
@@ -875,16 +884,28 @@ fn collect_old_rust_private_symbols(
     }
     let old_syms = symbols::extract_symbols(old_root, &old.source, LangId::Rust).ok()?;
     let mut counts = HashMap::new();
+    // 非公開メソッドの所有型は、綴りごとに数えて一意なら引く (`fn translate` のメソッドと
+    // `fn r#translate` の自由関数が並んでも、メソッドの呼び出しを探す)。
+    let mut spelling_counts = HashMap::new();
     for symbol in &old_syms {
         if rust_impl_owner::is_impl_owner(old_root, symbol) {
             continue;
         }
-        *counts.entry(symbol.name.as_str()).or_insert(0usize) += 1;
+        // refs と同じく `r#` を外して数える (`translate` と `r#translate` は同じ名前の参照になる)。
+        *counts
+            .entry(ci_key(LangId::Rust, &symbol.name))
+            .or_insert(0usize) += 1;
+        *spelling_counts
+            .entry(symbol.name.as_str())
+            .or_insert(0usize) += 1;
     }
     let mut root_names = HashSet::new();
+    let mut plain_functions = HashMap::new();
+    // 同じ名前の宣言の数は、旧版の AST を 1 回だけたどって数える (非公開の関数ごとにたどらない)。
+    let old_declarations = std::cell::OnceCell::<NamedDeclarations>::new();
     for symbol in &old_syms {
         if !rust_impl_owner::is_impl_owner(old_root, symbol)
-            && counts.get(symbol.name.as_str()) == Some(&1)
+            && counts.get(&ci_key(LangId::Rust, &symbol.name)) == Some(&1)
             && declaration::is_rust_file_root_symbol(old_root, symbol)
             && !symbols::is_symbol_exported(
                 old_root,
@@ -894,11 +915,20 @@ fn collect_old_rust_private_symbols(
             )
         {
             root_names.insert(symbol.name.clone());
+            if let Some(attributes) = super::descendant_for_range(old_root, &symbol.range)
+                .and_then(|node| plain_root_function_attributes(old_root, &old.source, node))
+                && old_declarations
+                    .get_or_init(|| NamedDeclarations::count(old_root, &old.source))
+                    .get(&ci_key(LangId::Rust, &symbol.name))
+                    == 1
+            {
+                plain_functions.insert(symbol.name.clone(), attributes);
+            }
         }
     }
     let method_owners: HashMap<String, String> = old_syms
         .iter()
-        .filter(|symbol| counts.get(symbol.name.as_str()) == Some(&1))
+        .filter(|symbol| spelling_counts.get(symbol.name.as_str()) == Some(&1))
         .filter_map(|symbol| {
             declaration::rust_private_inherent_method(old_root, &old.source, symbol)
                 .map(|owner| (symbol.name.clone(), owner))
@@ -906,6 +936,7 @@ fn collect_old_rust_private_symbols(
         .collect();
     let mut old_symbols = OldRustPrivateSymbols {
         root_names,
+        plain_functions,
         method_owners,
         ..Default::default()
     };
@@ -1042,6 +1073,226 @@ fn private_nominal_changes(
     private
 }
 
+/// `private_root_names` (旧新とも非公開のファイル直下の宣言) のうち、旧新とも関数で、名前を束縛し
+/// 直さない組み込みの属性だけのもの (Issue #472)。別のクレートの参照はこの関数を名指せない。
+fn private_root_functions(
+    old: &OldRustPrivateSymbols,
+    private_root_names: &HashSet<String>,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    syms: &[Symbol],
+) -> HashSet<String> {
+    let declarations = std::cell::OnceCell::<NamedDeclarations>::new();
+    private_root_names
+        .iter()
+        .filter(|name| {
+            let Some(old_attributes) = old.plain_functions.get(*name) else {
+                return false;
+            };
+            let key = ci_key(LangId::Rust, name);
+            let mut named = syms.iter().filter(|symbol| {
+                ci_key(LangId::Rust, &symbol.name) == key
+                    && !rust_impl_owner::is_impl_owner(root, symbol)
+            });
+            named
+                .next()
+                .filter(|_| named.next().is_none())
+                .and_then(|symbol| super::descendant_for_range(root, &symbol.range))
+                .and_then(|node| plain_root_function_attributes(root, source, node))
+                .is_some_and(|attributes| attributes == *old_attributes)
+                && declarations
+                    .get_or_init(|| NamedDeclarations::count(root, source))
+                    .get(&key)
+                    == 1
+        })
+        // 参照は `r#` を外した名前で引く。
+        .map(|name| ci_key(LangId::Rust, name))
+        .collect()
+}
+
+/// ファイルの中の、正規化した名前ごとの宣言の数 (入れ子・本体の中を含む)。シンボルの抽出が
+/// 数えない宣言 (`extern` のブロックの中の本体の無い関数、enum の variant など。`use Op::*` の先で
+/// `translate(1)` と呼べる) と、マクロの token tree の中の `fn translate` のような宣言の形も数える。
+/// モジュールの項目の位置のマクロの呼び出しがあれば、どの名前の宣言も作り得るとして 1 つ足す。
+struct NamedDeclarations {
+    counts: HashMap<String, usize>,
+    item_macro: bool,
+}
+
+impl NamedDeclarations {
+    fn count(root: tree_sitter::Node<'_>, source: &[u8]) -> Self {
+        let mut declarations = Self {
+            counts: HashMap::new(),
+            item_macro: false,
+        };
+        named_declarations(root, source, &mut declarations);
+        declarations
+    }
+
+    /// 正規化した名前 `key` の宣言の数。
+    fn get(&self, key: &str) -> usize {
+        self.counts.get(key).copied().unwrap_or(0) + usize::from(self.item_macro)
+    }
+}
+
+fn named_declarations(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    declarations: &mut NamedDeclarations,
+) {
+    const KINDS: &[&str] = &[
+        "function_item",
+        "function_signature_item",
+        "enum_variant",
+        "struct_item",
+        "enum_item",
+        "union_item",
+        "type_item",
+        "trait_item",
+        "mod_item",
+        "const_item",
+        "static_item",
+        "macro_definition",
+        "field_declaration",
+        "associated_type",
+    ];
+    const ITEM_KEYWORDS: &[&str] = &[
+        "fn", "struct", "enum", "union", "const", "static", "mod", "type", "trait",
+    ];
+    let key_of = |node: tree_sitter::Node<'_>| {
+        (node.kind() == "identifier")
+            .then(|| node.utf8_text(source).ok())
+            .flatten()
+            .map(|name| ci_key(LangId::Rust, name))
+    };
+    // モジュールの項目の位置のマクロの呼び出しがあるか。別のファイルで定義したマクロは、引数の名前
+    // (`generate!(translate)`) でも、本体に固定した名前 (`generate!((_: u8))` が `pub fn translate`
+    // を作る) でも、標準のマクロの名前で再公開したもの (`crate::defs::vec!(...)`) でも、同じ名前の
+    // 関数を作り得るので、呼び出しの名前と引数では決めない。
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        root,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if KINDS.contains(&node.kind())
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+            {
+                *declarations
+                    .counts
+                    .entry(ci_key(LangId::Rust, name))
+                    .or_insert(0) += 1;
+            }
+            if node.kind() == "macro_invocation" && module_item_position(node) {
+                declarations.item_macro = true;
+            }
+            if node.kind() == "token_tree" {
+                let mut cursor = node.walk();
+                let mut previous: Option<&str> = None;
+                for token in node.children(&mut cursor).filter(|token| !token.is_extra()) {
+                    let item_keyword = previous.is_some_and(|word| ITEM_KEYWORDS.contains(&word));
+                    if item_keyword && let Some(key) = key_of(token) {
+                        *declarations.counts.entry(key).or_insert(0) += 1;
+                    }
+                    previous = token.utf8_text(source).ok();
+                }
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+}
+
+/// マクロの呼び出しが、モジュールの項目の位置 (ファイルの直下・`mod`・`extern` のブロックの中) に
+/// あるか。関数の本体の中の呼び出しが作る項目はその本体の中だけで見え、`impl`・trait の中の
+/// 呼び出しが作るのは関連項目で、どちらも別のクレートの `translate(..)` の行き先にならない。
+fn module_item_position(invocation: tree_sitter::Node<'_>) -> bool {
+    let Some(mut parent) = invocation.parent() else {
+        return false;
+    };
+    // `generate!(translate);` は文の形 (`expression_statement`) になる。
+    if parent.kind() == "expression_statement" {
+        let Some(outer) = parent.parent() else {
+            return false;
+        };
+        parent = outer;
+    }
+    match parent.kind() {
+        "source_file" => true,
+        "declaration_list" => parent
+            .parent()
+            .is_none_or(|owner| !matches!(owner.kind(), "impl_item" | "trait_item")),
+        _ => false,
+    }
+}
+
+/// ファイル直下の関数で、宣言の前の属性と本体の直下の内側の属性が、名前も可視性も変えない組み込みの
+/// 属性 (`cfg`・`allow`・`inline`・`doc` など) だけのとき、その属性の綴り (空白を詰めて、書いた順)。
+/// `test` と derive (別名の import で属性マクロに差し替え得る)、`no_mangle`・`export_name`
+/// (依存の無いクレートからも記号の名前で呼べる)、`cfg_attr`・属性マクロは許さない。
+///
+/// 呼び出し側は旧新の綴りが同じことも求める。`#[cfg(any())]` を `#[cfg(all())]` に変えると、
+/// 無かった非公開の関数が現れて、同じ名前の公開の glob の再輸出 (`pub use api::*;`) を隠し、
+/// 別のクレートの `a::translate` が非公開の関数を指して壊れる。
+fn plain_root_function_attributes(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    node: tree_sitter::Node<'_>,
+) -> Option<Vec<String>> {
+    let plain = |item: tree_sitter::Node<'_>| {
+        super::rust_std_origin::safe_attribute(item, source).is_some_and(|names| names.is_empty())
+    };
+    // 属性のトークンの並び。文字列・文字のリテラルは中身ごと 1 つのトークンにする
+    // (`#[cfg(mode = "a  b")]` と `#[cfg(mode = "a b")]` は別の条件)。
+    let spelling = |item: tree_sitter::Node<'_>| {
+        let mut tokens = Vec::new();
+        let mut pending = vec![item];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "line_comment" | "block_comment") {
+                continue;
+            }
+            if node.child_count() == 0
+                || matches!(
+                    node.kind(),
+                    "string_literal" | "raw_string_literal" | "char_literal"
+                )
+            {
+                tokens.push(node.utf8_text(source).ok()?.to_owned());
+                continue;
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            pending.extend(children.into_iter().rev());
+        }
+        Some(tokens.join("\u{1f}"))
+    };
+    if node.kind() != "function_item" || node.parent() != Some(root) {
+        return None;
+    }
+    let mut attributes = Vec::new();
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" if !plain(sibling) => return None,
+            "attribute_item" => attributes.push(spelling(sibling)?),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    attributes.reverse();
+    let body = node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() == "inner_attribute_item" {
+            if !plain(child) {
+                return None;
+            }
+            attributes.push(spelling(child)?);
+        }
+    }
+    Some(attributes)
+}
+
 /// 変更したシンボルのうち、旧新とも非公開のファイル直下の宣言 (名前が新しい版で 1 つだけ) の
 /// 名前と、旧新で同じ型を所有元とする非公開の inherent メソッドの所有元。
 fn rust_private_symbols_of_changes(
@@ -1055,8 +1306,10 @@ fn rust_private_symbols_of_changes(
     let mut root_names = HashSet::new();
     let mut method_owners = HashMap::new();
     for change in affected {
+        let key = ci_key(LangId::Rust, &change.name);
         let mut named = syms.iter().filter(|symbol| {
-            symbol.name == change.name && !rust_impl_owner::is_impl_owner(root, symbol)
+            ci_key(LangId::Rust, &symbol.name) == key
+                && !rust_impl_owner::is_impl_owner(root, symbol)
         });
         if old.root_names.contains(&change.name)
             && let Some(symbol) = named.next()
