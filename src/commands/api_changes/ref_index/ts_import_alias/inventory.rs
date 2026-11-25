@@ -96,7 +96,7 @@ fn audit(input: &ModifiedClosureInput<'_>, caches: &mut ApiClosureCaches) -> Opt
             }
             if opaque_transport(node, source) {
                 let spec = transport_source(node, source)?;
-                let target = super::resolved_relative_source(input, &relative, spec)?;
+                let target = super::resolved_relative_source(input.dir, &relative, spec)?;
                 if super::super::diff_path_matches_ref(input.target_new_path, &target, input.dir) {
                     return None;
                 }

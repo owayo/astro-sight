@@ -324,7 +324,11 @@ pub(super) fn collect_removed_symbols(
             if new_export_surface_names.contains(name.as_str()) {
                 if is_js_ts_pair && matches!(kind.as_str(), "variable" | "constant") {
                     let signatures = forwarded_signatures.get_or_insert_with(|| {
-                        super::forwarded_values::signatures(dir, &df.new_path)
+                        super::forwarded_values::signatures(
+                            dir,
+                            &df.new_path,
+                            base_blobs.read(&df.old_path).as_deref(),
+                        )
                     });
                     // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
                     if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {

@@ -210,14 +210,14 @@ fn import_is_target(
     else {
         return false;
     };
-    resolved_relative_source(input, from, spec).is_some_and(|target| {
+    resolved_relative_source(input.dir, from, spec).is_some_and(|target| {
         super::diff_path_matches_ref(input.target_new_path, &target, input.dir)
             && !super::diff_path_matches_ref(input.target_new_path, from, input.dir)
     })
 }
 
-fn resolved_relative_source(
-    input: &ModifiedClosureInput<'_>,
+pub(in crate::commands::api_changes) fn resolved_relative_source(
+    dir: &str,
     from: &str,
     spec: &str,
 ) -> Option<String> {
@@ -225,7 +225,7 @@ fn resolved_relative_source(
         return None;
     }
     let candidates = super::super::removed_attribution::relative_import_candidates(from, spec)?;
-    let root = Path::new(input.dir);
+    let root = Path::new(dir);
     let mut existing = Vec::new();
     for candidate in candidates {
         match std::fs::symlink_metadata(root.join(&candidate)) {
