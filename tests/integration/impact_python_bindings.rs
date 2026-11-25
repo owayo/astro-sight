@@ -22,6 +22,51 @@ fn callers(result: &serde_json::Value, path: &str) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn namespace_lookup_keeps_same_named_local_callers_in_worktree_and_index() {
+    let repo = TestRepo::new();
+    let producer = "def total(x):\n    return x\n\ndef inside():\n    total = globals()['total']\n    return total(10)\n";
+    let runner = "from producer import total\nfrom builtins import getattr as read\n\ndef run():\n    total = globals()['total']\n    return total(20)\n\ndef alias(module, key):\n    total = read(module, key)\n    return total(30)\n\ndef plain():\n    return total(40)\n\ndef local():\n    total = lambda x: x\n    return total(50)\n";
+    repo.write("producer.py", producer);
+    repo.write("runner.py", runner);
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "producer.py",
+        producer.replace("total(x)", "total(x, required)"),
+    );
+    for args in [&["--git"][..], &["--git", "--staged"][..]] {
+        if args.contains(&"--staged") {
+            repo.stage_all();
+        }
+        let graph = repo.run_json("context", args);
+        let actual = callers(&graph, "producer.py");
+        for (path, line) in [
+            ("producer.py", 5),
+            ("runner.py", 5),
+            ("runner.py", 9),
+            ("runner.py", 12),
+        ] {
+            assert!(
+                actual.contains(&(path.to_owned(), line)),
+                "{path}:{line} {graph}"
+            );
+        }
+        assert!(!actual.contains(&("runner.py".to_owned(), 4)), "{graph}");
+        assert!(!actual.contains(&("runner.py".to_owned(), 8)), "{graph}");
+        assert!(!actual.contains(&("runner.py".to_owned(), 16)), "{graph}");
+    }
+    let refs = repo.run_json("refs", &["--name", "total"]);
+    assert!(
+        refs["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == "runner.py" && r["ln"] == 16),
+        "{refs}"
+    );
+}
+
+#[test]
 fn impact_python_direct_local_function_and_attribute_write_are_not_callers() {
     for staged in [false, true] {
         let repo = TestRepo::new();

@@ -307,6 +307,8 @@ Rebinding, aliases, passing the result to a call or `return`, nested scopes, `lo
 
 ### Python Local Function Definitions and Attribute Writes
 
+A local assignment can retrieve an imported function by name. After `total = globals()["total"]`, a call to `total(1)` remains a caller of the changed function. Impact analysis follows the lookup through local aliases. The assignment target itself is a write and ordinary local callables keep their usual scope.
+
 Impact analysis can also identify a unique, undecorated function declared directly in the reference file as the owner of a bare use after its declaration. Rebinding, duplicate or conditional definitions, decorators, and the namespace barriers above keep the reference unproven.
 
 For a modified function proven to be a normal module function on both sides, the attribute name on the left of a plain assignment is excluded from callers. Attribute calls, function values, augmented assignments, references on the right, and changes to methods or properties retain their existing handling. These two proofs are disabled when `context --staged` or `impact --staged` reads callers from the working tree while using index sources. `review --staged` can apply them within its index snapshot. The `refs` occurrence list and dead-code counts are unchanged.
