@@ -19,11 +19,13 @@ unknown または変更箇所が空の known な証拠は通常 JSON と既存�
 | `params` | 注釈・既定値を除く引数の名前、順序、パターン、省略/rest の印、区切り |
 | `default_value` | 引数の既定値の式と `=` |
 | `visibility` | 宣言の明示的な可視性と export |
-| `referenced_type` | 変数・定数の明示的な型注釈 |
+| `referenced_type` | 変数・定数の明示的な型注釈、または TypeScript の review で変更を確認した同一ファイルの型依存 |
 | `initializer` | 変数・定数の初期化式 |
 | `body` | 関数本体。内側のコードも含む |
 | `decorator` | Python の decorator と Rust の宣言属性 |
 | `other_declaration` | 修飾子・束縛種別など、それ以外の宣言トークンすべて |
+
+TypeScript の review では、変更した型を引数や戻り値の注釈が参照していると、`referenced_type` に `param_annotation` または `return_annotation` を添える。`Promise<Alias | undefined>` にだけ使う非公開のオブジェクト型別名から省略可能なプロパティを削除した場合、差分が宣言ファイルだけに収まり、関数が従来どおり残ったキーだけを持つリテラルまたは `undefined` を `Promise.resolve` に渡し、すべての呼び出しが直接 await して残ったスカラー型のキーにアクセスすると証明できれば、`optional_return_properties_removed` として扱う。消したキーを読む場合や戻り値全体をほかに渡す場合は blocking になる。
 
 空白・コメントは比較せず、リテラルの内容は保つ。`annotation_only` が true になるのは、空でない変更が上記の型注釈 3 種類だけの場合。`call_shape_unchanged` は、型注釈・本体を除くソース上の引数構文（既定値の式も含む）の比較で、型検査・実行時の互換性の保証ではない。decorator・属性がある宣言、その他の宣言トークンも変わる場合、呼び出せない宣言では null とする。変更のない decorator も呼び出し形を変える可能性があるため断定しない。引数・既定値の構文が変われば false。`analysis: "unknown"` では両 boolean を明示的な null とし、`unknown_reason` は `source_unavailable`、`parse_error`、`unsupported_language`、`unsupported_declaration_kind`、`unsupported_syntax`、`declaration_pairing_ambiguous`、`declaration_pairing_unavailable`、`resource_limit` のいずれか。unknown の空の `changed_parts` は「変更なし」の証拠ではない。
 

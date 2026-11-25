@@ -8,6 +8,164 @@ const PANEL_AFTER: &str = "export function Panel({\n\tlabel,\n\tonDone,\n}: {\n\
 const SCREEN: &str = "import { Panel } from \"./panel\";\n\nexport function Screen() {\n\treturn <Panel label=\"Open\" onDone={() => {}} />;\n}\n";
 const CALL: &str = "<Panel label=\"Open\" onDone={() => {}} />";
 
+#[test]
+fn private_return_alias_removal_proves_every_result_use() {
+    let declaration = "type Reply = { ready?: boolean; legacy?: boolean; label?: string };\nexport function probe(target: string): Promise<Reply | undefined> {\n return Promise.resolve(target ? { ready: true } : undefined);\n}\n";
+    for (use_site, safe) in [
+        ("(await probe(target))?.ready === true", true),
+        ("(await probe(target))?.legacy === true", false),
+        (
+            "(await probe(target))?.ready && (await probe(target))?.legacy",
+            false,
+        ),
+        ("await probe(target)", false),
+        ("(await probe(target))?.[target]", false),
+        ("probe", false),
+    ] {
+        let caller = format!(
+            "import {{ probe }} from './panel.js';\nexport async function read(target: string) {{ return {use_site}; }}\n"
+        );
+        let repo = props_repo(
+            declaration,
+            &declaration.replace(" legacy?: boolean;", ""),
+            &[("src/caller.ts", &caller)],
+        );
+        for staged in [false, true] {
+            let extra: &[&str] = if staged {
+                repo.stage_all();
+                repo.write("src/caller.ts", "export {};");
+                &["--staged"]
+            } else {
+                &[]
+            };
+            let (output, json) = hook_with(&repo, extra);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!safe)),
+                "{use_site} {staged}: {json}"
+            );
+            let change = &json["api"][if safe { "mod_compat" } else { "mod" }][0];
+            assert_eq!(change["n"], "probe", "{json}");
+            assert_eq!(
+                change["change_evidence"]["changed_parts"],
+                serde_json::json!(["return_annotation", "referenced_type"]),
+                "{json}"
+            );
+            assert_eq!(change["change_evidence"]["annotation_only"], true);
+            let affected = json["change_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["n"] == "probe")
+                .unwrap();
+            assert_eq!(
+                affected["change_evidence"], change["change_evidence"],
+                "{json}"
+            );
+            if safe {
+                assert_eq!(
+                    change["reason"], "optional_return_properties_removed",
+                    "{json}"
+                );
+            } else {
+                assert!(has_ref(&json["impacts"], "src/caller.ts", 1), "{json}");
+            }
+            assert_eq!(
+                json["blocking_categories"].as_array().unwrap().is_empty(),
+                safe,
+                "{json}"
+            );
+        }
+    }
+}
+
+#[test]
+fn private_parameter_alias_contract_evidence_keeps_body_changes() {
+    let declaration = "type Shape = { kind: 'circle'; radius: number } | { kind: 'rect'; width: number };\nexport function area(shape: Shape) { return shape.kind === 'circle' ? shape.radius : shape.width; }\n";
+    let caller = "import { area } from './panel.js';\nexport const total = area({kind: 'rect', width: 2});\n";
+    for with_body in [false, true] {
+        let mut new = declaration.replace("width: number", "width: number; height: number");
+        if with_body {
+            new = new.replace("shape.width;", "shape.width * shape.height;");
+        }
+        let repo = props_repo(declaration, &new, &[("src/caller.ts", caller)]);
+        let (output, json) = hook(&repo);
+        assert_eq!(output.status.code(), Some(1), "{json}");
+        let change = &json["api"]["mod"][0];
+        assert_eq!(change["n"], "area", "{json}");
+        let mut parts = vec!["param_annotation", "referenced_type"];
+        if with_body {
+            parts.push("body");
+        }
+        assert_eq!(
+            change["change_evidence"]["changed_parts"],
+            serde_json::json!(parts),
+            "{json}"
+        );
+        assert_eq!(change["change_evidence"]["annotation_only"], !with_body);
+        let review = repo.run_json("review", &["--git"]);
+        assert_eq!(
+            review["api_changes"]["modified"][0]["change_evidence"],
+            change["change_evidence"]
+        );
+        let affected = review["impact"]["changes"][0]["affected_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == "area")
+            .unwrap();
+        assert_eq!(affected["change_evidence"], change["change_evidence"]);
+    }
+}
+
+#[test]
+fn private_return_alias_keeps_unproven_contracts_blocking() {
+    let decl = "type Input = { target: string };\ntype Reply = { ready?: boolean; legacy?: boolean };\nexport function probe(input: Input): Promise<Reply | undefined> { return Promise.resolve(input.target ? { ready: true } : undefined); }\n";
+    let caller = "import { probe } from './panel.js';\nexport async function read() { return (await probe({ target: 'x' }))?.ready; }\n";
+    for (old, extra, parameter_changed) in [
+        (decl.to_owned(), "", true),
+        (
+            decl.replace("{ ready: true }", "{ ready: true, legacy: true }"),
+            "",
+            false,
+        ),
+        (
+            format!("{decl}export type PublicReply = Reply;\n"),
+            "",
+            false,
+        ),
+        (
+            decl.to_owned(),
+            "export {}; declare global { interface Promise<T> { unwrap(): T } }",
+            false,
+        ),
+    ] {
+        let mut new = old.replace(" legacy?: boolean", "");
+        if parameter_changed {
+            new = new.replace("target: string", "target: string; required: number");
+        }
+        let repo = props_repo(
+            &old,
+            &new,
+            &[("src/caller.ts", caller), ("src/env.ts", extra)],
+        );
+        let json = assert_blocking(&repo, "probe", &old);
+        let entry = json["api"]["mod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["n"] == "probe")
+            .unwrap();
+        let parts = &entry["change_evidence"]["changed_parts"];
+        let expected = if parameter_changed {
+            serde_json::json!(["return_annotation", "param_annotation", "referenced_type"])
+        } else {
+            serde_json::json!(["return_annotation", "referenced_type"])
+        };
+        assert_eq!(parts, &expected, "{json}");
+    }
+}
+
 /// `src/panel.tsx` の旧版と `files` をコミットしてから、`src/panel.tsx` を新版に書き換える。
 fn props_repo(before: &str, after: &str, files: &[(&str, &str)]) -> TestRepo {
     let repo = TestRepo::new();

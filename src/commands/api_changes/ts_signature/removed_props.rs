@@ -15,6 +15,8 @@ use super::type_dependencies::{DependencyEnvironment, type_dependencies_unchange
 use super::*;
 use crate::models::impact::DiffFile;
 
+mod return_alias;
+
 pub(crate) struct RemovedParameterProps {
     pub(crate) parameter: usize,
     pub(crate) names: HashSet<String>,
@@ -167,7 +169,16 @@ fn detect_props_removed(
     let src = sources.get(site)?;
     let (old_tree, new_tree) = src.parse_pair(lang)?;
     let (old_root, new_root) = (old_tree.root_node(), new_tree.root_node());
-    let removal = props_removal(old_root, &src.old, new_root, &src.new, site.name)?;
+    let removal =
+        props_removal(old_root, &src.old, new_root, &src.new, site.name).or_else(|| {
+            if !local_alias_only
+                || src.original_old() != src.old
+                || src.original_new() != src.new.as_ref()
+            {
+                return None;
+            }
+            return_alias::removal(old_root, &src.old, new_root, &src.new, site.name)
+        })?;
     if local_alias_only && !removal.local_alias {
         return None;
     }
@@ -178,9 +189,18 @@ fn detect_props_removed(
     // 環境の監査を先に確かめる。成り立たなければ、在庫の外の利用を探さない。
     {
         let evidence = cache.evidence(site.dir)?;
-        // JSX の型環境 (設定・ソース・自動の runtime と型の React の出どころ) が標準であることを
-        // 求める。
-        if !evidence.repository.as_ref()?.jsx_standard() {
+        if matches!(removal.uses, PropertyUses::AwaitedResult { .. }) {
+            // 大域の型環境は新版で監査する。他ファイルも変わると旧版の宣言はこの在庫で確かめられない。
+            if diff_files
+                .iter()
+                .any(|file| file.old_path != site.old_path || file.new_path != site.new_path)
+                || ["Promise", "PromiseConstructor", "PromiseLike", "undefined"]
+                    .iter()
+                    .any(|name| evidence.declares_global(name))
+            {
+                return None;
+            }
+        } else if !evidence.repository.as_ref()?.jsx_standard() {
             return None;
         }
         let packages = evidence.relaxation()?;
@@ -215,28 +235,48 @@ fn detect_props_removed(
     if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
+    let (rule, reason) = match &removal.uses {
+        PropertyUses::Argument {
+            removed,
+            explicit_return,
+        } => (
+            UseRule::PropsWithout {
+                removed,
+                calls_allowed: *explicit_return,
+            },
+            "optional_object_props_removed",
+        ),
+        PropertyUses::AwaitedResult { retained } => (
+            UseRule::AwaitedProperty(retained),
+            "optional_return_properties_removed",
+        ),
+    };
     prove_repository_uses(
         refs,
         &inventory,
         evidence.relaxation(),
         site.new_path,
         site.name,
-        UseRule::PropsWithout {
-            removed: &removal.removed,
-            calls_allowed: removal.explicit_return,
-        },
+        rule,
     )?;
-    Some(site.compatible("optional_object_props_removed"))
+    Some(site.compatible(reason))
 }
 
 struct PropsRemoval<'tree> {
     local_alias: bool,
-    /// 消した省略可能プロパティの名前。
-    removed: HashSet<String>,
-    /// 旧新で同じ明示の戻り値型がある。直接呼び出しは、このときだけ証明に使う。
-    explicit_return: bool,
+    uses: PropertyUses,
     /// 型の依存をたどる起点 (新の側の残った props の型と戻り値型)。
     type_roots: Vec<Node<'tree>>,
+}
+
+enum PropertyUses {
+    Argument {
+        removed: HashSet<String>,
+        explicit_return: bool,
+    },
+    AwaitedResult {
+        retained: HashSet<String>,
+    },
 }
 
 /// 宣言の旧新の差が、唯一の引数の inline object 型から省略可能プロパティを消し、その分割代入の
@@ -355,8 +395,10 @@ fn props_removal<'tree>(
     type_roots.extend(new_return);
     Some(PropsRemoval {
         local_alias: new_type.annotation.kind() == "type_identifier",
-        removed,
-        explicit_return,
+        uses: PropertyUses::Argument {
+            removed,
+            explicit_return,
+        },
         type_roots,
     })
 }
@@ -427,6 +469,17 @@ fn parameter_props_type<'tree>(
     if only_parameter(function)?.id() != parameter.id() {
         return None;
     }
+    Some(ParameterPropsType {
+        annotation: *ty,
+        object: exclusive_local_object(root, source, *ty)?,
+    })
+}
+
+fn exclusive_local_object<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    ty: Node<'tree>,
+) -> Option<Node<'tree>> {
     let name = ty.utf8_text(source).ok()?;
     let object = *type_dependencies::local_type_aliases(root, source)?.get(name)?;
     let declaration = object.parent()?;
@@ -449,10 +502,7 @@ fn parameter_props_type<'tree>(
         std::ops::ControlFlow::Continue(Walk::Descend)
     })
     .is_continue();
-    exclusive.then_some(ParameterPropsType {
-        annotation: *ty,
-        object,
-    })
+    exclusive.then_some(object)
 }
 
 struct Member<'tree> {
@@ -575,11 +625,15 @@ mod tests {
             new.as_bytes(),
             "Panel",
         )
-        .map(|removal| {
-            (
-                removal.removed.into_iter().collect(),
-                removal.explicit_return,
-            )
+        .and_then(|removal| {
+            let PropertyUses::Argument {
+                removed,
+                explicit_return,
+            } = removal.uses
+            else {
+                return None;
+            };
+            Some((removed.into_iter().collect(), explicit_return))
         })
     }
 
