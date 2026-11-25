@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use crate::engine::lexical_binding::LexicalBinding;
-use crate::engine::python_scope::PythonScopeIndex;
+use crate::engine::python_scope::{PythonScopeIndex, namespace};
 
 use crate::engine::refs::is_rust_struct_field_non_callable;
 
@@ -146,13 +146,11 @@ pub(super) fn python_decorated_functions(source: &[u8]) -> Option<HashSet<String
     )
 }
 
-/// 名前空間の辞書や名前で引く属性に届く名前 ([`PYTHON_REFLECTIVE_NAMES`]) が識別子
+/// 名前空間の辞書や名前で引く属性に届く名前 ([`namespace::reflective_name`]) が識別子
 /// (属性名を含む) として現れるか。
 fn python_mentions_reflective_name(all: &[Node<'_>], source: &[u8]) -> bool {
     all.iter().any(|n| {
-        n.kind() == "identifier"
-            && n.utf8_text(source)
-                .is_ok_and(|s| PYTHON_REFLECTIVE_NAMES.contains(&s))
+        n.kind() == "identifier" && n.utf8_text(source).is_ok_and(namespace::reflective_name)
     })
 }
 
@@ -307,61 +305,14 @@ fn python_names_are_static(all: &[Node<'_>], source: &[u8], name: &str) -> bool 
         if !s.is_ascii() && !unicode_normalization::is_nfkc(s) {
             return false;
         }
-        if PYTHON_DYNAMIC_NAMES.contains(&s)
-            && !(s == "getattr" && literal_getattr.contains(&n.id()))
-        {
+        if namespace::dynamic_name(s) && !(s == "getattr" && literal_getattr.contains(&n.id())) {
             return false;
         }
     }
     // getattr を許したファイルでは、名前空間の辞書や名前で引く属性に届く経路がほかに無いことも
     // 確かめる。`getattr(locals(), "update")` のように、取り出した値で束縛を書き換えられるため。
-    literal_getattr.is_empty()
-        || !all.iter().any(|n| {
-            n.kind() == "identifier"
-                && n.utf8_text(source)
-                    .is_ok_and(|s| PYTHON_REFLECTIVE_NAMES.contains(&s))
-        })
+    literal_getattr.is_empty() || !python_mentions_reflective_name(all, source)
 }
-
-/// 未知の束縛を作る・名前でコードや属性を引く経路の名前。識別子として現れたら、どのファイルでも
-/// 証明をやめる。`getattr` だけは、文字列リテラルで名前を渡す呼び出しを別に判定する。
-const PYTHON_DYNAMIC_NAMES: &[&str] = &[
-    "globals",
-    "vars",
-    "exec",
-    "eval",
-    "__import__",
-    "modules",
-    "getattr",
-    "setattr",
-    "__builtins__",
-    "__dict__",
-    "import_module",
-];
-
-/// 名前空間の辞書 (モジュール直下の `locals()`・関数やフレームの globals)、名前で引く属性、
-/// オブジェクトの参照関係に届く名前。`getattr` を許すファイルでだけ、識別子でも証明をやめる。
-/// 通常のコードにも現れる名前 (関数の中の `locals()` など) を含むため、ほかのファイルには広げない。
-const PYTHON_REFLECTIVE_NAMES: &[&str] = &[
-    "locals",
-    "delattr",
-    "__globals__",
-    "f_globals",
-    "f_locals",
-    "f_builtins",
-    "__getattribute__",
-    "__getattr__",
-    "__setattr__",
-    "__delattr__",
-    "attrgetter",
-    "methodcaller",
-    "getattr_static",
-    "getmembers",
-    "getmembers_static",
-    "get_objects",
-    "get_referrers",
-    "get_referents",
-];
 
 /// 裸の `getattr(obj, "name")` / `getattr(obj, "name", default)` の呼び出し (`call`) で、名前が
 /// 上の一覧にも削除した関数名にも当たらないもの。同じ名前の属性アクセス `obj.name` と同じく読むだけと
@@ -385,9 +336,7 @@ fn python_getattr_reads_literal(call: Node<'_>, source: &[u8], removed: &str) ->
         return false;
     }
     python_plain_string_name(args[1], source).is_some_and(|attr| {
-        attr != removed
-            && !PYTHON_DYNAMIC_NAMES.contains(&attr)
-            && !PYTHON_REFLECTIVE_NAMES.contains(&attr)
+        attr != removed && !namespace::dynamic_name(attr) && !namespace::reflective_name(attr)
     })
 }
 
@@ -723,7 +672,10 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        for name in PYTHON_DYNAMIC_NAMES.iter().chain(PYTHON_REFLECTIVE_NAMES) {
+        for name in namespace::DYNAMIC_NAMES
+            .iter()
+            .chain(namespace::REFLECTIVE_NAMES)
+        {
             statements.push(format!("getattr(os, '{name}')"));
             statements.push(format!("sep = getattr(os, 'sep')\nvalue = os.{name}"));
         }

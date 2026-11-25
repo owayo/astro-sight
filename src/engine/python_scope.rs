@@ -6,6 +6,8 @@ use tree_sitter::Node;
 
 use super::lexical_binding::LexicalBinding;
 
+pub(crate) mod namespace;
+
 const OPAQUE_SCOPES: &[&str] = &[
     "lambda",
     "list_comprehension",
@@ -29,6 +31,7 @@ const TARGET_WRAPPERS: &[&str] = &[
 struct Bindings {
     local: HashSet<String>,
     blocked: HashSet<String>,
+    namespace_values: HashSet<String>,
     ambiguous: bool,
 }
 
@@ -46,21 +49,24 @@ impl PythonScopeIndex {
         if root.has_error() {
             return None;
         }
-        let mut scopes = HashMap::new();
-        let mut parameter_positions = HashSet::new();
+        let mut functions = Vec::new();
+        let mut has_namespace_access = false;
         // 前順の走査で開いている class の終わりの位置。関数が class の中かを、祖先をたどらずに知る。
         let mut classes: Vec<usize> = Vec::new();
         let mut cursor = root.walk();
-        loop {
+        'scan: loop {
             let node = cursor.node();
             // Python は識別子を NFKC で正規化するので (`global ｔｏｔａｌ` は `global total`)、
             // 綴りで束縛を照合できない識別子があればファイル全体を証明しない。
-            if node.kind() == "identifier"
-                && !node
-                    .utf8_text(source)
-                    .is_ok_and(|name| name.is_ascii() || unicode_normalization::is_nfkc(name))
-            {
-                return None;
+            if node.kind() == "identifier" {
+                let name = node.utf8_text(source).ok()?;
+                if !name.is_ascii() && !unicode_normalization::is_nfkc(name) {
+                    return None;
+                }
+                if !has_namespace_access {
+                    has_namespace_access =
+                        namespace::dynamic_name(name) || namespace::reflective_name(name);
+                }
             }
             // walrus は内包表記から外側へ束縛が漏れる。型パラメータも独自の scope を持つ。
             // これらの名前解決を証明できるまではファイル全体で従来の判定を保つ。
@@ -84,10 +90,7 @@ impl PythonScopeIndex {
                 classes.push(node.end_byte());
             }
             if node.kind() == "function_definition" {
-                scopes.insert(
-                    node.id(),
-                    collect_bindings(node, source, &mut parameter_positions, !classes.is_empty()),
-                );
+                functions.push((node, !classes.is_empty()));
             }
             if cursor.goto_first_child() {
                 continue;
@@ -97,13 +100,31 @@ impl PythonScopeIndex {
                     break;
                 }
                 if !cursor.goto_parent() {
-                    return Some(Self {
-                        scopes,
-                        parameter_positions,
-                    });
+                    break 'scan;
                 }
             }
         }
+        let namespace_targets = if has_namespace_access && !functions.is_empty() {
+            namespace::binding_targets(root, source)
+        } else {
+            HashSet::new()
+        };
+        let mut scopes = HashMap::new();
+        let mut parameter_positions = HashSet::new();
+        for (function, in_class) in functions {
+            let bindings = collect_bindings(
+                function,
+                source,
+                &mut parameter_positions,
+                in_class,
+                &namespace_targets,
+            );
+            scopes.insert(function.id(), bindings);
+        }
+        Some(Self {
+            scopes,
+            parameter_positions,
+        })
     }
 
     pub(crate) fn resolve(&self, node: Node<'_>, source: &[u8]) -> LexicalBinding {
@@ -127,7 +148,20 @@ impl PythonScopeIndex {
         }
         let mut child = node;
         let mut crossed_function_body = false;
+        let mut within_target = true;
+        let mut writes_local = false;
         while let Some(parent) = child.parent() {
+            if within_target && !TARGET_WRAPPERS.contains(&parent.kind()) {
+                within_target = false;
+                let field = match parent.kind() {
+                    "assignment" | "for_statement" => Some("left"),
+                    "as_pattern" => Some("alias"),
+                    _ => None,
+                };
+                writes_local = field
+                    .and_then(|f| parent.child_by_field_name(f))
+                    .is_some_and(|n| n.id() == child.id());
+            }
             match parent.kind() {
                 "type" | "dotted_name" | "aliased_import" | "global_statement"
                 | "nonlocal_statement" | "case_pattern" => return LexicalBinding::Unknown,
@@ -151,6 +185,9 @@ impl PythonScopeIndex {
                         return LexicalBinding::Unknown;
                     }
                     if bindings.local.contains(name) {
+                        if !writes_local && bindings.namespace_values.contains(name) {
+                            return LexicalBinding::Unknown;
+                        }
                         return LexicalBinding::FunctionLocal;
                     }
                 }
@@ -174,8 +211,15 @@ fn collect_bindings(
     source: &[u8],
     parameter_positions: &mut HashSet<usize>,
     in_class: bool,
+    namespace_targets: &HashSet<usize>,
 ) -> Bindings {
     let mut bindings = Bindings::default();
+    let bind = |target: Node<'_>, bindings: &mut Bindings| {
+        if namespace_targets.contains(&target.id()) {
+            collect_targets(target, source, &mut bindings.namespace_values);
+        }
+        collect_targets(target, source, &mut bindings.local);
+    };
     if let Some(parameters) = function.child_by_field_name("parameters") {
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
@@ -187,7 +231,7 @@ fn collect_bindings(
                 _ => Some(parameter),
             };
             if let Some(target) = target {
-                collect_targets(target, source, &mut bindings.local);
+                bind(target, &mut bindings);
                 parameter_positions.extend(target_identifiers(target).into_iter().map(|n| n.id()));
             }
         }
@@ -226,12 +270,12 @@ fn collect_bindings(
                 if let Some(target) = node.child_by_field_name("left")
                     && (!annotation_only || target.kind() == "identifier")
                 {
-                    collect_targets(target, source, &mut bindings.local);
+                    bind(target, &mut bindings);
                 }
             }
             "as_pattern" => {
                 if let Some(target) = node.child_by_field_name("alias") {
-                    collect_targets(target, source, &mut bindings.local);
+                    bind(target, &mut bindings);
                 }
             }
             _ => {}
@@ -330,6 +374,36 @@ mod tests {
             "def main():\n    collect_items = collect_items(3)\n",
             // 右辺のある括弧付きの注釈は代入なので束縛する。
             "def main():\n    (collect_items): list = []\n    return collect_items\n",
+        ] {
+            assert_eq!(
+                resolve_last(source),
+                LexicalBinding::FunctionLocal,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_values_propagate_through_bindings_and_closures() {
+        for source in [
+            "read = globals\npool = read()\ndef run():\n    x = collect_items = pool['key']\n    return collect_items(1)\n",
+            "def names():\n    return globals()\ndef run():\n    collect_items = names().get(key)\n    return collect_items(1)\n",
+            "def run():\n    collect_items = (lambda: globals()['collect_items'])()\n    return collect_items(1)\n",
+            "read = lambda: globals()['collect_items']\ndef run():\n    collect_items = read()\n    return collect_items(1)\n",
+            "def setup(cache):\n    cache.read = globals\ndef run(cache):\n    collect_items = cache.read()['key']\n    return collect_items(1)\n",
+            "def outer():\n    collect_items, other = (getattr(module, key), None)\n    def inner():\n        return collect_items(1)\n",
+            "def run(collect_items=getattr(module, key)):\n    return collect_items(1)\n",
+            "def run():\n    for collect_items in vars(module).values():\n        collect_items(1)\n",
+            "def run():\n    with open_resource(getattr(module, key)) as collect_items:\n        collect_items(1)\n",
+        ] {
+            assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
+        }
+        for source in [
+            "def other():\n    return globals()\ndef run(collect_items):\n    return collect_items(1)\n",
+            "def other():\n    box = globals()\n    return box\ndef run():\n    box = {'key': standalone}\n    collect_items = box['key']\n    return collect_items(1)\n",
+            "def run(key):\n    ns = globals()\n    collect_items = {'key': standalone}[key]\n    return collect_items(1)\n",
+            "def run():\n    ns = globals()\n    collect_items = lambda: ns\n    return collect_items()\n",
+            "def run():\n    collect_items = (lambda unused: globals()['collect_items'])\n    return collect_items(1)\n",
         ] {
             assert_eq!(
                 resolve_last(source),
