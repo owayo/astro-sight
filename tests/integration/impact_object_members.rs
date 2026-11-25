@@ -83,6 +83,81 @@ fn impact_object_members_only_unchanged_direct_reads_are_informational() {
 }
 
 #[test]
+fn impact_object_members_split_const_assertions_and_template_changes_in_review() {
+    let before = "export const recordLayout = { endpoint: 'old', retries: 3, label: 'Example' };\n";
+    let consumer = "export function title() { return recordLayout.label; }\nexport function attempts() { return recordLayout.retries; }\nexport function endpoint() { return recordLayout.endpoint; }";
+    let asserted = before.replace("};", "} as const;");
+    for (old, new, blocking, informational) in [
+        (before, before.replace("3", "'3'"), vec![2], vec![0, 1, 3]),
+        (
+            asserted.as_str(),
+            asserted.replace("3", "'3'"),
+            vec![2],
+            vec![0, 1, 3],
+        ),
+        (
+            before,
+            format!(
+                "export const SERVER = 'new';\n{}",
+                before.replace("'old'", "`${SERVER}/`")
+            ),
+            vec![3],
+            vec![0, 1, 2],
+        ),
+        (
+            before,
+            before.replace("'old'", "`new/`"),
+            vec![3],
+            vec![0, 1, 2],
+        ),
+    ] {
+        let repo = object_repo("ts", old, &new, consumer);
+        for staged in [false, true] {
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"]);
+            if staged {
+                repo.stage_all();
+                repo.write("layout.ts", old);
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{json}");
+            assert_eq!(json["api"]["mod"][0]["n"], "recordLayout", "{json}");
+            let lines = |category: &str| {
+                let mut lines: Vec<_> = json[category]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|change| change["refs"].as_array().unwrap())
+                    .filter(|entry| entry["p"] == "consumer.ts")
+                    .map(|entry| entry["ln"].as_u64().unwrap())
+                    .collect();
+                lines.sort_unstable();
+                lines
+            };
+            assert_eq!(lines("impacts"), blocking, "{new} staged={staged}: {json}");
+            assert_eq!(lines("impact_info"), informational, "{json}");
+        }
+    }
+}
+
+#[test]
+fn impact_object_members_keep_whole_const_object_reads_blocking() {
+    let before = "export const recordLayout = { url: 'old', keep: true } as const;\n";
+    let after = before.replace("'old'", "`new/`");
+    for consumer in [
+        "consume(recordLayout);",
+        "export const copy = { ...recordLayout };",
+    ] {
+        let repo = object_repo("ts", before, &after, consumer);
+        assert_object_impact(&repo, true);
+    }
+}
+
+#[test]
 fn impact_object_members_keep_dynamic_and_non_read_consumers_blocking() {
     for consumer in [
         "export const key = recordLayout['key'];",
@@ -159,7 +234,7 @@ fn impact_object_members_keep_ambiguous_literals_and_header_changes_blocking() {
         ),
         (
             "export const recordLayout = { key: 1, level: 10 } as const;\n",
-            "export const recordLayout = { key: 1, level: 20 } as const;\n",
+            "export const recordLayout = { key: 1, level: 20 };\n",
         ),
     ] {
         let repo = object_repo("ts", before, after, "export const key = recordLayout.key;");
