@@ -695,6 +695,10 @@ Python function definitions replaced by an unconditional explicit local `from ..
 
 The `python_import_rebinding` compatible reason requires a separate narrow proof: matching plain function ASTs with inert primitive annotations/defaults, a return expression containing only parameters and literals/operators, no module-global dependency, static local import graphs without cycles or import-time effects, and a complete repository scan that rejects function-value escape, aliases, introspection and dynamic binding. Conditional/function-local imports, decorators, unresolved imports, namespace imports, and unproved contracts remain blocking. The original `refs` occurrences are retained. Staged review uses the index snapshot; fallback worktree evidence is discarded when it cannot represent the index.
 
+### Python module aliases in removal checks
+
+For an attribute call such as `u.total()`, `review` resolves `u` in the scope containing that use. An `import math as u` inside a different function has no effect on the module-level `u`. Conflicting or conditional imports keep the removal blocking when the receiver cannot be resolved.
+
 ### Python module functions accessed by name
 
 When a module-level function is removed, `review` also checks uses of its name in Python strings. A remaining `globals()["total"]`, `getattr(module, "total")` or `mock.patch("pkg.module.total")` can keep the removal in `api.rm` and make the hook exit with status 1. Ordinary dictionary keys and log messages can still produce `api.rm_dead`. If the scan cannot read or parse a source, or exceeds 2 MiB per file or 64 MiB in total, it keeps the remaining candidates blocking and reports the reason in `truncations`.

@@ -10,6 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+mod python_imports;
+use python_imports::PythonImports;
+
 use super::removed_ffi::ForeignBindability;
 use crate::engine::parser;
 use crate::language::LangId;
@@ -499,8 +502,8 @@ pub(super) fn is_js_ts_family(lang: LangId) -> bool {
 /// (`re.search` / `self.search` / `pkg.mod.search`) かどうかを判定する。
 ///
 /// すべて属性アクセスなら、レシーバの「実効モジュール名」集合を返す。実効モジュール名は
-/// レシーバ式の末尾識別子を、そのファイルの `as` 別名 (`import pkg.core as c` / `from pkg
-/// import core as c`) で解決したもの。モジュールレベルの自由関数・クラスへ属性アクセスで
+/// 単純な識別子ならその位置で見える import 別名を解決し、属性連鎖なら末尾の属性名を使う。
+/// モジュールレベルの自由関数・クラスへ属性アクセスで
 /// 到達する経路は `<module>.<name>` (と再エクスポートした祖先パッケージの `<package>.<name>`)
 /// だけなので、この集合に削除モジュール名と祖先パッケージ名が無ければ削除シンボル由来では
 /// ないと言える。
@@ -522,7 +525,10 @@ fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttribution
         local_positions: super::removed_scope::python_local_positions(root, &source, symbol),
         ..RefAttributionFacts::opaque()
     };
-    let aliases = collect_python_import_aliases(root, &source);
+    if root.has_error() {
+        return facts;
+    }
+    let aliases = PythonImports::collect(root, &source, symbol);
     let mut receivers: HashSet<String> = HashSet::new();
     let mut import_only = HashMap::new();
     if !collect_python_attribute_receivers(
@@ -576,34 +582,6 @@ fn analyze_rust_facts(
     }
 }
 
-/// `import pkg.core as c` / `from pkg import core as c` の別名 → 実モジュール名 (末尾segment)。
-/// 別名を持たない import は識別子がそのままモジュール名になるため収集不要。
-fn collect_python_import_aliases(
-    node: tree_sitter::Node,
-    source: &[u8],
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る
-    // (同じ別名が複数あれば後の import が勝つ順序も再帰版と同じ)。
-    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
-        node,
-        crate::engine::tree_walk::Children::Named,
-        |node, _| {
-            if node.kind() == "aliased_import"
-                && let Some(name) = node.child_by_field_name("name")
-                && let Some(alias) = node.child_by_field_name("alias")
-                && let Ok(alias_text) = alias.utf8_text(source)
-                && let Ok(name_text) = name.utf8_text(source)
-            {
-                let module = name_text.rsplit('.').next().unwrap_or(name_text);
-                out.insert(alias_text.to_string(), module.to_string());
-            }
-            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
-        },
-    );
-    out
-}
-
 /// symbol の出現を走査し、すべてが属性アクセスなら true を返してレシーバの実効モジュール名を
 /// `out` に積む。bare identifier としての出現を 1 件でも見つけたら false (証明不能)。
 ///
@@ -613,10 +591,10 @@ fn collect_python_import_aliases(
 /// `BACKENDS[name].search(q)` と呼べる。その場合は名前から削除モジュールかどうかを決められない
 /// ため、証明しない (false)。`import_only` は先頭の識別子ごとの判定結果のキャッシュ。
 fn collect_python_attribute_receivers(
-    node: tree_sitter::Node,
+    root: tree_sitter::Node,
     source: &[u8],
     symbol: &str,
-    aliases: &std::collections::HashMap<String, String>,
+    aliases: &PythonImports<'_>,
     import_only: &mut HashMap<String, bool>,
     out: &mut HashSet<String>,
 ) -> bool {
@@ -625,7 +603,7 @@ fn collect_python_attribute_receivers(
 
     // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
     // 証明できない出現を見つけた時点で打ち切る (再帰版の `all` と同じ)。
-    let walk = walk_preorder(node, Children::Named, |node, _| {
+    let walk = walk_preorder(root, Children::Named, |node, _| {
         // 文字列の中の識別子は f-string の補間 (`f"{search()}"`) の式だけなので、文字列は飛ばさない。
         if node.kind() == "comment" {
             return ControlFlow::Continue(Walk::Skip);
@@ -653,20 +631,13 @@ fn collect_python_attribute_receivers(
         let Ok(base_name) = base.utf8_text(source) else {
             return ControlFlow::Break(());
         };
-        let root = {
-            let mut root = node;
-            while let Some(parent) = root.parent() {
-                root = parent;
-            }
-            root
-        };
         let bound_only_by_import = *import_only
             .entry(base_name.to_string())
             .or_insert_with(|| python_name_bound_only_by_import(root, source, base_name));
         if !bound_only_by_import {
             return ControlFlow::Break(());
         }
-        let Some(name) = python_receiver_effective_name(object, source, aliases) else {
+        let Some(name) = python_receiver_effective_name(object, base_name, source, aliases) else {
             return ControlFlow::Break(());
         };
         out.insert(name);
@@ -760,21 +731,23 @@ fn python_import_binds_name(statement: tree_sitter::Node, source: &[u8], name: &
 /// 添字・関数呼び出しなど識別子で終わらない式は None。
 fn python_receiver_effective_name(
     object: tree_sitter::Node,
+    base: &str,
     source: &[u8],
-    aliases: &std::collections::HashMap<String, String>,
+    aliases: &PythonImports<'_>,
 ) -> Option<String> {
-    let last = match object.kind() {
-        "identifier" => object,
-        "attribute" => object.child_by_field_name("attribute")?,
-        _ => return None,
-    };
-    let text = last.utf8_text(source).ok()?;
-    Some(
-        aliases
-            .get(text)
-            .cloned()
-            .unwrap_or_else(|| text.to_string()),
-    )
+    let module = aliases.module_at(object, base)?;
+    match object.kind() {
+        "identifier" => Some(module.to_owned()),
+        // pkg.util の util は属性名なので、同じ綴りの import 別名に置き換えない。
+        "attribute" => Some(
+            object
+                .child_by_field_name("attribute")?
+                .utf8_text(source)
+                .ok()?
+                .to_owned(),
+        ),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1448,6 +1421,92 @@ mod tests {
         assert!(facts.python_attribute_receivers.is_none());
     }
 
+    #[test]
+    fn python_receiver_imports_distinguish_lexical_scopes() {
+        for (source, expected) in [
+            (
+                "import math as u\nclass C:\n    check = lambda: u.total(1)\n",
+                Some("math"),
+            ),
+            (
+                "import tools.util as u\nclass C:\n    import math as u\n    check = lambda: u.total(1)\n",
+                None,
+            ),
+            (
+                "import tools.util as u\ndef other():\n    import math as u\ndef use():\n    return u.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "def other():\n    from tools import math as u\nfrom tools import util as u\nu.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "def use():\n    from tools import util as u\n    return u.total(1)\ndef other():\n    import math as u\n",
+                Some("util"),
+            ),
+            (
+                "def outer():\n    import tools.util as u\n    def other():\n        import math as u\n    def inner():\n        return u.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "import tools.util as u\nclass C:\n    import math as u\n    def use(self):\n        return u.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "import tools.util as u\ndef f(value=u.total(1)):\n    import math as u\n",
+                Some("util"),
+            ),
+            (
+                "from tools import util\ndef other():\n    import math as util\nutil.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "import tools.util\nimport math as util\ntools.util.total(1)\n",
+                Some("util"),
+            ),
+            (
+                "def use():\n    import math as u\n    return u.total(1)\n",
+                Some("math"),
+            ),
+            (
+                "import tools.util as u\ndef use():\n    from elsewhere import other as u\n    return u.total(1)\n",
+                Some("other"),
+            ),
+            (
+                "import tools.util as u\nclass C:\n    import math as u\n    result = u.total(1)\n",
+                Some("math"),
+            ),
+            (
+                "import math as u\nimport tools.util as u\nu.total(1)\n",
+                None,
+            ),
+            (
+                "import math as u\nif flag:\n    import tools.util as u\nu.total(1)\n",
+                None,
+            ),
+            (
+                "def other():\n    import math as u\ndef use():\n    return u.total(1)\n",
+                None,
+            ),
+            (
+                "import tools.util as u\ndef use():\n    u.total(1)\n    import math as u\n",
+                None,
+            ),
+            (
+                "import math as u\ndef change():\n    global u\n    import tools.util as u\nu.total(1)\n",
+                None,
+            ),
+            (
+                "import math as u\nimport tools.util as ｕ\nu.total(1)\n",
+                None,
+            ),
+        ] {
+            let receivers = python_facts_for(source, "total").python_attribute_receivers;
+            let expected = expected.map(|name: &str| HashSet::from([name.to_owned()]));
+            assert_eq!(receivers.as_deref(), expected.as_ref(), "{source}");
+        }
+    }
+
     /// モジュールは普通の値なので、辞書・変数・引数・呼び出し結果に入れたレシーバ
     /// (`BACKENDS[name].search(q)` / `backend.search(q)`) の名前からは削除モジュールかどうかを
     /// 決められない。レシーバの先頭が import 文だけに束縛された名前のときだけ証明に使う。
@@ -1504,35 +1563,6 @@ mod tests {
     }
 
     /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
-    fn collect_python_import_aliases_recursive(
-        node: tree_sitter::Node,
-        source: &[u8],
-    ) -> std::collections::HashMap<String, String> {
-        let mut out = std::collections::HashMap::new();
-        fn walk(
-            node: tree_sitter::Node,
-            source: &[u8],
-            out: &mut std::collections::HashMap<String, String>,
-        ) {
-            if node.kind() == "aliased_import"
-                && let Some(name) = node.child_by_field_name("name")
-                && let Some(alias) = node.child_by_field_name("alias")
-                && let Ok(alias_text) = alias.utf8_text(source)
-                && let Ok(name_text) = name.utf8_text(source)
-            {
-                let module = name_text.rsplit('.').next().unwrap_or(name_text);
-                out.insert(alias_text.to_string(), module.to_string());
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                walk(child, source, out);
-            }
-        }
-        walk(node, source, &mut out);
-        out
-    }
-
-    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
     fn python_receiver_base_identifier_recursive(
         object: tree_sitter::Node,
     ) -> Option<tree_sitter::Node> {
@@ -1553,7 +1583,7 @@ mod tests {
         node: tree_sitter::Node,
         source: &[u8],
         symbol: &str,
-        aliases: &std::collections::HashMap<String, String>,
+        aliases: &PythonImports<'_>,
         import_only: &mut HashMap<String, bool>,
         out: &mut HashSet<String>,
     ) -> bool {
@@ -1591,7 +1621,8 @@ mod tests {
             if !bound_only_by_import {
                 return false;
             }
-            let Some(name) = python_receiver_effective_name(object, source, aliases) else {
+            let Some(name) = python_receiver_effective_name(object, base_name, source, aliases)
+            else {
                 return false;
             };
             out.insert(name);
@@ -1610,7 +1641,7 @@ mod tests {
         })
     }
 
-    /// 反復版の Python の別名・レシーバの収集が、浅い入力で再帰版と同じ結果 (戻り値・
+    /// 反復版の Python のレシーバの収集が、浅い入力で再帰版と同じ結果 (戻り値・
     /// 集めたレシーバ・import だけの束縛の判定キャッシュ) を返す。
     #[test]
     fn python_attribute_helpers_match_recursive_version() {
@@ -1628,13 +1659,8 @@ mod tests {
         for src in sources {
             let tree = parser::parse_source(src.as_bytes(), LangId::Python).unwrap();
             let root = tree.root_node();
-            let aliases = collect_python_import_aliases(root, src.as_bytes());
-            assert_eq!(
-                aliases,
-                collect_python_import_aliases_recursive(root, src.as_bytes()),
-                "{src}"
-            );
             for symbol in ["search", "attr", "re", "core", "missing"] {
+                let aliases = PythonImports::collect(root, src.as_bytes(), symbol);
                 let mut import_only = HashMap::new();
                 let mut out = HashSet::new();
                 let mut import_only_recursive = HashMap::new();

@@ -66,6 +66,59 @@ fn python_free_function_removal_reads_literal_getattr_like_attribute_access() {
 
 const UTIL_OLD: &str = "def total(x):\n    return x\n\n\ndef keep():\n    return 1\n";
 const UTIL_NEW: &str = "def keep():\n    return 1\n";
+
+#[test]
+fn removal_resolves_import_aliases_at_the_attribute_use() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("tools");
+    repo.write("tools/util.py", UTIL_OLD);
+    repo.write("tools/other.py", "def total(value): return value\n");
+    let caller = "import tools.util as u\n\ndef run():\n    return u.total(1)\n\ndef other():\n    import math as u\n    return u.pi\n";
+    repo.write("report.py", caller);
+    repo.commit_all("base");
+    repo.write("tools/util.py", UTIL_NEW);
+    repo.stage_all();
+    repo.write(
+        "report.py",
+        caller.replace(
+            "def run():\n",
+            "def run():\n    from tools import other as u\n",
+        ),
+    );
+    for (staged, blocking) in [(true, true), (false, false)] {
+        let mut args = vec!["--git"];
+        if staged {
+            args.push("--staged");
+        }
+        let review = repo.run_json("review", &args);
+        let bucket = if blocking { "removed" } else { "removed_dead" };
+        assert_eq!(
+            review["api_changes"][bucket][0]["name"], "total",
+            "{review}"
+        );
+        let hook = cargo_bin()
+            .args(["review", "--hook", "--dir"])
+            .arg(repo.root())
+            .args(&args)
+            .output()
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+        assert_eq!(hook.status.code(), Some(i32::from(blocking)), "{result}");
+        let bucket = if blocking { "rm" } else { "rm_dead" };
+        assert_eq!(result["api"][bucket][0]["n"], "total", "{result}");
+    }
+    let refs = repo.run_json("refs", &["--name", "total"]);
+    assert!(
+        refs["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == "report.py" && r["ln"] == 4),
+        "{refs}"
+    );
+}
+
 /// 削除元と同じモジュールの、引数とローカルの代入で同じ名前を隠す関数 (変更の前後とも置く)。
 const SHADOWS: &str = "\n\ndef use_param(total):\n    return total\n\n\ndef use_local():\n    total = 2\n    return total\n";
 
