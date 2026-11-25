@@ -9,9 +9,13 @@ use crate::language::LangId;
 use crate::models::impact::AffectedSymbol;
 use crate::models::symbol::Symbol;
 
+mod templates;
+use templates::{LiteralIds, TemplateBindings};
+
 #[derive(PartialEq)]
 enum StaticValue {
     Literal(String, String),
+    Template(String, Vec<usize>),
     Object(Vec<(String, StaticValue)>),
 }
 
@@ -74,7 +78,12 @@ fn static_key(node: Node<'_>, source: &[u8]) -> Option<String> {
     Some(key.to_string())
 }
 
-fn static_value(node: Node<'_>, source: &[u8], depth: usize) -> Option<StaticValue> {
+fn static_value(
+    node: Node<'_>,
+    source: &[u8],
+    depth: usize,
+    bindings: Option<&TemplateBindings<'_>>,
+) -> Option<StaticValue> {
     // 病的な入れ子で Rust のスタックを使い切らない。
     if depth > 64 || node.has_error() || node.is_missing() {
         return None;
@@ -95,7 +104,12 @@ fn static_value(node: Node<'_>, source: &[u8], depth: usize) -> Option<StaticVal
                 if !keys.insert(key.clone()) {
                     return None;
                 }
-                let value = static_value(child.child_by_field_name("value")?, source, depth + 1)?;
+                let value = static_value(
+                    child.child_by_field_name("value")?,
+                    source,
+                    depth + 1,
+                    bindings,
+                )?;
                 members.push((key, value));
             }
             Some(StaticValue::Object(members))
@@ -104,6 +118,7 @@ fn static_value(node: Node<'_>, source: &[u8], depth: usize) -> Option<StaticVal
             node.kind().to_string(),
             node.utf8_text(source).ok()?.to_string(),
         )),
+        "template_string" => templates::template_value(node, source, bindings?),
         _ => None,
     }
 }
@@ -184,6 +199,7 @@ fn object_declaration(
     root: Node<'_>,
     source: &[u8],
     symbol: &Symbol,
+    bindings: Option<&TemplateBindings<'_>>,
 ) -> Option<(Vec<String>, StaticValue)> {
     let declaration = super::descendant_for_range(root, &symbol.range)?;
     if declaration.kind() != "variable_declarator"
@@ -202,7 +218,19 @@ fn object_declaration(
     {
         return None;
     }
-    let value = declaration.child_by_field_name("value")?;
+    let mut value = declaration.child_by_field_name("value")?;
+    if value.kind() == "as_expression" {
+        let mut cursor = value.walk();
+        let mut children = value.children(&mut cursor).filter(|node| !node.is_extra());
+        let object = children.next()?;
+        if children.next()?.kind() != "as"
+            || children.next()?.kind() != "const"
+            || children.next().is_some()
+        {
+            return None;
+        }
+        value = object;
+    }
     if value.kind() != "object" {
         return None;
     }
@@ -212,7 +240,16 @@ fn object_declaration(
         .unwrap_or(lexical);
     Some((
         header_tokens(header, value.id(), source)?,
-        static_value(value, source, 0)?,
+        static_value(
+            value,
+            source,
+            0,
+            bindings.filter(|_| {
+                header
+                    .parent()
+                    .is_some_and(|parent| parent.id() == root.id())
+            }),
+        )?,
     ))
 }
 
@@ -230,6 +267,9 @@ pub(super) fn collect_object_member_changes(
     if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx) || root.has_error() {
         return empty;
     }
+    let literal_ids = LiteralIds::default();
+    let new_bindings = TemplateBindings::new(root, source, syms, &literal_ids);
+    let typescript = matches!(lang, LangId::Typescript | LangId::Tsx);
     let candidates: Vec<_> = affected
         .iter()
         .filter(|affected| affected.change_type == "modified")
@@ -239,7 +279,8 @@ pub(super) fn collect_object_member_changes(
             if matches.next().is_some() {
                 return None;
             }
-            let (header, value) = object_declaration(root, source, symbol)?;
+            let (header, value) =
+                object_declaration(root, source, symbol, typescript.then_some(&new_bindings))?;
             Some((symbol, header, value))
         })
         .collect();
@@ -262,6 +303,12 @@ pub(super) fn collect_object_member_changes(
     let mut changes = HashMap::new();
     let mut new_declarations = HashMap::new();
     let mut old_declarations = HashMap::new();
+    let old_bindings = TemplateBindings::new(
+        old_tree.root_node(),
+        &old_source.source,
+        &old_symbols,
+        &literal_ids,
+    );
     for (symbol, header, new) in candidates {
         let mut matches = old_symbols.iter().filter(|old| old.name == symbol.name);
         let Some(old_symbol) = matches.next() else {
@@ -273,9 +320,12 @@ pub(super) fn collect_object_member_changes(
         {
             continue;
         }
-        let Some((old_header, old)) =
-            object_declaration(old_tree.root_node(), &old_source.source, old_symbol)
-        else {
+        let Some((old_header, old)) = object_declaration(
+            old_tree.root_node(),
+            &old_source.source,
+            old_symbol,
+            typescript.then_some(&old_bindings),
+        ) else {
             continue;
         };
         if old_header != header {
@@ -362,7 +412,10 @@ fn source_escapes(
             });
             let value = if old_side { &change.old } else { &change.new };
             let literal_read = direct_member_read(node, source).is_some_and(|path| {
-                matches!(own_value(value, &path), Some(StaticValue::Literal(..)))
+                matches!(
+                    own_value(value, &path),
+                    Some(StaticValue::Literal(..) | StaticValue::Template(..))
+                )
             });
             if !named_export && !literal_read {
                 escaped.insert(name.to_string());
@@ -525,6 +578,8 @@ mod tests {
             "export let layout = { key: 1, level: 20 };",
             "export const layout: { key: number, level: number } = { key: 1, level: 20 };",
             "export const layout = { key: 1, level: 20 } satisfies object;",
+            "export const layout = { key: 1, level: 20 } as const;",
+            "export const layout = { key: 1, level: 20 } as Layout;",
             "export const layout = { key: 1, level: [20] };",
             "export const layout = { key: 1, level };",
             "export const layout = { key: 1, '\\u006bey': 1, level: 20 };",
@@ -533,6 +588,46 @@ mod tests {
         ] {
             assert!(evidence(before, after).is_empty(), "{after}");
             assert!(evidence(after, before).is_empty(), "old: {after}");
+        }
+    }
+
+    #[test]
+    fn object_member_changes_compare_template_bindings_in_both_snapshots() {
+        let before = "const HOST = 'old'; const PORT = 8; export const layout = { url: `${HOST}:${PORT}/`, count: 1, keep: true } as const; console.log(layout.url);";
+        let changed = before.replace("count: 1", "count: 2");
+        let same_inputs = evidence(before, &changed);
+        assert!(same_inputs["layout"].read_is_unchanged("url"));
+        for different_inputs in [
+            changed.replace("'old'", "'new'"),
+            changed.replace("= 8", "= 9"),
+        ] {
+            let changes = evidence(before, &different_inputs);
+            let layout = &changes["layout"];
+            assert!(layout.read_is_unchanged("keep"));
+            for path in ["", "url", "count"] {
+                assert!(!layout.read_is_unchanged(path), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn object_member_changes_require_safe_template_evaluation_in_both_snapshots() {
+        let plain = "export const layout = { url: 'old', keep: true };";
+        let object = "export const layout = { url: `${HOST}/`, keep: true };";
+        for dynamic in [
+            format!("let HOST = 'a'; {object}"),
+            format!("import {{ HOST }} from './host'; {object}"),
+            format!("{object} const HOST = 'a';"),
+            format!("const HOST = {{ toString() {{ throw 0; }} }}; {object}"),
+            format!("const HOST = getHost(); {object}"),
+            format!("const HOST = 'a'; const HOST = 'b'; {object}"),
+            object.replace("HOST", "getHost()"),
+            object.replace("HOST", "config.host"),
+            object.replace("`${HOST}/`", "tag`raw`"),
+            object.replace("`${HOST}/`", r"`\8`"),
+        ] {
+            assert!(evidence(plain, &dynamic).is_empty(), "new: {dynamic}");
+            assert!(evidence(&dynamic, plain).is_empty(), "old: {dynamic}");
         }
     }
 
@@ -617,6 +712,8 @@ mod tests {
                 "binary_expression",
                 "ternary_expression",
                 "template_substitution",
+                "template_string",
+                "string_fragment",
                 "shorthand_property_identifier",
                 "export_specifier",
                 "import_specifier",
@@ -624,6 +721,10 @@ mod tests {
             ] {
                 tree_sitter::Query::new(&lang.ts_language(), &format!("({kind}) @node"))
                     .unwrap_or_else(|error| panic!("{lang:?}/{kind}: {error}"));
+            }
+            if lang != LangId::Javascript {
+                tree_sitter::Query::new(&lang.ts_language(), "(as_expression \"as\" \"const\")")
+                    .unwrap();
             }
         }
     }
