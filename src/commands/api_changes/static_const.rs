@@ -236,7 +236,7 @@ fn static_const_contract<'tree>(
                     "template_substitution" => {
                         substitutions.push(child.utf8_text(source).ok()?.to_owned())
                     }
-                    "string_fragment" | "escape_sequence" => {}
+                    _ if super::js_const::is_template_text(child, source) => {}
                     _ => return None,
                 }
             }

@@ -177,22 +177,12 @@ fn number_literal(node: Node<'_>, source: &[u8]) -> bool {
 
 fn literal_escapes_are_safe(value: Node<'_>, source: &[u8]) -> bool {
     walk_preorder(value, Children::Named, |node, _| {
-        if node.kind() == "escape_sequence" {
-            let Ok(text) = node.utf8_text(source) else {
-                return ControlFlow::Break(());
-            };
-            if text.as_bytes().first() == Some(&b'\\')
-                && text.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
-            {
-                return ControlFlow::Break(());
-            }
-            if let Some(hex) = text
-                .strip_prefix("\\u{")
-                .and_then(|text| text.strip_suffix('}'))
-                && !u32::from_str_radix(hex, 16).is_ok_and(|value| value <= 0x10_FFFF)
-            {
-                return ControlFlow::Break(());
-            }
+        if node.kind() == "escape_sequence"
+            && !node
+                .utf8_text(source)
+                .is_ok_and(super::super::js_const::valid_non_numeric_escape)
+        {
+            return ControlFlow::Break(());
         }
         ControlFlow::Continue(Walk::Descend)
     })
