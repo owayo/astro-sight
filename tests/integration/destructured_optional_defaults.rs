@@ -56,6 +56,158 @@ fn compatible(result: &serde_json::Value) -> bool {
 }
 
 #[test]
+fn unannotated_object_parameters_report_inferred_contract_changes() {
+    for (extension, before, after, argument, changes) in [
+        (
+            "ts",
+            "{ label = '' }",
+            "{ label = 0 }",
+            Some("{label: 'first'}"),
+            true,
+        ),
+        (
+            "tsx",
+            "{ label = '' }",
+            "{ label = '', size }",
+            Some("{}"),
+            true,
+        ),
+        ("ts", "{ label = '' }", "{ label }", None, true),
+        (
+            "ts",
+            "{ key: { value = true } }",
+            "{ key: { value = 1 } }",
+            Some("{key: {value: true}}"),
+            true,
+        ),
+        (
+            "ts",
+            "{ label = 'a b' as const }",
+            "{ label = 'a  b' as const }",
+            Some("{label: 'a b'}"),
+            true,
+        ),
+        (
+            "ts",
+            "{ label: local = '' }, size = fallback",
+            "{ label: fallback = '' }, size = fallback",
+            Some("{}, 5"),
+            true,
+        ),
+        (
+            "ts",
+            "{ label: local = '', size = fallback }",
+            "{ label: fallback = '', size = fallback }",
+            Some("{size: 5}"),
+            true,
+        ),
+        (
+            "ts",
+            "{ label: x = '' }",
+            "{ /* note */ label: y = 'next' }",
+            Some("{}"),
+            false,
+        ),
+        (
+            "tsx",
+            "{ size = 1 }",
+            "{ size = 3 }",
+            Some("{size: 5}"),
+            false,
+        ),
+        (
+            "ts",
+            "tag: string, { label = 0 }",
+            "tag: string, { /* note */ label = 0 }",
+            Some("'tag', {}"),
+            false,
+        ),
+        (
+            "ts",
+            "{ box: { label = 0 } }",
+            "{\n box:\n { label = 0 }\n}",
+            Some("{box: {}}"),
+            false,
+        ),
+        (
+            "ts",
+            "{ key = Number('1') }",
+            "{ /* note */ key = Number('1') }",
+            Some("{}"),
+            false,
+        ),
+        (
+            "ts",
+            "{ key = Number('1') }",
+            "{ key = Number( /* note */ '1' ) }",
+            Some("{}"),
+            false,
+        ),
+        (
+            "ts",
+            "{ key = 'x' as const }",
+            "{ key = 'x'  as  const }",
+            Some("{}"),
+            false,
+        ),
+        (
+            "ts",
+            "{ key = () => { return 1; } }",
+            "{ key = () => { return\n1; } }",
+            Some("{}"),
+            true,
+        ),
+        (
+            "ts",
+            "{ label }: { label: string }",
+            "{ label: item }: { label: string }",
+            Some("{label: 'a'}"),
+            false,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let path = format!("panel.{extension}");
+        let write = |parameter: &str| {
+            repo.write(
+                &path,
+                format!(
+                    "const fallback = 7;\nexport function Panel({parameter}) {{ return 0; }}\n"
+                ),
+            )
+        };
+        write(before);
+        if let Some(argument) = argument {
+            repo.write(
+                "home.ts",
+                format!(
+                    "import {{ Panel }} from './panel';\nexport const home = Panel({argument});\n"
+                ),
+            );
+        }
+        repo.commit_all("base");
+        write(after);
+        let review = repo.run_json("review", &["--git"]);
+        repo.stage_all();
+        write(before);
+        let (output, hook) = run_review(&repo, true);
+        let modified = review["api_changes"]["modified"].as_array().unwrap();
+        if changes {
+            assert_eq!(output.status.code(), Some(1), "{before} -> {after}: {hook}");
+            assert_eq!(
+                hook["api"]["mod"][0]["n"], "Panel",
+                "{before} -> {after}: {hook}"
+            );
+            assert_eq!(modified[0]["name"], "Panel");
+            assert_ne!(modified[0]["old_signature"], modified[0]["new_signature"]);
+        } else {
+            assert!(modified.is_empty(), "{before} -> {after}: {review}");
+            assert!(hook["api"].is_null(), "{hook}");
+        }
+    }
+}
+
+#[test]
 fn destructured_optional_defaults_literal_unions_are_compatible() {
     for (ty, value) in [("'plain' | 'muted'", "'plain'"), ("1 | 2", "1")] {
         let (output, result) = review_default("", ty, value);

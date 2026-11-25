@@ -489,6 +489,10 @@ astro-sight review --dir . --git \
 
 ### TypeScript の互換性が未証明の変更
 
+TS / TSX の `function Panel({ label = '' })` では、呼び出し側は `label` を省略するか、文字列を渡せる。引数に型注釈がないため、`review` は分割代入から推論されるプロパティをシグネチャに含める。既定値を数値に変える、既定値を外す、必須のプロパティを足すと、通常出力の `api_changes.modified` と hook の `api.mod` に関数が載る。
+
+単純な単一引数では、文字列の既定値を別の文字列に変えても同じ型として扱う。入れ子の分割代入や複数引数では束縛名も比較するため、ローカルな別名だけの変更が確認対象に残ることがある。
+
 blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` は、`unverified` を持つ。分類・blocking・終了コードは変えず、型検査で非互換だと断定するものではない。
 
 | `unverified.reason` | 意味 |

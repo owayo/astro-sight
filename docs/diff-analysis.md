@@ -485,6 +485,10 @@ On top of the impact analysis of `context`, `review` returns candidates for miss
 
 ### Unverified TypeScript modifications
 
+In a TS or TSX declaration such as `function Panel({ label = '' })`, callers can omit `label` or pass a string. With no type annotation on the parameter, `review` includes the properties inferred from the pattern in the signature. Changing the default to a number, removing the default, or adding a required property puts the function in `api_changes.modified` and in the hook's `api.mod`.
+
+For a single parameter with a simple pattern, changing one string default to another preserves the inferred type. Nested patterns and multi-parameter signatures also compare binding names, so renaming a local binding can still appear in the review.
+
 Blocking TS / TSX entries in `api_changes.modified` and hook `api.mod` carry `unverified`. This adds evidence for triage without changing classification, blocking, or exit status. It does not establish a TypeScript type error.
 
 | `unverified.reason` | Meaning |

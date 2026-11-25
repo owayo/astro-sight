@@ -1,6 +1,6 @@
 //! API シグネチャの抽出と正規化。言語別の binding shape と Tauri / TypeScript の正規化を含む。
 
-use super::signature_tokens::{SigTokens, signature_tokens_in_range};
+use super::signature_tokens::{SigTokens, destructured_pattern_text, signature_tokens_in_range};
 use super::*;
 
 /// シンボルの種類に応じた API シグネチャを抽出する。
@@ -164,12 +164,7 @@ pub(crate) fn extract_api_signature_with_original(
                         let s = cur.start_byte();
                         let e =
                             function_body_start_byte(cur).unwrap_or_else(|| cur.end_byte());
-                        // TS/TSX の関数 destructured params (`function foo({ a, b }: T)`) は
-                        // `{ ... }` 内の variable 列が変わっても呼び出し側契約 (`: T` 型注釈)
-                        // に影響しないため、signature 比較から除外する。React の Props
-                        // 拡張 (optional prop 追加 + destructure 受け取り追加) で api.mod に
-                        // 出る false positive を防ぐ (Issue
-                        // 2026-05-28-api-mod-optional-props-additive 対応)。
+                        // 分割代入の引数は、型注釈がないと束縛の形から公開型が決まる。
                         if matches!(
                             lang_id,
                             crate::language::LangId::Typescript | crate::language::LangId::Tsx
@@ -1150,82 +1145,72 @@ pub(crate) fn normalize_rust_tauri_command_signature(
     Some(normalize_signature_whitespace(rebuilt.as_bytes()))
 }
 
-/// TS/TSX 関数の signature を抽出し、parameters 直下の `object_pattern`
-/// (destructured params) を `{}` に正規化する。
-///
-/// `function foo({ a, b, c = 0 }: Props)` と `function foo({ a, b }: Props)` は
-/// どちらも呼び出し側契約は `: Props` のみで、destructure 中身は内部 binding。
-/// 正規化することで Props 拡張に伴う destructure 行の追加が api.mod に出ない。
-///
-/// 型注釈側の inline object type (`function foo({x}: {x: string, y: number})` の
-/// `{x: string, y: number}`) は `type_annotation` 子なので置換対象外。
-///
-/// 「引数なし `()` から省略可能な destructured 引数追加」の互換性判定は、
-/// signature 単独では行わない (型注釈変更だけ起きるケースを誤って互換扱いする
-/// リスクがあるため)。両側 signature を見て判定するロジックは
-/// [`is_ts_no_arg_to_optional_destructured_compatible`] が detect_api_changes
-/// 経路で行う。
+/// 注釈付きの object pattern は束縛を畳み、注釈がなければ呼び出し側の型を決めるキーと既定値を残す。
 pub(crate) fn normalize_typescript_destructure_signature(
     fn_node: tree_sitter::Node<'_>,
     source: &[u8],
     start_byte: usize,
     end_byte: usize,
 ) -> String {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    if let Some(params) = fn_node.child_by_field_name("parameters") {
-        collect_parameter_object_pattern_ranges(params, &mut ranges);
-    }
-    if ranges.is_empty() {
-        if let Some(bytes) = source.get(start_byte..end_byte) {
-            return normalize_signature_whitespace(bytes);
-        }
-        return String::new();
-    }
-    ranges.sort_by_key(|r| r.0);
-
-    let mut buf: Vec<u8> = Vec::with_capacity(end_byte - start_byte);
-    let mut cursor = start_byte;
-    for (op_start, op_end) in &ranges {
-        if *op_start < cursor || *op_end > end_byte {
-            continue;
-        }
-        if let Some(bytes) = source.get(cursor..*op_start) {
-            buf.extend_from_slice(bytes);
-        }
-        buf.extend_from_slice(b"{}");
-        cursor = *op_end;
-    }
-    if let Some(bytes) = source.get(cursor..end_byte) {
-        buf.extend_from_slice(bytes);
-    }
-    normalize_signature_whitespace(&buf)
-}
-
-/// TS/TSX の formal_parameters 直下にある `object_pattern` のバイト範囲を集める。
-///
-/// パラメータの `type_annotation` (inline object type など) には踏み込まないため、
-/// 型注釈側の object type は影響を受けない。required_parameter / optional_parameter の
-/// `pattern` フィールドを直接見て object_pattern かを判定する。
-pub(crate) fn collect_parameter_object_pattern_ranges(
-    params: tree_sitter::Node<'_>,
-    ranges: &mut Vec<(usize, usize)>,
-) {
-    let mut cursor = params.walk();
-    for child in params.children(&mut cursor) {
-        match child.kind() {
-            "required_parameter" | "optional_parameter" => {
-                if let Some(pattern) = child.child_by_field_name("pattern")
-                    && pattern.kind() == "object_pattern"
-                {
-                    ranges.push((pattern.start_byte(), pattern.end_byte()));
+    let header = source.get(start_byte..end_byte).unwrap_or_default();
+    let Some(params) = fn_node.child_by_field_name("parameters") else {
+        return normalize_signature_whitespace(header);
+    };
+    // 引数や戻り値の注釈から束縛を参照し得る場合は、ローカル名もそのまま残す。
+    let standalone = params
+        .named_children(&mut params.walk())
+        .filter(|n| !n.is_extra())
+        .count()
+        == 1
+        && fn_node.child_by_field_name("type_parameters").is_none()
+        && fn_node.child_by_field_name("return_type").is_none_or(|ty| {
+            ty.named_child(0)
+                .is_some_and(|inner| inner.kind() == "predefined_type")
+        });
+    let mut signature = String::new();
+    let mut pos = start_byte;
+    for param in params.named_children(&mut params.walk()) {
+        let pattern = match param.kind() {
+            "object_pattern" => param,
+            "optional_parameter" | "required_parameter" => {
+                match param.child_by_field_name("pattern") {
+                    Some(node) if node.kind() == "object_pattern" => node,
+                    _ => continue,
                 }
             }
-            // 無型 JS スタイル: parameter ノードがなく object_pattern が直接子に来る
-            // ケース。安全側に倒して同様に正規化する (TS/TSX に限定済み)。
-            "object_pattern" => {
-                ranges.push((child.start_byte(), child.end_byte()));
-            }
-            _ => {}
+            _ => continue,
+        };
+        if pattern.start_byte() < pos || pattern.end_byte() > end_byte {
+            return String::from_utf8_lossy(header).into_owned();
+        }
+        append_header_text(&mut signature, &source[pos..pattern.start_byte()]);
+        if param.child_by_field_name("type").is_some() {
+            signature.push_str("{}");
+        } else if standalone
+            && param.child_by_field_name("value").is_none()
+            && let Some(shape) = super::ts_signature::inferred_parameter_pattern(pattern, source)
+        {
+            signature.push_str(&shape);
+        } else {
+            signature.push_str(&destructured_pattern_text(pattern, source));
+        }
+        pos = pattern.end_byte();
+    }
+    if pos == start_byte {
+        return normalize_signature_whitespace(header);
+    }
+    append_header_text(&mut signature, &source[pos..end_byte]);
+    signature.truncate(signature.trim_end().len());
+    signature
+}
+
+/// パターンの前後だけ空白をまとめる。パターン内の式を再度空白で分割しない。
+fn append_header_text(signature: &mut String, bytes: &[u8]) {
+    for ch in String::from_utf8_lossy(bytes).chars() {
+        if !ch.is_whitespace() {
+            signature.push(ch);
+        } else if !signature.is_empty() && !signature.ends_with(' ') {
+            signature.push(' ');
         }
     }
 }

@@ -12,6 +12,33 @@ pub(super) fn signature_tokens_in_range(
     start: usize,
     end: usize,
 ) -> Option<SigTokens> {
+    collect_signature_tokens(node, source, start, end, |_| false)
+}
+
+/// 分割代入の署名では、既定値に含まれる関数・クラスの本体の改行（自動セミコロン挿入）も残す。
+pub(super) fn destructured_pattern_text(node: Node<'_>, source: &[u8]) -> String {
+    let tokens =
+        collect_signature_tokens(node, source, node.start_byte(), node.end_byte(), |kind| {
+            matches!(kind, "statement_block" | "class_body")
+        });
+    let Some(SigTokens(tokens)) = tokens else {
+        return node.utf8_text(source).unwrap_or_default().to_owned();
+    };
+    tokens
+        .iter()
+        .filter(|(kind, _)| kind != "comment")
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_signature_tokens(
+    node: Node<'_>,
+    source: &[u8],
+    start: usize,
+    end: usize,
+    keep_subtree: impl Fn(&str) -> bool,
+) -> Option<SigTokens> {
     if node.has_error() || start < node.start_byte() || end > node.end_byte() {
         return None;
     }
@@ -32,6 +59,7 @@ pub(super) fn signature_tokens_in_range(
                 "string" | "template_string" | "template_literal_type" | "regex" | "comment"
             )
             || current.kind().starts_with("jsx_")
+            || keep_subtree(current.kind())
         {
             if current.start_byte() < start || current.end_byte() > end {
                 return None;
