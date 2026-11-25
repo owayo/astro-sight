@@ -111,13 +111,61 @@ fn literal_const_values_regex_and_templates_follow_default_and_strict_policy() {
 }
 
 #[test]
+fn literal_const_values_interpolated_template_text_follows_ts_hook_policy() {
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let file = format!("settings.{extension}");
+        let source = "const SITE = 'https://docs.example.test';\nexport const LINK = `${SITE}/signup?plan=${encodeURIComponent('Free Plan')}`;\n";
+        repo.write(&file, source);
+        repo.write(
+            format!("caller.{extension}"),
+            "import { LINK } from './settings';\nexport function link() { return LINK; }\n",
+        );
+        repo.commit_all("initial");
+        repo.write(&file, source.replace("/signup", "/register"));
+        for staged in [false, true] {
+            if staged {
+                repo.stage_all();
+                repo.write(&file, source);
+            }
+            for strict in [false, true] {
+                let (output, json) = hook(&repo, staged, strict);
+                assert_eq!(output.status.code(), Some(i32::from(strict)), "{json}");
+                let entry = &json["api"]["const_value"][0];
+                assert_eq!(entry["n"], "LINK", "{json}");
+                assert_eq!(
+                    entry["change_evidence"]["changed_parts"],
+                    serde_json::json!(["initializer"])
+                );
+                assert!(json["api"]["mod"].is_null(), "{json}");
+                assert!(json["impact_info"].is_array(), "{json}");
+                let blocking = json["blocking_categories"].as_array().unwrap();
+                if strict {
+                    assert!(
+                        blocking
+                            .iter()
+                            .any(|category| category == "api.const_value"),
+                        "{json}"
+                    );
+                } else {
+                    assert!(blocking.is_empty(), "{json}");
+                    assert!(json["impacts"].is_null(), "{json}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn literal_const_values_keep_different_kinds_dynamic_templates_and_containers_blocking() {
     for extension in ["js", "ts", "tsx"] {
         for (before, after) in [
             ("/a/", "'b'"),
             ("/a/", "`b`"),
             ("`a`", "42"),
-            ("`a${suffix}`", "`b${suffix}`"),
+            ("`a${suffix}`", "`b${suffix.toUpperCase()}`"),
+            ("`a${suffix}`", "`b`"),
             ("String.raw`a`", "String.raw`b`"),
             ("{ pattern: /a/ }", "{ pattern: /b/ }"),
             ("[/a/]", "[/b/]"),

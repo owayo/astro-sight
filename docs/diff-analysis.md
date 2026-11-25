@@ -514,7 +514,9 @@ Recovered candidates use the existing compatibility, argument-count, and type-me
 
 For an otherwise unchanged exported `const` declaration without a type annotation, changes between regular-expression literals use `api_changes.const_value_changes` (`api.const_value` in hook output). Pattern and flag changes retain the same `RegExp` kind. Templates without substitutions, including empty templates and escapes, share the existing string-literal kind, so string/template replacements also use this value policy. This applies to JS, TS and TSX, including staged review.
 
-The default hook treats these value changes as informational; `--strict-public-const-values` makes them blocking. This policy does not establish equivalent runtime behavior: flags such as `g` and `y` can change how a regular expression is used. Changes between different kinds, templates with substitutions, tagged templates, assertions and `satisfies` retain their previous handling. Declaration-header checks and the separate scalar-leaf rules for static object/array constants are unchanged.
+For TS and TSX, an unannotated `const` initialized directly with an untagged template can also change its fixed text. The old and new templates must contain the same `${...}` substitutions in the same order, including the original text of each expression. The hook reports the value change in `api.const_value` and its references in `impact_info`.
+
+The default hook treats these value changes as informational. `--strict-public-const-values` makes them blocking and can also report affected consumers under `impacts`. For example, changing a regular expression flag such as `g` or `y` can alter its behavior. Tagged templates, type assertions, `satisfies`, and changes between initializer kinds use the existing declaration and initializer checks. Static objects and arrays have separate rules for their scalar leaves.
 
 ### JavaScript and TypeScript removals and non-relative imports
 

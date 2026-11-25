@@ -1,4 +1,4 @@
-//! 型注釈のない const の静的な object/array の構造を比較する。
+//! 型注釈のない const の初期化子を元ソースで比較する。
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -90,6 +90,8 @@ enum StaticShape {
     Scalar(ScalarKind),
     /// `as const` の内側でも演算結果は literal 型にならない。
     Expression(ScalarKind),
+    /// 直に代入した TS テンプレートの置換式。式の順序と原文を保つ。
+    InterpolatedTemplate(Vec<String>),
     Object(Vec<(String, StaticShape)>),
     Array(Vec<StaticShape>),
     ConstAssert(Box<StaticShape>),
@@ -125,7 +127,7 @@ pub(super) fn classify_static_const_change(
     let Some(lang) = site.lang_in(&[LangId::Javascript, LangId::Typescript, LangId::Tsx]) else {
         return StaticConstChange::NotApplicable;
     };
-    // container があり得ない候補を読み込み前に除外し、構造の証明は AST に任せる。
+    // container も ${...} もない候補をソースの読み込み前に除く。
     if [site.old_sig, site.new_sig]
         .iter()
         .any(|signature| !signature.contains('{') && !signature.contains('['))
@@ -146,6 +148,22 @@ pub(super) fn classify_static_const_change(
     };
     if !same_contract(&old, &new) {
         return StaticConstChange::NotApplicable;
+    }
+    if matches!(old.shape, StaticShape::InterpolatedTemplate(_)) {
+        let old_range = old_value.byte_range();
+        let new_range = new_value.byte_range();
+        let before = &source.old[old_range.clone()];
+        let after = &source.new[new_range.clone()];
+        // stripInternal の加工前も同じ初期化子で、固定文字が実際に変わった場合だけを扱う。
+        return if before != after
+            && source.original_old().get(old_range) == Some(before)
+            && source.original_new().get(new_range) == Some(after)
+            && site.old_path == site.new_path
+        {
+            StaticConstChange::ValueOnly
+        } else {
+            StaticConstChange::NotApplicable
+        };
     }
     let (Some(old_tokens), Some(new_tokens)) = (
         primitive_value_tokens(old_value, &source.old),
@@ -193,7 +211,7 @@ fn widened_shape(shape: &StaticShape) -> Option<WidenedShape> {
                 .collect(),
         )),
         // Literal types and readonly tuples cannot be reduced to a set of widened shapes.
-        StaticShape::ConstAssert(_) => None,
+        StaticShape::ConstAssert(_) | StaticShape::InterpolatedTemplate(_) => None,
     }
 }
 
@@ -210,10 +228,26 @@ fn static_const_contract<'tree>(
     }
     check_candidate(statement, source)?;
     let value = declarator.child_by_field_name("value")?;
-    let shape = static_shape(value, source, lang, 0)?;
-    if !is_container(&shape) {
-        return None;
-    }
+    let shape =
+        if value.kind() == "template_string" && matches!(lang, LangId::Typescript | LangId::Tsx) {
+            let mut substitutions = Vec::new();
+            for child in value.named_children(&mut value.walk()) {
+                match child.kind() {
+                    "template_substitution" => {
+                        substitutions.push(child.utf8_text(source).ok()?.to_owned())
+                    }
+                    "string_fragment" | "escape_sequence" => {}
+                    _ => return None,
+                }
+            }
+            if substitutions.is_empty() {
+                return None;
+            }
+            StaticShape::InterpolatedTemplate(substitutions)
+        } else {
+            let shape = static_shape(value, source, lang, 0)?;
+            is_container(&shape).then_some(shape)?
+        };
     Some((
         StaticConstContract {
             prefix: header_tokens(
@@ -330,7 +364,9 @@ fn is_container(shape: &StaticShape) -> bool {
     match shape {
         StaticShape::Object(_) | StaticShape::Array(_) => true,
         StaticShape::ConstAssert(inner) => is_container(inner),
-        StaticShape::Scalar(_) | StaticShape::Expression(_) => false,
+        StaticShape::Scalar(_)
+        | StaticShape::Expression(_)
+        | StaticShape::InterpolatedTemplate(_) => false,
     }
 }
 
@@ -529,6 +565,35 @@ mod tests {
 
     fn initializer(value: &str, lang: LangId) -> Option<StaticConstContract> {
         contract(&format!("export const VALUE = {value};"), lang)
+    }
+
+    #[test]
+    fn template_contract_keeps_substitution_order_and_original_literal_text() {
+        let template = "`a${first}${format('two words')}`";
+        let old = initializer(template, LangId::Typescript).unwrap();
+        let new = initializer("`b${first}c${format('two words')}d`", LangId::Typescript).unwrap();
+        assert!(same_contract(&old, &new));
+        for changed in [
+            "`b${format('two words')}${first}`",
+            "`b${first}${format('two  words')}`",
+            "`b${first}`",
+        ] {
+            let new = initializer(changed, LangId::Typescript).unwrap();
+            assert!(!same_contract(&old, &new), "{changed}");
+        }
+        for unsupported in [
+            "'fixed'",
+            "`fixed`",
+            "String.raw`b${first}`",
+            "`b${first}` as const",
+            "`b${first}` satisfies string",
+        ] {
+            assert!(
+                initializer(unsupported, LangId::Typescript).is_none(),
+                "{unsupported}"
+            );
+        }
+        assert!(initializer(template, LangId::Javascript).is_none());
     }
 
     #[test]
