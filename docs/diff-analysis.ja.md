@@ -423,10 +423,10 @@ condition = { command_exists = "astro-sight" }
 
 ### staged review の書き出しの上限
 
-`review --git --staged` は、index にある通常ファイルをすべて一時ディレクトリに書き出してから解析する。ファイル数が 50,000、または合計が 512 MiB を超えるリポジトリでは書き出さず、作業ツリーのファイルを読む経路に切り替える (変更したファイルだけは index の内容を読む)。エラーにはせず、切り替えたことを `truncations` で申告する:
+`review --git --staged` は通常、index 全体を一時ディレクトリに書き出す。通常ファイルが 50,000 件または合計 512 MiB を超えると、`truncations` に `staged_snapshot_unavailable` が出る。API 判定に使う変更ファイルと関連するソース・設定は、作業ツリーと index の一致にかかわらず index から読む。たとえば、関数の削除をステージした後に作業ツリーの宣言を元に戻しても、ステージした削除が報告される。この書き出しにも同じ件数・容量の上限を適用し、収まらなければエラーを返す。
 
 ```json
-{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); the working tree matched the index, so files were read from the working tree" }] }
+{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); API sources were read from the index and the working tree matched the index" }] }
 ```
 
 切り替えた経路では、作業ツリーに未ステージの編集があると、参照の検索結果はコミットされる内容と一致しない。そこで、作業ツリーが index と違うときは、参照が無いことを根拠に非 blocking へ分ける判定 (`mod_closed` / `mod_compat` / `rm_dead`) を使わず、blocking のまま残す。`--hook` では `trunc: [{"r": "staged_snapshot_unavailable"}]` として出る (解析範囲の申告なので、これだけでは exit 1 にしない)。

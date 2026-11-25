@@ -417,10 +417,10 @@ With `--hook`, this is printed as `trunc: [{"f": "generated.rs", "r": "untracked
 
 ### Size limit of the staged snapshot
 
-`review --git --staged` writes every regular file in the index to a temporary directory before analyzing it. When the repository has more than 50,000 files or 512 MiB in total, it does not write them and reads the working tree instead (only the changed files are read from the index). This is not an error; the switch is reported in `truncations`:
+`review --git --staged` normally writes the entire index to a temporary directory. When the index exceeds 50,000 regular files or 512 MiB, `truncations` reports `staged_snapshot_unavailable`. API analysis reads the changed files and supporting source and configuration files from the index, including when the working tree matches the index. For example, a function deleted in the index is still reported as removed after its declaration is restored in the working tree. The same size and file-count limits apply to this smaller snapshot. If it also exceeds a limit, review returns an error.
 
 ```json
-{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); the working tree matched the index, so files were read from the working tree" }] }
+{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); API sources were read from the index and the working tree matched the index" }] }
 ```
 
 On this path, references found in the working tree do not match the content being committed when it has unstaged edits. So when the working tree differs from the index, the checks that move a change to a non-blocking category because no references remain (`mod_closed` / `mod_compat` / `rm_dead`) are not used, and the change stays blocking. With `--hook`, this is printed as `trunc: [{"r": "staged_snapshot_unavailable"}]` (it reports the analyzed scope, so it does not cause exit 1 by itself).

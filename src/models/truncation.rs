@@ -128,9 +128,9 @@ impl TruncationInfo {
         working_tree_matches_index: bool,
     ) -> Self {
         let consequence = if working_tree_matches_index {
-            "the working tree matched the index, so files were read from the working tree"
+            "API sources were read from the index and the working tree matched the index"
         } else {
-            "files were read from the working tree, which differs from the index, so \
+            "API sources were read from the index. The working tree differed from the index, so \
              reference-based API downgrades (mod_closed / mod_compat / rm_dead) were kept blocking"
         };
         Self::new(

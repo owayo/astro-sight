@@ -781,10 +781,28 @@ fn library_pair<'a>(
     base_blobs: &'a crate::commands::git_input::GitBlobBatch,
     root: String,
 ) -> (CrateVersion<'a>, CrateVersion<'a>) {
-    let worktree = move |path: &str| {
-        super::super::source_pair::load_new_source(dir, path).map(|source| source.to_vec())
-    };
+    // #[path] の先には任意の拡張子を使える。部分展開に無ければ固定した tree の通常 blob を読む。
+    let projected = std::cell::OnceCell::new();
+    let worktree = Rc::new(move |path: &str| {
+        if let Some(source) = super::super::source_pair::load_new_source(dir, path) {
+            return Some(source.to_vec());
+        }
+        if crate::commands::git_snapshot::api_context_file(std::path::Path::new(path)) {
+            return None;
+        }
+        let blobs = projected
+            .get_or_init(|| {
+                crate::git_support::snapshot_tree(dir, crate::git_support::API_SNAPSHOT_MARKER)
+                    .map(|tree| crate::commands::git_input::GitBlobBatch::new(dir, &tree))
+            })
+            .as_ref()?;
+        if !crate::engine::impact::is_safe_diff_path(path) || !blobs.is_regular_file(path) {
+            return None;
+        }
+        blobs.read_limited(path, crate::commands::common::MAX_INPUT_SIZE)
+    });
     let read_old: SourceReader<'a> = {
+        let worktree = Rc::clone(&worktree);
         let old_paths = paths.old.clone();
         let new_paths = paths.new.clone();
         Box::new(move |path: &str| {

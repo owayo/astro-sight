@@ -220,6 +220,7 @@ fn review_swift_protocol_configuration_survives_a_retry() {
             &AppService::new(),
             &opts,
             &config.swift_protocol_methods,
+            index_snapshot::SnapshotBudget::DEFAULT,
             |result, _| {
                 assert!(
                     !result
@@ -242,4 +243,221 @@ fn review_swift_protocol_configuration_survives_a_retry() {
     })
     .unwrap();
     assert_eq!(attempts, 2);
+}
+
+#[test]
+fn over_budget_review_compares_staged_api_with_the_requested_base() {
+    let temporary = repository(false);
+    let repo = temporary.path();
+    let original = "export function removed() {}\nexport function changed(a: number) {}\nexport function kept() {}\n";
+    std::fs::write(repo.join("api.ts"), original).unwrap();
+    std::fs::write(repo.join("cold.txt"), "not code").unwrap();
+    std::fs::write(
+        repo.join("caller.ts"),
+        "import {removed, kept} from './api';\nremoved(); kept();\n",
+    )
+    .unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "selected base"]);
+    std::fs::write(
+        repo.join("api.ts"),
+        format!("{original}export function headOnly() {{}}\n"),
+    )
+    .unwrap();
+    git(repo, &["add", "api.ts"]);
+    git(repo, &["commit", "-qm", "later HEAD"]);
+    std::fs::write(
+        repo.join("api.ts"),
+        "export function changed(a: number, staged: string) {}\nexport function kept() {}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("new.ts"), "export function addedInIndex() {}\n").unwrap();
+    git(repo, &["add", "."]);
+    std::fs::write(
+        repo.join("api.ts"),
+        "export function removed() {}\nexport function changed(a: number, unstaged: boolean) {}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(repo.join("new.ts")).unwrap();
+
+    let mut opts = options(repo.to_str().unwrap(), true);
+    opts.base = Some("HEAD~1");
+    for budget in [
+        index_snapshot::SnapshotBudget::DEFAULT,
+        index_snapshot::SnapshotBudget {
+            files: 3,
+            bytes: u64::MAX,
+        },
+    ] {
+        review_attempt_with_swift_protocols(
+            &AppService::new(),
+            &opts,
+            &SwiftProtocolMethods::default(),
+            budget,
+            |review, _| {
+                let api = &review.api_changes;
+                assert_eq!(
+                    api.removed
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["removed"],
+                    "{api:?}"
+                );
+                assert!(
+                    api.added.iter().any(|s| s.name == "addedInIndex"),
+                    "{api:?}"
+                );
+                let changed = api
+                    .modified
+                    .iter()
+                    .find(|s| s.name == "changed")
+                    .expect("staged signature");
+                assert!(
+                    changed
+                        .new_signature
+                        .as_deref()
+                        .unwrap()
+                        .contains("staged: string"),
+                    "{changed:?}"
+                );
+                assert_eq!(
+                    review.truncations.iter().any(|t| t.reason
+                        == crate::models::truncation::TruncationReason::StagedSnapshotUnavailable),
+                    budget.files == 3
+                );
+            },
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn over_budget_staged_api_uses_index_attributes_and_limits_its_own_inputs() {
+    let temporary = repository(false);
+    let repo = temporary.path();
+    std::fs::write(repo.join(".gitattributes"), "api.ts -linguist-generated\n").unwrap();
+    std::fs::write(repo.join("cold.dat"), "padding").unwrap();
+    git(repo, &["add", ".gitattributes", "cold.dat"]);
+    git(repo, &["commit", "-qm", "index attributes"]);
+    std::fs::write(repo.join("api.ts"), "export const remaining = 1;\n").unwrap();
+    git(repo, &["add", "api.ts"]);
+    let opts = options(repo.to_str().unwrap(), true);
+    let budget = index_snapshot::SnapshotBudget {
+        files: 2,
+        bytes: u64::MAX,
+    };
+    for generated in [false, true] {
+        let attr = |flag| {
+            if flag {
+                "api.ts linguist-generated\n"
+            } else {
+                "api.ts -linguist-generated\n"
+            }
+        };
+        std::fs::write(repo.join(".gitattributes"), attr(generated)).unwrap();
+        git(repo, &["add", ".gitattributes"]);
+        std::fs::write(repo.join(".gitattributes"), attr(!generated)).unwrap();
+        review_attempt_with_swift_protocols(
+            &AppService::new(),
+            &opts,
+            &SwiftProtocolMethods::default(),
+            budget,
+            |review, _| {
+                assert_eq!(
+                    review
+                        .api_changes
+                        .removed
+                        .iter()
+                        .any(|item| item.name == "target"),
+                    !generated
+                );
+            },
+        )
+        .unwrap();
+    }
+    let error = review_attempt_with_swift_protocols(
+        &AppService::new(),
+        &opts,
+        &SwiftProtocolMethods::default(),
+        index_snapshot::SnapshotBudget { files: 1, ..budget },
+        |_, _| panic!("partial output"),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("Staged API sources exceed"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn over_budget_staged_strip_internal_reads_the_index_extends_target() {
+    let temporary = repository(false);
+    let repo = temporary.path();
+    std::fs::create_dir_all(repo.join("node_modules/publisher")).unwrap();
+    std::fs::write(
+        repo.join("tsconfig.json"),
+        r#"{"compilerOptions":{"stripInternal":false},"include":["*.ts"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("node_modules/publisher/publish.settings"),
+        r#"{"compilerOptions":{"stripInternal":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("caller.ts"),
+        "import { internalOnly } from './api'; internalOnly();\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("cold.dat"), "padding").unwrap();
+    std::fs::write(
+        repo.join("api.ts"),
+        "/** @internal */\nexport function internalOnly() {}\nexport function publicName() {}\n",
+    )
+    .unwrap();
+    git(repo, &["add", "."]);
+    git(
+        repo,
+        &["add", "-f", "node_modules/publisher/publish.settings"],
+    );
+    git(repo, &["commit", "-qm", "internal declarations"]);
+    std::fs::write(
+        repo.join("tsconfig.json"),
+        r#"{"extends":"./node_modules/publisher/publish.settings","include":["*.ts"]}"#,
+    )
+    .unwrap();
+    git(repo, &["add", "tsconfig.json"]);
+    std::fs::write(
+        repo.join("node_modules/publisher/publish.settings"),
+        r#"{"compilerOptions":{"stripInternal":false}}"#,
+    )
+    .unwrap();
+    let opts = options(repo.to_str().unwrap(), true);
+    for budget in [
+        index_snapshot::SnapshotBudget::DEFAULT,
+        index_snapshot::SnapshotBudget {
+            files: 4,
+            bytes: u64::MAX,
+        },
+    ] {
+        review_attempt_with_swift_protocols(
+            &AppService::new(),
+            &opts,
+            &SwiftProtocolMethods::default(),
+            budget,
+            |review, _| {
+                assert!(
+                    review
+                        .api_changes
+                        .removed
+                        .iter()
+                        .any(|symbol| symbol.name == "internalOnly"),
+                    "{:?}",
+                    review.api_changes
+                );
+            },
+        )
+        .unwrap();
+    }
 }
