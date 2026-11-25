@@ -5,6 +5,37 @@ use tree_sitter::Node;
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::ts_const_arg::{collect_bindings_named, declarator_is_const};
 
+/// tree-sitter が escape_sequence として受理する数値・Unicode エスケープを検査する。
+pub(super) fn valid_non_numeric_escape(text: &str) -> bool {
+    let Some(escape) = text.strip_prefix('\\') else {
+        return false;
+    };
+    if let Some(hex) = escape.strip_prefix("u{") {
+        return hex.strip_suffix('}').is_some_and(|digits| {
+            u32::from_str_radix(digits, 16).is_ok_and(|value| value <= 0x10_FFFF)
+        });
+    }
+    escape
+        .as_bytes()
+        .first()
+        .is_some_and(|c| !c.is_ascii_digit())
+}
+
+pub(super) fn is_template_text(node: Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "string_fragment" => true,
+        "escape_sequence" => node.utf8_text(source).is_ok_and(|text| {
+            // \09 の 9 が次の string_fragment に分かれる場合もある。
+            if text == r"\0" {
+                !source.get(node.end_byte()).is_some_and(u8::is_ascii_digit)
+            } else {
+                valid_non_numeric_escape(text)
+            }
+        }),
+        _ => false,
+    }
+}
+
 /// 本文内のローカル束縛と、module の同名宣言を区別する。
 pub(super) fn is_module_binding(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {

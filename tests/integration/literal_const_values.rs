@@ -111,6 +111,53 @@ fn literal_const_values_regex_and_templates_follow_default_and_strict_policy() {
 }
 
 #[test]
+fn untagged_template_escapes_respect_digit_and_unicode_limits() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let before = r#"const BASE = 'docs';
+export const DECIMAL = `doc/${BASE}`;
+export const NUL_DIGIT = `nul/${BASE}`;
+export const TOO_LARGE = `overflow/`;
+export const VALID = `valid/${BASE}`;
+"#;
+    repo.write("values.ts", before);
+    repo.write("consumer.ts", "import { DECIMAL, NUL_DIGIT, TOO_LARGE, VALID } from './values';\nexport function links() { return [DECIMAL, NUL_DIGIT, TOO_LARGE, VALID]; }");
+    repo.commit_all("initial");
+    repo.write(
+        "values.ts",
+        before
+            .replace("doc/", r"doc/\8")
+            .replace("nul/", r"nul/\09")
+            .replace("overflow/", r"overflow/\u{110000}")
+            .replace("valid/", r"valid/\0\n\x41\u{10FFFF}\\8"),
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("values.ts", before);
+        }
+        let (output, json) = hook(&repo, staged, false);
+        assert_eq!(output.status.code(), Some(1), "{json}");
+        let names = |bucket: &str| {
+            let mut names: Vec<_> = json["api"][bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["n"].as_str().unwrap())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(
+            names("mod"),
+            ["DECIMAL", "NUL_DIGIT", "TOO_LARGE"],
+            "{json}"
+        );
+        assert_eq!(names("const_value"), ["VALID"], "{json}");
+    }
+}
+
+#[test]
 fn literal_const_values_interpolated_template_text_follows_ts_hook_policy() {
     for extension in ["ts", "tsx"] {
         let repo = TestRepo::new();

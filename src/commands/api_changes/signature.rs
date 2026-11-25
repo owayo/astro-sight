@@ -964,7 +964,7 @@ fn js_const_literal_kind(
             let mut cursor = value.walk();
             value
                 .named_children(&mut cursor)
-                .all(|child| matches!(child.kind(), "string_fragment" | "escape_sequence"))
+                .all(|child| super::js_const::is_template_text(child, source))
                 .then_some(JsConstLiteralKind::Scalar(
                     super::static_const::ScalarKind::String,
                 ))

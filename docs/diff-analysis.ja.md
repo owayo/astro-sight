@@ -518,7 +518,7 @@ blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` �
 
 型注釈がなく、それ以外の宣言が不変の公開 `const` では、正規表現リテラル同士の変更も `api_changes.const_value_changes`（hook では `api.const_value`）に分類する。pattern・flags が変わっても種類は `RegExp` として比較する。置換を含まない template は、空の template や escape を含むものも既存の文字列リテラルと同じ種類にし、文字列との相互変更にもこの値変更ポリシーを適用する。JS / TS / TSX と staged review で同じ扱いになる。
 
-TS / TSX では、型注釈のない `const` にタグなしのテンプレート文字列を直接代入し、固定文字の部分だけを変えた場合も値変更として扱う。旧版と新版の `${...}` は、個数、順序、各式の原文がすべて一致する必要がある。hook は値変更を `api.const_value`、参照元を `impact_info` に出す。
+TS / TSX では、型注釈のない `const` にタグなしのテンプレート文字列を直接代入し、固定文字の部分だけを変えた場合も値変更として扱う。旧版と新版の `${...}` は、個数、順序、各式の原文がすべて一致する必要がある。タグなしテンプレートの固定部分に `\8` や `\u{110000}` などの無効なエスケープがあると、置換の有無にかかわらず `api.mod` に残る。hook は値変更を `api.const_value`、参照元を `impact_info` に出す。
 
 既定の hook は値変更を情報として報告する。`--strict-public-const-values` 指定時は blocking とし、影響を受ける利用側も `impacts` に出る場合がある。たとえば正規表現の `g`・`y` などのフラグの変更は、利用側での動作を変えうる。タグ付きテンプレート、型アサーション、`satisfies`、初期化子の種類が変わる場合には、宣言と初期化子に応じた判定を使う。静的な object / array の中のスカラー値は別に判定する。
 
