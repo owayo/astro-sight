@@ -173,3 +173,117 @@ fn nullable_input_rejects_other_contract_changes_and_function_props() {
         assert!(api.compatible_modified.is_empty(), "{after}: {api:?}");
     }
 }
+
+#[test]
+fn parameter_union_widening_retains_all_old_arms_and_type_bindings() {
+    let before = "type A = 'a';\ntype B = 'b';\ntype C = 'c';\nexport function word(text: A | B) { return `${text}`; }\n";
+    let after = before.replace(": A | B", ": (B | C) | A");
+    let api = changes(before, &after, CALL, &[]);
+    assert!(api.modified.is_empty(), "{api:?}");
+    assert_eq!(
+        api.compatible_modified[0].reason,
+        "parameter_union_widening"
+    );
+    assert_eq!(api.type_change_evidence[0].changes[0].member, "C");
+
+    for after in [
+        before.replace(": A | B", ": A | C"),
+        after.replace("type A = 'a'", "type A = 'other'"),
+        after.replace("type C = 'c'", "type C = (value: number) => void"),
+    ] {
+        let api = changes(before, &after, CALL, &[]);
+        assert!(api.modified.iter().any(|c| c.name == "word"), "{api:?}");
+    }
+}
+
+#[test]
+fn parameter_union_widening_keeps_expected_type_errors_blocking() {
+    let before = "export function word(text: string) { return 'fixed'; }\n";
+    let after = before.replace("text: string", "text: string | undefined");
+    let config = [("tsconfig.json", r#"{"compilerOptions":{"strict":true}}"#)];
+    let caller = "import { word } from './render';\n// @ts-expect-error\nword(undefined);\n";
+    let api = changes(before, &after, caller, &config);
+    assert!(api.modified.iter().any(|c| c.name == "word"), "{api:?}");
+    let caller = "import { word } from './render';\nword('@ts-expect-error');\n";
+    let api = changes(before, &after, caller, &config);
+    assert!(api.modified.is_empty(), "{api:?}");
+    assert_eq!(
+        api.compatible_modified[0].reason,
+        "parameter_union_widening"
+    );
+}
+
+#[test]
+fn parameter_union_widening_requires_unchanged_call_and_return_contracts() {
+    for (before, after) in [
+        ("text: string", "text: number | null"),
+        ("text: string | null", "text: string"),
+        ("text: string", "text?: string | undefined"),
+        (
+            "text: string, count?: number",
+            "text: string | undefined, count: number",
+        ),
+        (
+            "text: (x: string) => void",
+            "text: (x: string | undefined) => void",
+        ),
+        (
+            "text: string, suffix: string = text.trim()",
+            "text: string | undefined, suffix: string = text.trim()",
+        ),
+    ] {
+        let decl = |params: &str| format!("export function word({params}) {{ return 'fixed'; }}\n");
+        let api = changes(&decl(before), &decl(after), CALL, &[]);
+        assert!(
+            api.modified.iter().any(|c| c.name == "word"),
+            "{after}: {api:?}"
+        );
+    }
+    for body in [
+        "return text;",
+        "return { text };",
+        "return `${text.trim()}`;",
+        "return `${text ?? Symbol()}`;",
+        "return text !== null;",
+    ] {
+        let before = format!("export function word(text: string) {{ {body} }}\n");
+        let after = before.replace("text: string", "text: string | null");
+        let api = changes(&before, &after, CALL, &[]);
+        assert!(
+            api.modified.iter().any(|c| c.name == "word"),
+            "{body}: {api:?}"
+        );
+    }
+}
+
+#[test]
+fn parameter_union_widening_proves_unused_data_types_and_checks_contextual_types() {
+    let objects = "type A = { a: number };\ninterface B { b: string }\ninterface C { c: boolean }\nexport function word(text: A | B) { return 1; }\n";
+    let caller = "import { word } from './render';\nword({ a: 1 });\n";
+    let api = changes(
+        objects,
+        &objects.replace(": A | B", ": A | B | C"),
+        caller,
+        &[],
+    );
+    assert!(api.modified.is_empty(), "{api:?}");
+    assert_eq!(
+        api.compatible_modified[0].reason,
+        "parameter_union_widening"
+    );
+    for (before, after, caller) in [
+        (
+            "export function word(text: 'a'): 'a' { return `${text}`; }\n",
+            "export function word(text: 'a' | 'b'): 'a' { return `${text}`; }\n",
+            CALL,
+        ),
+        (
+            "type A = { run: (x: string) => void }; type B = { run: (x: number) => void };\nexport function word(text: A) { return 1; }\n",
+            "type A = { run: (x: string) => void }; type B = { run: (x: number) => void };\nexport function word(text: A | B) { return 1; }\n",
+            "import { word } from './render';\nword({ run: x => x.trim() });\n",
+        ),
+    ] {
+        let api = changes(before, after, caller, &[]);
+        assert!(api.modified.iter().any(|c| c.name == "word"), "{api:?}");
+    }
+}

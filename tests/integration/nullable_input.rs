@@ -27,6 +27,46 @@ fn hook(repo: &TestRepo, staged: bool) -> (std::process::Output, serde_json::Val
 }
 
 #[test]
+fn parameter_union_widening_review_uses_the_selected_snapshot() {
+    let before = r#"export function formatLabel(prefix: string, value: number, options?: { pad: number }) {
+    return `${prefix ?? ""}${String(value).padStart(options?.pad ?? 0, "0")}`;
+}
+"#;
+    let caller = "import { formatLabel } from './label.js';\nexport const label = formatLabel('No.', 7, { pad: 3 });\n";
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("label.ts", before);
+    repo.write("main.ts", caller);
+    repo.commit_all("initial");
+    for (member, reason) in [
+        ("null", "nullable_input_widening"),
+        ("undefined", "parameter_union_widening"),
+    ] {
+        repo.write(
+            "label.ts",
+            before.replace("prefix: string", &format!("prefix: string | {member}")),
+        );
+        repo.stage_all();
+        let (out, result) = hook(&repo, false);
+        assert!(out.status.success(), "{result}");
+        assert!(
+            result["impacts"].is_null() && result["api"]["mod"].is_null(),
+            "{result}"
+        );
+        assert_eq!(result["api"]["mod_compat"][0]["reason"], reason);
+        let evidence = &result["api"]["type_change_evidence"][0];
+        assert_eq!(evidence["usage"], "direct_calls_proven");
+        assert_eq!(evidence["changes"][0]["member"], member);
+        repo.write(
+            "label.ts",
+            before.replace("prefix: string", "prefix: number | null"),
+        );
+        assert_eq!(hook(&repo, false).0.status.code(), Some(1));
+        assert!(hook(&repo, true).0.status.success());
+    }
+}
+
+#[test]
 fn nullable_input_review_preserves_evidence_and_staged_scope() {
     let repo = repo(
         AFTER,

@@ -248,6 +248,15 @@ pub(super) fn local_type_aliases<'tree>(
     root: Node<'tree>,
     source: &[u8],
 ) -> Option<HashMap<String, Node<'tree>>> {
+    local_type_values(root, source, false)
+}
+
+/// 一意な非ジェネリック宣言の右辺。必要なら継承のない interface の本体も含める。
+pub(super) fn local_type_values<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    include_interfaces: bool,
+) -> Option<HashMap<String, Node<'tree>>> {
     if root.has_error() {
         return None;
     }
@@ -262,12 +271,19 @@ pub(super) fn local_type_aliases<'tree>(
                 let [(_, declaration)] = declarations.as_slice() else {
                     return None;
                 };
-                if declaration.kind() != "type_alias_declaration"
-                    || declaration.child_by_field_name("type_parameters").is_some()
-                {
+                if declaration.child_by_field_name("type_parameters").is_some() {
                     return None;
                 }
-                Some((name, declaration.child_by_field_name("value")?))
+                let value = match declaration.kind() {
+                    "type_alias_declaration" => declaration.child_by_field_name("value")?,
+                    "interface_declaration"
+                        if include_interfaces && !super::interface_has_extends(*declaration) =>
+                    {
+                        declaration.child_by_field_name("body")?
+                    }
+                    _ => return None,
+                };
+                Some((name, value))
             })
             .collect(),
     )
