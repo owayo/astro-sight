@@ -596,6 +596,7 @@ mod tests {
 
     fn file_context(new_path: &str, lang_id: LangId) -> FileContext {
         FileContext {
+            rebound_const_callers: Default::default(),
             python_modified_direct_function_names: Default::default(),
             js_modified_direct_function_names: Default::default(),
             new_path: new_path.to_string(),

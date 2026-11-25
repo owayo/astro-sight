@@ -51,7 +51,13 @@ struct Pass1Inputs<'a> {
     /// hunk を持つ変更が同一パスの 1 ファイルだけ。単一ファイル用の宣言の証明に使う。
     single_in_place_file: bool,
     /// JS 系の旧側監査は、追加候補を見つけたときに一度だけ実行する。
-    old_js_declarations: OnceCell<Option<HashSet<(String, &'static str)>>>,
+    old_js_declarations: OnceCell<Option<OldJsDeclarations>>,
+}
+
+#[derive(Default)]
+struct OldJsDeclarations {
+    names: HashSet<(String, &'static str)>,
+    opaque_exports: HashSet<String>,
 }
 
 impl Pass1Inputs<'_> {
@@ -59,7 +65,7 @@ impl Pass1Inputs<'_> {
         self.old_js_declarations
             .get_or_init(|| collect_old_js_declarations(self))
             .as_ref()
-            .is_some_and(|declarations| !declarations.contains(&(name.to_owned(), kind)))
+            .is_some_and(|declarations| !declarations.names.contains(&(name.to_owned(), kind)))
     }
 }
 
@@ -125,12 +131,24 @@ pub(super) fn collect(
     };
     let mut file_contexts = Vec::new();
     let mut registry = CrossFileSymbolRegistry::default();
+    let mut const_exports = crate::commands::ts_const_rebinding::AddedExports::default();
     for df in diff_files {
-        let Some(analyzed) = analyze_changed_file(&inputs, df) else {
+        let Some(analyzed) = analyze_changed_file(&inputs, df, &mut const_exports) else {
             continue;
         };
         registry.register(analyzed.registrations);
         file_contexts.push(analyzed.context);
+    }
+    if matches!(new_side_source, NewSideSource::WorkingTree) {
+        let mut callers =
+            const_exports.rebound_callers(dir, diff_files, &inputs.file_sections, |path| {
+                new_side_source.read_checked(dir, path)
+            });
+        for context in &mut file_contexts {
+            if let Some(rebound) = callers.remove(&context.new_path) {
+                context.rebound_const_callers = rebound;
+            }
+        }
     }
     revoke_value_only_constants_with_changed_types(&mut file_contexts);
     AffectedSymbolCollection {
@@ -146,13 +164,11 @@ fn is_js_family(lang: LangId) -> bool {
 }
 
 /// 証明が必要になったときだけ旧側を走査する。構文木はファイルごとに手放す。
-fn collect_old_js_declarations(
-    inputs: &Pass1Inputs<'_>,
-) -> Option<HashSet<(String, &'static str)>> {
+fn collect_old_js_declarations(inputs: &Pass1Inputs<'_>) -> Option<OldJsDeclarations> {
     if !complete_text_diff(inputs.diff_input, inputs.diff_files.len()) {
         return None;
     }
-    let mut declarations = HashSet::new();
+    let mut declarations = OldJsDeclarations::default();
     // 単一の同一パス差分は、このファイルの構文証拠だけで足りる。
     if inputs.single_in_place_file {
         return Some(declarations);
@@ -196,7 +212,10 @@ fn collect_old_js_declarations(
             return None;
         }
         let symbols = symbols::extract_symbols_without_complexity(root, &old, lang).ok()?;
-        declarations.extend(
+        if !crate::commands::ts_const_rebinding::has_direct_exports_only(root) {
+            declarations.opaque_exports.insert(file.old_path.clone());
+        }
+        declarations.names.extend(
             symbols
                 .into_iter()
                 .map(|symbol| (ci_key(lang, &symbol.name), symbol_kind_str(symbol.kind))),
@@ -282,7 +301,11 @@ fn complete_text_diff(input: &str, file_count: usize) -> bool {
 }
 
 /// 変更ファイル 1 つを解析する。読めない・構文解析できないファイルは None (解析しない)。
-fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<AnalyzedChangedFile> {
+fn analyze_changed_file(
+    inputs: &Pass1Inputs<'_>,
+    df: &DiffFile,
+    const_exports: &mut crate::commands::ts_const_rebinding::AddedExports,
+) -> Option<AnalyzedChangedFile> {
     let &Pass1Inputs {
         dir,
         new_side_source,
@@ -432,13 +455,24 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
         for (symbol, original) in affected.iter_mut().zip(&originals) {
             if symbol.change_type == "modified"
                 && syntax_evidence.proves_added(&symbol.name, &symbol.kind, lang_id)
-                && (!js_in_place
+            {
+                if !js_in_place
                     || inputs.has_no_matching_old_js_declaration(
                         &symbol.name,
                         symbol_kind_str(original.kind),
-                    ))
-            {
-                symbol.change_type = "added".to_owned();
+                    )
+                {
+                    symbol.change_type = "added".to_owned();
+                } else if matches!(lang_id, LangId::Typescript | LangId::Tsx)
+                    && symbol.kind == "variable"
+                    && inputs
+                        .old_js_declarations
+                        .get()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|old| !old.opaque_exports.contains(&df.old_path))
+                {
+                    const_exports.record(&df.new_path, &symbol.name, root, &source);
+                }
             }
         }
     }
@@ -686,6 +720,7 @@ fn analyze_changed_file(inputs: &Pass1Inputs<'_>, df: &DiffFile) -> Option<Analy
     }
     Some(AnalyzedChangedFile {
         context: FileContext {
+            rebound_const_callers: HashMap::new(),
             new_path: df.new_path.clone(),
             lang_id,
             js_modified_direct_function_names: declaration_proof.js_modified_direct_function_names,

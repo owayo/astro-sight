@@ -72,6 +72,7 @@ pub(super) struct RefEventMini {
     pub(super) local_shadow_hint: bool,
     /// Barrel origin evidence only applies to a value/type use of the imported binding.
     pub(super) ts_import_binding_use: bool,
+    ts_rebound_const_owner: u32,
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
@@ -589,6 +590,18 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     "identifier" | "type_identifier" | "shorthand_property_identifier"
                 )
             });
+        let ts_rebound_const_owner = node
+            .filter(|_| ts_import_binding_use)
+            .and_then(|node| {
+                self.sym_to_fc.get(ix)?.iter().copied().find(|&fc| {
+                    self.file_contexts[fc as usize]
+                        .rebound_const_callers
+                        .get(self.path_str)
+                        .and_then(|names| names.get(&self.all_symbol_names[ix]))
+                        .is_some_and(|binding| binding.covers(node))
+                })
+            })
+            .unwrap_or(u32::MAX);
 
         // Rust の証拠なし bare identifier を low に落とす際、macro 引数だけは high 維持するため
         // context 行の macro 呼び出し有無を見ておく (non-Rust では使わないので Rust のみ算出)。
@@ -1040,6 +1053,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             confidence: confidence_u8,
             local_shadow_hint,
             ts_import_binding_use,
+            ts_rebound_const_owner,
             ref_in_macro,
             rust_macro_evidence,
             rust_macro_callee,
@@ -1891,7 +1905,7 @@ impl<'a> ImpactCollector<'a> {
                         .get(sym_key_canonical)
                         .is_some_and(|change| change.is_omitted_by(shape))
                 });
-        if scope.visibility_only_informational {
+        if scope.visibility_only_informational || e.ts_rebound_const_owner == fc_ix as u32 {
             CallerRoute::Informational
         } else if scope.private_method_low {
             CallerRoute::Low
@@ -1980,6 +1994,7 @@ mod tests {
             confidence,
             local_shadow_hint: false,
             ts_import_binding_use: false,
+            ts_rebound_const_owner: u32::MAX,
             ref_in_macro: false,
             rust_macro_evidence: false,
             rust_macro_callee: false,
@@ -2126,6 +2141,7 @@ mod tests {
         sig_changes: Vec<SignatureChange>,
     ) -> FileContext {
         FileContext {
+            rebound_const_callers: Default::default(),
             python_modified_direct_function_names: Default::default(),
             js_modified_direct_function_names: Default::default(),
             new_path: "src/changed.rs".to_string(),
