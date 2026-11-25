@@ -472,13 +472,19 @@ pub(super) fn is_rust_file_root_symbol(root: Node<'_>, symbol: &Symbol) -> bool 
     false
 }
 
-/// A private inherent method declared by an impl at the file module root.
-/// The owner is the syntactic type name; aliases and qualified impl targets remain unproven.
+#[derive(Clone, Debug)]
+pub(super) struct PrivateMethodOwner {
+    pub(super) name: String,
+    /// 呼び出し側の型パスで所有元を証明できる、属性と型引数のない impl のメソッド。
+    pub(super) unconditional: bool,
+}
+
+/// ファイル直下の private inherent メソッドの所有型を取得する。
 pub(super) fn rust_private_inherent_method(
     root: Node<'_>,
     source: &[u8],
     symbol: &Symbol,
-) -> Option<String> {
+) -> Option<PrivateMethodOwner> {
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
         return None;
     }
@@ -508,14 +514,30 @@ pub(super) fn rust_private_inherent_method(
         return None;
     }
     let owner = impl_item.child_by_field_name("type")?;
+    let inner_attribute = |scope: Node<'_>| {
+        let mut cursor = scope.walk();
+        scope
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+            .is_some_and(|child| child.kind() == "inner_attribute_item")
+    };
+    let unconditional = !root.has_error()
+        && owner.kind() == "type_identifier"
+        && impl_item.child_by_field_name("type_parameters").is_none()
+        && !super::rust_path_owner::has_attribute_prefix(impl_item)
+        && !super::rust_path_owner::has_attribute_prefix(method)
+        && !inner_attribute(body)
+        && !inner_attribute(method.child_by_field_name("body")?);
     let owner = if owner.kind() == "generic_type" {
         owner.named_child(0)?
     } else {
         owner
     };
-    (owner.kind() == "type_identifier")
-        .then(|| owner.utf8_text(source).ok().map(str::to_owned))
-        .flatten()
+    (owner.kind() == "type_identifier").then_some(())?;
+    Some(PrivateMethodOwner {
+        name: owner.utf8_text(source).ok()?.to_owned(),
+        unconditional,
+    })
 }
 
 /// inherent impl (trait の無い `impl`) の直下のメソッドなら、所有型の名前

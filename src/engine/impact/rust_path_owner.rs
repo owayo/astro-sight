@@ -149,9 +149,9 @@ pub(super) type RustSourceModule = (PathBuf, PathBuf, Vec<String>);
 pub(super) type RustModuleKey = (PathBuf, Vec<String>);
 
 #[derive(Clone)]
-struct VisibilityModule {
-    crate_root: PathBuf,
-    modules: Vec<String>,
+pub(super) struct VisibilityModule {
+    pub(super) crate_root: PathBuf,
+    pub(super) modules: Vec<String>,
 }
 
 /// 直接 import の証明で、import の先の宣言に求める名前空間。参照の構文から決める。
@@ -1335,6 +1335,13 @@ impl RustPathOwnerProjectProof {
             return None;
         }
         proof.classify(&source.modules, &reference.modules)
+    }
+
+    pub(super) fn private_call_module(&self, file: &Path) -> Option<VisibilityModule> {
+        if !self.private_scope_wiring_unchanged || !self.unrelocated(file) || !self.macro_free() {
+            return None;
+        }
+        self.visibility_module(file)
     }
 
     fn visibility_module(&self, file: &Path) -> Option<VisibilityModule> {

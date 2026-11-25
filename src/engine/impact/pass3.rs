@@ -33,48 +33,6 @@ pub(super) fn decode_caller_map(typed_map: TypedCallerMap, pool: &StringPool) ->
     out
 }
 
-/// A same-name definition in the reference file makes an untyped receiver ambiguous.
-/// Preserve the candidate but avoid a blocking result until its owner is known.
-pub(super) fn demote_private_method_local_competitors(
-    normal: &mut CallerMap,
-    low: &mut CallerMap,
-    ctx: &FileContext,
-    def_paths_by_ix: &[Vec<u32>],
-    pool: &StringPool,
-    sym_ix: &HashMap<String, usize>,
-) {
-    if ctx.rust_private_method_owners.is_empty() {
-        return;
-    }
-    let mut demoted = Vec::new();
-    normal.retain(|(path, line), (caller, symbols)| {
-        let mut moved = Vec::new();
-        symbols.retain(|name| {
-            let competing_here = ctx.rust_private_method_owners.contains_key(name)
-                && sym_ix
-                    .get(&ci_key(ctx.lang_id, name))
-                    .and_then(|&ix| def_paths_by_ix.get(ix))
-                    .is_some_and(|paths| paths.iter().any(|&pid| pool.get(pid) == path));
-            if competing_here {
-                moved.push(name.clone());
-            }
-            !competing_here
-        });
-        if !moved.is_empty() {
-            demoted.push(((path.clone(), *line), (caller.clone(), moved)));
-        }
-        !symbols.is_empty()
-    });
-    for (key, (caller, moved)) in demoted {
-        let entry = low.entry(key).or_insert_with(|| (caller, Vec::new()));
-        for name in moved {
-            if !entry.1.contains(&name) {
-                entry.1.push(name);
-            }
-        }
-    }
-}
-
 /// Pass 4 (per-fc): 1 ファイル分の `CallerMap` と `FileContext` から `FileImpact` を組み立てる。
 /// 同一ファイル内の `call_edges` もここでマージする。
 ///

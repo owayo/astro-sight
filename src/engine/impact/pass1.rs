@@ -832,7 +832,7 @@ struct OldRustPrivateSymbols {
     /// `root_names` のうち、名前を束縛し直さない組み込みの属性だけの関数と、その属性の綴り
     /// ([`plain_root_function_attributes`])。
     plain_functions: HashMap<String, Vec<String>>,
-    method_owners: HashMap<String, String>,
+    method_owners: HashMap<String, declaration::PrivateMethodOwner>,
     /// 旧い版の名前ごとの inherent メソッドの所有型 ([`rust_inherent_owners_by_name`])。
     inherent_owners: HashMap<String, Option<BTreeSet<String>>>,
 }
@@ -961,7 +961,7 @@ fn collect_old_rust_private_symbols(
             }
         }
     }
-    let method_owners: HashMap<String, String> = old_syms
+    let method_owners: HashMap<String, declaration::PrivateMethodOwner> = old_syms
         .iter()
         .filter(|symbol| spelling_counts.get(symbol.name.as_str()) == Some(&1))
         .filter_map(|symbol| {
@@ -1337,7 +1337,10 @@ fn rust_private_symbols_of_changes(
     source: &[u8],
     syms: &[Symbol],
     affected: &[AffectedSymbol],
-) -> (HashSet<String>, HashMap<String, String>) {
+) -> (
+    HashSet<String>,
+    HashMap<String, declaration::PrivateMethodOwner>,
+) {
     let mut root_names = HashSet::new();
     let mut method_owners = HashMap::new();
     for change in affected {
@@ -1354,12 +1357,12 @@ fn rust_private_symbols_of_changes(
         {
             root_names.insert(change.name.clone());
         }
-        let new_methods: Vec<_> = syms
+        let mut new_methods = syms
             .iter()
             .filter(|symbol| symbol.name == change.name && symbol_overlaps_hunks(symbol, &df.hunks))
-            .filter_map(|symbol| declaration::rust_private_inherent_method(root, source, symbol))
-            .collect();
-        if new_methods.len() == 1
+            .filter_map(|symbol| declaration::rust_private_inherent_method(root, source, symbol));
+        if let Some(mut new_owner) = new_methods.next()
+            && new_methods.next().is_none()
             && syms
                 .iter()
                 .filter(|symbol| {
@@ -1367,9 +1370,11 @@ fn rust_private_symbols_of_changes(
                 })
                 .count()
                 == 1
-            && old.method_owners.get(&change.name) == Some(&new_methods[0])
+            && let Some(old_owner) = old.method_owners.get(&change.name)
+            && old_owner.name == new_owner.name
         {
-            method_owners.insert(change.name.clone(), new_methods[0].clone());
+            new_owner.unconditional &= old_owner.unconditional;
+            method_owners.insert(change.name.clone(), new_owner);
         }
     }
     (root_names, method_owners)

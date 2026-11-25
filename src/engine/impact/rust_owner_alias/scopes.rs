@@ -105,6 +105,136 @@ fn extend_scope<'a>(ends: &mut HashMap<&'a str, usize>, name: &'a str, end: usiz
     *until = (*until).max(end);
 }
 
+/// 参照位置で書かれた型のパスと、変更元のクレート・モジュール・型名が一致する呼び出し。
+pub(in super::super) fn private_calls(
+    mut root: Node<'_>,
+    source: &[u8],
+    file: &Path,
+    contexts: &[super::super::FileContext],
+    project: &RustPathOwnerProjectProof,
+) -> Option<HashMap<usize, u32>> {
+    let reference = project.private_call_module(file)?;
+    let mut targets = HashMap::<String, HashMap<Vec<String>, u32>>::new();
+    for (index, ctx) in contexts.iter().enumerate() {
+        if ctx.rust_private_method_owners.is_empty() || Path::new(&ctx.new_path) == file {
+            continue;
+        }
+        let Some(origin) = project.private_call_module(Path::new(&ctx.new_path)) else {
+            continue;
+        };
+        if reference.crate_root != origin.crate_root
+            || !reference.modules.starts_with(&origin.modules)
+        {
+            continue;
+        }
+        for (method, owner) in &ctx.rust_private_method_owners {
+            if !owner.unconditional {
+                continue;
+            }
+            let mut path = origin.modules.clone();
+            path.push(identifier(&owner.name));
+            targets
+                .entry(identifier(method))
+                .or_default()
+                .entry(path)
+                .and_modify(|index| *index = u32::MAX)
+                .or_insert(index as u32);
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    if root.has_error() {
+        return None;
+    }
+    let mut module = reference.modules;
+    let mut scopes = vec![(root, 0, std::cell::OnceCell::<Option<Names>>::new())];
+    let mut shadowed = HashMap::new();
+    let mut generic_end = 0;
+    let mut calls = HashMap::new();
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+        let skip = ControlFlow::Continue(Walk::Skip);
+        while scopes.len() > 1 && scopes.last().unwrap().0.end_byte() <= node.start_byte() {
+            scopes.pop();
+            module.pop();
+        }
+        let (scope, body_depth, names) = scopes.last().unwrap();
+        if node.kind() == "mod_item" {
+            if depth != body_depth + 1 {
+                return skip;
+            }
+            let (Some(body), Some(name)) = (
+                node.child_by_field_name("body"),
+                field(node, "name", source),
+            ) else {
+                return skip;
+            };
+            module.push(identifier(name));
+            scopes.push((body, depth + 1, Default::default()));
+        } else if matches!(
+            node.kind(),
+            "token_tree" | "use_declaration" | "attribute_item"
+        ) || node.kind() == "block" && !index_scope(node, source, &mut shadowed)
+        {
+            return skip;
+        } else if node.child_by_field_name("type_parameters").is_some() {
+            generic_end = generic_end.max(node.end_byte());
+        } else if node.kind() == "call_expression"
+            && let Some(callee) = node.child_by_field_name("function")
+            && let Some(member) = callee
+                .child_by_field_name("name")
+                .filter(|_| callee.kind() == "scoped_identifier")
+            && let Some(owners) = plain_name(member, source).and_then(|name| targets.get(name))
+            && let Some(receiver) = callee.child_by_field_name("path")
+        {
+            let target = match receiver.kind() {
+                "identifier" => plain_name(receiver, source).and_then(|alias| {
+                    if node.start_byte() < generic_end
+                        || shadowed
+                            .get(alias)
+                            .is_some_and(|&end| node.start_byte() < end)
+                    {
+                        return None;
+                    }
+                    let names = names
+                        .get_or_init(|| Names::collect(*scope, source, &module))
+                        .as_ref()?;
+                    let alias = identifier(alias);
+                    let (origin, target) = names.imports.get(&alias)?.as_ref()?;
+                    (*origin == UsePathOrigin::Anchored
+                        && !names.items.contains(&alias)
+                        && names.globs.is_empty())
+                    .then(|| target.clone())
+                }),
+                "scoped_identifier" if path_segments(receiver, source).is_some() => {
+                    crate::engine::rust_use_tree::resolve_use_path_node(
+                        receiver,
+                        source,
+                        &[],
+                        &module,
+                    )
+                    .and_then(|(mut path, name, origin)| {
+                        if origin != UsePathOrigin::Anchored {
+                            return None;
+                        }
+                        path.push(name?);
+                        Some(path.iter().map(|s| identifier(s)).collect())
+                    })
+                }
+                _ => None,
+            };
+            if let Some(index) = target.and_then(|target| owners.get(&target)) {
+                calls.insert(member.id(), *index);
+            }
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    Some(calls)
+}
+
 fn index_scope<'a>(scope: Node<'_>, source: &'a [u8], ends: &mut HashMap<&'a str, usize>) -> bool {
     #[cfg(test)]
     tests::BLOCK_SCANS.update(|n| n + 1);

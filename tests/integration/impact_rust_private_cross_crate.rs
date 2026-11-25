@@ -227,6 +227,105 @@ fn rust_extern_formatting_preserves_the_caller_with_crlf() {
 }
 
 #[test]
+fn private_inherent_calls_resolve_the_qualified_owner_in_a_workspace() {
+    let mut case = Case::new(A_OLD);
+    case.a_old =
+        "mod child;\npub struct S;\nimpl S {\n    fn translate(_: u8) {}\n}\nfn r#translate() {}\n"
+            .into();
+    case.a_new = case.a_old.replace("_: u8", "");
+    case.files = vec![(
+        "a/src/child.rs",
+        r#"use super::S as Owner;
+struct S;
+impl S { fn translate(_: u8) {} }
+fn run() {
+    super::S::translate(1);
+    crate::S::translate(1);
+    Owner::translate(1);
+    S::translate(1);
+}
+mod inner {
+    fn run() {
+        super::super::S::translate(1);
+        super::S::translate(1);
+    }
+}
+fn rebound() {
+    type Owner = S;
+    r#Owner::translate(1);
+}
+"#
+        .into(),
+    )];
+    let repo = case.changed_repo();
+    for staged in [false, true] {
+        let mut args = vec!["--git"];
+        if staged {
+            repo.stage_all();
+            repo.write("a/src/lib.rs", &case.a_old);
+            args.push("--staged");
+        }
+        let review = repo.run_json("review", &args);
+        let changes = &review["impact"]["changes"][0];
+        let callers = changes["impacted_callers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let reported = callers
+            .iter()
+            .filter(|c| {
+                c["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "translate")
+            })
+            .map(|c| (c["path"].as_str().unwrap(), c["line"].as_u64().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reported,
+            [
+                ("a/src/child.rs", 4),
+                ("a/src/child.rs", 5),
+                ("a/src/child.rs", 6),
+                ("a/src/child.rs", 11)
+            ],
+            "{changes}"
+        );
+        let result = cargo_bin()
+            .current_dir(repo.root())
+            .args(["review", "--dir", ".", "--hook"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn private_inherent_call_keeps_a_conditional_method_uncertain() {
+    for implementation in [
+        "impl S {\n    #[cfg(any())]\n    fn translate(_: u8) {}\n}",
+        "impl S {\n    // disabled impl\n    #![cfg(any())]\n    fn translate(_: u8) {}\n}",
+        "impl S {\n    fn translate(_: u8) {\n        /* disabled method */\n        #![cfg(any())]\n    }\n}",
+    ] {
+        let mut case = Case::new(A_OLD);
+        case.files = vec![(
+            "a/src/child.rs",
+            "trait F { fn translate(_: u8) {} }\nimpl F for super::S {}\nfn run() { super::S::translate(1); }\n".into(),
+        )];
+        case.a_old = format!("mod child;\npub struct S;\n{implementation}\n");
+        case.a_new = case.a_old.replace("_: u8", "");
+        assert_eq!(case.run(), (0, vec![]), "{implementation}");
+    }
+}
+
+#[test]
 fn impact_rust_private_function_excludes_crates_that_cannot_name_it() {
     // Issue の最小の再現 (別の項目の `#[unsafe(no_mangle)]` と、`b` の glob の import)。
     assert_eq!(Case::new(A_OLD).run(), (1, vec![CHILD_LINE.to_owned()]));

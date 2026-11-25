@@ -1,6 +1,6 @@
 //! Pass 2: per-file streaming 収集 (fold/reduce) の実装。
 //!
-//! `stream_caller_maps_and_defs` が tree-sitter parse を 1 回だけ実行し、
+//! `stream_caller_maps` が tree-sitter parse を 1 回だけ実行し、
 //! `ImpactCollector`（`refs::RefVisitor` 実装）で Definition 集合と References を同時に集め、
 //! その場で `TypedCallerMap` にフィルタ適用して流す。worker local state は `CHUNK_SIZE` 件
 //! ずつに区切って rayon fold/reduce で処理し、各 chunk の終了時に global accumulator へ
@@ -76,7 +76,6 @@ pub(super) struct StreamCallerMaps {
     pub(super) caller_maps: Vec<TypedCallerMap>,
     pub(super) low_caller_maps: Vec<TypedCallerMap>,
     pub(super) informational_caller_maps: Vec<TypedCallerMap>,
-    pub(super) def_paths_by_ix: Vec<Vec<u32>>,
     pub(super) string_pool: StringPool,
 }
 
@@ -273,7 +272,6 @@ fn new_worker_state(n_fc: usize, n_sym: usize) -> WorkerState {
         local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         local_low_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         local_informational_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-        local_def_paths: vec![Vec::new(); n_sym],
         target_cache: new_target_file_cache(),
         import_facts_cache: new_target_file_cache(),
         ref_hit: vec![false; n_sym],
@@ -309,7 +307,7 @@ fn impact_worker_count() -> usize {
 /// worker local state の肥大化を抑えるため、ファイル群を `CHUNK_SIZE` 件ずつに区切って
 /// rayon fold/reduce を動かし、chunk 終了時に global accumulator へ merge → chunk state を
 /// drop する。これにより次の chunk 開始時には前回の chunk local は解放済みとなる。
-pub(super) fn stream_caller_maps_and_defs(
+pub(super) fn stream_caller_maps(
     file_contexts: &[FileContext],
     all_symbol_names: &[String],
     sym_ix: &HashMap<String, usize>,
@@ -335,7 +333,6 @@ pub(super) fn stream_caller_maps_and_defs(
         caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-        def_paths_by_ix: vec![Vec::new(); n_sym],
         string_pool: StringPool::new(),
     };
 
@@ -429,7 +426,6 @@ pub(super) fn stream_caller_maps_and_defs(
         (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_informational_maps: Vec<TypedCallerMap> =
         (0..n_fc).map(|_| new_typed_caller_map()).collect();
-    let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
         let chunk_state = rayon_pool.install(|| {
@@ -460,7 +456,6 @@ pub(super) fn stream_caller_maps_and_defs(
                             local_maps,
                             local_low_maps,
                             local_informational_maps,
-                            local_def_paths,
                             target_cache,
                             import_facts_cache,
                             ref_hit,
@@ -491,6 +486,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             rust_owner_sources: &rust_owner_sources,
                             rust_ref_module: Default::default(),
                             rust_ref_unrelocated: Default::default(),
+                            rust_private_calls: Default::default(),
                             rust_method_bindings: Default::default(),
                             python_import_cache: &python_import_cache,
                             python_changed_names: sym_ix,
@@ -504,7 +500,6 @@ pub(super) fn stream_caller_maps_and_defs(
                             local_maps: local_maps.as_mut_slice(),
                             local_low_maps: local_low_maps.as_mut_slice(),
                             local_informational_maps: local_informational_maps.as_mut_slice(),
-                            local_def_paths: local_def_paths.as_mut_slice(),
                             target_cache,
                             ref_hit: ref_hit.as_mut_slice(),
                             ref_events,
@@ -538,11 +533,6 @@ pub(super) fn stream_caller_maps_and_defs(
                         &mut acc.local_informational_maps,
                         local.local_informational_maps,
                     );
-                    for (acc_v, local_v) in
-                        acc.local_def_paths.iter_mut().zip(local.local_def_paths)
-                    {
-                        acc_v.extend(local_v);
-                    }
                     acc
                 })
         });
@@ -554,9 +544,6 @@ pub(super) fn stream_caller_maps_and_defs(
             &mut global_informational_maps,
             chunk_state.local_informational_maps,
         );
-        for (g, c) in global_defs.iter_mut().zip(chunk_state.local_def_paths) {
-            g.extend(c);
-        }
     }
 
     let pool = string_pool
@@ -566,7 +553,6 @@ pub(super) fn stream_caller_maps_and_defs(
         caller_maps: global_maps,
         low_caller_maps: global_low_maps,
         informational_caller_maps: global_informational_maps,
-        def_paths_by_ix: global_defs,
         string_pool: pool,
     })
 }
