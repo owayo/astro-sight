@@ -83,7 +83,7 @@ pub struct FileCollection {
     ignored: IgnoredFiles,
     /// 拡張子が無く、先頭を読めずに言語を判定できなかったファイルの数。
     /// 対応言語のスクリプトかもしれないので「対応言語のファイルが無い」根拠にしない。
-    unreadable_candidates: usize,
+    pub(crate) unreadable_candidates: usize,
     /// `.gitattributes` の属性を解決できず、生成物として外さずに残したファイルと原因。
     generated_undetermined: Vec<(std::path::PathBuf, AttributeLookupError)>,
 }

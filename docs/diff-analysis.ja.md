@@ -697,6 +697,10 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 
 `python_import_rebinding` の互換判定には別の狭い証明が必要です。通常の関数の AST が同じで、注釈・既定値が静的なプリミティブ型/値、戻り式が引数とリテラル・演算子だけ、module のグローバル値への依存がなく、ローカル import の経路に循環や初期化時の副作用がなく、リポジトリ全体で関数値の持ち出し・別名化・内省・動的な束縛がないと確かめられる場合に限ります。条件付き/関数内の import、デコレータ、未解決の import、名前空間の import、契約が未証明のものは blocking を保ちます。`refs` の出現は削りません。staged review は index のスナップショットを使い、作業ツリーで代用した証拠を index の事実として残しません。
 
+### Python の関数名を文字列で参照する場合
+
+モジュール直下の関数を削除すると、`review` は Python の文字列を介した名前の参照も調べる。`globals()["total"]`、`getattr(module, "total")`、`mock.patch("pkg.module.total")` などが残ると、削除は `api.rm` に入り、hook は終了コード 1 を返す。通常の辞書キーやログに同じ文字列があるだけなら `api.rm_dead` にできる。ソースの読み取りや解析が失敗した場合、または1ファイル 2 MiB・合計 64 MiB の上限を超えた場合は、未確認の候補を blocking に残し、理由を `truncations` に出す。
+
 ### Python の受け手が未解決なメンバー削除
 
 `api_changes.removed_unresolved`（hook では `api.rm_unresolved`）は、削除が確定していても、残った属性参照の受け手を特定できず、使用位置の型要求だけが分かる候補を報告する。`confidence: "low"` の情報提供として扱い、hook を止めない。削除メンバーへの参照の有無は未確定で、`removed_dead` の証明条件は変えない。シェルの解析エラーで削除自体を確定できない `uncertain_removals` / `rm_unverified` も別区分のまま維持する。

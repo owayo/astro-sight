@@ -394,6 +394,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         &rust_packages,
         removed,
         &ambiguous_relation_keys,
+        &mut state.buckets.parse_truncations,
     );
     removed_kept.extend(unverified_removed);
     // 有る設定の一部から消えた Rust の項目 (Issue #291) は、項目そのものは残るので移動の相殺に
@@ -1034,6 +1035,7 @@ mod python_literal;
 mod python_member_origin;
 mod python_optional_removal;
 mod python_private_owner;
+mod python_removed_references;
 
 mod python_protocol_arg;
 mod python_return_usage;

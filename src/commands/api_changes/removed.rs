@@ -41,6 +41,7 @@ pub(crate) fn partition_removed_dead_candidates(
     rust_packages: &super::removed_cargo::RemovedRustPackages<'_>,
     candidates: Vec<ApiSymbolCandidate>,
     ambiguous_relation_keys: &HashSet<ApiRelationKey>,
+    notices: &mut Vec<crate::models::truncation::TruncationInfo>,
 ) -> (
     Vec<ApiSymbolCandidate>,
     Vec<ApiSymbolCandidate>,
@@ -84,7 +85,8 @@ pub(crate) fn partition_removed_dead_candidates(
 
     // Initialized submodules belong to another repository. Keep refs occurrence
     // output unchanged; omit those files only from this repository's API proof.
-    if let Some(gitlinks) = current_gitlinks(dir) {
+    let gitlinks = current_gitlinks(dir).unwrap_or_default();
+    if !gitlinks.is_empty() {
         for result in &mut batch_result {
             result.references.retain(|reference| {
                 !gitlinks
@@ -439,6 +441,14 @@ pub(crate) fn partition_removed_dead_candidates(
         removed_kept = kept;
         removed_dead.extend(follow);
     }
+
+    super::python_removed_references::retain_referenced(
+        dir,
+        &gitlinks,
+        &mut removed_kept,
+        &mut removed_dead,
+        notices,
+    );
 
     // 第 3 パス: 対応付け不能な削除グループの区分を揃える。
     // 同一キーの候補が blocking と informational に割れていたら、保守側 (blocking) へ寄せる。
