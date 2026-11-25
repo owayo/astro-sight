@@ -52,11 +52,11 @@ pub(crate) use removed_params::{
     optional_removal_words,
 };
 pub(crate) use removed_props::{
-    RemovedParameterProps, call_omits_removed_props, removed_parameter_props,
+    ProvenPropertyRemoval, detect_optional_object_props_removed_compatible_mod,
+    prove_local_alias_property_removal,
 };
 pub(crate) use removed_props::{
-    detect_local_alias_props_removed_compatible_mod,
-    detect_optional_object_props_removed_compatible_mod,
+    RemovedParameterProps, call_omits_removed_props, removed_parameter_props,
 };
 pub(crate) use type_members::{
     classify_member_property_removal, classify_member_type_narrowing,

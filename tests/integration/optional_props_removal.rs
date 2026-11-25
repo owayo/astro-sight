@@ -44,7 +44,7 @@ fn private_return_alias_removal_proves_every_result_use() {
                 Some(i32::from(!safe)),
                 "{use_site} {staged}: {json}"
             );
-            let change = &json["api"][if safe { "mod_compat" } else { "mod" }][0];
+            let change = &json["api"][if safe { "mod_closed" } else { "mod" }][0];
             assert_eq!(change["n"], "probe", "{json}");
             assert_eq!(
                 change["change_evidence"]["changed_parts"],
@@ -63,10 +63,15 @@ fn private_return_alias_removal_proves_every_result_use() {
                 "{json}"
             );
             if safe {
-                assert_eq!(
-                    change["reason"], "optional_return_properties_removed",
-                    "{json}"
-                );
+                assert!(!lists(&json["api"]["mod_compat"], "probe"), "{json}");
+                assert!(has_ref(&json["impact_info"], "src/caller.ts", 1), "{json}");
+                assert!(!has_ref(&json["impacts"], "src/caller.ts", 1), "{json}");
+                let mut args = vec!["--git"];
+                args.extend_from_slice(extra);
+                let review = repo.run_json("review", &args);
+                let closed = &review["api_changes"]["modified_closed_in_diff"][0];
+                assert_eq!(closed["name"], "probe", "{review}");
+                assert_eq!(closed["change_evidence"], change["change_evidence"]);
             } else {
                 assert!(has_ref(&json["impacts"], "src/caller.ts", 1), "{json}");
             }
@@ -76,6 +81,37 @@ fn private_return_alias_removal_proves_every_result_use() {
                 "{json}"
             );
         }
+    }
+}
+
+#[test]
+fn private_return_alias_type_observations_and_value_transfers_stay_blocking() {
+    let old = "type Reply = { ready?: boolean; legacy?: boolean };\nexport function probe(target: string): Promise<Reply | undefined> { return Promise.resolve(target ? { ready: true } : undefined); }\n";
+    for usage in [
+        "export type Keys = Exclude<keyof NonNullable<Awaited<ReturnType<typeof probe>>>, 'ready'>;",
+        "export async function copy() { return {...(await probe('x'))}; }",
+        "export async function rest() { const {ready, ...other} = (await probe('x')) ?? {}; return other; }",
+        "declare function take(value: unknown): void; export async function send() { take(await probe('x')); }",
+        "export async function write() { const reply = await probe('x'); if (reply) reply.legacy = false; }",
+        "export { probe as publicProbe };",
+    ] {
+        let caller = format!(
+            "import {{ probe }} from './panel.js';\nexport async function read() {{ return (await probe('x'))?.ready; }}\n{usage}\n"
+        );
+        let repo = props_repo(
+            old,
+            &old.replace(" legacy?: boolean", ""),
+            &[("src/caller.ts", &caller)],
+        );
+        let json = assert_blocking(&repo, "probe", usage);
+        assert!(
+            !lists(&json["api"]["mod_closed"], "probe"),
+            "{usage}: {json}"
+        );
+        assert!(
+            has_ref(&json["impacts"], "src/caller.ts", 1),
+            "{usage}: {json}"
+        );
     }
 }
 
@@ -135,6 +171,20 @@ fn private_return_alias_keeps_unproven_contracts_blocking() {
             false,
         ),
         (
+            decl.replace(
+                "probe(input: Input)",
+                "probe(input: Input, previous?: Reply)",
+            ),
+            "",
+            false,
+        ),
+        (
+            format!("const Promise = globalThis.Promise;\n{decl}"),
+            "",
+            false,
+        ),
+        (decl.to_owned(), "export function unfinished(", false),
+        (
             decl.to_owned(),
             "export {}; declare global { interface Promise<T> { unwrap(): T } }",
             false,
@@ -157,7 +207,7 @@ fn private_return_alias_keeps_unproven_contracts_blocking() {
             .find(|entry| entry["n"] == "probe")
             .unwrap();
         let parts = &entry["change_evidence"]["changed_parts"];
-        let expected = if parameter_changed {
+        let expected = if parameter_changed || old.contains("previous?: Reply") {
             serde_json::json!(["return_annotation", "param_annotation", "referenced_type"])
         } else {
             serde_json::json!(["return_annotation", "referenced_type"])

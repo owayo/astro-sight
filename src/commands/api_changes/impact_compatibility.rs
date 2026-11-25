@@ -60,31 +60,41 @@ pub(crate) fn compatible_impact_names_for_api(
     let mut candidates: BTreeMap<String, Vec<CompatibleApiModification>> = BTreeMap::new();
     let mut names = BTreeSet::new();
     let mut changes = api.compatible_modified.clone();
-    if api.modified_closed_in_diff.iter().any(|change| {
-        matches!(change.kind.as_str(), "function" | "interface" | "trait")
+    let closed_returns = super::type_dependency_symbols::closed_return_declarations(api);
+    let handoffs = if api.modified_closed_in_diff.iter().any(|change| {
+        !closed_returns.contains_key(&(change.file.as_str(), change.name.as_str()))
+            && matches!(change.kind.as_str(), "function" | "interface" | "trait")
             && matches!(
                 crate::language::LangId::from_path(camino::Utf8Path::new(&change.file)),
                 Ok(crate::language::LangId::Typescript | crate::language::LangId::Tsx)
             )
     }) {
         let blobs = GitBlobBatch::new(dir, base);
-        if let Some(proof) = super::ts_function_values::HandoffProof::build(dir, &blobs, diff_files)
+        super::ts_function_values::HandoffProof::build(dir, &blobs, diff_files)
+    } else {
+        None
+    };
+    for change in &api.modified_closed_in_diff {
+        let reason = if closed_returns.contains_key(&(change.file.as_str(), change.name.as_str())) {
+            "optional_return_properties_removed"
+        } else if handoffs
+            .as_ref()
+            .is_some_and(|proof| proof.covers(&change.file, &change.name))
         {
-            for change in &api.modified_closed_in_diff {
-                if proof.covers(&change.file, &change.name) {
-                    changes.push(CompatibleApiModification {
-                        change_evidence: None,
-                        inline_module: change.inline_module.clone(),
-                        name: change.name.clone(),
-                        kind: change.kind.clone(),
-                        file: change.file.clone(),
-                        old_signature: change.old_signature.clone(),
-                        new_signature: change.new_signature.clone(),
-                        reason: "closed_function_value_handoff".to_owned(),
-                    });
-                }
-            }
-        }
+            "closed_function_value_handoff"
+        } else {
+            continue;
+        };
+        changes.push(CompatibleApiModification {
+            change_evidence: None,
+            inline_module: change.inline_module.clone(),
+            name: change.name.clone(),
+            kind: change.kind.clone(),
+            file: change.file.clone(),
+            old_signature: change.old_signature.clone(),
+            new_signature: change.new_signature.clone(),
+            reason: reason.to_owned(),
+        });
     }
     for change in changes {
         names.insert(bare_name(&change.name).to_string());
@@ -249,6 +259,48 @@ mod tests {
     use crate::commands::tests::common::{
         git_commit_files, init_git_repo_for_test, resolve_git_diff_parts,
     };
+
+    #[test]
+    fn closed_return_impact_needs_the_result_use_proof() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        let source = "type Reply = { ready?: boolean; legacy?: boolean };\nexport function probe(target: string): Promise<Reply | undefined> { return Promise.resolve(target ? { ready: true } : undefined); }\n";
+        let caller = "import { probe } from './probe.js';\nexport async function read() { return (await probe('x'))?.ready; }\n";
+        init_git_repo_for_test(dir);
+        git_commit_files(
+            dir,
+            &[("probe.ts", source), ("caller.ts", caller)],
+            "initial",
+        );
+        std::fs::write(
+            dir.join("probe.ts"),
+            source.replace(" legacy?: boolean", ""),
+        )
+        .unwrap();
+        let files = crate::engine::diff::parse_unified_diff(&resolve_git_diff_parts(dir).0);
+        let dir = dir.to_str().unwrap();
+        let mut api = detect_api_changes(dir, "HEAD", &files);
+        assert!(api.type_dependency_symbols["probe.ts"].contains("probe"));
+        let proven = |api: &ApiChanges| compatible_impact_names_for_api(dir, "HEAD", &files, api);
+        assert!(proven(&api)["probe.ts"].contains("probe"));
+        let original = api.modified_closed_in_diff[0].clone();
+        for kind in ["function", "type"] {
+            let mut other = original.clone();
+            other.kind = kind.to_owned();
+            api.modified.push(other.clone());
+            assert!(proven(&api).is_empty(), "{kind}");
+            api.modified.pop();
+            api.modified_closed_in_diff.push(other);
+            assert!(proven(&api).is_empty(), "{kind}");
+            api.modified_closed_in_diff.pop();
+        }
+        api.modified_closed_in_diff[0].kind = "type".into();
+        assert!(proven(&api).is_empty());
+        api.modified_closed_in_diff[0] = original;
+        // 型依存の証拠がない closed を同じ形の戻り値とみなさない。
+        api.type_dependency_symbols.clear();
+        assert!(proven(&api).is_empty());
+    }
 
     #[test]
     fn python_compatible_method_names_require_every_changed_declaration_proven() {

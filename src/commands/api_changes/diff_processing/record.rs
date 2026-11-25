@@ -67,6 +67,12 @@ pub(super) fn record_signature_decision(
             buckets.compatible_modified.push(compat)
         }
         SignatureDecision::ClosedInDiff => buckets.modified_closed_in_diff.push(change),
+        SignatureDecision::ClosedReturnProperties => {
+            buckets
+                .closed_return_properties
+                .push((change.file.clone(), change.name.clone()));
+            buckets.modified_closed_in_diff.push(change);
+        }
         SignatureDecision::CallbackBodyOnly => {
             buckets
                 .callback_body_changes

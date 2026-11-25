@@ -141,16 +141,24 @@ pub(crate) fn detect_optional_object_props_removed_compatible_mod(
     cache: &mut OptionalRemovalCache,
     diff_files: &[DiffFile],
 ) -> Option<CompatibleApiModification> {
-    detect_props_removed(index, site, sources, cache, diff_files, false)
+    match detect_props_removed(index, site, sources, cache, diff_files, false)? {
+        ProvenPropertyRemoval::Compatible(reason) => Some(site.compatible(reason)),
+        ProvenPropertyRemoval::ClosedReturn => None,
+    }
 }
 
-pub(crate) fn detect_local_alias_props_removed_compatible_mod(
+pub(crate) enum ProvenPropertyRemoval {
+    Compatible(&'static str),
+    ClosedReturn,
+}
+
+pub(crate) fn prove_local_alias_property_removal(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
     cache: &mut OptionalRemovalCache,
     diff_files: &[DiffFile],
-) -> Option<CompatibleApiModification> {
+) -> Option<ProvenPropertyRemoval> {
     detect_props_removed(index, site, sources, cache, diff_files, true)
 }
 
@@ -161,7 +169,7 @@ fn detect_props_removed(
     cache: &mut OptionalRemovalCache,
     diff_files: &[DiffFile],
     local_alias_only: bool,
-) -> Option<CompatibleApiModification> {
+) -> Option<ProvenPropertyRemoval> {
     if site.kind != "function" || site.name.contains('.') || site.old_path != site.new_path {
         return None;
     }
@@ -235,7 +243,7 @@ fn detect_props_removed(
     if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
-    let (rule, reason) = match &removal.uses {
+    let (rule, proof) = match &removal.uses {
         PropertyUses::Argument {
             removed,
             explicit_return,
@@ -244,11 +252,11 @@ fn detect_props_removed(
                 removed,
                 calls_allowed: *explicit_return,
             },
-            "optional_object_props_removed",
+            ProvenPropertyRemoval::Compatible("optional_object_props_removed"),
         ),
         PropertyUses::AwaitedResult { retained } => (
             UseRule::AwaitedProperty(retained),
-            "optional_return_properties_removed",
+            ProvenPropertyRemoval::ClosedReturn,
         ),
     };
     prove_repository_uses(
@@ -259,7 +267,7 @@ fn detect_props_removed(
         site.name,
         rule,
     )?;
-    Some(site.compatible(reason))
+    Some(proof)
 }
 
 struct PropsRemoval<'tree> {
