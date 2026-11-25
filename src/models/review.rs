@@ -159,7 +159,7 @@ pub struct ApiChanges {
     /// (Issue 2026-06-02-react-memo / 2026-06-02-provider-avatar 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub compatible_modified: Vec<CompatibleApiModification>,
-    /// null の増減と利用方向。証拠自体は互換性の保証ではない。
+    /// union 要素の増減、その入出力位置と利用の証拠。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub type_change_evidence: Vec<TypeChangeEvidence>,
     /// 無条件の明示 import によって公開名が残る Python の定義元変更。

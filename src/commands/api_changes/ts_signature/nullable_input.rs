@@ -1,4 +1,4 @@
-//! null だけの入力拡大と、その利用方向の証拠。
+//! 入力の union 拡大と、null の増減を含む利用方向の証拠。
 
 use tree_sitter::Node;
 
@@ -12,6 +12,10 @@ use crate::models::review::{
     ApiChanges, NullableTypeChange, TypeChangeDirection, TypeChangeEvidence, TypeChangePosition,
     TypeChangeUsage,
 };
+mod parameter_union;
+
+const NULLABLE: &str = "nullable_input_widening";
+const PARAMETER_UNION: &str = "parameter_union_widening";
 
 pub(crate) fn detect_nullable_input_compatible_mod(
     index: &ApiRefIndex,
@@ -74,6 +78,25 @@ pub(crate) fn detect_nullable_input_compatible_mod(
     if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
+    // 以前は型エラーだった呼び出しが通ると、利用側の @ts-expect-error がエラーになる。
+    if analysis.extended_proof
+        && inventory.parsed().any(|(_, source, root, _)| {
+            memchr::memmem::find(source, b"@ts-expect-error").is_some()
+                && memchr::memmem::find(source, site.name.as_bytes()).is_some()
+                && crate::engine::tree_walk::any_node(
+                    root,
+                    crate::engine::tree_walk::Children::Named,
+                    |node| {
+                        node.kind() == "comment"
+                            && node
+                                .utf8_text(source)
+                                .is_ok_and(|text| text.contains("@ts-expect-error"))
+                    },
+                )
+        })
+    {
+        return None;
+    }
     prove_repository_uses(
         refs,
         &inventory,
@@ -82,7 +105,16 @@ pub(crate) fn detect_nullable_input_compatible_mod(
         site.name,
         UseRule::CallArity(analysis.arity),
     )?;
-    Some(site.compatible("nullable_input_widening"))
+    let reason = if analysis
+        .changes
+        .iter()
+        .all(|change| change.member == "null")
+    {
+        NULLABLE
+    } else {
+        PARAMETER_UNION
+    };
+    Some(site.compatible(reason))
 }
 
 fn nullable_site(site: &CompatibleModSite<'_>) -> Option<crate::language::LangId> {
@@ -95,6 +127,7 @@ fn nullable_site(site: &CompatibleModSite<'_>) -> Option<crate::language::LangId
 struct Analysis<'tree> {
     changes: Vec<NullableTypeChange>,
     same_contract: bool,
+    extended_proof: bool,
     arity: usize,
     type_roots: Vec<Node<'tree>>,
 }
@@ -173,8 +206,8 @@ fn analyze<'new>(
     let (new, new_statement) = unique_function_declaration(new_root, b, name)?;
     let old_params = old.child_by_field_name("parameters")?;
     let new_params = new.child_by_field_name("parameters")?;
-    let old_return = old.child_by_field_name("return_type")?;
-    let new_return = new.child_by_field_name("return_type")?;
+    let old_return = old.child_by_field_name("return_type");
+    let new_return = new.child_by_field_name("return_type");
     let old_body = old.child_by_field_name("body")?;
     let new_body = new.child_by_field_name("body")?;
     let old_parameters = named(old_params);
@@ -182,7 +215,7 @@ fn analyze<'new>(
     if old_parameters.len() != new_parameters.len() {
         return None;
     }
-    let same_contract = same_range(
+    let mut same_contract = same_range(
         old_statement,
         a,
         old_statement.start_byte()..old_params.start_byte(),
@@ -192,28 +225,30 @@ fn analyze<'new>(
     ) && same_range(
         old,
         a,
-        old_params.end_byte()..old_return.start_byte(),
+        old_params.end_byte()..old_return.unwrap_or(old_body).start_byte(),
         new,
         b,
-        new_params.end_byte()..new_return.start_byte(),
+        new_params.end_byte()..new_return.unwrap_or(new_body).start_byte(),
     ) && same_range(
         old,
         a,
-        old_return.end_byte()..old_body.start_byte(),
+        old_return.unwrap_or(old_params).end_byte()..old_body.start_byte(),
         new,
         b,
-        new_return.end_byte()..new_body.start_byte(),
-    ) && node_signature_tokens(old_body, a)
-        == node_signature_tokens(new_body, b);
+        new_return.unwrap_or(new_params).end_byte()..new_body.start_byte(),
+    ) && node_signature_tokens(old_body, a)?
+        == node_signature_tokens(new_body, b)?;
     let mut changes = Vec::new();
     let mut roots = Vec::new();
+    let mut extended_proof = new_return.is_none();
     for (parameter, (old, new)) in old_parameters.iter().zip(&new_parameters).enumerate() {
         let old_type = old.child_by_field_name("type")?;
         let new_type = new.child_by_field_name("type")?;
         if !shell(*old, a, old_type, *new, b, new_type) {
             return None;
         }
-        compare_types(
+        let previous = changes.len();
+        if compare_types(
             old_type,
             a,
             new_type,
@@ -221,25 +256,59 @@ fn analyze<'new>(
             TypeChangePosition::Input,
             Some(parameter),
             &mut changes,
-        )?;
+        )
+        .is_none()
+        {
+            changes.truncate(previous);
+            for member in parameter_union::added_members(old_type, a, new_type, b)? {
+                changes.push(NullableTypeChange {
+                    position: TypeChangePosition::Input,
+                    parameter: Some(parameter),
+                    property_path: Vec::new(),
+                    direction: TypeChangeDirection::Widening,
+                    member,
+                });
+            }
+            extended_proof = true;
+        }
         roots.push(new_type);
     }
-    compare_types(
-        old_return,
-        a,
-        new_return,
-        b,
-        TypeChangePosition::Return,
-        None,
-        &mut changes,
-    )?;
-    roots.push(new_return);
+    match (old_return, new_return) {
+        (Some(old), Some(new)) => {
+            compare_types(
+                old,
+                a,
+                new,
+                b,
+                TypeChangePosition::Return,
+                None,
+                &mut changes,
+            )?;
+            roots.push(new);
+        }
+        (None, None) => {}
+        _ => return None,
+    }
     if changes.is_empty() {
         return None;
+    }
+    if extended_proof {
+        same_contract &= old_body.utf8_text(a).ok()? == new_body.utf8_text(b).ok()?
+            && parameter_union::body_preserves_contract(
+                new_root,
+                new_params,
+                &new_parameters,
+                new_body,
+                b,
+                new_return,
+                &changes,
+            )
+            .is_some();
     }
     Some(Analysis {
         changes,
         same_contract,
+        extended_proof,
         arity: new_parameters.len(),
         type_roots: roots,
     })
@@ -305,16 +374,24 @@ fn compare_types(
 
 type UnionMembers = Vec<Vec<(String, String)>>;
 
-fn union_parts(node: Node<'_>, source: &[u8]) -> Option<(bool, UnionMembers)> {
+fn union_arms(node: Node<'_>) -> Option<Vec<Node<'_>>> {
     let mut pending = vec![node];
-    let mut null = false;
-    let mut members = Vec::new();
+    let mut arms = Vec::new();
     while let Some(node) = pending.pop() {
         let node = inner(node)?;
         if node.kind() == "union_type" {
             pending.extend(named(node));
-            continue;
+        } else {
+            arms.push(node);
         }
+    }
+    Some(arms)
+}
+
+fn union_parts(node: Node<'_>, source: &[u8]) -> Option<(bool, UnionMembers)> {
+    let mut null = false;
+    let mut members = Vec::new();
+    for node in union_arms(node)? {
         if node.kind() == "literal_type" && node.utf8_text(source).ok()? == "null" {
             if null {
                 return None;
@@ -365,7 +442,7 @@ fn non_function_type(node: Node<'_>, source: &[u8]) -> bool {
                 if named(node).first().is_some_and(|value| {
                     matches!(value.kind(), "string" | "number" | "true" | "false")
                 }) => {}
-            "object_type" => {
+            "object_type" | "interface_body" => {
                 for member in named(node) {
                     if member.kind() != "property_signature"
                         || member
@@ -415,7 +492,7 @@ pub(crate) fn collect_nullable_type_evidence(
             &change.kind,
             &change.old_signature,
             &change.new_signature,
-            change.reason == "nullable_input_widening",
+            matches!(change.reason.as_str(), NULLABLE | PARAMETER_UNION),
         )
     });
     let mut result = Vec::new();
