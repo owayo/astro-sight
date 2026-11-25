@@ -840,6 +840,14 @@ fn api_optional_object_extension_handles_deep_union() {
         "{buckets:?}"
     );
     assert!(!in_bucket(&buckets, "modified", "save"), "{buckets:?}");
+
+    repo.write("use.ts", "import { save, after } from './api';\nconst options = { mode: 'fast', label: 5 };\nexport const result = save('a', options) + after();\n");
+    let buckets = review_api_buckets("deep union with incompatible variable", &repo);
+    assert!(in_bucket(&buckets, "modified", "save"), "{buckets:?}");
+    assert!(
+        !in_bucket(&buckets, "compatible_modified", "save"),
+        "{buckets:?}"
+    );
 }
 
 /// `review --git` を実行し、正常終了したことを確かめて API 差分の分類 → 名前の一覧を返す。

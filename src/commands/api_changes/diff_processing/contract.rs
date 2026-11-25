@@ -89,7 +89,7 @@ pub(super) fn decide_signature_change(
             }
         };
     }
-    if let Some(compat) = compatible_modification(
+    let compatible = match compatible_modification(
         ref_index,
         &site,
         sources,
@@ -97,6 +97,10 @@ pub(super) fn decide_signature_change(
         public_name_differs,
         inputs.diff_files,
     ) {
+        Ok(result) => result,
+        Err(()) => return SignatureDecision::Blocking(None),
+    };
+    if let Some(compat) = compatible {
         if dependency_status == super::ts_signature::DependencyStatus::Unknown
             && matches!(
                 compat.reason.as_str(),
@@ -241,24 +245,24 @@ pub(super) fn compatible_modification(
     caches: &mut ApiClosureCaches,
     public_name_differs: bool,
     diff_files: &[crate::models::impact::DiffFile],
-) -> Option<CompatibleApiModification> {
+) -> Result<Option<CompatibleApiModification>, ()> {
     if let Some(compat) =
         detect_fixed_callback_contract_compatible_mod(ref_index, site, sources, caches)
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
     if !public_name_differs
         && let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, site, sources, caches)
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // exported object の未参照プロパティ削除も compatible_modified
     if let Some(compat) = detect_object_members_compatible_mod(site, sources) {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     if let Some(compat) = detect_type_members_compatible_mod(site, sources) {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     if !public_name_differs
         && let Some(compat) = detect_trailing_default_type_params_compatible_mod(
@@ -269,12 +273,12 @@ pub(super) fn compatible_modification(
             diff_files,
         )
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
     // arity は変わらないため compatible_modified として扱う。
     if let Some(compat) = detect_trailing_optional_params_compatible_mod(site, sources) {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     if !public_name_differs
         && let Some(compat) = super::ts_signature::detect_nullable_input_compatible_mod(
@@ -285,7 +289,7 @@ pub(super) fn compatible_modification(
             diff_files,
         )
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     if !public_name_differs
         && let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(
@@ -295,7 +299,7 @@ pub(super) fn compatible_modification(
             &mut caches.optional_removal,
         )
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // TS/TSX の関数コンポーネントの inline object 型の props から省略可能プロパティを消し、
     // リポジトリ内のどの JSX 要素・直接呼び出しもそのキーを渡さないと証明できたものも、
@@ -309,23 +313,24 @@ pub(super) fn compatible_modification(
             diff_files,
         )
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
-    // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
-    // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
-    if let Some(compat) = detect_optional_object_props_compatible_mod(
+    // 追加キーの型と全呼び出しが両立しなければ、参照行を変えただけで追随済みにしない。
+    if let Some(result) = detect_optional_object_props_compatible_mod(
+        ref_index,
         site,
         sources,
-        &mut caches.react_memo,
+        caches,
         diff_files,
+        public_name_differs,
     ) {
-        return Some(compat);
+        return result.map(Some);
     }
     // 同一ファイル内で有限 literal union の値集合が old/new 同値と証明できる type alias
     // 変更は、表記・alias 経路だけの変更なので compatible_modified とする。
     // import 越し・循環・非 literal・集合差分ありは判定器が None に倒し blocking を維持する。
     if let Some(compat) = detect_equivalent_literal_union_alias_compatible_mod(site, sources) {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
@@ -333,7 +338,7 @@ pub(super) fn compatible_modification(
         && let Some(compat) =
             detect_async_jsx_component_compatible_mod(ref_index, site, sources, caches)
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // 引数なし関数コンポーネントへ default 値の無い全 optional の destructured props を
     // 足しただけで、参照がすべて JSX タグ利用なら `<X />` はそのまま通るため
@@ -342,18 +347,20 @@ pub(super) fn compatible_modification(
         && let Some(compat) =
             detect_optional_props_jsx_component_compatible_mod(ref_index, site, sources, caches)
     {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // Python のトップレベル関数 / モジュール直下クラスのメソッドへ末尾 optional/default
     // 引数 (`*` 後の kwonly+default 含む) を追加しただけなら、既存呼び出しが壊れないため
     // compatible_modified として扱う。
     if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(site, sources) {
-        return Some(compat);
+        return Ok(Some(compat));
     }
     // Python のデフォルト値・型注釈にある純粋な隣接文字列リテラルを分割・結合しただけで、
     // 正規化後のシグネチャ全体が同一なら compatible_modified とする。f-string、escape、
     // 演算子、異種 prefix 等を含む場合は判定器が None に倒し blocking を維持する。
-    detect_python_implicit_string_concat_compatible_mod(site, sources)
+    Ok(detect_python_implicit_string_concat_compatible_mod(
+        site, sources,
+    ))
 }
 
 /// 全 cross-file 参照が同一 diff で追随済みなら informational、callback 本体だけの変更なら

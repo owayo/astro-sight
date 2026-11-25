@@ -11,6 +11,7 @@ use crate::models::review::CompatibleApiModification;
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::{ApiClosureCaches, ApiRefIndex, has_blocking_value_usage};
 
+mod added_props;
 mod callable;
 mod callback_contract;
 mod constructor_params;
@@ -721,13 +722,14 @@ fn ts_parameter_default_tokens(
 
 /// inline object、または union の一意な object 枝への optional プロパティ追加を判定する。
 /// kind/default は不変で、pattern の追加束縛は別途 signature 全体でも検査する。
-fn ts_param_pair_optional_object_extension(
+fn ts_param_pair_optional_object_extension<'new>(
     old_param: tree_sitter::Node<'_>,
     old_source: &[u8],
-    new_param: tree_sitter::Node<'_>,
+    new_param: tree_sitter::Node<'new>,
     new_source: &[u8],
     site: Option<&CompatibleModSite<'_>>,
-) -> Option<Vec<pattern_extension::AddedBinding>> {
+    bindings: &mut Vec<pattern_extension::AddedBinding>,
+) -> Option<added_props::PropertyTypes<'new>> {
     if old_param.kind() != new_param.kind()
         || !matches!(
             old_param.kind(),
@@ -749,11 +751,9 @@ fn ts_param_pair_optional_object_extension(
     let new_annotation = new_param.child_by_field_name("type")?;
     let old_ty = old_annotation.named_child(0)?;
     let new_ty = new_annotation.named_child(0)?;
-    if !ts_type_is_optional_object_extension(old_ty, old_source, new_ty, new_source) {
-        return None;
-    }
+    let members = ts_type_optional_property_additions(old_ty, old_source, new_ty, new_source)?;
     if old_tokens == new_tokens {
-        return Some(Vec::new());
+        return Some(members);
     }
     // pattern/type 以外の modifier、区切り、引数全体の default は変更しない。
     for (old_start, old_end, new_start, new_end) in [
@@ -783,26 +783,27 @@ fn ts_param_pair_optional_object_extension(
         }
     }
     let added = pattern_extension::added_optional_keys(old_ty, old_source, new_ty, new_source)?;
-    pattern_extension::added_bindings(
+    bindings.extend(pattern_extension::added_bindings(
         old_pattern,
         old_source,
         new_pattern,
         new_source,
         &added,
         site,
-    )
+    )?);
+    Some(members)
 }
 
 /// union の枝は同順・同数で、変更する object 枝以外のトークンがすべて一致すること。
 /// 括弧や intersection は展開せず、既存の inline object の証明に限って比較する。
-fn ts_type_is_optional_object_extension(
+fn ts_type_optional_property_additions<'new>(
     old_ty: tree_sitter::Node<'_>,
     old_source: &[u8],
-    new_ty: tree_sitter::Node<'_>,
+    new_ty: tree_sitter::Node<'new>,
     new_source: &[u8],
-) -> bool {
+) -> Option<added_props::PropertyTypes<'new>> {
     if old_ty.has_error() || new_ty.has_error() {
-        return false;
+        return None;
     }
     match (old_ty.kind(), new_ty.kind()) {
         ("object_type", "object_type") => {
@@ -812,41 +813,35 @@ fn ts_type_is_optional_object_extension(
             let old_parts = ts_union_type_parts(old_ty);
             let new_parts = ts_union_type_parts(new_ty);
             if old_parts.len() != new_parts.len() {
-                return false;
+                return None;
             }
-            let mut object_seen = false;
+            let mut object = None;
             for (old, new) in old_parts.into_iter().zip(new_parts) {
                 if old.kind() != new.kind() {
-                    return false;
+                    return None;
                 }
                 match old.kind() {
                     "object_type" => {
-                        if object_seen
-                            || !ts_object_type_members_optional_superset(
-                                old, old_source, new, new_source,
-                            )
-                        {
-                            return false;
+                        if object.is_some() {
+                            return None;
                         }
-                        object_seen = true;
+                        object = Some(ts_object_type_members_optional_superset(
+                            old, old_source, new, new_source,
+                        )?);
                     }
-                    "intersection_type" | "parenthesized_type" => return false,
+                    "intersection_type" | "parenthesized_type" => return None,
                     _ => {
-                        let (Some(old_tokens), Some(new_tokens)) = (
-                            node_signature_tokens(old, old_source),
-                            node_signature_tokens(new, new_source),
-                        ) else {
-                            return false;
-                        };
-                        if old_tokens != new_tokens {
-                            return false;
+                        if node_signature_tokens(old, old_source)?
+                            != node_signature_tokens(new, new_source)?
+                        {
+                            return None;
                         }
                     }
                 }
             }
-            object_seen
+            object
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -879,21 +874,17 @@ fn ts_param_object_type(param: tree_sitter::Node<'_>) -> Option<tree_sitter::Nod
 }
 
 /// old object_type の全メンバーが new にテキスト一致で残り、new の追加メンバーがすべて
-/// optional (`?`) の property_signature なら true。メンバー削除・変更は false。メンバーの間と
+/// optional (`?`) の property_signature なら、追加したキーと型を返す。メンバーの間と
 /// 中の通常のコメントは比べない ([`object_type_members`])。
-fn ts_object_type_members_optional_superset(
+fn ts_object_type_members_optional_superset<'new>(
     old_ty: tree_sitter::Node<'_>,
     old_source: &[u8],
-    new_ty: tree_sitter::Node<'_>,
+    new_ty: tree_sitter::Node<'new>,
     new_source: &[u8],
-) -> bool {
+) -> Option<added_props::PropertyTypes<'new>> {
     use std::collections::HashMap;
-    let (Some(new), Some(old)) = (
-        object_type_members(new_ty, new_source),
-        object_type_members(old_ty, old_source),
-    ) else {
-        return false;
-    };
+    let new = object_type_members(new_ty, new_source)?;
+    let old = object_type_members(old_ty, old_source)?;
     // signature tokens -> 出現ノード列 (同一テキストの重複は TS エラーだが multiset で保守)
     let mut new_members: HashMap<SigTokens, Vec<tree_sitter::Node>> = HashMap::new();
     for (text, member) in new {
@@ -905,13 +896,33 @@ fn ts_object_type_members_optional_superset(
             Some(nodes) if !nodes.is_empty() => {
                 nodes.pop();
             }
-            _ => return false,
+            _ => return None,
         }
     }
     // 残った new 側メンバー = 追加分。すべて optional property_signature であること。
-    new_members.values().flatten().all(|member| {
-        member.kind() == "property_signature" && ts_property_signature_is_optional(*member)
-    })
+    let mut additions = added_props::PropertyTypes::default();
+    for member in new_members.into_values().flatten() {
+        if member.kind() != "property_signature" || !ts_property_signature_is_optional(member) {
+            return None;
+        }
+        let key = member.child_by_field_name("name")?;
+        let name = match key.kind() {
+            "property_identifier" => key.utf8_text(new_source).ok().filter(|s| !s.contains('\\')),
+            "string" => static_js_string_text(key, new_source),
+            _ => None,
+        };
+        if let (Some(name), Some(ty)) = (
+            name,
+            member
+                .child_by_field_name("type")
+                .and_then(|n| n.named_child(0)),
+        ) {
+            additions.unresolved |= additions.named.insert(name.to_owned(), ty).is_some();
+        } else {
+            additions.unresolved = true;
+        }
+    }
+    Some(additions)
 }
 
 /// 型リテラルのメンバーと、比べるトークン。説明のコメントは型を変えないので、メンバーの間の

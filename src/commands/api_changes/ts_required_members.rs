@@ -63,6 +63,7 @@ pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
 mod parameter_properties;
+pub(super) use parameter_properties::INHERITED_NAMES;
 mod partial_factory;
 mod removed_uses;
 mod return_producers;

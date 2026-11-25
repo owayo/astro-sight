@@ -29,29 +29,57 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
 /// inline object type の第一階層へ optional property を追加しただけなら互換とする。
 /// `react` の `memo()` で包んだ関数部品は、包んだ関数に委ねる (Issue #266)。
 pub(crate) fn detect_optional_object_props_compatible_mod(
+    index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
-    react_memo: &mut super::ReactMemoCache,
+    caches: &mut ApiClosureCaches,
     diff_files: &[crate::models::impact::DiffFile],
-) -> Option<CompatibleApiModification> {
-    let check = |old_fn: Node<'_>, old_source: &[u8], new_fn: Node<'_>, new_source: &[u8]| {
-        optional_object_props_extension(old_fn, old_source, new_fn, new_source, Some(site))
-    };
-    with_resolved_ts_callable_pair(site, sources, check).or_else(|| {
-        super::react_memo::with_resolved_react_memo_pair(
-            site, sources, react_memo, diff_files, check,
+    public_name_differs: bool,
+) -> Option<Result<CompatibleApiModification, ()>> {
+    let mut check = |old_fn: Node<'_>,
+                     old_source: &[u8],
+                     new_fn: Node<'_>,
+                     new_source: &[u8],
+                     memo| {
+        let additions =
+            optional_object_props_extension(old_fn, old_source, new_fn, new_source, Some(site))?;
+        let safe = additions.is_empty()
+            || (!public_name_differs
+                && added_props::repository_accepts(
+                    index,
+                    site,
+                    &mut caches.optional_removal,
+                    new_fn,
+                    new_source,
+                    additions,
+                    memo,
+                ));
+        Some(
+            safe.then(|| site.compatible("optional_object_props"))
+                .ok_or(()),
         )
-    })?;
-    Some(site.compatible("optional_object_props"))
+    };
+    with_resolved_ts_callable_pair(site, sources, |old, old_source, new, new_source| {
+        check(old, old_source, new, new_source, false)
+    })
+    .or_else(|| {
+        super::react_memo::with_resolved_react_memo_pair(
+            site,
+            sources,
+            &mut caches.react_memo,
+            diff_files,
+            |old, old_source, new, new_source| check(old, old_source, new, new_source, true),
+        )
+    })
 }
 
-pub(super) fn optional_object_props_extension(
+pub(super) fn optional_object_props_extension<'new>(
     old_fn: tree_sitter::Node<'_>,
     old_source: &[u8],
-    new_fn: tree_sitter::Node<'_>,
+    new_fn: tree_sitter::Node<'new>,
     new_source: &[u8],
     site: Option<&CompatibleModSite<'_>>,
-) -> Option<()> {
+) -> Option<Vec<added_props::ParameterAddition<'new>>> {
     let old_parts = ts_function_signature_parts(old_fn, old_source)?;
     let new_parts = ts_function_signature_parts(new_fn, new_source)?;
     if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
@@ -61,31 +89,50 @@ pub(super) fn optional_object_props_extension(
     let old_params_node = old_fn.child_by_field_name("parameters")?;
     let new_params_node = new_fn.child_by_field_name("parameters")?;
     let mut old_cursor = old_params_node.walk();
-    let old_children: Vec<tree_sitter::Node> =
-        old_params_node.named_children(&mut old_cursor).collect();
+    let old_children: Vec<tree_sitter::Node> = old_params_node
+        .named_children(&mut old_cursor)
+        .filter(|n| !n.is_extra())
+        .collect();
     let mut new_cursor = new_params_node.walk();
-    let new_children: Vec<tree_sitter::Node> =
-        new_params_node.named_children(&mut new_cursor).collect();
+    let new_children: Vec<tree_sitter::Node> = new_params_node
+        .named_children(&mut new_cursor)
+        .filter(|n| !n.is_extra())
+        .collect();
     if old_children.len() != new_children.len() {
         return None;
     }
 
     let mut any_extension = false;
     let mut added_bindings = Vec::new();
-    for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
+    let mut additions = Vec::new();
+    for (position, (old_param, new_param)) in
+        old_children.iter().zip(new_children.iter()).enumerate()
+    {
         let old_text = node_signature_tokens(*old_param, old_source)?;
         let new_text = node_signature_tokens(*new_param, new_source)?;
         if old_text == new_text {
             continue;
         }
-        added_bindings.extend(ts_param_pair_optional_object_extension(
-            *old_param, old_source, *new_param, new_source, site,
-        )?);
+        let members = ts_param_pair_optional_object_extension(
+            *old_param,
+            old_source,
+            *new_param,
+            new_source,
+            site,
+            &mut added_bindings,
+        )?;
+        if !members.is_empty() {
+            additions.push(added_props::ParameterAddition {
+                position,
+                parameter: *new_param,
+                members,
+            });
+        }
         any_extension = true;
     }
     (any_extension
         && pattern_extension::signature_preserves_bindings(new_fn, new_source, &added_bindings))
-    .then_some(())
+    .then_some(additions)
 }
 
 /// server component 関数への `async` 追加だけなら JSX 呼び出し互換とする。

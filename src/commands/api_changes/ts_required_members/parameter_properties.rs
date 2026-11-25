@@ -3,7 +3,7 @@
 use super::*;
 
 /// 読み出すと `Object.prototype` から継承した値を返しうる名前。宣言の型だけでは値を決められない。
-const INHERITED_NAMES: &[&str] = &[
+pub(in crate::commands::api_changes) const INHERITED_NAMES: &[&str] = &[
     "constructor",
     "toString",
     "toLocaleString",
