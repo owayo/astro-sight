@@ -725,6 +725,7 @@ fn ts_param_pair_optional_object_extension(
     old_source: &[u8],
     new_param: tree_sitter::Node<'_>,
     new_source: &[u8],
+    site: Option<&CompatibleModSite<'_>>,
 ) -> Option<Vec<pattern_extension::AddedBinding>> {
     if old_param.kind() != new_param.kind()
         || !matches!(
@@ -781,7 +782,14 @@ fn ts_param_pair_optional_object_extension(
         }
     }
     let added = pattern_extension::added_optional_keys(old_ty, old_source, new_ty, new_source)?;
-    pattern_extension::added_bindings(old_pattern, old_source, new_pattern, new_source, &added)
+    pattern_extension::added_bindings(
+        old_pattern,
+        old_source,
+        new_pattern,
+        new_source,
+        &added,
+        site,
+    )
 }
 
 /// union の枝は同順・同数で、変更する object 枝以外のトークンがすべて一致すること。

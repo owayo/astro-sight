@@ -78,6 +78,33 @@ pub(crate) fn load_new_source(dir: &str, new_path: &str) -> Option<SourceBuf> {
     parser::read_file(new_utf8).ok()
 }
 
+/// 相対指定子が一意な TS/TSX の実装ファイルを指す場合に、そのソースを読む。
+pub(super) fn relative_ts_source(
+    dir: &str,
+    path: &str,
+    module: &str,
+) -> Option<(SourceBuf, LangId)> {
+    let file = module.strip_prefix("./")?;
+    if file.is_empty()
+        || file
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || file.contains(['\\', ':', '?', '#', '%'])
+        || super::removed_attribution::relative_directory_has_manifest(dir, path, module)
+    {
+        return None;
+    }
+    let target = super::ref_index::resolved_relative_source(dir, path, module)?;
+    if target == path || super::ts_module_paths::is_declaration_path(&target) {
+        return None;
+    }
+    let lang = LangId::from_path(camino::Utf8Path::new(&target)).ok()?;
+    if !matches!(lang, LangId::Typescript | LangId::Tsx) {
+        return None;
+    }
+    Some((load_new_source(dir, &target)?, lang))
+}
+
 /// 先読み済みの working tree ソースと base 側 blob を組にする。
 ///
 /// 両パスはここでも再検証する。呼び出し側の前段ゲートを信頼境界にしない。
