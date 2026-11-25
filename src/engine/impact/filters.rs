@@ -29,7 +29,7 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) rust_alias_changes: &'a HashSet<String>,
     /// 初期値だけを変えた非公開の Rust の const / static (`declaration::rust_value_only_constants`)。
     pub(super) rust_value_only_constants: &'a HashMap<String, declaration::RustValueOnlyConstant>,
-    pub(super) rust_private_method_owners: &'a HashMap<String, String>,
+    pub(super) rust_private_method_owners: &'a HashMap<String, declaration::PrivateMethodOwner>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,

@@ -37,7 +37,6 @@ pub(super) struct WorkerState {
     pub(super) local_low_maps: Vec<TypedCallerMap>,
     /// import-only など blocking にはしない情報提供 caller の振り分け先。
     pub(super) local_informational_maps: Vec<TypedCallerMap>,
-    pub(super) local_def_paths: Vec<Vec<u32>>,
     pub(super) target_cache: LruCache<String, Option<ParsedFile>>,
     /// TS/TSX/JS の名前衝突 false positive 抑制用 (Issue
     /// 2026-06-05-multi-attachment-conversations-fp 対応)。ref file ごとの import specifier
@@ -89,6 +88,7 @@ pub(super) struct RefEventMini {
     pub(super) rust_method_syntax: bool,
     /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
     pub(super) rust_explicit_method_owner_id: u32,
+    pub(super) rust_private_call_target: u32,
     /// 呼び出し側で確認した具体型名。依存先の名前は空文字、所有元が不明なら u32::MAX。
     pub(super) rust_call_owner_id: u32,
     /// マクロ展開先のスコープに移り得る参照には、ファイルの可視性を適用しない。
@@ -380,6 +380,7 @@ pub(super) struct ImpactCollector<'a> {
         std::cell::OnceCell<Option<std::sync::Arc<super::rust_path_owner::PrivateModule>>>,
     /// [`Self::owner_layout_proved`] の結果 (参照ファイルごと)。
     pub(super) rust_ref_unrelocated: std::cell::OnceCell<bool>,
+    pub(super) rust_private_calls: std::cell::OnceCell<Option<HashMap<usize, u32>>>,
     pub(super) rust_method_bindings:
         std::cell::OnceCell<Option<super::rust_owner_alias::MethodBindings>>,
     pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
@@ -399,7 +400,6 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) local_low_maps: &'a mut [TypedCallerMap],
     /// import-only など情報提供 caller の振り分け先。
     pub(super) local_informational_maps: &'a mut [TypedCallerMap],
-    pub(super) local_def_paths: &'a mut [Vec<u32>],
     pub(super) target_cache: &'a mut LruCache<String, Option<ParsedFile>>,
 
     pub(super) ref_hit: &'a mut [bool],
@@ -668,6 +668,29 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         } else {
             u32::MAX
         };
+        let rust_private_call_target = node
+            .filter(|_| {
+                rust_explicit_method_owner_id != u32::MAX
+                    && self.rust_path_owner_enabled
+                    && !is_import
+                    && rust_macro_site.is_none()
+            })
+            .and_then(|node| {
+                self.rust_private_calls
+                    .get_or_init(|| {
+                        super::rust_owner_alias::private_calls(
+                            node,
+                            source,
+                            Path::new(self.path_str),
+                            self.file_contexts,
+                            self.rust_path_owner_project,
+                        )
+                    })
+                    .as_ref()?
+                    .get(&node.id())
+                    .copied()
+            })
+            .unwrap_or(u32::MAX);
         // 変更した inherent メソッドの参照だけ、パスの修飾が指す型の名前を確かめる (Issue #470)。
         let rust_call_owner_id = if self.ref_lang == Some(LangId::Rust)
             && !is_import
@@ -1060,6 +1083,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_receiver_member,
             rust_method_syntax,
             rust_explicit_method_owner_id,
+            rust_private_call_target,
             rust_call_owner_id,
             rust_private_type_site,
             rust_name_site,
@@ -1338,7 +1362,7 @@ impl<'a> ImpactCollector<'a> {
     }
 
     /// ファイル走査完了時に呼ぶ。buffered events に対して参照位置ごとの
-    /// filter を適用し、`local_maps` / `local_def_paths` に push する。バッファは clear して
+    /// filter を適用し、呼び出し元を集約する。バッファは clear して
     /// 次ファイルで再利用する。
     ///
     /// 定義の記録 → 参照ファイル単位の証拠の準備 → 参照 × 変更元ごとの判定
@@ -1350,7 +1374,7 @@ impl<'a> ImpactCollector<'a> {
         if let Some(index) = collector.rust_path_owner.get() {
             index.forget_verified_source();
         }
-        collector.record_definitions();
+        collector.def_events.sort_unstable();
 
         // References: 1 件ずつ参照位置ごとの filter を適用し local_maps へ流す。
         // Stage 6 (import 判定) と caller_name の抽出は on_ref 時点で済ませてあるため、
@@ -1376,29 +1400,12 @@ impl<'a> ImpactCollector<'a> {
             }
         }
         *collector.ref_events = events;
+        collector.def_events.clear();
 
         // ref_hit のクリア（次ファイル向け）
         for v in collector.ref_hit.iter_mut() {
             *v = false;
         }
-    }
-
-    /// Definition: path を 1 回だけ intern して全 def sym へ配布する。
-    fn record_definitions(&mut self) {
-        if self.def_events.is_empty() {
-            return;
-        }
-        let path_id = self
-            .pool
-            .lock()
-            .expect("string pool mutex poisoned")
-            .intern(self.path_str);
-        for &ix in self.def_events.iter() {
-            if let Some(paths) = self.local_def_paths.get_mut(ix as usize) {
-                paths.push(path_id);
-            }
-        }
-        self.def_events.clear();
     }
 
     /// 参照ファイル単位で 1 回だけ求める証拠と、候補の判定で共有するキャッシュを用意する。
@@ -1790,7 +1797,7 @@ impl<'a> ImpactCollector<'a> {
                 .get(name)
                 .is_some_and(|owner| {
                     let pool = self.pool.lock().expect("string pool mutex poisoned");
-                    pool.get(e.rust_explicit_method_owner_id) != owner
+                    pool.get(e.rust_explicit_method_owner_id) != owner.name
                 });
         let private_method_unanchored = private_method_candidate
             && facts.has_parent_type
@@ -1907,10 +1914,11 @@ impl<'a> ImpactCollector<'a> {
                 });
         if scope.visibility_only_informational || e.ts_rebound_const_owner == fc_ix as u32 {
             CallerRoute::Informational
-        } else if scope.private_method_low {
+        } else if scope.private_method_low && e.rust_private_call_target != fc_ix as u32 {
             CallerRoute::Low
         } else {
-            RouteDecisionContext {
+            let bound_method = e.rust_private_call_target == fc_ix as u32;
+            let route = RouteDecisionContext {
                 filter_disabled,
                 js_signature_sites_trusted: self.new_side_is_worktree,
                 ref_lang: self.ref_lang,
@@ -1924,10 +1932,21 @@ impl<'a> ImpactCollector<'a> {
                 e,
                 ctx,
                 sym_key_canonical,
-                facts.has_parent_type,
-                facts.base_route_low,
+                facts.has_parent_type || bound_method,
+                facts.base_route_low && !bound_method,
                 member_unchanged,
-            )
+            );
+            if route == CallerRoute::Normal
+                && !bound_method
+                && ctx
+                    .rust_private_method_owners
+                    .contains_key(sym_key_canonical)
+                && self.def_events.binary_search(&e.sym_ix).is_ok()
+            {
+                CallerRoute::Low
+            } else {
+                route
+            }
         }
     }
 
@@ -2001,6 +2020,7 @@ mod tests {
             rust_receiver_member: false,
             rust_method_syntax: false,
             rust_explicit_method_owner_id: u32::MAX,
+            rust_private_call_target: u32::MAX,
             rust_call_owner_id: u32::MAX,
             rust_private_type_site: false,
             rust_name_site: super::super::rust_macro_site::MacroSite::Plain,

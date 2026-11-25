@@ -38,8 +38,8 @@ use crate::models::call::CallEdge;
 use crate::models::impact::{AffectedSymbol, DiffFile, FileImpact, HunkInfo, SignatureChange};
 use crate::models::symbol::symbol_kind_str;
 
-use pass2::{Pass2Evidence, stream_caller_maps_and_defs};
-use pass3::{build_file_impact, decode_caller_map, demote_private_method_local_competitors};
+use pass2::{Pass2Evidence, stream_caller_maps};
+use pass3::{build_file_impact, decode_caller_map};
 pub(crate) use python_imports::non_method::{
     NamespaceCache as PythonNamespaceCache, sites as python_non_method_sites,
 };
@@ -218,7 +218,7 @@ struct FileContext {
     /// ファイル直下の関数 (別のクレートからは名指せない。Issue #472)。
     rust_private_root_functions: HashSet<String>,
     /// Private inherent method candidates; a value proves the same owner on both sides.
-    rust_private_method_owners: HashMap<String, String>,
+    rust_private_method_owners: HashMap<String, declaration::PrivateMethodOwner>,
     /// 新旧とも定義モジュールの外に公開していない型。
     rust_private_types: HashSet<String>,
     rust_owner_derive: bool,
@@ -378,7 +378,7 @@ where
     let diff_blocks = diff::scan_blocks(diff_input);
     let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
         && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, false);
-    let pass2_maps = stream_caller_maps_and_defs(
+    let pass2_maps = stream_caller_maps(
         &file_contexts,
         &all_symbol_names,
         &sym_ix,
@@ -404,7 +404,6 @@ where
         mut caller_maps,
         mut low_caller_maps,
         mut informational_caller_maps,
-        def_paths_by_ix,
         string_pool,
     } = pass2_maps;
 
@@ -418,16 +417,8 @@ where
         let typed_map = std::mem::take(&mut caller_maps[fc_ix]);
         let typed_low_map = std::mem::take(&mut low_caller_maps[fc_ix]);
         let typed_informational_map = std::mem::take(&mut informational_caller_maps[fc_ix]);
-        let mut caller_map = decode_caller_map(typed_map, &string_pool);
-        let mut low_caller_map = decode_caller_map(typed_low_map, &string_pool);
-        demote_private_method_local_competitors(
-            &mut caller_map,
-            &mut low_caller_map,
-            &ctx,
-            &def_paths_by_ix,
-            &string_pool,
-            &sym_ix,
-        );
+        let caller_map = decode_caller_map(typed_map, &string_pool);
+        let low_caller_map = decode_caller_map(typed_low_map, &string_pool);
         let informational_caller_map = decode_caller_map(typed_informational_map, &string_pool);
         let impact = build_file_impact(ctx, caller_map, low_caller_map, informational_caller_map);
         // affected_symbols / impacted_callers / signature_changes / low_confidence_callers /
