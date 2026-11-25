@@ -218,33 +218,39 @@ impl GitBlobBatch {
 
     /// blob の取得元と同じ場所・revision で、通常ファイルの mode を確認する。
     pub(crate) fn is_regular_file(&self, path: &str) -> bool {
+        matches!(self.tree_mode(path), Some(0o100644 | 0o100755))
+    }
+
+    /// 指定した tree エントリの mode。存在しなければ 0、読み出せなければ None。
+    pub(crate) fn tree_mode(&self, path: &str) -> Option<u32> {
         use std::process::Stdio;
 
-        let check = || -> Option<()> {
-            validate_git_revision(&self.rev, "git revision").ok()?;
-            validate_git_revision(path, "diff file path").ok()?;
-            let mut child = crate::git_support::git_command_for_dir(&self.dir)
-                .args([
-                    "--literal-pathspecs",
-                    "ls-tree",
-                    "-z",
-                    "--format=%(objectmode)",
-                ])
-                .args([&self.rev, "--", path])
-                .current_dir(&self.dir)
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let mode = read_bytes_limited_and_drain(child.stdout.take()?, 32, "git file mode");
-            if !child.wait().ok()?.success() {
-                return None;
-            }
-            matches!(mode.ok()?.as_slice(), b"100644\0" | b"100755\0").then_some(())
-        };
-        check().is_some()
+        validate_git_revision(&self.rev, "git revision").ok()?;
+        validate_git_revision(path, "diff file path").ok()?;
+        let mut child = crate::git_support::git_command_for_dir(&self.dir)
+            .args([
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--format=%(objectmode)",
+            ])
+            .args([&self.rev, "--", path])
+            .current_dir(&self.dir)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mode = read_bytes_limited_and_drain(child.stdout.take()?, 32, "git file mode");
+        if !child.wait().ok()?.success() {
+            return None;
+        }
+        let bytes = mode.ok()?;
+        if bytes.is_empty() {
+            return Some(0);
+        }
+        u32::from_str_radix(std::str::from_utf8(bytes.strip_suffix(&[0])?).ok()?, 8).ok()
     }
 
     /// 常駐プロセスで読めている (単発の `git show` へ落ちていない) か。テストで経路を確かめる。

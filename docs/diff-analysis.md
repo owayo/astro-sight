@@ -683,6 +683,8 @@ When a binding changed, the declaration is a blocking `api.mod` with `unverified
 
 When a public `async fn` or a function returning `impl Trait` calls a private helper, the helper can affect the hidden return type. For example, a value kept across an `.await` can determine whether the future implements `Send`. If `warehouse::inventory` calls its own module's private `limit()`, editing a separate `landing::limit` leaves `inventory` out of `api.mod` when the local binding can be verified.
 
+On a struct using Clap 4 from crates.io, editing only the literal in `#[command(about = "…")]` following `#[derive(clap::Parser)]` changes the command's help text. Review preserves the API classification of unchanged async functions, including functions that take this struct as an argument. With an additional derive or a Cargo source override, the same attribute can affect a generated type, so review keeps the change blocking.
+
 ### Rust items moved behind `pub use`
 
 When a Rust item is moved to another file and the old file keeps its public path with a `pub use` (`mod detail; pub use detail::greet;`), the old declaration is not reported as removed. Instead, `api_changes` resolves the re-export to the declaration it names and compares the two the same way as an in-place change (a function's signature, the shape of a struct, enum, or union, and so on). A change that breaks code using the old path is a blocking `api.mod`, a compatible change keeps its `mod_compat` or `const_value` classification and the item is also reported as `moved`, and an unchanged item is reported as `moved` instead of `added`.

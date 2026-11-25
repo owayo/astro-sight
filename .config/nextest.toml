@@ -8,6 +8,12 @@ nextest-version = { required = "0.9.150" }
 # 60 秒を超えたテストを報告する (libtest の "has been running for over 60 seconds" と同じ間隔)。報告だけで止めない
 slow-timeout = { period = "60s" }
 
+# Clap の表示文と opaque 戻り値について、通常・index の Cargo 設定やマクロを対比する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::review::clap_about_)'
+priority = 50
+threads-required = 2
+
 # TS の分割代入引数で型・束縛・整形の違いを作業ツリーと index から検査する。
 [[profile.default.overrides]]
 filter = 'test(=integration::destructured_optional_defaults::unannotated_object_parameters_report_inferred_contract_changes) | test(integration::destructured_optional_defaults::optional_prop_additions_check_)'

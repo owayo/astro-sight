@@ -646,6 +646,34 @@ pub(crate) struct ScopeFingerprint {
 }
 
 impl DependencyIndex {
+    /// 対象自身の属性以外に derive の経路・属性を再束縛し得る項目がないか。
+    pub(super) fn known_derive_scope(&self, scope: &[String], own_attributes: usize) -> bool {
+        let Some(bindings) = self.scopes.get(scope) else {
+            return false;
+        };
+        self.file_availability() == Some(&[])
+            && bindings.opaque.is_empty()
+            && bindings.attributed.len() == own_attributes
+            && bindings.macros.is_empty()
+            && bindings.globs.is_empty()
+            && ["clap", "derive", "command"].into_iter().all(|name| {
+                !bindings.items.contains_key(name)
+                    && !bindings.modules.contains_key(name)
+                    && !bindings.aliases.contains_key(name)
+                    && !bindings.uses.contains_key(name)
+            })
+    }
+
+    pub(super) fn keeps_macro_prelude(&self) -> bool {
+        std::str::from_utf8(&self.source).is_ok_and(|text| {
+            !(text.contains("macro_use") || text.contains("no_implicit_prelude"))
+                || !crate::engine::impact::changes_name_resolution(
+                    self.tree.root_node(),
+                    &self.source,
+                )
+        })
+    }
+
     /// 同じ module の値の名前空間に、無条件の非公開自由関数が一意にあるか。
     pub(super) fn private_function_binding(&self, scope: &[String], name: &str) -> bool {
         let Some(bindings) = self.scopes.get(scope) else {

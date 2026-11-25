@@ -78,12 +78,13 @@ pub(crate) fn detect_api_changes_with_renames(
     renames: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
     let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
-    detect_api_changes_with_renames_and_blobs(dir, base, diff_files, renames, &base_blobs)
+    detect_api_changes_with_renames_and_blobs(dir, dir, base, diff_files, renames, &base_blobs)
 }
 
 /// 同じ review の base 読み手を、API 差分と改名候補の解析で共有する。
 pub(crate) fn detect_api_changes_with_renames_and_blobs(
     dir: &str,
+    checkout: &str,
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
     renames: &[crate::models::impact::DiffFile],
@@ -182,6 +183,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
 
     let inputs = DetectionInputs {
         dir,
+        checkout,
         base,
         diff_files,
         diff_new_paths: &diff_new_paths,
