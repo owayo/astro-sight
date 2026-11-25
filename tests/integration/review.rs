@@ -5,6 +5,161 @@ use super::support::*;
 #[allow(unused_imports)]
 use std::process::{Command, Stdio};
 
+const CLAP_MANIFEST: &str = "[package]\nname = \"caption_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nclap = { version = \"4.6.7\", features = [\"derive\"] }\n";
+const CLAP_SETTINGS: &str = "#[derive(clap::Parser)]\n#[command(about = \"before\")]\npub struct Settings { #[arg(long)] pub limit: u16 }\n";
+
+fn clap_about_fixture(manifest: &str, item: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("Cargo.toml", manifest);
+    repo.write("src/lib.rs", "pub mod console;\npub mod records;\n");
+    repo.write("src/console.rs", item);
+    repo.write("src/records.rs", "use crate::console::Settings;\npub async fn open(settings: Settings) -> u16 { std::future::ready(settings.limit).await }\npub async fn finish() -> usize { std::future::ready(0).await }\n");
+    repo.commit_all("base");
+    repo
+}
+
+fn assert_clap_opaque_changes(repo: &TestRepo, staged: bool, expected: bool) {
+    let args = if staged {
+        &["--git", "--staged"][..]
+    } else {
+        &["--git"][..]
+    };
+    let review = repo.run_json("review", args);
+    for name in ["open", "finish"] {
+        let found = review["api_changes"]["modified"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|change| change["name"] == name);
+        assert_eq!(found, expected, "{name}, staged={staged}: {review}");
+    }
+}
+
+#[test]
+fn clap_about_only_leaves_async_contracts_unchanged() {
+    for (source, cargo, field_change, expected) in [
+        (
+            CLAP_SETTINGS.to_owned(),
+            CLAP_MANIFEST.to_owned(),
+            false,
+            false,
+        ),
+        (
+            CLAP_SETTINGS.to_owned(),
+            CLAP_MANIFEST.to_owned(),
+            true,
+            true,
+        ),
+        (
+            CLAP_SETTINGS.replace("clap::Parser", "clap::Parser, watch::ReadHelp"),
+            CLAP_MANIFEST.to_owned(),
+            false,
+            true,
+        ),
+        (
+            format!("use watch as clap;\n{CLAP_SETTINGS}"),
+            CLAP_MANIFEST.to_owned(),
+            false,
+            true,
+        ),
+        (
+            CLAP_SETTINGS.to_owned(),
+            format!("{CLAP_MANIFEST}[patch.crates-io]\nclap_derive = {{ path = \"watch\" }}\n"),
+            false,
+            true,
+        ),
+    ] {
+        let repo = clap_about_fixture(&cargo, &source);
+        let mut edited = source.replace("before", "after");
+        if field_change {
+            edited = edited.replace("u16", "u32");
+        }
+        repo.write("src/console.rs", edited);
+        assert_clap_opaque_changes(&repo, false, expected);
+        repo.stage_all();
+        repo.write("src/console.rs", &source);
+        assert_clap_opaque_changes(&repo, true, expected);
+    }
+}
+
+#[test]
+fn clap_about_keeps_root_extern_aliases_and_macro_imports_unresolved() {
+    for prelude in [
+        "extern crate watch as clap;",
+        "#[macro_use] extern crate watch;",
+    ] {
+        let repo = clap_about_fixture(CLAP_MANIFEST, CLAP_SETTINGS);
+        repo.write(
+            "src/lib.rs",
+            format!("{prelude}\npub mod console;\npub mod records;\n"),
+        );
+        repo.commit_all("add crate binding");
+        repo.write("src/console.rs", CLAP_SETTINGS.replace("before", "after"));
+        assert_clap_opaque_changes(&repo, false, true);
+        repo.stage_all();
+        assert_clap_opaque_changes(&repo, true, true);
+    }
+}
+
+#[test]
+fn clap_about_keeps_simultaneous_dependency_changes() {
+    let repo = clap_about_fixture(CLAP_MANIFEST, CLAP_SETTINGS);
+    let source = "registry+https://github.com/rust-lang/crates.io-index";
+    let mut lock = String::from(
+        "version = 4\n[[package]]\nname = \"caption_probe\"\nversion = \"0.1.0\"\ndependencies = [\"clap\"]\n",
+    );
+    for name in ["clap", "clap_builder", "clap_derive"] {
+        lock.push_str(&format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"4.6.7\"\nsource = \"{source}\"\n"
+        ));
+        if name == "clap" {
+            lock.push_str("dependencies = [\"clap_builder\", \"clap_derive\"]\n");
+        }
+    }
+    repo.write("Cargo.lock", &lock);
+    repo.commit_all("lock the registry versions");
+    repo.write("src/console.rs", CLAP_SETTINGS.replace("before", "after"));
+    assert_clap_opaque_changes(&repo, false, false);
+    repo.write("Cargo.lock", lock.replace("4.6.7", "4.6.8"));
+    assert_clap_opaque_changes(&repo, false, true);
+    repo.write("Cargo.lock", lock);
+    repo.write("Cargo.toml", CLAP_MANIFEST.replace("4.6.7", "4"));
+    assert_clap_opaque_changes(&repo, false, true);
+}
+
+#[test]
+fn clap_about_uses_cargo_settings_and_lock_from_the_selected_tree() {
+    for (path, contents) in [
+        (
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\ndirectory = \"vendor\"\n",
+        ),
+        (
+            "Cargo.lock",
+            "[[package]]\nname = \"clap\"\nversion = \"4.6.7\"\n",
+        ),
+    ] {
+        for override_staged in [true, false] {
+            let repo = clap_about_fixture(CLAP_MANIFEST, CLAP_SETTINGS);
+            repo.create_dir_all(".cargo");
+            repo.write("src/console.rs", CLAP_SETTINGS.replace("before", "after"));
+            if override_staged {
+                repo.write(path, contents);
+            }
+            repo.stage_all();
+            if override_staged {
+                repo.remove_file(path);
+            } else {
+                repo.write(path, contents);
+            }
+            assert_clap_opaque_changes(&repo, false, !override_staged);
+            assert_clap_opaque_changes(&repo, true, override_staged);
+        }
+    }
+}
+
 #[test]
 fn opaque_returns_use_the_private_helper_in_the_index_snapshot() {
     let repo = TestRepo::new();

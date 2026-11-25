@@ -16,6 +16,7 @@ mod rust_const_value;
 mod rust_impl_owner;
 mod rust_line_endings;
 mod rust_macro_site;
+pub(crate) use rust_macro_site::changes_name_resolution;
 mod rust_owner_alias;
 mod rust_path_owner;
 mod rust_reexport_owner;

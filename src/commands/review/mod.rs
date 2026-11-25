@@ -347,6 +347,7 @@ fn review_attempt_with_swift_protocols(
         let api_changes = timed("api_changes", || {
             detect_api_changes_with_renames_and_blobs(
                 api_dir,
+                dir,
                 analysis_base,
                 &api_files,
                 &renames,

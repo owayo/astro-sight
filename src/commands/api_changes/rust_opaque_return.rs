@@ -14,6 +14,8 @@
 //! 版で範囲を確かめ切れない (置き場をたどり切れない・lib crate のファイルを全て読めていない・`include!` がある・
 //! glob のファイルを文字列のパスで読み得る・範囲と祖先の `mod` に属性マクロが付く) なら、package 全体に戻す。
 
+mod clap_help;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::ControlFlow;
 
@@ -110,6 +112,7 @@ struct Snapshot {
     scope_children: BTreeMap<String, BTreeSet<String>>,
     /// module の置き場を確かめきれなかったとき、名前だけの依存に戻す自由関数。
     local_functions: BTreeMap<(String, Vec<String>), BTreeMap<String, String>>,
+    clap_help: BTreeMap<Key, (Vec<String>, blake3::Hash)>,
 }
 
 /// 版での、ファイルの置き場とテストの module の判定。
@@ -896,6 +899,14 @@ fn nested_constructs(node: tree_sitter::Node<'_>, source: &[u8], path: &str) -> 
 }
 
 fn fingerprint(node: tree_sitter::Node<'_>, source: &[u8]) -> blake3::Hash {
+    item_fingerprint(node, source, None)
+}
+
+fn item_fingerprint(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    help: Option<tree_sitter::Node<'_>>,
+) -> blake3::Hash {
     let mut tokens = Vec::new();
     if matches!(node.kind(), "mod_item" | "trait_item") {
         let body = node.child_by_field_name("body");
@@ -912,6 +923,9 @@ fn fingerprint(node: tree_sitter::Node<'_>, source: &[u8]) -> blake3::Hash {
     let mut previous = node.prev_named_sibling();
     while let Some(attribute) = previous {
         match attribute.kind() {
+            "attribute_item" if Some(attribute) == help => {
+                tokens.push("@clap-about-literal".into())
+            }
             "attribute_item" => push_tokens(attribute, source, &mut tokens),
             "line_comment" | "block_comment" => {}
             _ => break,
@@ -1106,6 +1120,7 @@ impl Snapshot {
                     node, &preceding, source,
                 ))
                 .map(|(enclosing, own)| enclosing.iter().cloned().chain(own).collect::<Vec<_>>());
+            let unconditional = conditions.as_deref() == Some(&[]);
             let available = conditions.clone().unwrap_or_default();
             let satisfiable = !super::rust_availability::unsatisfiable(&available);
             // 展開の見えない属性は、付いた項目とまとめて 1 つの構成として、参照する名前と置いた位置の印と有る条件
@@ -1311,24 +1326,41 @@ impl Snapshot {
             } else {
                 None
             };
-            self.declarations
-                .entry((
-                    path.to_owned(),
-                    *scope.as_bytes(),
-                    kind.to_owned(),
-                    name.clone(),
-                ))
-                .or_default()
-                .push(Declaration {
-                    fingerprint: fingerprint(node, source),
-                    name,
-                    bound_names,
-                    references,
-                    conditions: available,
-                    public,
-                    glob_scope,
-                    module: kind == "mod_item",
-                });
+            let key = (
+                path.to_owned(),
+                *scope.as_bytes(),
+                kind.to_owned(),
+                name.clone(),
+            );
+            if kind == "struct_item"
+                && unconditional
+                && let Some(index) = &file.index
+                && let Some(help) = clap_help::about(&preceding, source)
+            {
+                let inline = inline_modules(&scopes);
+                if let Some(module) = file.scope_module(&inline)
+                    && index.known_derive_scope(
+                        &inline,
+                        super::rust_declarations::replaceable_attribute_conditions(node, source)
+                            .len(),
+                    )
+                {
+                    self.clap_help.insert(
+                        key.clone(),
+                        (module, item_fingerprint(node, source, Some(help))),
+                    );
+                }
+            }
+            self.declarations.entry(key).or_default().push(Declaration {
+                fingerprint: fingerprint(node, source),
+                name,
+                bound_names,
+                references,
+                conditions: available,
+                public,
+                glob_scope,
+                module: kind == "mod_item",
+            });
             ControlFlow::Continue(if matches!(kind, "mod_item" | "trait_item") {
                 Walk::Descend
             } else {
@@ -1814,7 +1846,9 @@ pub(super) fn record(
     }
     // module の範囲の glob は、旧新の版の置き場で範囲を確かめ切れなければ package 全体に戻す (Issue #381)。
     for (package, (old, new)) in &mut snapshots {
-        confine(old, new, libraries.get(package).copied());
+        let library = libraries.get(package).copied();
+        clap_help::compare(old, new, library, inputs, package);
+        confine(old, new, library);
     }
     for (old, new) in snapshots.values() {
         let dependents = dependents(old, new);

@@ -120,6 +120,8 @@ pub(crate) struct ApiChangeBuckets {
 /// 「書き換える先」を取り違えてもコンパイルが通らないようにする。
 pub(crate) struct DetectionInputs<'a> {
     pub(crate) dir: &'a str,
+    /// index の snapshot を使うときも、Cargo の外部設定を探す場所は実際の checkout。
+    pub(crate) checkout: &'a str,
     pub(crate) base: &'a str,
     pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
     pub(crate) diff_new_paths: &'a HashSet<String>,

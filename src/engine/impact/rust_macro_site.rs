@@ -402,7 +402,7 @@ fn objc2_crate_path(path: &str) -> bool {
 /// `#[no_implicit_prelude]` は extern prelude を外して `objc2` をローカルの束縛だけで解く。属性の名前の
 /// 識別子をどこでも数える (`cfg_attr` の中、マクロの本体・引数の token tree の中の
 /// `#[no_implicit_prelude] $i` も。コメントと文字列の中の綴りは数えない)。
-pub(super) fn changes_name_resolution(root: Node<'_>, source: &[u8]) -> bool {
+pub(crate) fn changes_name_resolution(root: Node<'_>, source: &[u8]) -> bool {
     root.has_error() || names_identifier(root, source, &["macro_use", "no_implicit_prelude"])
 }
 

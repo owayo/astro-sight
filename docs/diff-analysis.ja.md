@@ -687,6 +687,8 @@ lib crate のほかのファイルの束縛も追う (#300)。差分が、packag
 
 公開の `async fn` や `impl Trait` を返す関数が非公開関数を呼ぶ場合、その呼び出しは戻り値の具体型に影響し得る。たとえば `.await` をまたいで保持する値によって、Future が `Send` を実装するかが変わる。`warehouse::inventory` の `limit()` が同じモジュールの非公開関数に解決できれば、別の `landing::limit` を編集しても `inventory` は `api.mod` に載らない。
 
+crates.io の Clap 4 を使う構造体で、`#[derive(clap::Parser)]` に続く `#[command(about = "…")]` の文字列だけを編集すると、コマンドのヘルプ文が変わる。レビューは、構造体を引数に取る関数を含め、未変更の async 関数の公開契約をそのまま扱う。別の derive を併用した場合、または Cargo の設定で依存元を差し替えた場合は、同じ属性が生成する型に影響し得るため、従来の blocking 判定を使う。
+
 ### `pub use` の後ろへ移した Rust の項目
 
 Rust の項目を別のファイルへ移し、元のファイルで `pub use` によって公開のパスを保つとき (`mod detail; pub use detail::greet;`)、旧い宣言は削除として報告しない。代わりに `api_changes` は再公開が指す宣言を解き、その場で変えた場合と同じく比べる (関数のシグネチャ、構造体・enum・union の形など)。旧いパスを使うコードを壊す変更は blocking な `api.mod` にし、互換な変更は `mod_compat` や `const_value` の区分のまま `moved` にも出し、変えずに移した項目は `added` ではなく `moved` にする。

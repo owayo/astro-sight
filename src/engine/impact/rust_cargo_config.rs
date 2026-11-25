@@ -269,7 +269,7 @@ fn file_keeps_sources(path: &Path) -> bool {
     }
 }
 
-fn config_keeps_sources(text: &str) -> bool {
+pub(crate) fn config_keeps_sources(text: &str) -> bool {
     let Ok(config) = toml::from_str::<toml::Table>(text) else {
         return false;
     };
