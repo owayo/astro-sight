@@ -107,7 +107,7 @@ fn tree_path_bytes(path: &Path) -> &[u8] {
 #[derive(Default)]
 struct TreeManifest {
     /// 通常ファイル (100644 / 100755)。
-    files: Vec<PathBuf>,
+    files: Vec<(PathBuf, u64)>,
     /// サブモジュールは親 index にコードを持たないため、空ディレクトリだけを作る。
     gitlinks: Vec<PathBuf>,
     symlinks: Vec<PathBuf>,
@@ -138,7 +138,7 @@ fn read_manifest(listing: &[u8]) -> Result<TreeManifest> {
                     .total_bytes
                     .checked_add(size)
                     .ok_or_else(|| failure("Staged snapshot size overflow"))?;
-                manifest.files.push(path);
+                manifest.files.push((path, size));
             }
             _ => return Err(failure("Unsupported staged tree entry")),
         }
@@ -210,9 +210,8 @@ fn omission_record(
         LinkTarget, OmissionRecord, OmittedEntry, SNAPSHOT_OMISSIONS_VERSION,
     };
     let mut complete = true;
-    let mut names = |paths: &[PathBuf]| -> BTreeSet<String> {
+    let mut names = |paths: &mut dyn Iterator<Item = &PathBuf>| -> BTreeSet<String> {
         paths
-            .iter()
             .filter_map(|path| {
                 let name = path.to_str().map(str::to_owned);
                 complete &= name.is_some();
@@ -220,12 +219,12 @@ fn omission_record(
             })
             .collect()
     };
-    let symlinks = names(&manifest.symlinks);
-    let gitlinks = names(&manifest.gitlinks);
+    let symlinks = names(&mut manifest.symlinks.iter());
+    let gitlinks = names(&mut manifest.gitlinks.iter());
     let mut entries = Vec::new();
     if !symlinks.is_empty() {
         // symlink の先の分類にだけ、tree の全ての名前が要る。
-        let files = names(&manifest.files);
+        let files = names(&mut manifest.files.iter().map(|(path, _)| path));
         // tree のディレクトリは、その下に要素があるものだけ。gitlink の中は辿れない。
         let mut directories = BTreeSet::new();
         for path in files.iter().chain(&symlinks).chain(&gitlinks) {
@@ -285,6 +284,7 @@ fn create_directories(root: &Path, manifest: &TreeManifest) -> Result<()> {
     let parents = manifest
         .files
         .iter()
+        .map(|(path, _)| path)
         .chain(&manifest.symlinks)
         .filter_map(|path| path.parent());
     for directory in parents.chain(manifest.gitlinks.iter().map(PathBuf::as_path)) {
@@ -312,7 +312,7 @@ fn create_directories(root: &Path, manifest: &TreeManifest) -> Result<()> {
 /// 1 ファイルずつ `cat-file` に `<tree>:<path>` を問い合わせて書く旧実装は、パス解決と
 /// 往復の待ちで 1 万ファイルに 30 秒以上かかっていた。checkout-index は並列に書けるうえ、
 /// 上書きしないので衝突も検出できる。変換は `RAW_CHECKOUT_ATTRIBUTES` と `-c` で止める。
-fn checkout_files(root: &Path, files: &[PathBuf]) -> Result<()> {
+fn checkout_files(root: &Path, files: &[(PathBuf, u64)]) -> Result<()> {
     let git_dir = root.join(".git");
     fs::create_dir_all(git_dir.join("info"))?;
     fs::write(
@@ -322,7 +322,7 @@ fn checkout_files(root: &Path, files: &[PathBuf]) -> Result<()> {
     // パス一覧はファイル経由で stdin に渡す (パイプへの書き込みと子の終了待ちで詰まらせない)。
     let list = git_dir.join("astro-sight-checkout-paths");
     let mut writer = std::io::BufWriter::new(fs::File::create(&list)?);
-    for path in files {
+    for (path, _) in files {
         writer.write_all(tree_path_bytes(path))?;
         writer.write_all(b"\0")?;
     }
@@ -367,6 +367,36 @@ fn diff_contract(diff: &str) -> String {
         .join("\n")
 }
 
+fn verify_snapshot_diff(
+    analysis_dir: &Path,
+    base: &str,
+    expected_diff: &str,
+    staged: bool,
+    extension_proof: &crate::commands::git_input::TsExtensionProof,
+) -> Result<()> {
+    let analysis_text = analysis_dir
+        .to_str()
+        .ok_or_else(|| failure("Non-UTF-8 staged analysis path"))?;
+    if diff_contract(
+        &crate::commands::git_input::run_git_diff_with_extension_proof(
+            analysis_text,
+            base,
+            staged,
+            &mut Vec::new(),
+            Some(extension_proof),
+        )?
+        .0,
+    ) != diff_contract(expected_diff)
+    {
+        return Err(AstroError::new(
+            ErrorCode::ReviewInputChanged,
+            "Staged input changed while creating the analysis snapshot",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// 上限を超えたかの判定に使う予算。テストは小さい値を渡して縮退経路を確かめる。
 #[derive(Clone, Copy)]
 pub(super) struct SnapshotBudget {
@@ -383,9 +413,7 @@ impl SnapshotBudget {
 
 pub(super) enum PreparedSnapshot {
     Ready(IndexSnapshot),
-    /// 書き出す前に上限超過が分かったので作らなかった。呼び出し側はスナップショット導入前の
-    /// 経路 (作業ツリー + 変更ファイルだけ index の blob) へ縮退し、申告を出す。
-    /// 規模だけを理由に review 全体を失敗させない (5 万ファイルで 170 秒かけてエラーになっていた)。
+    /// 完全展開の上限を超えた。API 比較用に固定した index と在庫を残す。
     OverBudget(OverBudget),
 }
 
@@ -394,9 +422,109 @@ pub(super) struct OverBudget {
     pub files: usize,
     pub bytes: u64,
     pub budget: SnapshotBudget,
+    temporary: tempfile::TempDir,
+    prefix: PathBuf,
+    manifest: TreeManifest,
+    tree: String,
+    extension_proof: crate::commands::git_input::TsExtensionProof,
+}
+
+/// 宣言の公開範囲・型・参照を決める入力。拡張子の無いスクリプトと設定も残す。
+pub(in crate::commands) fn api_context_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        return true;
+    };
+    let Some(path) = camino::Utf8Path::from_path(path) else {
+        return true;
+    };
+    path.file_name() == Some("CMakeLists.txt")
+        || crate::language::LangId::from_path(path).is_ok()
+        || crate::engine::refs::is_unanalyzable_source_ext(ext)
+        || matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "json"
+                | "jsonc"
+                | "toml"
+                | "xml"
+                | "yaml"
+                | "yml"
+                | "bazel"
+                | "gradle"
+                | "properties"
+                | "lockfile"
+                | "lock"
+                | "lockb"
+                | "cfg"
+                | "pth"
+        )
 }
 
 impl OverBudget {
+    /// 完全な index を持つ一時リポジトリから、API 差分が読むパスだけを書き出す。
+    pub(super) fn changed_sources<'a>(
+        self,
+        dir: &str,
+        base: &str,
+        expected_diff: &str,
+        files: impl Iterator<Item = &'a crate::models::impact::DiffFile>,
+    ) -> Result<IndexSnapshot> {
+        let root = self.temporary.path();
+        let mut paths = BTreeSet::new();
+        for path in files.flat_map(|f| [&f.old_path, &f.new_path]) {
+            if path == "/dev/null" {
+                continue;
+            }
+            if !safe_path(path) {
+                return Err(failure("Unsafe staged API source path"));
+            }
+            let path = self.prefix.join(path);
+            paths.insert(path.clone());
+            for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+                paths.insert(ancestor.join(".gitattributes"));
+            }
+        }
+        let mut manifest = TreeManifest::default();
+        for (path, size) in &self.manifest.files {
+            if paths.contains(path) || api_context_file(path) {
+                manifest.total_bytes += size;
+                if manifest.files.len() >= self.budget.files
+                    || manifest.total_bytes > self.budget.bytes
+                {
+                    return Err(failure(
+                        "Staged API sources exceed the analysis snapshot limit",
+                    ));
+                }
+                manifest.files.push((path.clone(), *size));
+            }
+        }
+        fs::write(
+            root.join(".git")
+                .join(crate::git_support::API_SNAPSHOT_MARKER),
+            &self.tree,
+        )?;
+        write_omission_record(root, &self.tree, &self.manifest);
+        manifest.gitlinks = self.manifest.gitlinks;
+        manifest.symlinks = self.manifest.symlinks;
+        create_directories(root, &manifest)?;
+        checkout_files(root, &manifest.files)?;
+        crate::git_support::forget_tree_views();
+        let analysis_dir = root.join(self.prefix);
+        fs::create_dir_all(&analysis_dir)?;
+        verify_snapshot_diff(
+            &analysis_dir,
+            base,
+            expected_diff,
+            true,
+            &self.extension_proof,
+        )?;
+        let attributes = crate::engine::gitattributes::register_snapshot(root, Path::new(dir));
+        Ok(IndexSnapshot {
+            _temporary: self.temporary,
+            analysis_dir,
+            _attributes: attributes,
+        })
+    }
+
     pub(super) fn truncation(&self, working_tree_matches_index: bool) -> TruncationInfo {
         TruncationInfo::staged_snapshot_unavailable(
             self.files,
@@ -625,6 +753,11 @@ impl IndexSnapshot {
                 files: manifest.files.len(),
                 bytes: manifest.total_bytes,
                 budget,
+                temporary,
+                prefix,
+                manifest,
+                tree,
+                extension_proof,
             }));
         }
         create_directories(root, &manifest)?;
@@ -633,26 +766,7 @@ impl IndexSnapshot {
         crate::git_support::forget_tree_views();
         let analysis_dir = root.join(prefix);
         fs::create_dir_all(&analysis_dir)?;
-        let analysis_text = analysis_dir
-            .to_str()
-            .ok_or_else(|| failure("Non-UTF-8 staged analysis path"))?;
-        if diff_contract(
-            &crate::commands::git_input::run_git_diff_with_extension_proof(
-                analysis_text,
-                base,
-                false,
-                &mut Vec::new(),
-                Some(&extension_proof),
-            )?
-            .0,
-        ) != diff_contract(expected_diff)
-        {
-            return Err(AstroError::new(
-                ErrorCode::ReviewInputChanged,
-                "Staged input changed while creating the analysis snapshot",
-            )
-            .into());
-        }
+        verify_snapshot_diff(&analysis_dir, base, expected_diff, false, &extension_proof)?;
         let attributes =
             crate::engine::gitattributes::register_snapshot(root, std::path::Path::new(dir));
         Ok(PreparedSnapshot::Ready(Self {

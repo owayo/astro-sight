@@ -10,10 +10,16 @@ use crate::error::{AstroError, ErrorCode};
 
 pub(crate) const INDEX_SNAPSHOT_MARKER: &str = "astro-sight-index-snapshot";
 
+pub(crate) const API_SNAPSHOT_MARKER: &str = "astro-sight-api-snapshot";
+
 pub(crate) fn index_snapshot_tree(dir: impl AsRef<std::path::Path>) -> Option<String> {
+    snapshot_tree(dir, INDEX_SNAPSHOT_MARKER)
+}
+
+pub(crate) fn snapshot_tree(dir: impl AsRef<std::path::Path>, marker_name: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(dir).ok()?;
     for parent in canonical.ancestors() {
-        let marker = parent.join(".git").join(INDEX_SNAPSHOT_MARKER);
+        let marker = parent.join(".git").join(marker_name);
         if marker.is_file() {
             let tree = std::fs::read_to_string(marker).ok()?;
             let tree = tree.trim();

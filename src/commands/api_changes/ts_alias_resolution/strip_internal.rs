@@ -44,6 +44,7 @@ pub(crate) enum StripState {
 }
 
 pub(crate) struct StripInternalConfigs {
+    projected_tree: Option<(String, String)>,
     root: Option<PathBuf>,
     loader: ConfigLoader,
     /// ディレクトリ → その設定 (一覧を読めなければ None)。
@@ -97,12 +98,17 @@ fn stronger(a: StripState, b: StripState) -> StripState {
 
 impl StripInternalConfigs {
     pub(crate) fn new(dir: &str) -> Self {
-        Self::with_fs(dir, ConfigFs::Current)
+        let mut configs = Self::with_fs(dir, ConfigFs::Current);
+        configs.projected_tree =
+            crate::git_support::snapshot_tree(dir, crate::git_support::API_SNAPSHOT_MARKER)
+                .map(|tree| (dir.to_owned(), tree));
+        configs
     }
 
     /// 設定をファイルシステム `fs` (今のものか base の版) から読む。
     pub(crate) fn with_fs(dir: &str, fs: ConfigFs) -> Self {
         Self {
+            projected_tree: None,
             root: std::path::absolute(Path::new(dir))
                 .ok()
                 .and_then(|path| path.canonicalize().ok()),
@@ -138,6 +144,14 @@ impl StripInternalConfigs {
     /// どちらの判定もあり得るものとし、どちらでも有効にするときだけ有効、判定が分かれれば決め
     /// られないとする。取り込みを辿るのは、届けば判定が変わり得るときだけ。
     fn evaluate(&mut self, path: &str) -> (bool, StripState) {
+        // extends の先には任意の拡張子を使える。部分展開で省いた設定も同じ index から辿る。
+        if let Some((dir, tree)) = self.projected_tree.take() {
+            if let Some(tree) = super::BaseTree::load(&dir, &tree) {
+                self.loader.fs = ConfigFs::Index(Rc::new(tree));
+            } else {
+                self.root = None;
+            }
+        }
         let Some(file) = self.root.as_ref().map(|root| root.join(path)) else {
             return (false, StripState::Unknown);
         };

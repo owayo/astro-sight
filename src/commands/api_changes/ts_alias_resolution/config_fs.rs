@@ -24,6 +24,8 @@ pub(crate) enum ConfigFs {
     Current,
     /// base の版。
     Base(Rc<BaseTree>),
+    /// 部分展開した index。追跡した node_modules の設定も同じ tree にある。
+    Index(Rc<BaseTree>),
 }
 
 /// ディレクトリの一覧。
@@ -170,15 +172,15 @@ impl BaseTree {
     }
 
     /// `path` が base の tree から読む場所なら、root 相対のパス。root の外と node_modules の下は
-    /// None (今のファイルシステムから読む)。
-    fn relative(&self, path: &Path) -> Option<String> {
+    /// None (今のファイルシステムから読む)。index では追跡した node_modules も tree から読む。
+    fn relative(&self, path: &Path, include_dependencies: bool) -> Option<String> {
         let rest = path.strip_prefix(&self.root).ok()?;
         let mut parts = Vec::new();
         for component in rest.components() {
             match component {
                 Component::Normal(part) => {
                     let part = part.to_str()?;
-                    if part == "node_modules" {
+                    if !include_dependencies && part == "node_modules" {
                         return None;
                     }
                     parts.push(part);
@@ -195,7 +197,10 @@ impl ConfigFs {
     fn base(&self, path: &Path) -> Option<(&BaseTree, String)> {
         match self {
             ConfigFs::Current => None,
-            ConfigFs::Base(tree) => Some((tree, tree.spelled(tree.relative(path)?))),
+            ConfigFs::Base(tree) | ConfigFs::Index(tree) => {
+                let path = tree.relative(path, matches!(self, ConfigFs::Index(_)))?;
+                Some((tree, tree.spelled(path)))
+            }
         }
     }
 

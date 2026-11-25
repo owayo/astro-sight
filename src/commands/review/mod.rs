@@ -95,7 +95,13 @@ pub fn cmd_review_with_swift_protocols(
 ) -> Result<()> {
     let git_input = opts.git && opts.diff.is_none() && opts.diff_file.is_none();
     let result = retry_review(git_input, |_| {
-        review_attempt_with_swift_protocols(service, opts, swift_protocols, |_, _| {})
+        review_attempt_with_swift_protocols(
+            service,
+            opts,
+            swift_protocols,
+            index_snapshot::SnapshotBudget::DEFAULT,
+            |_, _| {},
+        )
     });
     if opts.hook && result.as_ref().is_err_and(review_input_changed) {
         eprintln!("review input kept changing; run review again");
@@ -142,6 +148,7 @@ fn review_attempt(
         service,
         opts,
         &SwiftProtocolMethods::default(),
+        index_snapshot::SnapshotBudget::DEFAULT,
         before_check,
     )
 }
@@ -150,6 +157,7 @@ fn review_attempt_with_swift_protocols(
     service: &AppService,
     opts: &CmdReviewOpts<'_>,
     swift_protocols: &SwiftProtocolMethods,
+    snapshot_budget: index_snapshot::SnapshotBudget,
     mut before_check: impl FnMut(&ReviewResult, &str),
 ) -> Result<()> {
     // 本体は従来の局所変数名のまま使うため、ここで一括分解する
@@ -296,16 +304,12 @@ fn review_attempt_with_swift_protocols(
     }
     let StagedSource {
         snapshot,
+        over_budget,
         notice: snapshot_notice,
         keep_reference_downgrades_blocking,
     } = if matches!(new_side, crate::models::impact::DiffNewSide::Index) {
         timed_ok("staged_snapshot", || {
-            prepare_staged_source(
-                dir,
-                analysis_base,
-                &diff_input,
-                index_snapshot::SnapshotBudget::DEFAULT,
-            )
+            prepare_staged_source(dir, analysis_base, &diff_input, snapshot_budget)
         })?
     } else {
         StagedSource::default()
@@ -320,20 +324,41 @@ fn review_attempt_with_swift_protocols(
         framework_globs
     };
 
+    let api_files = api_diff_files(&diff_files, &diff_input);
+    let renames = crate::engine::diff::parse_hunkless_changes(&diff_input);
+    let api_snapshot = over_budget
+        .map(|over| {
+            over.changed_sources(
+                dir,
+                analysis_base,
+                &diff_input,
+                api_files.iter().chain(&renames),
+            )
+        })
+        .transpose()?;
+    let api_dir = api_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.dir())
+        .transpose()?
+        .unwrap_or(analysis_dir);
     // 型依存で変わった契約を impact の起点にするため、API 差分を先に求める。
     let (mut api_changes, rename_report) = {
-        let base_blobs = super::git_input::GitBlobBatch::new(analysis_dir, analysis_base);
+        let base_blobs = super::git_input::GitBlobBatch::new(api_dir, analysis_base);
         let api_changes = timed("api_changes", || {
             detect_api_changes_with_renames_and_blobs(
-                analysis_dir,
+                api_dir,
                 analysis_base,
-                &api_diff_files(&diff_files, &diff_input),
-                &crate::engine::diff::parse_hunkless_changes(&diff_input),
+                &api_files,
+                &renames,
                 &base_blobs,
             )
         });
         let rename_report = timed("rename_candidates", || {
-            rename_candidates::collect_rename_candidates(analysis_dir, &diff_files, &base_blobs)
+            if api_snapshot.is_some() {
+                rename_candidates::RenameReport::default()
+            } else {
+                rename_candidates::collect_rename_candidates(analysis_dir, &diff_files, &base_blobs)
+            }
         });
         (api_changes, rename_report)
     };
@@ -461,7 +486,7 @@ fn review_attempt_with_swift_protocols(
     rename_candidates::clear_staged_fallback(&mut result, new_side, snapshot.is_some());
     let compatible_impacts = if hook && !keep_reference_downgrades_blocking {
         super::api_changes::compatible_impact_names_for_api(
-            analysis_dir,
+            api_dir,
             analysis_base,
             &diff_files,
             &result.api_changes,
@@ -490,6 +515,7 @@ fn review_attempt_with_swift_protocols(
         )?;
         // `process::exit` はデストラクタを走らせないため、staged の一時スナップショットを
         // exit の前に片付ける (Drop 任せにすると blocking のたびに一時ディレクトリが残る)。
+        drop(api_snapshot);
         drop(snapshot);
         if blocking {
             std::process::exit(1);
@@ -544,13 +570,13 @@ fn ensure_review_diff_unchanged(
 #[derive(Default)]
 struct StagedSource {
     snapshot: Option<index_snapshot::IndexSnapshot>,
+    over_budget: Option<index_snapshot::OverBudget>,
     notice: Option<crate::models::truncation::TruncationInfo>,
     /// 作業ツリー由来の参照を根拠にした API の降格を blocking に戻すか。
     keep_reference_downgrades_blocking: bool,
 }
 
-/// staged review の index tree スナップショットを用意する。上限を超えたらエラーにせず、
-/// スナップショット導入前の経路 (作業ツリー + 変更ファイルだけ index の blob) へ縮退する。
+/// staged review の index を固定する。完全展開の上限を超えたときも、API 比較の新側には index を使う。
 /// 作業ツリーの追跡ファイルが index と同じなら、作業ツリーから集めた参照は staged のものと
 /// 一致する。違うときは参照の状況を根拠にした降格を確定させない (fail-closed)。
 fn prepare_staged_source(
@@ -566,7 +592,8 @@ fn prepare_staged_source(
                 ..StagedSource::default()
             },
             index_snapshot::PreparedSnapshot::OverBudget(over) => {
-                if crate::engine::diff::parse_unified_diff(diff)
+                let changes = crate::engine::diff::parse_unified_diff(diff);
+                if changes
                     .iter()
                     .any(|file| file.new_path.to_ascii_lowercase().ends_with(".swift"))
                 {
@@ -577,9 +604,11 @@ fn prepare_staged_source(
                     .into());
                 }
                 let matches = working_tree_matches_index(dir);
+                let notice = over.truncation(matches);
                 StagedSource {
                     snapshot: None,
-                    notice: Some(over.truncation(matches)),
+                    over_budget: Some(over),
+                    notice: Some(notice),
                     keep_reference_downgrades_blocking: !matches,
                 }
             }
