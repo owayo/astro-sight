@@ -1,6 +1,7 @@
 //! TypeScript 関数シグネチャ固有の互換性判定。
 
 use super::*;
+use tree_sitter::Node;
 
 /// 末尾へ optional/default 引数を追加しただけなら既存呼び出しと互換とする。
 pub(crate) fn detect_trailing_optional_params_compatible_mod(
@@ -33,17 +34,14 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     react_memo: &mut super::ReactMemoCache,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_callable_pair(site, sources, optional_object_props_extension).or_else(
-        || {
-            super::react_memo::with_resolved_react_memo_pair(
-                site,
-                sources,
-                react_memo,
-                diff_files,
-                optional_object_props_extension,
-            )
-        },
-    )?;
+    let check = |old_fn: Node<'_>, old_source: &[u8], new_fn: Node<'_>, new_source: &[u8]| {
+        optional_object_props_extension(old_fn, old_source, new_fn, new_source, Some(site))
+    };
+    with_resolved_ts_callable_pair(site, sources, check).or_else(|| {
+        super::react_memo::with_resolved_react_memo_pair(
+            site, sources, react_memo, diff_files, check,
+        )
+    })?;
     Some(site.compatible("optional_object_props"))
 }
 
@@ -52,6 +50,7 @@ pub(super) fn optional_object_props_extension(
     old_source: &[u8],
     new_fn: tree_sitter::Node<'_>,
     new_source: &[u8],
+    site: Option<&CompatibleModSite<'_>>,
 ) -> Option<()> {
     let old_parts = ts_function_signature_parts(old_fn, old_source)?;
     let new_parts = ts_function_signature_parts(new_fn, new_source)?;
@@ -80,7 +79,7 @@ pub(super) fn optional_object_props_extension(
             continue;
         }
         added_bindings.extend(ts_param_pair_optional_object_extension(
-            *old_param, old_source, *new_param, new_source,
+            *old_param, old_source, *new_param, new_source, site,
         )?);
         any_extension = true;
     }

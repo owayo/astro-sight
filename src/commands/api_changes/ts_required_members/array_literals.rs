@@ -98,7 +98,10 @@ fn array_variable<'t>(target: Node<'t>, source: &[u8]) -> Option<ArrayVariable<'
 }
 
 /// 穴・spread を除いた literal の要素を、全件展開する中間 Vec を作らずに列挙する。
-fn visit_elements<'t>(array: Node<'t>, mut visit: impl FnMut(usize, Node<'t>)) -> Option<usize> {
+pub(in crate::commands::api_changes) fn visit_elements<'t>(
+    array: Node<'t>,
+    mut visit: impl FnMut(usize, Node<'t>),
+) -> Option<usize> {
     if array.kind() != "array" {
         return None;
     }

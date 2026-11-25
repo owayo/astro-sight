@@ -273,6 +273,58 @@ pub(super) fn local_type_aliases<'tree>(
     )
 }
 
+/// 同名の型宣言がない名前付き import を、その指定子と公開名へ解く。
+pub(super) fn named_type_import<'s>(
+    root: Node<'_>,
+    source: &'s [u8],
+    name: &str,
+) -> Option<(&'s str, String)> {
+    if root.has_error() {
+        return None;
+    }
+    let Binding::Import(statement, ImportKind::Named(remote)) =
+        TopLevel::collect(root, source)?.bindings.remove(name)?
+    else {
+        return None;
+    };
+    // inline の `type` ではモジュールの評価が残り得る。
+    if !statement
+        .children(&mut statement.walk())
+        .any(|n| n.kind() == "type")
+    {
+        return None;
+    }
+    Some((
+        static_specifier(statement.child_by_field_name("source")?, source)?,
+        remote,
+    ))
+}
+
+/// 直接名前付きで公開された、型引数を持たない一意な型別名の右辺。
+pub(super) fn exported_type_alias<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    name: &str,
+) -> Option<Node<'tree>> {
+    let top = TopLevel::collect(root, source)?;
+    if top.exported.contains(name) {
+        return None;
+    }
+    let Binding::Types(declarations) = top.bindings.get(name)? else {
+        return None;
+    };
+    let [(statement, declaration)] = declarations.as_slice() else {
+        return None;
+    };
+    (statement.kind() == "export_statement"
+        && !statement
+            .children(&mut statement.walk())
+            .any(|n| n.kind() == "default")
+        && declaration.kind() == "type_alias_declaration"
+        && declaration.child_by_field_name("type_parameters").is_none())
+    .then(|| declaration.child_by_field_name("value"))?
+}
+
 fn plain(node: Node<'_>, source: &[u8]) -> Option<String> {
     let text = node.utf8_text(source).ok()?;
     (!text.is_empty() && !text.contains('\\')).then(|| text.to_owned())

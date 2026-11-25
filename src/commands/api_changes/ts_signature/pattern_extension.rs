@@ -5,6 +5,8 @@ use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use std::ops::ControlFlow;
 use tree_sitter::Node;
 
+mod alias_defaults;
+
 pub(super) struct AddedBinding {
     name: String,
     node_id: usize,
@@ -216,17 +218,58 @@ fn inert_literal(node: Node<'_>, source: &[u8]) -> bool {
     }
 }
 
-fn default_matches_type(value: Node<'_>, ty: Node<'_>, source: &[u8]) -> bool {
+fn literal_matches(
+    value: Node<'_>,
+    source: &[u8],
+    literal: Node<'_>,
+    literal_source: &[u8],
+) -> Option<bool> {
+    if !inert_literal(literal, literal_source) {
+        return None;
+    }
+    let same_tokens =
+        node_signature_tokens(value, source)? == node_signature_tokens(literal, literal_source)?;
+    let plain_string = |node: Node<'_>, bytes: &[u8]| {
+        node.kind() == "string" && node.utf8_text(bytes).is_ok_and(|s| !s.contains('\\'))
+    };
+    Some(
+        same_tokens
+            || (plain_string(value, source)
+                && plain_string(literal, literal_source)
+                && static_js_string_text(value, source)?
+                    == static_js_string_text(literal, literal_source)?),
+    )
+}
+
+fn scalar_type_matches(
+    value: Node<'_>,
+    source: &[u8],
+    ty: Node<'_>,
+    type_source: &[u8],
+) -> Option<bool> {
+    if ty.kind() == "literal_type" {
+        return literal_matches(value, source, ty.named_child(0)?, type_source);
+    }
+    if ty.kind() != "predefined_type" {
+        return None;
+    }
+    Some(match ty.utf8_text(type_source).ok()? {
+        "string" => matches!(value.kind(), "string" | "template_string"),
+        "number" => matches!(value.kind(), "number" | "unary_expression"),
+        "boolean" => matches!(value.kind(), "true" | "false"),
+        _ => return None,
+    })
+}
+
+fn default_matches_type(
+    value: Node<'_>,
+    ty: Node<'_>,
+    source: &[u8],
+    site: Option<&CompatibleModSite<'_>>,
+) -> bool {
     if !inert_literal(value, source) {
         return false;
     }
-    let expected = match value.kind() {
-        "string" | "template_string" => "string",
-        "number" | "unary_expression" => "number",
-        "true" | "false" => "boolean",
-        "null" => "null",
-        _ => return false,
-    };
     let mut parts = vec![(ty, false)];
     let mut aliases = HashSet::new();
     let mut local_aliases = None;
@@ -242,7 +285,7 @@ fn default_matches_type(value: Node<'_>, ty: Node<'_>, source: &[u8]) -> bool {
             aliases.remove(&part.id());
             continue;
         }
-        let actual = match part.kind() {
+        match part.kind() {
             "union_type" | "parenthesized_type" => {
                 let mut cursor = part.walk();
                 parts.extend(
@@ -250,7 +293,6 @@ fn default_matches_type(value: Node<'_>, ty: Node<'_>, source: &[u8]) -> bool {
                         .filter(|child| child.kind() != "comment")
                         .map(|child| (child, false)),
                 );
-                continue;
             }
             "type_identifier" => {
                 // 関数等の型引数が別名を隠し得る文脈では証明しない。
@@ -268,49 +310,33 @@ fn default_matches_type(value: Node<'_>, ty: Node<'_>, source: &[u8]) -> bool {
                     .and_then(|aliases| aliases.get(&name))
                     .copied()
                 else {
-                    return false;
+                    let Some(matches) = site.and_then(|site| {
+                        alias_defaults::imported(root, source, &name, value, site)
+                    }) else {
+                        return false;
+                    };
+                    found |= matches;
+                    continue;
                 };
                 if !aliases.insert(alias.id()) {
                     return false;
                 }
                 parts.push((alias, true));
                 parts.push((alias, false));
-                continue;
             }
-            "predefined_type" => match part.utf8_text(source).ok() {
-                Some("string") => "string",
-                Some("number") => "number",
-                Some("boolean") => "boolean",
-                _ => return false,
-            },
-            "literal_type" => {
-                let Some(literal) = part.named_child(0) else {
+            "lookup_type" => {
+                let Some(matches) = alias_defaults::indexed(root, part, value, source) else {
                     return false;
                 };
-                if !inert_literal(literal, source) {
-                    return false;
-                }
-                let same_tokens = node_signature_tokens(value, source)
-                    .zip(node_signature_tokens(literal, source))
-                    .is_some_and(|(value, literal)| value == literal);
-                let same_plain_string = value.kind() == "string"
-                    && literal.kind() == "string"
-                    && value
-                        .utf8_text(source)
-                        .ok()
-                        .zip(literal.utf8_text(source).ok())
-                        .is_some_and(|(value, literal)| {
-                            !value.contains('\\')
-                                && !literal.contains('\\')
-                                && value.get(1..value.len().saturating_sub(1))
-                                    == literal.get(1..literal.len().saturating_sub(1))
-                        });
-                found |= same_tokens || same_plain_string;
-                continue;
+                found |= matches;
             }
-            _ => return false,
-        };
-        found |= actual == expected;
+            _ => {
+                let Some(matches) = scalar_type_matches(value, source, part, source) else {
+                    return false;
+                };
+                found |= matches;
+            }
+        }
     }
     found
 }
@@ -321,6 +347,7 @@ pub(super) fn added_bindings(
     new_pattern: Node<'_>,
     new_source: &[u8],
     added_keys: &HashMap<String, Node<'_>>,
+    site: Option<&CompatibleModSite<'_>>,
 ) -> Option<Vec<AddedBinding>> {
     let old = entries(old_pattern, old_source)?;
     let new = entries(new_pattern, new_source)?;
@@ -356,7 +383,7 @@ pub(super) fn added_bindings(
                 | "await"
         ) || entry
             .default
-            .is_some_and(|value| !default_matches_type(value, ty, new_source))
+            .is_some_and(|value| !default_matches_type(value, ty, new_source, site))
         {
             return None;
         }
@@ -676,6 +703,7 @@ mod tests {
             old.as_bytes(),
             new_fn,
             new.as_bytes(),
+            None,
         )
         .is_some()
     }
@@ -1507,6 +1535,12 @@ mod tests {
     fn destructured_optional_props_node_kinds_exist_in_both_grammars() {
         for lang in [LangId::Typescript, LangId::Tsx] {
             for kind in [
+                "lookup_type",
+                "parenthesized_type",
+                "type_query",
+                "as_expression",
+                "array",
+                "object",
                 "object_type",
                 "predefined_type",
                 "literal_type",

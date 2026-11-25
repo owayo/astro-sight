@@ -57,6 +57,7 @@ use super::ref_index::{
 };
 
 mod array_literals;
+pub(super) use array_literals::visit_elements;
 mod callbacks;
 pub(crate) mod invariant_members;
 mod local_producers;

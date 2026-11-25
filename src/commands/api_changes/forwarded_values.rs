@@ -174,25 +174,7 @@ fn imports_value(
 type LiteralExports = HashMap<String, (Option<String>, String)>;
 
 fn target_literals(dir: &str, path: &str, module: &str) -> Option<LiteralExports> {
-    let file = module.strip_prefix("./")?;
-    if file.is_empty()
-        || file
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || file.contains(['\\', ':', '?', '#', '%'])
-        || super::removed_attribution::relative_directory_has_manifest(dir, path, module)
-    {
-        return None;
-    }
-    let target = super::ref_index::resolved_relative_source(dir, path, module)?;
-    if target == path || super::ts_module_paths::is_declaration_path(&target) {
-        return None;
-    }
-    let lang = LangId::from_path(camino::Utf8Path::new(&target)).ok()?;
-    if !matches!(lang, LangId::Typescript | LangId::Tsx) {
-        return None;
-    }
-    let source = super::source_pair::load_new_source(dir, &target)?;
+    let (source, lang) = super::source_pair::relative_ts_source(dir, path, module)?;
     literal_exports(&source, lang, true)
 }
 
