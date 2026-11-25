@@ -170,7 +170,7 @@ fn python_strings_mention(all: &[Node<'_>], source: &[u8], name: &str) -> bool {
 }
 
 /// `string` / `concatenated_string` の値。エスケープを解けないときは `None`。
-fn python_string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
+pub(super) fn python_string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut value = String::new();
     let mut cursor = node.walk();
     if node.kind() == "concatenated_string" {

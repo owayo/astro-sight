@@ -259,3 +259,92 @@ fn python_free_function_removal_keeps_parameters_that_request_fixtures() {
         false,
     );
 }
+
+#[test]
+fn python_removed_functions_reached_by_string_names_use_the_review_snapshot() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("pkg");
+    repo.write("pkg/__init__.py", "");
+    repo.write("pkg/other.py", "def noise(): return 0\n");
+    let owner = "def _keep():\n    return globals()['by_global']()\n";
+    let caller = r#"from unittest.mock import patch as replace
+import operator
+import pkg.api as api
+import pkg.other as other
+from typing import Annotated, Literal
+
+def use(row, monkeypatch):
+    getattr(api, 'by_getattr')()
+    replace('pkg.api.by_patch')
+    vars(api)['by_vars']()
+    api.__dict__['by_dict']()
+    operator.methodcaller('by_operator')(api)
+    monkeypatch.setattr('pkg.api.by_monkeypatch', None)
+    getattr(other, 'noise')()
+    print('pkg.api.noise', row['noise'])
+    replace('elsewhere.api.noise')
+
+def annotated(arg: Literal["noise"]) -> Annotated["list[api.by_annotation]", "noise"]:
+    pass
+"#;
+    let names = [
+        "by_export",
+        "by_global",
+        "by_getattr",
+        "by_patch",
+        "by_vars",
+        "by_dict",
+        "by_operator",
+        "by_annotation",
+        "by_monkeypatch",
+        "noise",
+    ];
+    let declarations: String = names
+        .iter()
+        .map(|name| format!("def {name}(): pass\n"))
+        .collect();
+    repo.write("pkg/api.py", format!("{owner}{declarations}"));
+    repo.write("caller.py", caller);
+    repo.commit_all("base");
+    // __all__ は削除後も列挙される名前だけの参照になる。
+    repo.write("pkg/api.py", format!("__all__ = ['by_export']\n{owner}"));
+    repo.stage_all();
+    // index に残る caller が作業ツリーと異なる場合も調べる。
+    repo.write("caller.py", "print('by_getattr', 'pkg.api.by_patch')\n");
+    for staged in [true, false] {
+        let mut flags = vec!["--git"];
+        if staged {
+            flags.push("--staged");
+        }
+        let report = repo.run_json("review", &flags);
+        let hook = cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(&flags)
+            .arg("--hook")
+            .output()
+            .unwrap();
+        assert_eq!(hook.status.code(), Some(1), "{report}");
+        let hook: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+        for name in names {
+            let live = name != "noise" && (staged || matches!(name, "by_export" | "by_global"));
+            for (entries, field, expected) in [
+                (&report["api_changes"]["removed"], "name", live),
+                (&report["api_changes"]["removed_dead"], "name", !live),
+                (&hook["api"]["rm"], "n", live),
+                (&hook["api"]["rm_dead"], "n", !live),
+            ] {
+                assert_eq!(
+                    entries
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|e| e[field] == name),
+                    expected,
+                    "{staged}/{name}: {entries}, {report}"
+                );
+            }
+        }
+    }
+}
