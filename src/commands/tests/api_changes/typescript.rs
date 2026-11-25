@@ -3140,13 +3140,13 @@ fn detect_api_changes_forwarded_values_preserve_changes_and_unknown_contracts() 
             "export const LIMIT: number = 2;",
             "export { LIMIT } from './next';",
             "export const LIMIT: number = 2;",
-            "mod",
+            "unchanged",
         ),
         (
             "export const LIMIT = 2;",
             "export { LIMIT } from './next';",
             "export const LIMIT = 2;",
-            "mod",
+            "unchanged",
         ),
         (
             "export const LIMIT: number = 2;",
@@ -3164,6 +3164,30 @@ fn detect_api_changes_forwarded_values_preserve_changes_and_unknown_contracts() 
             "export const LIMIT: number = 2;",
             "export { OTHER as LIMIT } from './next';",
             "export const OTHER: number = 2;",
+            "unchanged",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { LIMIT } from './next.js';",
+            "import './effects'; export const LIMIT = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { LIMIT } from './next.js'; console.log(LIMIT);",
+            "export const LIMIT = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { LIMIT } from './next.js';",
+            "export const LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { type LIMIT } from './next.js';",
+            "export const LIMIT = 2;",
             "mod",
         ),
         (
@@ -3201,6 +3225,18 @@ fn detect_api_changes_forwarded_values_preserve_changes_and_unknown_contracts() 
             "export { LIMIT } from './next';",
             "export const LIMIT = () => 5;",
             "mod",
+        ),
+        (
+            "export function LIMIT() { return 2; }",
+            "export { LIMIT } from './next.js';",
+            "export function LIMIT() { return 2; }",
+            "unchanged",
+        ),
+        (
+            "export type LIMIT = 'two';",
+            "export type { LIMIT } from './next.js';",
+            "export type LIMIT = 'two';",
+            "unchanged",
         ),
         (
             "export function LIMIT() { return 2; }",

@@ -4210,6 +4210,37 @@ fn review_hook_keeps_forwarded_public_value_changes_blocking() {
     }
 }
 
+#[test]
+fn review_hook_accepts_forwarded_literal_with_unchanged_callers() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let describe = "export function message(open: boolean) { return open ? 'open' : NOTICE; }\n";
+    repo.write(
+        "api.ts",
+        format!("export const NOTICE = 'closed';\n{describe}"),
+    );
+    repo.write("page.ts", "import { NOTICE, message } from './api.js';\nexport function page() { return message(false) + NOTICE; }\n");
+    repo.commit_all("base");
+    repo.write("api.ts", format!("import {{ NOTICE }} from './text.js';\nexport {{ NOTICE }} from './text.js';\n{describe}"));
+    repo.write("text.ts", "export const NOTICE = 'closed';\n");
+    for staged in [false, true] {
+        let mut cmd = cargo_bin();
+        cmd.args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        if staged {
+            repo.stage_all();
+            cmd.arg("--staged");
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "staged={staged}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// 明示 diff (`--diff` / `--diff-file`) の review も、recent 注釈は解決済みの base で評価する。
 /// 以前は `HEAD` という名前のまま渡り、OID でないというだけで理由が必ず invalid_metadata になった。
 #[test]
