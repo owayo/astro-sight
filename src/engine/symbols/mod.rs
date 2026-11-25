@@ -538,13 +538,10 @@ fn node_kind_to_symbol_kind(kind: &str) -> SymbolKind {
 fn symbol_query(lang_id: LangId) -> &'static str {
     match lang_id {
         LangId::Rust => {
-            // trait の必須メソッド (`fn area(&self) -> f64;`) は本体を持たない
-            // function_signature_item。extern ブロックの外部関数宣言も同じノードなので、
-            // trait 本体の直下に限定する (Swift protocol / Java interface の要求メソッドを
-            // 列挙しているのと揃える)。
             r#"
             (function_item name: (identifier) @function.name)
             (trait_item body: (declaration_list (function_signature_item name: (identifier) @function.name)))
+            (foreign_mod_item body: (declaration_list (function_signature_item name: (identifier) @function.name)))
             (struct_item name: (type_identifier) @struct.name)
             (enum_item name: (type_identifier) @enum.name)
             (union_item name: (type_identifier) @union.name)
