@@ -197,7 +197,7 @@ pub(super) fn python_contract_decision(
     }
 }
 
-/// props 専用の private alias からの削除だけは、型依存の変更そのものを証明の対象にする。
+/// private alias の引数では渡すキーを、戻り値では生成箇所と全利用で扱うキーを確かめる。
 pub(super) fn local_props_alias_removal_decision(
     inputs: &DetectionInputs<'_>,
     caches: &mut ApiClosureCaches,
@@ -217,14 +217,19 @@ pub(super) fn local_props_alias_removal_decision(
     {
         return None;
     }
-    detect_local_alias_props_removed_compatible_mod(
+    prove_local_alias_property_removal(
         inputs.ref_index,
         site,
         sources,
         &mut caches.optional_removal,
         inputs.diff_files,
     )
-    .map(SignatureDecision::Compatible)
+    .map(|proof| match proof {
+        ProvenPropertyRemoval::Compatible(reason) => {
+            SignatureDecision::Compatible(site.compatible(reason))
+        }
+        ProvenPropertyRemoval::ClosedReturn => SignatureDecision::ClosedReturnProperties,
+    })
 }
 
 /// 呼び出し側を壊さない変更を、互換判定器を記述順に試して最初に当てはまったもので返す。

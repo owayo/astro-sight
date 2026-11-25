@@ -81,6 +81,8 @@ pub(crate) struct ApiChangeBuckets {
     pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub(crate) modified: Vec<ApiSymbolChange>,
     pub(crate) modified_closed_in_diff: Vec<ApiSymbolChange>,
+    /// 非公開の戻り値型で、削除したキーの生成元と全利用を確認できた宣言 (file, name)。
+    pub(crate) closed_return_properties: Vec<(String, String)>,
     pub(crate) const_value_changes: Vec<ApiSymbolChange>,
     pub(crate) unchanged_static_consts: Vec<ApiSymbol>,
     pub(crate) type_annotation_changes: Vec<crate::models::review::TypeAnnotationChange>,

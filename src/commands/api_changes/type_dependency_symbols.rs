@@ -1,5 +1,6 @@
 //! 型依存で契約が変わった公開宣言を、通常の影響解析へ引き渡す。
 
+use crate::models::review::{ApiChanges, ApiSymbolChange};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
@@ -39,4 +40,43 @@ pub(super) fn collect<'a>(
         }
     }
     symbols
+}
+
+/// 型依存の一覧は blocking の変更と、戻り値の全利用を確認した変更からだけ作る。
+/// 同じ名前で別の変更も記録された場合は、一覧から戻り値の証明を取り出せない。
+pub(in crate::commands) fn closed_return_declarations(
+    api: &ApiChanges,
+) -> BTreeMap<(&str, &str), &ApiSymbolChange> {
+    let mut declarations = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for change in &api.modified_closed_in_diff {
+        if !api
+            .type_dependency_symbols
+            .get(&change.file)
+            .is_some_and(|names| names.contains(&change.name))
+        {
+            continue;
+        }
+        let key = (change.file.as_str(), change.name.as_str());
+        if seen.insert(key) && change.kind == "function" {
+            declarations.insert(key, change);
+        } else {
+            declarations.remove(&key);
+        }
+    }
+    if !declarations.is_empty() {
+        for key in api
+            .modified
+            .iter()
+            .map(|change| (change.file.as_str(), change.name.as_str()))
+            .chain(
+                api.compatible_modified
+                    .iter()
+                    .map(|change| (change.file.as_str(), change.name.as_str())),
+            )
+        {
+            declarations.remove(&key);
+        }
+    }
+    declarations
 }

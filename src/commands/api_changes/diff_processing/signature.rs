@@ -715,6 +715,8 @@ pub(super) enum SignatureDecision {
     MovedConstAddition(CompatibleApiModification),
     /// 全 cross-file 参照が同一 diff で追随済み (modified_closed_in_diff)。
     ClosedInDiff,
+    /// 非公開の戻り値型から削除したプロパティの生成元と利用をすべて確認した。
+    ClosedReturnProperties,
     /// callback 本体だけの変更 (callback_body_changes)。
     CallbackBodyOnly,
     /// blocking な api.mod。型契約の種別を確定できたときだけ添える。

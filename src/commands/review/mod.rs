@@ -683,6 +683,7 @@ fn attach_contract_evidence(api: &ApiChanges, impact: &mut crate::models::impact
     let evidence: std::collections::BTreeMap<_, _> = api
         .modified
         .iter()
+        .chain(super::api_changes::closed_return_declarations(api).into_values())
         .map(|change| {
             (
                 &change.file,

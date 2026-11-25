@@ -467,10 +467,9 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
             .map(|change| (&change.file, &change.name))
             .chain(
                 buckets
-                    .compatible_modified
+                    .closed_return_properties
                     .iter()
-                    .filter(|change| change.reason == "optional_return_properties_removed")
-                    .map(|change| (&change.file, &change.name)),
+                    .map(|(file, name)| (file, name)),
             ),
     );
     fill_modification_diagnostics(&mut buckets.modified);
@@ -1085,6 +1084,7 @@ mod ts_class_api;
 mod ts_module_paths;
 mod ts_signature;
 mod type_dependency_symbols;
+pub(super) use type_dependency_symbols::closed_return_declarations;
 
 pub(crate) use candidate::ApiSymbolCandidate;
 pub(crate) use diff_processing::*;
