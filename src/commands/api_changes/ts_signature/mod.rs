@@ -45,6 +45,7 @@ pub(crate) use nullable_input::{
     collect_nullable_type_evidence, detect_nullable_input_compatible_mod,
 };
 pub(crate) use object_members::*;
+pub(super) use pattern_extension::inferred_parameter_pattern;
 pub(crate) use react::*;
 pub(crate) use react_memo::ReactMemoCache;
 pub(crate) use removed_params::{

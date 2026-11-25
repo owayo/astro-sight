@@ -163,6 +163,31 @@ pub(super) fn entries<'tree>(pattern: Node<'tree>, source: &[u8]) -> Option<Vec<
     Some(result)
 }
 
+/// 単独の型注釈なし引数。推論が変わらないリテラルを同じ型の代表値にそろえる。
+pub(in crate::commands::api_changes) fn inferred_parameter_pattern(
+    pattern: Node<'_>,
+    source: &[u8],
+) -> Option<String> {
+    let mut properties = Vec::new();
+    for entry in entries(pattern, source)? {
+        let mut key = entry.key;
+        if let Some(default) = entry.default {
+            if !inert_literal(default, source) {
+                return None;
+            }
+            key.push_str(match default.kind() {
+                "string" | "template_string" => " = ''",
+                "number" | "unary_expression" => " = 0",
+                "true" | "false" => " = false",
+                "null" => " = null",
+                _ => return None,
+            });
+        }
+        properties.push(key);
+    }
+    Some(format!("{{{}}}", properties.join(", ")))
+}
+
 fn number_literal(node: Node<'_>, source: &[u8]) -> bool {
     node.kind() == "number"
         && node.utf8_text(source).is_ok_and(|text| {
