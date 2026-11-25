@@ -646,6 +646,28 @@ pub(crate) struct ScopeFingerprint {
 }
 
 impl DependencyIndex {
+    /// 同じ module の値の名前空間に、無条件の非公開自由関数が一意にあるか。
+    pub(super) fn private_function_binding(&self, scope: &[String], name: &str) -> bool {
+        let Some(bindings) = self.scopes.get(scope) else {
+            return false;
+        };
+        let Some([item]) = bindings.items.get(name).map(Vec::as_slice) else {
+            return false;
+        };
+        item.kind == "function_item"
+            && matches!(&item.visibility, Visibility::Within(owner)
+                if self.file_module.as_deref().is_some_and(|file|
+                    owner.iter().eq(file.iter().chain(scope))))
+            && item.conditions.is_empty()
+            && !item.opaque_attributes
+            && self.file_availability() == Some(&[])
+            && bindings.macros.is_empty()
+            && bindings.attributed.is_empty()
+            && bindings.globs.is_empty()
+            && !bindings.uses.contains_key(name)
+            && !bindings.constants.contains_key(name)
+    }
+
     /// Rust のソース `source` (ファイル `file`、`dir` 相対) の索引。module の経路はパスの規約
     /// (`src` 相対の位置) から決める。構文エラーなら None。
     pub(crate) fn new(source: &[u8], file: &str) -> Option<Self> {
@@ -2158,6 +2180,29 @@ fn names_generic(reference: &Reference, generics: &[String]) -> bool {
         .segments
         .first()
         .is_some_and(|first| generics.iter().any(|generic| generic == first))
+}
+
+/// 裸の関数名、同じ module の self::name、crate から同じ module を名指す呼び出し。
+pub(super) fn local_callee<'a>(
+    call: tree_sitter::Node<'a>,
+    source: &[u8],
+    module: &[String],
+) -> Option<tree_sitter::Node<'a>> {
+    let callee = call.child_by_field_name("function")?;
+    if callee.kind() == "identifier" {
+        return Some(callee);
+    }
+    if callee.kind() != "scoped_identifier" {
+        return None;
+    }
+    let qualifier = callee.child_by_field_name("path")?;
+    let same = qualifier.kind() == "self"
+        || path_segments(qualifier, source).is_some_and(|parts| {
+            parts
+                .split_first()
+                .is_some_and(|(root, rest)| root == "crate" && rest == module)
+        });
+    same.then(|| callee.child_by_field_name("name")).flatten()
 }
 
 /// パスのノード (`identifier`・`type_identifier`・`scoped_identifier`・`scoped_type_identifier`・

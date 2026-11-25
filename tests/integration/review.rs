@@ -6,6 +6,44 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn opaque_returns_use_the_private_helper_in_the_index_snapshot() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"inventory\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod landing;\npub mod warehouse;\n");
+    let landing = "fn limit() -> u8 { 1 }\npub fn preview() -> u8 { limit() }\n";
+    let warehouse = "fn limit() -> u8 { 20 }\npub async fn inventory() -> u8 { limit() }\n";
+    repo.write("src/landing.rs", landing);
+    repo.write("src/warehouse.rs", warehouse);
+    repo.commit_all("base");
+    repo.write("src/landing.rs", landing.replace("1", "2"));
+    repo.stage_all();
+    repo.write("src/warehouse.rs", warehouse.replace("20", "21"));
+    for (staged, expected) in [(false, 1), (true, 0)] {
+        let mut command = cargo_bin();
+        command
+            .current_dir(repo.root())
+            .args(["review", "--dir", ".", "--git", "--hook"]);
+        if staged {
+            command.arg("--staged");
+        }
+        let output = command.output().unwrap();
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{hook}");
+        let reported = hook["api"]["mod"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|symbol| symbol["n"] == "inventory");
+        assert_eq!(reported, !staged, "{hook}");
+    }
+}
+
+#[test]
 fn test_only_api_modifications_keep_hook_output_and_staged_policy() {
     for extension in ["ts", "tsx"] {
         for const_value in [false, true] {
