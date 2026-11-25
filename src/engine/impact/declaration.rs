@@ -1669,7 +1669,7 @@ fn ts_only_typed_function_body_changed(
     old_prefix == new_prefix && old_suffix == new_suffix
 }
 
-/// AST のヘッダが同じトークン列で、ヘッダ以外は byte 一致するときだけ整形差を取り消す。
+/// AST のヘッダが同じトークン列で、ヘッダ以外は改行コードを除いて一致するときだけ整形差を取り消す。
 fn rust_only_header_formatting_changed(
     input: &DeclarationChangeInput<'_>,
     old_side: &mut LazyOldSide,
@@ -1710,8 +1710,8 @@ fn rust_only_header_formatting_changed(
     else {
         return false;
     };
-    old_prefix == new_prefix
-        && old_suffix == new_suffix
+    super::rust_line_endings::same_text(old_prefix, new_prefix)
+        && super::rust_line_endings::same_text(old_suffix, new_suffix)
         && crate::engine::rust_signature::rust_signature_formatting_equivalent(
             old_header, new_header,
         )

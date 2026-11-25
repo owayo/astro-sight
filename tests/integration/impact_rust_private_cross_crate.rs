@@ -60,9 +60,7 @@ impl<'a> Case<'a> {
         self
     }
 
-    /// `a/src/lib.rs` を `a_old` から `a_new` に変えて `impact --dir . --git` を流し、
-    /// (終了コード, 未解決の影響の行) を返す。
-    fn run(self) -> (i32, Vec<String>) {
+    fn changed_repo(&self) -> TestRepo {
         let repo = TestRepo::new();
         let members = self
             .members
@@ -113,6 +111,12 @@ impl<'a> Case<'a> {
         repo.init_git();
         repo.commit_all("initial");
         repo.write("a/src/lib.rs", &self.a_new);
+        repo
+    }
+
+    /// `impact --dir . --git` の終了コードと未解決の影響の行を返す。
+    fn run(self) -> (i32, Vec<String>) {
+        let repo = self.changed_repo();
         let mut command = cargo_bin();
         command
             .current_dir(repo.root())
@@ -131,6 +135,94 @@ impl<'a> Case<'a> {
             .map(str::to_owned)
             .collect();
         (output.status.code().unwrap(), lines)
+    }
+}
+
+#[test]
+fn rust_extern_signature_change_reaches_the_dependent_crate() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old.push_str("\npub mod api {\n    unsafe extern \"C\" {\n        pub fn translate(x: u8);\n        fn local(x: u8);\n    }\n}\n");
+    case.a_new = case
+        .a_old
+        .replace("fn translate(x: u8);", "fn translate();")
+        .replace("fn local(x: u8);", "fn local();");
+    case.b_lib = "pub fn run() {\n    unsafe { a::api::translate(1); }\n}\n";
+    let repo = case.changed_repo();
+    let review = repo.run_json("review", &["--git"]);
+    let modified = review["api_changes"]["modified"].as_array().unwrap();
+    assert_eq!(modified.len(), 1, "{modified:?}");
+    assert_eq!(modified[0]["name"], "translate", "{modified:?}");
+    let output = cargo_bin()
+        .current_dir(repo.root())
+        .args(["impact", "--dir", ".", "--git"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("→ b/src/lib.rs:2 [translate]"), "{stderr}");
+
+    for extra in [None, Some("--staged")] {
+        if extra.is_some() {
+            repo.stage_all();
+            repo.write("a/src/lib.rs", &case.a_old);
+        }
+        let output = cargo_bin()
+            .current_dir(repo.root())
+            .args(["review", "--dir", ".", "--git", "--hook"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let hook: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        let modified = hook["api"]["mod"].as_array().unwrap();
+        assert_eq!(modified.len(), 1, "{hook}");
+        assert_eq!(modified[0]["n"], "translate", "{hook}");
+        assert!(
+            hook["impacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["p"] == "b/src/lib.rs"
+                        && r["ln"] == 1
+                        && r["s"] == serde_json::json!(["translate"]))),
+            "{hook}"
+        );
+    }
+}
+
+#[test]
+fn rust_extern_formatting_preserves_the_caller_with_crlf() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old = "unsafe extern \"C\" {\r\n    pub fn render(x: u8);\r\n}\r\n".to_owned();
+    case.b_lib = "pub const RENDER: unsafe extern \"C\" fn(u8) = a::render;\n";
+    let wrapped = case
+        .a_old
+        .replace("render(x: u8)", "render(\r\n        x: u8,\r\n    )");
+    for (source, blocking) in [
+        (wrapped.clone(), false),
+        (wrapped.replace("x: u8", "x: u16"), true),
+        (wrapped.replace("\"C\"", "\"C-unwind\""), true),
+    ] {
+        case.a_new = source;
+        let repo = case.changed_repo();
+        for command in ["impact", "review"] {
+            let result = cargo_bin()
+                .current_dir(repo.root())
+                .args([command, "--dir", ".", "--git", "--hook"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(i32::from(blocking)),
+                "{command}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 }
 
@@ -1806,7 +1898,7 @@ fn impact_rust_private_function_counts_raw_identifiers_as_the_same_name() {
             .any(|line| line.starts_with("→ b/src/lib.rs:2 [")),
         "{lines:?}"
     );
-    // 本体の無い `extern` の関数の宣言も同じ名前の宣言 (シンボルの抽出は数えない)。子のモジュール
+    // 本体の無い `extern` の関数の宣言も同じ名前の宣言。子のモジュール
     // (`mod child;`) を残し、ファイルの外の呼び出しを探す形にする。
     let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
     case.a_old = "mod child;\nfn translate(_: u8) {}\n\npub mod api {\n    unsafe extern \"C\" {\n        pub fn translate(x: u8);\n    }\n}\n".to_owned();

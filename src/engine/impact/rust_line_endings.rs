@@ -103,8 +103,8 @@ fn normalized(source: &[u8]) -> impl Iterator<Item = u8> + '_ {
     })
 }
 
-fn same_text(old: &[u8], new: &[u8]) -> bool {
-    normalized(old).eq(normalized(new))
+pub(super) fn same_text(old: &[u8], new: &[u8]) -> bool {
+    old == new || normalized(old).eq(normalized(new))
 }
 
 fn attributes(mut node: Node<'_>, source: &[u8], out: &mut Vec<Vec<u8>>) {

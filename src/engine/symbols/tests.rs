@@ -4060,7 +4060,7 @@ fn python_custom_query_keeps_non_lambda_assignments_for_non_function_captures() 
 }
 
 /// Java / C# の record、Go の型エイリアス、Rust trait の必須メソッドを抽出する。
-/// extern ブロックの外部関数宣言は同じ function_signature_item でも拾わない。
+/// extern ブロックの関数宣言は trait のメソッドと区別する。
 #[test]
 fn records_go_alias_and_rust_trait_requirements_are_symbols() {
     let java = syms_of(
@@ -4111,7 +4111,9 @@ fn records_go_alias_and_rust_trait_requirements_are_symbols() {
         let sym = rust.iter().find(|s| s.name == name).unwrap();
         assert_eq!(sym.container.as_deref(), Some("Shape"), "{name}");
     }
-    assert!(!rust.iter().any(|s| s.name == "c_func"));
+    let foreign = rust.iter().find(|s| s.name == "c_func").unwrap();
+    assert_eq!(foreign.kind, SymbolKind::Function);
+    assert!(foreign.container.is_none());
 }
 
 /// trait 本体のメソッドは可視性修飾子を書けず、trait の可視性を継承する。
