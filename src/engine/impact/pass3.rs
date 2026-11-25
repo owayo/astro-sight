@@ -234,6 +234,7 @@ mod tests {
 
     fn empty_ctx(path: &str) -> FileContext {
         FileContext {
+            rebound_const_callers: Default::default(),
             python_modified_direct_function_names: Default::default(),
             js_modified_direct_function_names: Default::default(),
             new_path: path.to_string(),

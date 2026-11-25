@@ -174,6 +174,8 @@ fn paths_change_rust_cargo_inputs(
 
 struct FileContext {
     new_path: String,
+    /// このファイルの追加 const へ、差分内でローカル const を付け替えた参照元と名前。
+    rebound_const_callers: crate::commands::ts_const_rebinding::ReboundCallers,
     lang_id: LangId,
     affected: Vec<AffectedSymbol>,
     sig_changes: Vec<SignatureChange>,

@@ -1,5 +1,136 @@
 use super::support::*;
 
+#[test]
+fn impact_ts_rebound_const_follows_worktree_and_index() {
+    let repo = TestRepo::new();
+    let producer = "export function retries(): number {\n  return 3;\n}\n";
+    let user = "const SERVER = 'http://old';\nexport const PATTERN = `${SERVER}/*`;\n";
+    repo.write("config.ts", producer);
+    repo.write("build.ts", user);
+    repo.init_git();
+    repo.commit_all("initial");
+    let changed =
+        producer.replace("return 3", "return 5") + "export const SERVER = 'https://new';\n";
+    let imported = user.replace(
+        "const SERVER = 'http://old';",
+        "import { SERVER } from './config';",
+    );
+    repo.write("config.ts", &changed);
+    repo.write("build.ts", &imported);
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("config.ts", producer);
+            repo.write("build.ts", user);
+        }
+        let hook = review_hook(&repo, staged, 0);
+        assert_eq!(hook["blocking_categories"], serde_json::json!([]), "{hook}");
+    }
+}
+
+#[test]
+fn impact_ts_rebound_const_requires_new_export_matching_type_and_exact_import() {
+    let repo = TestRepo::new();
+    let config = "export function retry() {\n return 3;\n}\n";
+    let reader = "const SERVER = 'old';\nexport const base = `${SERVER}`;\n";
+    repo.write("config.ts", config);
+    repo.write("reader.ts", reader);
+    repo.write(
+        "unchanged.ts",
+        "import { SERVER } from './config';\nconsole.log(SERVER);\n",
+    );
+    repo.create_dir_all("other");
+    repo.write("other/config.ts", "export const SERVER = 'other';\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    for (value, import, proven) in [
+        ("'new'", "import { SERVER } from './config';", true),
+        ("12", "import { SERVER } from './config';", false),
+        ("'new'", "import type { SERVER } from './config';", false),
+        ("'new'", "import { type SERVER } from './config';", false),
+        ("'new'", "import { SERVER } from './other/config';", false),
+    ] {
+        repo.write(
+            "config.ts",
+            config.replace("return 3", "return 4") + &format!("export const SERVER = {value};\n"),
+        );
+        repo.write("reader.ts", reader.replace("const SERVER = 'old';", import));
+        let context = repo.run_json("context", &["--git"]);
+        let high = callers(&context, "impacted_callers");
+        assert!(high.contains(&("unchanged.ts".to_owned(), 1)), "{context}");
+        assert_eq!(
+            !high.contains(&("reader.ts".to_owned(), 1)),
+            proven,
+            "{context}"
+        );
+        if proven {
+            assert!(
+                callers(&context, "informational_callers").contains(&("reader.ts".to_owned(), 1)),
+                "{context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn impact_ts_rebound_const_literal_type_and_call_arguments_keep_blocking() {
+    let repo = TestRepo::new();
+    let config = "export function retry() {\n return 3;\n}\n";
+    let before = r#"const SERVER = 'old';
+export const link = `/${SERVER}`;
+export const pinned: 'old' = SERVER;
+function fixed(v: 'old') { return v; }
+export const result = fixed(SERVER);
+export const pinnedTemplate: '/old' = `/${SERVER}`;
+"#;
+    repo.write("config.ts", config);
+    repo.write("user.ts", before);
+    repo.init_git();
+    repo.commit_all("initial");
+    let changed = config.replace("return 3", "return 4") + "export const SERVER = 'old';\n";
+    repo.write("config.ts", &changed);
+    repo.write(
+        "user.ts",
+        before.replace(
+            "const SERVER = 'old';",
+            "import { SERVER } from './config';",
+        ),
+    );
+    let hook = review_hook(&repo, false, 0);
+    assert!(hook["impacts"].is_null(), "{hook}");
+    repo.write("config.ts", changed.replace("'old'", "'new'"));
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("config.ts", config);
+            repo.write("user.ts", before);
+        }
+        let hook = review_hook(&repo, staged, 1);
+        let refs = hook["impacts"][0]["refs"].as_array().unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|r| r["ln"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [2, 4, 5],
+            "{hook}"
+        );
+    }
+}
+
+fn review_hook(repo: &TestRepo, staged: bool, code: i32) -> serde_json::Value {
+    let mut command = cargo_bin();
+    command
+        .current_dir(repo.root())
+        .args(["review", "--dir", ".", "--git", "--hook"]);
+    if staged {
+        command.arg("--staged");
+    }
+    let output = command.output().unwrap();
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(code), "{hook}");
+    hook
+}
+
 fn callers(value: &serde_json::Value, bucket: &str) -> Vec<(String, u64)> {
     let mut result: Vec<_> = value["changes"]
         .as_array()

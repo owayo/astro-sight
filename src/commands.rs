@@ -882,6 +882,7 @@ pub(crate) use review::hook::{build_review_hook_json, build_review_hook_json_for
 pub use review::{CmdReviewOpts, cmd_review, cmd_review_with_swift_protocols};
 
 mod api_changes;
+pub(crate) use api_changes::ts_const_rebinding;
 mod dead_code;
 mod dead_code_default_liveness;
 mod dead_code_member_liveness;
