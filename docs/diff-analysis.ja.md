@@ -685,6 +685,8 @@ lib crate のほかのファイルの束縛も追う (#300)。差分が、packag
 
 束縛が変わったら、シグネチャが同じでも、互換・値だけ・同じファイルの中だけ・呼び出し側が追随した変更と判定し得るときも、`unverified.reason` が `rust_signature_dependency_changed` の blocking な `api.mod` にする。束縛を解けなければ (別名の循環など) 理由は `rust_signature_dependency_unresolved`。右辺を変えた公開の別名は、別名自身と、それを名指す契約の宣言のどちらにも出す。同じ場所の `#[cfg]` の分岐は分岐ごとに比べ、`#[cfg]` で分けた同じ名前の inline module は条件を引き継ぐ。対象外: `[lib] path` で lib の crate root を変えた package、bin の target、`cfg_attr` の中の `#[path]` と `#[path]` の付いた inline module の中の `mod` (変化に触れるパスがそこを通れば解けない)、workspace のほかの crate の束縛、lib が package のディレクトリの外から `#[path]` で読むソース、enum の variant の判別値を使う配列の長さと const 引数 (`Packet as usize`)、ファイルを親から読む `mod` の宣言の条件 (`#[cfg(x)] mod m;`)、差分で変えていない構文エラーのソースを通る束縛 (変わらないとみなす)、glob からさらに glob でたどる名前、edition による識別子で始まる `use` の経路の読み方の違い (2018 以降の読み方で読む)、構文エラーのファイル。
 
+公開の `async fn` や `impl Trait` を返す関数が非公開関数を呼ぶ場合、その呼び出しは戻り値の具体型に影響し得る。たとえば `.await` をまたいで保持する値によって、Future が `Send` を実装するかが変わる。`warehouse::inventory` の `limit()` が同じモジュールの非公開関数に解決できれば、別の `landing::limit` を編集しても `inventory` は `api.mod` に載らない。
+
 ### `pub use` の後ろへ移した Rust の項目
 
 Rust の項目を別のファイルへ移し、元のファイルで `pub use` によって公開のパスを保つとき (`mod detail; pub use detail::greet;`)、旧い宣言は削除として報告しない。代わりに `api_changes` は再公開が指す宣言を解き、その場で変えた場合と同じく比べる (関数のシグネチャ、構造体・enum・union の形など)。旧いパスを使うコードを壊す変更は blocking な `api.mod` にし、互換な変更は `mod_compat` や `const_value` の区分のまま `moved` にも出し、変えずに移した項目は `added` ではなく `moved` にする。

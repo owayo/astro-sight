@@ -1,7 +1,7 @@
 //! `impl Trait` と async の戻り値に漏れる auto trait を、本体と宣言の依存から保守的に比べる。
 //!
-//! 変更された library package の宣言を名前でつなぐ過大近似であり、型や局所束縛の同一性は証明しない。
-//! 本体が参照し得る宣言が変われば、同名の候補を含めて未検証の契約変更として残す。公開面と、
+//! 変更された library package の宣言を名前でつなぐ。単純な直接呼び出しは、同じ module の
+//! 無条件の非公開関数が一意なときだけその宣言に結ぶ。ほかは同名の候補も依存に残す。公開面と、
 //! 両立しない cfg の判定は既存の証明を使う。ファイル数・読み込み量・parse の不足は申告する。
 //!
 //! glob の import は束縛名を決められない。可視性の修飾の無い glob が変える束縛は、置いた module M と
@@ -106,8 +106,10 @@ struct Snapshot {
     /// どの範囲の glob も確かめ切れない構成がある (Issue #381): 取り込むファイルを決められない構成 (`include!`、
     /// 解けない文字列のパス。どのファイルも取り込み得る) か、付く項目の無い外側の属性 (展開を確かめられない)。
     unconfined: bool,
-    /// module の範囲の印 → 子の module の範囲の印 (Issue #381)。範囲の印の変化を子孫の範囲へ伝える。
+    /// 範囲の印を子の module に伝える辺。所有元を確定できない関数の名前から局所の鍵にも伝える。
     scope_children: BTreeMap<String, BTreeSet<String>>,
+    /// module の置き場を確かめきれなかったとき、名前だけの依存に戻す自由関数。
+    local_functions: BTreeMap<(String, Vec<String>), BTreeMap<String, String>>,
 }
 
 /// 版での、ファイルの置き場とテストの module の判定。
@@ -119,14 +121,32 @@ struct FilePlacement<'t, 'v, 'a> {
     /// テストの module のスコープにある宣言は、依存の変化の起点にも伝播の中継にも入れない
     /// (`rust_dependencies/dependents.rs` と同じ約束)。置いた module が 1 つに決まるときだけ使う。
     tests: Option<&'t TestScopes<'v, 'a>>,
+    index: Option<super::rust_dependencies::File>,
 }
 
 impl<'t, 'v, 'a> FilePlacement<'t, 'v, 'a> {
     /// 版 `version` でのファイル `path` の置き場。`#[path]` もたどった木で引く。
     fn of(tests: Option<&'t TestScopes<'v, 'a>>, version: &CrateVersion<'_>, path: &str) -> Self {
+        let modules = version.tree_modules(path);
+        let index = (|| {
+            let [module] = modules.as_deref()? else {
+                return None;
+            };
+            let [placement] = version.placements().files.get(module)?.as_slice() else {
+                return None;
+            };
+            (placement.file == path
+                && placement
+                    .clauses
+                    .iter()
+                    .any(|clause| clause.attributes.as_deref() == Some(&[])))
+            .then(|| placement.index.clone())
+            .flatten()
+        })();
         Self {
-            modules: version.tree_modules(path),
+            modules,
             tests,
+            index,
         }
     }
 
@@ -143,6 +163,7 @@ impl<'t, 'v, 'a> FilePlacement<'t, 'v, 'a> {
         Self {
             modules: None,
             tests: None,
+            index: None,
         }
     }
 
@@ -394,6 +415,62 @@ fn identifiers(node: tree_sitter::Node<'_>, source: &[u8]) -> BTreeSet<String> {
         ControlFlow::Continue(Walk::Descend)
     });
     names
+}
+
+/// 関数の中で、名前の出現がすべて直接呼び出しの関数位置なら同じ module の束縛で置き換えられる。
+/// 引数・局所宣言・ほかの修飾パスにも同名があれば残す。名前を展開する use、マクロ、属性も保留する。
+fn retain_direct_calls(
+    function: tree_sitter::Node<'_>,
+    source: &[u8],
+    module: &[String],
+    candidates: &mut BTreeMap<String, String>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let definition = function.child_by_field_name("name");
+    let mut callee = None;
+    let _: ControlFlow<()> = walk_preorder(function, Children::Named, |node, _| {
+        match node.kind() {
+            "use_declaration"
+            | "macro_invocation"
+            | "macro_definition"
+            | "attribute_item"
+            | "inner_attribute_item"
+            | "extern_crate_declaration" => candidates.clear(),
+            "call_expression" => {
+                callee = super::rust_dependencies::local_callee(node, source, module)
+            }
+            "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "shorthand_field_identifier"
+                if Some(node) != callee && Some(node) != definition =>
+            {
+                if let Ok(text) = node.utf8_text(source) {
+                    let name =
+                        crate::language::normalize_identifier(crate::language::LangId::Rust, text);
+                    candidates.remove(name.as_ref());
+                } else {
+                    candidates.clear();
+                }
+            }
+            _ => {}
+        }
+        if candidates.is_empty() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(Walk::Descend)
+        }
+    });
+}
+
+fn bind_local_calls(references: &mut BTreeSet<String>, local: &BTreeMap<String, String>) {
+    for (name, key) in local {
+        if references.remove(name) {
+            references.insert(key.clone());
+        }
+    }
 }
 
 /// 関数のシグネチャの型の識別子 (引数の型・型引数・戻り値の型・where 節。Issue #381)。async の future と
@@ -1162,7 +1239,38 @@ impl Snapshot {
             }
             references.insert(imports.clone());
             references.extend(markers.iter().cloned());
-            let (bound_names, glob_scope) = if kind == "use_declaration" {
+            let mut local = BTreeMap::new();
+            let mut private_key = None;
+            if kind == "function_item"
+                && scopes
+                    .last()
+                    .is_none_or(|scope| scope.name.starts_with("mod_item:"))
+                && let (Some(index), Some([module])) = (&file.index, keys.as_deref())
+            {
+                let inline = inline_modules(&scopes);
+                let mut candidates: BTreeMap<_, _> = references
+                    .iter()
+                    .filter(|reference| index.private_function_binding(&inline, reference))
+                    .map(|name| (name.clone(), format!("@fn:{}:{name}", module.to_hex())))
+                    .collect();
+                if !candidates.is_empty()
+                    && let Some(path_in_crate) = file.scope_module(&inline)
+                {
+                    if let Some(key) = candidates.get(&name) {
+                        self.local_functions
+                            .entry((path.to_owned(), path_in_crate.clone()))
+                            .or_default()
+                            .insert(name.clone(), key.clone());
+                        private_key = Some(key.clone());
+                    }
+                    if macro_attributes.is_empty() && available.is_empty() {
+                        retain_direct_calls(node, source, &path_in_crate, &mut candidates);
+                        bind_local_calls(&mut references, &candidates);
+                        local = candidates;
+                    }
+                }
+            }
+            let (mut bound_names, glob_scope) = if kind == "use_declaration" {
                 import_bound_names(
                     node,
                     source,
@@ -1174,6 +1282,7 @@ impl Snapshot {
             } else {
                 (BTreeSet::new(), None)
             };
+            bound_names.extend(private_key);
             let start = node.start_position();
             let public = if opaque_function(node) {
                 exported.remove(&(start.row, start.column)).and_then(
@@ -1181,6 +1290,7 @@ impl Snapshot {
                         let body = node.child_by_field_name("body")?;
                         // 本体と、取り込む引数の型・囲む impl と trait の見出し (receiver の型) に依存する。
                         let mut function_references = identifiers(body, source);
+                        bind_local_calls(&mut function_references, &local);
                         function_references.extend(signature_identifiers(node, source));
                         for scope in &scopes {
                             function_references.extend(scope.header.iter().cloned());
@@ -1312,16 +1422,21 @@ impl Snapshot {
     }
 }
 
-/// module の範囲の印にした glob のうち、旧新のどちらかの版で範囲を確かめ切れないものを package 全体の印に
-/// 戻す (Issue #381)。全てのファイルを足した後に呼ぶ。`library` は旧新の lib crate (置き場は範囲の印の glob が
-/// あるときだけ引く)。
+/// 全ファイルを読んだ後、旧新の片側で置き場が不明な glob や自由関数を package 全体の名前に戻す。
 fn confine(old: &mut Snapshot, new: &mut Snapshot, library: Option<&LibraryVersions<'_>>) {
-    let globs: BTreeSet<(String, Vec<String>)> = [&*old, &*new]
+    let scopes: BTreeSet<(String, Vec<String>)> = [&*old, &*new]
         .into_iter()
-        .flat_map(|snapshot| snapshot.glob_scopes())
+        .flat_map(|snapshot| {
+            snapshot.glob_scopes().chain(
+                snapshot
+                    .local_functions
+                    .keys()
+                    .map(|(path, scope)| (path.as_str(), scope)),
+            )
+        })
         .map(|(path, scope)| (path.to_owned(), scope.clone()))
         .collect();
-    if globs.is_empty() {
+    if scopes.is_empty() {
         return;
     }
     let placements = [
@@ -1329,13 +1444,20 @@ fn confine(old: &mut Snapshot, new: &mut Snapshot, library: Option<&LibraryVersi
         library.map(|library| library.new.placements()),
     ];
     let confinable = old.confinable(placements[0]) && new.confinable(placements[1]);
-    let unconfined: BTreeSet<(String, Vec<String>)> = globs
+    let unconfined: BTreeSet<(String, Vec<String>)> = scopes
         .into_iter()
         .filter(|(path, scope)| {
             !(confinable && old.confines(path, scope) && new.confines(path, scope))
         })
         .collect();
     for snapshot in [old, new] {
+        for (scope, bindings) in std::mem::take(&mut snapshot.local_functions) {
+            if unconfined.contains(&scope) {
+                for (name, key) in bindings {
+                    snapshot.scope_children.entry(name).or_default().insert(key);
+                }
+            }
+        }
         for ((path, ..), declarations) in &mut snapshot.declarations {
             for declaration in declarations {
                 if declaration
@@ -1843,6 +1965,77 @@ mod tests {
     }
 
     #[test]
+    fn opaque_returns_resolve_private_helpers_in_their_own_module() {
+        let root = "pub mod landing;\npub mod warehouse;\n";
+        let other = "fn limit() -> u8 { 1 }\npub fn preview() -> u8 { limit() }\n";
+        let warehouse = "fn r#limit() -> u8 { 20 }\npub async fn inventory() -> u8 { limit() }\npub fn count() -> impl Copy { limit() }\npub async fn from_self() -> u8 { self::limit() }\npub async fn from_crate() -> u8 { crate::warehouse::limit() }\n";
+        let files = [
+            ("src/lib.rs", root),
+            ("src/landing.rs", other),
+            ("src/warehouse.rs", warehouse),
+        ];
+        let local_change = warehouse.replace("20", "30");
+        let unrelated_change = other.replace("1", "2");
+        for (update, expected) in [
+            (("src/landing.rs", unrelated_change.as_str()), false),
+            (("src/warehouse.rs", local_change.as_str()), true),
+        ] {
+            let api = changes(&files, &[update]);
+            for name in ["inventory", "count", "from_self", "from_crate"] {
+                assert_eq!(modified(&api, name), expected, "{name}: {api:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_returns_keep_shadowed_and_transitive_helper_calls() {
+        let root = "pub mod landing;\npub mod warehouse;\n";
+        let helper = "pub(super) async fn limit() { let held = (); std::future::pending::<()>().await; drop(held); }";
+        let api_source = r#"async fn limit() {}
+pub async fn local() { limit().await }
+pub async fn qualified() { crate::landing::limit().await }
+pub async fn alias() { use crate::landing::limit as run; run().await }
+pub async fn imported() { use crate::landing::limit; limit().await }
+pub async fn glob() { use crate::landing::*; limit().await }
+pub async fn mixed() { limit().await; crate::landing::limit().await }
+pub async fn by_macro() { macro_rules! call { () => { crate::landing::limit() }; } call!().await }
+pub mod bridge {
+    async fn limit() { crate::landing::limit().await }
+    pub async fn indirect() { limit().await }
+}
+pub mod conditional {
+    #[cfg(feature = "wide")] async fn limit() {}
+    #[cfg(not(feature = "wide"))] use crate::landing::limit;
+    pub async fn choose() { limit().await }
+}
+"#;
+        let api = changes(
+            &[
+                ("src/lib.rs", root),
+                ("src/landing.rs", helper),
+                ("src/warehouse.rs", api_source),
+            ],
+            &[(
+                "src/landing.rs",
+                &helper.replace("held = ()", "held = std::rc::Rc::new(())"),
+            )],
+        );
+        for name in [
+            "qualified",
+            "alias",
+            "imported",
+            "glob",
+            "mixed",
+            "by_macro",
+            "indirect",
+            "choose",
+        ] {
+            assert!(modified(&api, name), "{name}: {api:?}");
+        }
+        assert!(!modified(&api, "local"), "{api:?}");
+    }
+
+    #[test]
     fn opaque_returns_follow_other_file_helpers_and_async_bodies() {
         let root = "mod hidden;\npub fn produce() -> impl Copy { hidden::make() }\npub async fn future() { hidden::wait().await; }\npub fn ordinary() -> u8 { hidden::plain() }\n";
         let before = "type Hidden = ();\npub fn make() -> Hidden { Hidden::default() }\npub async fn wait() { let held = (); std::future::ready(()).await; drop(held); }\npub fn plain() -> u8 { 0 }\n";
@@ -1942,6 +2135,7 @@ mod tests {
         let placement = FilePlacement {
             modules: Some(vec![Vec::new()]),
             tests: None,
+            index: None,
         };
         let mut old = Snapshot::default();
         let mut new = Snapshot::default();
