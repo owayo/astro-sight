@@ -377,6 +377,8 @@ impl OptionalRemovalCache {
 pub(super) enum UseRule<'a> {
     /// 直接呼び出しで、実引数の個数が上限以下 (末尾の省略可能引数の削除)。
     CallArity(usize),
+    /// 直接呼び出しを await して残るキーを読む利用。
+    AwaitedProperty(&'a HashSet<String>),
     /// JSX 要素と、`calls_allowed` のときだけ object リテラル 1 個の直接呼び出しで、
     /// `removed` のどのキーも渡していない (省略可能 props の削除)。
     PropsWithout {
@@ -950,6 +952,27 @@ fn prove_file(
             return None;
         }
         match rule {
+            UseRule::AwaitedProperty(retained) => {
+                direct_call_arity(node)?;
+                let value = node.parent()?.parent()?;
+                if value.kind() != "await_expression" {
+                    return None;
+                }
+                let group = value.parent()?;
+                let member = group.parent()?;
+                if group.kind() != "parenthesized_expression"
+                    || member.kind() != "member_expression"
+                    || member.child_by_field_name("object")?.id() != group.id()
+                    || !retained.contains(
+                        member
+                            .child_by_field_name("property")?
+                            .utf8_text(source)
+                            .ok()?,
+                    )
+                {
+                    return None;
+                }
+            }
             UseRule::CallArity(arity) => {
                 if direct_call_arity(node)? > arity {
                     return None;

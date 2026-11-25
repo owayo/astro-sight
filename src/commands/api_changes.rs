@@ -457,7 +457,21 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         })
         .collect();
 
-    let type_dependency_symbols = type_dependency_symbols::collect(&inputs, &buckets.modified);
+    let dependencies = type_dependency_symbols::by_path(&inputs);
+    let type_dependency_symbols = type_dependency_symbols::collect(
+        &dependencies,
+        buckets
+            .modified
+            .iter()
+            .map(|change| (&change.file, &change.name))
+            .chain(
+                buckets
+                    .compatible_modified
+                    .iter()
+                    .filter(|change| change.reason == "optional_return_properties_removed")
+                    .map(|change| (&change.file, &change.name)),
+            ),
+    );
     fill_modification_diagnostics(&mut buckets.modified);
     let added_reference_summary = added_reference_summary::collect(
         &buckets.added_reference_candidates,
@@ -521,7 +535,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
                 })
         },
     );
-    attach_syntax_evidence(&mut api, dir, base_blobs, diff_files);
+    attach_syntax_evidence(&mut api, dir, base_blobs, diff_files, &dependencies);
     api
 }
 
@@ -530,6 +544,7 @@ fn attach_syntax_evidence(
     dir: &str,
     blobs: &super::git_input::GitBlobBatch,
     diff_files: &[crate::models::impact::DiffFile],
+    dependencies: &std::collections::BTreeMap<&str, &ts_signature::DependencyChanges>,
 ) {
     use crate::engine::change_evidence::ChangeEvidenceIndex;
     let paths: std::collections::BTreeSet<_> = api
@@ -571,6 +586,20 @@ fn attach_syntax_evidence(
                 Some(ChangeEvidenceIndex::from_sources(&old, &new, lang))
             })
             .unwrap_or_else(ChangeEvidenceIndex::unavailable);
+        let evidence_for = |name: &str, kind: &str| {
+            let mut evidence = lang.map_or_else(
+                || {
+                    crate::models::change_evidence::ChangeEvidence::unknown(
+                        crate::models::change_evidence::ChangeUnknownReason::UnsupportedLanguage,
+                    )
+                },
+                |lang| index.get(name, kind, lang),
+            );
+            if let Some(types) = dependencies.get(path.as_str()) {
+                types.annotate(name, &mut evidence);
+            }
+            evidence
+        };
         for change in api
             .modified
             .iter_mut()
@@ -588,28 +617,14 @@ fn attach_syntax_evidence(
             )
             .filter(|change| change.file == path)
         {
-            change.change_evidence = Some(lang.map_or_else(
-                || {
-                    crate::models::change_evidence::ChangeEvidence::unknown(
-                        crate::models::change_evidence::ChangeUnknownReason::UnsupportedLanguage,
-                    )
-                },
-                |lang| index.get(&change.name, &change.kind, lang),
-            ));
+            change.change_evidence = Some(evidence_for(&change.name, &change.kind));
         }
         for change in api
             .compatible_modified
             .iter_mut()
             .filter(|change| change.file == path)
         {
-            change.change_evidence = Some(lang.map_or_else(
-                || {
-                    crate::models::change_evidence::ChangeEvidence::unknown(
-                        crate::models::change_evidence::ChangeUnknownReason::UnsupportedLanguage,
-                    )
-                },
-                |lang| index.get(&change.name, &change.kind, lang),
-            ));
+            change.change_evidence = Some(evidence_for(&change.name, &change.kind));
         }
     }
 }

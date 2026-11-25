@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::models::change_evidence::{ChangeEvidence, ChangedPart};
 use tree_sitter::Node;
 
 use super::super::signature_tokens::{SigTokens, signature_tokens_in_range};
@@ -20,11 +21,18 @@ pub(crate) enum DependencyStatus {
 #[derive(Default)]
 pub(crate) struct DependencyChanges {
     statuses: BTreeMap<String, DependencyStatus>,
+    positions: BTreeMap<String, BTreeSet<ChangedPart>>,
     old_references: BTreeMap<String, Option<Vec<Reference>>>,
     new_references: BTreeMap<String, Option<Vec<Reference>>>,
 }
 
 impl DependencyChanges {
+    pub(crate) fn annotate(&self, name: &str, evidence: &mut ChangeEvidence) {
+        if let Some(parts) = self.positions.get(name) {
+            evidence.add_type_parts(parts.iter().copied());
+        }
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&DependencyStatus> {
         self.statuses.get(name)
     }
@@ -42,6 +50,7 @@ impl DependencyChanges {
 #[derive(Clone, Default)]
 struct References {
     names: BTreeSet<Reference>,
+    positions: BTreeSet<(ChangedPart, Reference)>,
     unknown: bool,
 }
 
@@ -56,6 +65,7 @@ impl References {
     fn extend(&mut self, other: Self) {
         self.unknown |= other.unknown;
         self.names.extend(other.names);
+        self.positions.extend(other.positions);
     }
 }
 
@@ -102,7 +112,23 @@ fn header_references(node: Node<'_>, source: &[u8], outer: &[String]) -> Referen
     let mut references = References::default();
     for field in ["type_parameters", "parameters", "return_type", "type"] {
         if let Some(root) = node.child_by_field_name(field) {
-            references.add(root, source, &names);
+            let mut section = References::default();
+            section.add(root, source, &names);
+            let part = match field {
+                "parameters" => Some(ChangedPart::ParamAnnotation),
+                "return_type" => Some(ChangedPart::ReturnAnnotation),
+                _ => None,
+            };
+            if let Some(part) = part {
+                references.positions.extend(
+                    section
+                        .names
+                        .iter()
+                        .cloned()
+                        .map(|reference| (part, reference)),
+                );
+            }
+            references.extend(section);
         }
     }
     references
@@ -444,6 +470,7 @@ impl DependencySnapshot {
                 }
             }
         }
+        let mut positions = BTreeMap::new();
         let statuses = new
             .declarations
             .iter()
@@ -464,6 +491,17 @@ impl DependencySnapshot {
                 for reference in refs {
                     if changed.contains(&reference.name) {
                         status = DependencyStatus::Changed;
+                        let mut parts = BTreeSet::from([ChangedPart::ReferencedType]);
+                        if let Some(previous) = previous {
+                            parts.extend(
+                                previous
+                                    .positions
+                                    .intersection(&references.positions)
+                                    .filter(|(_, reference)| changed.contains(&reference.name))
+                                    .map(|(part, _)| *part),
+                            );
+                        }
+                        positions.insert(name.clone(), parts);
                         break;
                     }
                     if reference.member.is_some()
@@ -489,6 +527,7 @@ impl DependencySnapshot {
         };
         DependencyChanges {
             statuses,
+            positions,
             old_references: proof_references(self),
             new_references: proof_references(new),
         }

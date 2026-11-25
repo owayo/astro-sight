@@ -48,6 +48,20 @@ pub enum ChangeUnknownReason {
 }
 
 impl ChangeEvidence {
+    /// 構文比較に成功した宣言へ、別途確かめた型依存の変更箇所を加える。
+    pub(crate) fn add_type_parts(&mut self, parts: impl IntoIterator<Item = ChangedPart>) {
+        if self.analysis != ChangeAnalysis::Known {
+            return;
+        }
+        let was_empty = self.changed_parts.is_empty();
+        self.changed_parts.extend(parts);
+        self.changed_parts.sort_unstable();
+        self.changed_parts.dedup();
+        if was_empty && !self.changed_parts.is_empty() {
+            self.annotation_only = Some(true);
+        }
+    }
+
     pub(crate) fn unknown(reason: ChangeUnknownReason) -> Self {
         Self {
             analysis: ChangeAnalysis::Unknown,

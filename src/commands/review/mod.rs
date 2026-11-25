@@ -362,6 +362,7 @@ fn review_attempt_with_swift_protocols(
         };
         service.analyze_context(&diff_input, analysis_dir, &context_options)
     })?;
+    attach_contract_evidence(&api_changes, &mut impact);
     if matches!(new_side, crate::models::impact::DiffNewSide::Index) && snapshot.is_none() {
         invalidate_staged_syntax_evidence(&mut api_changes, &mut impact);
     }
@@ -642,6 +643,57 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
         change.unverified = None;
     }
     super::api_changes::fill_modification_diagnostics(&mut api.modified);
+}
+
+/// API で特定した型依存を、同じ宣言に由来する impact の根拠にも載せる。
+fn attach_contract_evidence(api: &ApiChanges, impact: &mut crate::models::impact::ContextResult) {
+    use crate::models::change_evidence::{ChangeAnalysis, ChangedPart};
+    if api.type_dependency_symbols.is_empty() {
+        return;
+    }
+    let evidence: std::collections::BTreeMap<_, _> = api
+        .modified
+        .iter()
+        .map(|change| {
+            (
+                &change.file,
+                &change.name,
+                &change.kind,
+                &change.change_evidence,
+            )
+        })
+        .chain(api.compatible_modified.iter().map(|change| {
+            (
+                &change.file,
+                &change.name,
+                &change.kind,
+                &change.change_evidence,
+            )
+        }))
+        .filter_map(|(path, name, kind, evidence)| {
+            let evidence = evidence.as_ref()?;
+            (evidence.analysis == ChangeAnalysis::Known
+                && api.type_dependency_symbols.get(path)?.contains(name))
+            .then_some(((path, name, kind), evidence))
+        })
+        .collect();
+    for file in &mut impact.changes {
+        for symbol in &mut file.affected_symbols {
+            if let Some(current) = &mut symbol.change_evidence
+                && current.analysis == ChangeAnalysis::Known
+                && let Some(contract) = evidence.get(&(&file.path, &symbol.name, &symbol.kind))
+            {
+                current.add_type_parts(contract.changed_parts.iter().copied().filter(|part| {
+                    matches!(
+                        part,
+                        ChangedPart::ParamAnnotation
+                            | ChangedPart::ReturnAnnotation
+                            | ChangedPart::ReferencedType
+                    )
+                }));
+            }
+        }
+    }
 }
 
 fn invalidate_staged_syntax_evidence(

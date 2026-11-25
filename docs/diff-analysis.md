@@ -19,11 +19,13 @@ Unknown or known-empty syntax evidence remains in normal JSON and alongside exis
 | `params` | Remaining parameter tokens: names, order, patterns, optional/rest markers and separators |
 | `default_value` | Parameter default expression and `=` |
 | `visibility` | Explicit declaration visibility/export tokens |
-| `referenced_type` | Variable/constant declaration's explicit type annotation |
+| `referenced_type` | Variable/constant declaration's explicit type annotation, or a changed same-file type dependency in TypeScript review |
 | `initializer` | Variable/constant initializer expression |
 | `body` | Function body tokens, including nested code |
 | `decorator` | Python decorators and Rust declaration attributes |
 | `other_declaration` | All remaining declaration tokens, including qualifiers and binding kind |
+
+When TypeScript review traces a changed type to a parameter or return annotation, it reports `referenced_type` together with `param_annotation` or `return_annotation`. For a private object alias used only in `Promise<Alias | undefined>`, `optional_return_properties_removed` identifies a proven removal of optional properties. The proof covers changes confined to the declaring file. It checks that the unchanged function returns `Promise.resolve` with a literal containing retained keys or `undefined`, and that every caller directly awaits the result and accesses a retained scalar property. Reading a removed key or passing the whole result elsewhere keeps the change blocking.
 
 Whitespace/comments are ignored; literal contents are retained. `annotation_only` is true only for a nonempty change entirely within the three annotation/type parts. `call_shape_unchanged` compares source parameter syntax (including default expressions), ignoring annotations/body. It is not type checking or a runtime compatibility guarantee. Decorators/attributes, other changed declaration tokens, and noncallable declarations yield `null`; even unchanged decorators can transform a callable. Parameter/default syntax changes yield false. With `analysis: "unknown"`, both booleans are explicitly `null`, and `unknown_reason` is `source_unavailable`, `parse_error`, `unsupported_language`, `unsupported_declaration_kind`, `unsupported_syntax`, `declaration_pairing_ambiguous`, `declaration_pairing_unavailable`, or `resource_limit`. Each source is limited to 1 MiB for this additional AST comparison; exceeding it returns explicit `resource_limit` without changing existing analysis. Empty unknown `changed_parts` does not prove no change.
 

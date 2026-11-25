@@ -283,7 +283,7 @@ fn simple_type_at(
     (!atoms.is_empty()).then_some(atoms)
 }
 
-fn generic_argument<'t>(ty: Node<'t>, source: &[u8], name: &str) -> Option<Node<'t>> {
+pub(super) fn generic_argument<'t>(ty: Node<'t>, source: &[u8], name: &str) -> Option<Node<'t>> {
     (ty.kind() == "generic_type"
         && ty.child_by_field_name("name")?.kind() == "type_identifier"
         && ty.child_by_field_name("name")?.utf8_text(source).ok() == Some(name))
@@ -2499,7 +2499,7 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 /// コメントを除いた名前付きの子がちょうど 1 つなら、その子。
-fn only_named_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn only_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     let mut children = node
         .named_children(&mut cursor)
