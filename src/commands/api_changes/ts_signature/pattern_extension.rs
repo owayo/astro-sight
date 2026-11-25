@@ -276,6 +276,22 @@ fn scalar_type_matches(
     })
 }
 
+/// 呼び出しのリテラル (値のない JSX 属性は true) が、宣言側の型のいずれかの枝に合うか。
+pub(super) fn caller_literal_matches(
+    value: Option<Node<'_>>,
+    source: &[u8],
+    ty: Node<'_>,
+    type_source: &[u8],
+) -> bool {
+    if value.is_some_and(|node| !inert_literal(node, source)) {
+        return false;
+    }
+    ts_union_type_parts(ty).into_iter().any(|part| match value {
+        Some(value) => scalar_type_matches(value, source, part, type_source) == Some(true),
+        None => matches!(part.utf8_text(type_source).ok(), Some("boolean" | "true")),
+    })
+}
+
 fn default_matches_type(
     value: Node<'_>,
     ty: Node<'_>,

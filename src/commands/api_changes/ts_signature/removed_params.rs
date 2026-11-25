@@ -87,7 +87,7 @@ fn read_source(path: &Path) -> Option<(RemovalFile, usize)> {
     if !matches!(lang, LangId::Typescript | LangId::Tsx | LangId::Javascript) {
         return None;
     }
-    let nodes = checked_nodes(tree.root_node())?.len();
+    let nodes = visit_proof_nodes(tree.root_node(), |_| {})?;
     Some((RemovalFile { source, tree, lang }, nodes))
 }
 
@@ -375,6 +375,7 @@ impl OptionalRemovalCache {
 /// 対象の名前の出現 1 つを、利用として証明する規則。
 #[derive(Clone, Copy)]
 pub(super) enum UseRule<'a> {
+    AddedProps(&'a super::added_props::AddedPropUses<'a>),
     /// 直接呼び出しで、実引数の個数が上限以下 (末尾の省略可能引数の削除)。
     CallArity(usize),
     /// 直接呼び出しを await して残るキーを読む利用。
@@ -414,7 +415,7 @@ pub(super) fn prove_repository_uses(
             &mut proven_positions,
         )?;
     }
-    if uses == 0
+    if (uses == 0 && !matches!(rule, UseRule::AddedProps(_)))
         || refs.iter().any(|reference| {
             !proven_positions.contains(&(
                 normalize_workspace_separators(&reference.path),
@@ -468,23 +469,57 @@ pub(crate) fn detect_trailing_optional_params_removed_compatible_mod(
 }
 
 pub(super) fn checked_nodes(root: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut nodes = Vec::new();
+    visit_proof_nodes(root, |node| nodes.push(node))?;
+    Some(nodes)
+}
+
+/// union は結合順によらず各枝を同じ深さで調べる。文字列リテラル型の枝は原文を持つ string
+/// 1 個で足りる。型参照・コメント・式を含む枝は通常どおり検査する。
+fn visit_proof_nodes<'tree>(
+    root: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) -> Option<usize> {
     if root.has_error() {
         return None;
     }
-    let mut result = Vec::new();
-    let mut stack = vec![(root, 0)];
-    while let Some((node, depth)) = stack.pop() {
-        if depth > MAX_DEPTH || result.len() >= MAX_NODES || node.is_missing() || node.is_error() {
-            return None;
-        }
-        result.push(node);
-        if node.child_count() as usize > MAX_NODES {
+    let mut count = 0;
+    let mut stack = vec![(root, 0, false)];
+    while let Some((node, depth, union_branch)) = stack.pop() {
+        if depth > MAX_DEPTH
+            || node.child_count() as usize > MAX_NODES
+            || node.is_missing()
+            || node.is_error()
+        {
             return None;
         }
         let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor).map(|child| (child, depth + 1)));
+        if node.kind() == "union_type" {
+            stack.extend(
+                node.named_children(&mut cursor)
+                    .map(|branch| (branch, depth, true)),
+            );
+            continue;
+        }
+        if count == MAX_NODES {
+            return None;
+        }
+        count += 1;
+        if union_branch
+            && node.kind() == "literal_type"
+            && node.child_count() == 1
+            && let Some(string) = node.named_child(0).filter(|inner| inner.kind() == "string")
+        {
+            visit(string);
+        } else {
+            visit(node);
+            stack.extend(
+                node.children(&mut cursor)
+                    .map(|child| (child, depth + 1, false)),
+            );
+        }
     }
-    Some(result)
+    Some(count)
 }
 
 /// `name` を束縛する構文の列。`collect_bindings_named` は `name` フィールドを持つノードを広く
@@ -754,7 +789,15 @@ fn prove_file(
     let root = file.tree.root_node();
     let source = &file.source;
     let nodes = checked_nodes(root)?;
-    let props_rule = matches!(rule, UseRule::PropsWithout { .. });
+    let props_rule = matches!(rule, UseRule::PropsWithout { .. } | UseRule::AddedProps(_));
+    // 追加キーが受理されると、従来の診断を抑える指示自体が未使用になり得る。
+    let expects_error = matches!(rule, UseRule::AddedProps(_))
+        && nodes.iter().any(|node| {
+            node.kind() == "comment"
+                && node
+                    .utf8_text(source)
+                    .is_ok_and(|text| text.contains("@ts-expect-error"))
+        });
     // JSX の名前空間を作る・公開するファイルは、別名の公開や runtime の差し替えを通して、
     // 属性を書かない要素の型検査も変え得る。
     if props_rule && declares_jsx_name(root, source) {
@@ -794,6 +837,11 @@ fn prove_file(
                     None => None,
                     Some(specifier) => match dependency_target(specifier, source, path, paths) {
                         Some(resolved) => Some(resolved),
+                        None if matches!(rule, UseRule::AddedProps(props) if props.audited_react)
+                            && static_specifier(specifier, source) == Some("react") =>
+                        {
+                            None
+                        }
                         // registry の依存から、対象と別の名前だけを束縛する named import は、
                         // 対象を運ばない (Issue #175 の輸送の監査と同じ構文上の規則)。ワークスペース
                         // や `file:` の依存は、node_modules の中から対象を別名で再 export し得る。
@@ -901,14 +949,16 @@ fn prove_file(
     {
         return Some(0);
     }
-    let bindings = bindings_named(root, source, name);
-    let declaration_name = if path == target {
+    let declaration_name = if path == target && matches!(rule, UseRule::AddedProps(_)) {
+        None
+    } else if path == target {
         // 宣言の契約 (戻り値型の要否を含む) は判定器が旧新のソースで確かめ済み。
         unique_function_declaration(root, source, name)?
             .0
             .child_by_field_name("name")
             .map(|node| node.id())
     } else {
+        let bindings = bindings_named(root, source, name);
         if !bindings.is_empty()
             && (import_names.len() != 1
                 || bindings.iter().any(|binding| {
@@ -933,7 +983,13 @@ fn prove_file(
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
                 | "statement_identifier"
-        ) || node.utf8_text(source).ok()? != name
+        ) {
+            continue;
+        }
+        let spelling = node.utf8_text(source).ok()?;
+        if spelling != name
+            && !(path == target
+                && matches!(rule, UseRule::AddedProps(props) if props.matches_inner_name(spelling, node)))
         {
             continue;
         }
@@ -942,7 +998,11 @@ fn prove_file(
         }
         let position = node.start_position();
         positions.insert((path.to_string(), position.row, position.column));
-        if declaration_name == Some(node.id()) || import_names.contains(&node.id()) {
+        if declaration_name == Some(node.id())
+            || import_names.contains(&node.id())
+            || (path == target
+                && matches!(rule, UseRule::AddedProps(props) if props.is_declaration(node)))
+        {
             continue;
         }
         if path != target && import_names.is_empty() {
@@ -952,6 +1012,11 @@ fn prove_file(
             return None;
         }
         match rule {
+            UseRule::AddedProps(props) => {
+                if expects_error || !props.accepts(node, source) {
+                    return None;
+                }
+            }
             UseRule::AwaitedProperty(retained) => {
                 direct_call_arity(node)?;
                 let value = node.parent()?.parent()?;
@@ -1044,6 +1109,14 @@ fn object_argument_omits(identifier: Node<'_>, source: &[u8], removed: &HashSet<
 }
 
 pub(super) fn object_omits(object: Node<'_>, source: &[u8], removed: &HashSet<String>) -> bool {
+    object_properties_match(object, source, |key, _| !removed.contains(key))
+}
+
+pub(super) fn object_properties_match<'tree>(
+    object: Node<'tree>,
+    source: &[u8],
+    mut accepts: impl FnMut(&str, Node<'tree>) -> bool,
+) -> bool {
     if object.kind() != "object" {
         return false;
     }
@@ -1059,7 +1132,7 @@ pub(super) fn object_omits(object: Node<'_>, source: &[u8], removed: &HashSet<St
             _ => return false,
         };
         key.utf8_text(source)
-            .is_ok_and(|text| !text.contains('\\') && !removed.contains(text))
+            .is_ok_and(|text| !text.contains('\\') && accepts(text, entry))
     })
 }
 
@@ -1096,6 +1169,33 @@ pub(super) fn escaped_identifier(node: Node<'_>, source: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_union_proof_nodes_preserve_nonliteral_branches_and_depth_limits() {
+        let branches = " | 'value'".repeat(MAX_DEPTH * 2);
+        let source = format!("type Input = typeof save /* observed */{branches};");
+        let parse = |text: &str| parser::parse_source(text.as_bytes(), LangId::Typescript).unwrap();
+        let tree = parse(&source);
+        let nodes = checked_nodes(tree.root_node()).unwrap();
+        for (kind, text) in [
+            ("identifier", "save"),
+            ("comment", "/* observed */"),
+            ("string", "'value'"),
+        ] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| n.kind() == kind && n.utf8_text(source.as_bytes()).ok() == Some(text))
+            );
+        }
+        let nested = format!(
+            "type Input = {}string{};",
+            "(".repeat(MAX_DEPTH),
+            ")".repeat(MAX_DEPTH)
+        );
+        assert!(checked_nodes(parse(&nested).root_node()).is_none());
+        assert!(checked_nodes(parse("type Broken = 'a' | ;").root_node()).is_none());
+    }
 
     #[test]
     fn optional_removal_requires_unique_explicit_declaration_contract() {

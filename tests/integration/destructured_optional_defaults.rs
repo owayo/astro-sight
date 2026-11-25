@@ -56,6 +56,177 @@ fn compatible(result: &serde_json::Value) -> bool {
 }
 
 #[test]
+fn optional_prop_additions_check_each_caller_in_the_reviewed_snapshot() {
+    let before = "export function Panel({ label }: { label: string }) { return <p>{label}</p>; }\n";
+    let after = before.replace(
+        "{ label: string }",
+        "{ label: string; tone?: 'plain' | 'muted' }",
+    );
+    for (old_call, new_call, safe) in [
+        ("<Panel {...props} />", "<Panel {...props} />", false),
+        ("Panel(props)", "Panel(props)", false),
+        ("Panel({ ...props })", "Panel({ ...props })", false),
+        ("Panel", "Panel", false),
+        (
+            "(\n// @ts-expect-error\nPanel({ label: 'a', tone: 'plain' }))",
+            "(\n// @ts-expect-error\nPanel({ label: 'a', tone: 'plain' }))",
+            false,
+        ),
+        ("Panel(props)", "Panel({ ...props, label: 'b' })", false),
+        (
+            "Panel({ label: 'a' })",
+            "Panel({ label: 'b', tone: 1 })",
+            false,
+        ),
+        (
+            "Panel({ label: 'a' })",
+            "Panel({ label: 'b', tone: 'plain' })",
+            true,
+        ),
+        ("<Panel label='a' />", "<Panel label='a' />", true),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("panel.tsx", before);
+        let caller = |call: &str| {
+            format!(
+                "import {{ Panel }} from './panel';\nconst props = {{ label: 'a', tone: 123 }};\n{call};\n"
+            )
+        };
+        repo.write("home.tsx", caller(old_call));
+        repo.commit_all("base");
+        repo.write("panel.tsx", &after);
+        repo.write("home.tsx", caller(new_call));
+        repo.stage_all();
+        for staged in [false, true] {
+            if staged {
+                repo.write(
+                    "home.tsx",
+                    caller(if safe {
+                        "Panel(props)"
+                    } else {
+                        "<Panel label='a' />"
+                    }),
+                );
+            }
+            let (output, result) = run_review(&repo, staged);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!safe)),
+                "{new_call}/{staged}: {result}"
+            );
+            assert_eq!(compatible(&result), safe, "{new_call}: {result}");
+            assert_eq!(
+                result["api"]["mod"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|item| item["n"] == "Panel"),
+                !safe,
+                "{new_call}: {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn optional_prop_additions_check_defaults_and_this_parameter_positions() {
+    for (parameter, call, safe) in [
+        ("p: { label: string } = props", "Panel()", false),
+        ("p: { label: string } | string", "Panel('old')", true),
+        ("p: { label: string } | null", "Panel(null)", true),
+        ("p: { label: string } = { label: 'x' }", "Panel()", true),
+        ("this: void, p: { label: string }", "Panel(props)", false),
+        (
+            "this: void, p: { label: string }",
+            "Panel({label:'x'})",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let declaration = |param: &str| {
+            format!(
+                "const props = {{ label: 'x', tone: 123 }};\nexport function Panel({param}) {{ return 0; }}\n"
+            )
+        };
+        repo.write("panel.ts", declaration(parameter));
+        repo.write("home.ts", format!("import {{ Panel }} from './panel';\nconst props = {{ label: 'x', tone: 123 }};\nexport const home = {call};\n"));
+        repo.commit_all("base");
+        repo.write(
+            "panel.ts",
+            declaration(&parameter.replace("label: string", "label: string; tone?: string")),
+        );
+        let (output, result) = run_review(&repo, false);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!safe)),
+            "{parameter}/{call}: {result}"
+        );
+        assert_eq!(compatible(&result), safe, "{result}");
+    }
+}
+
+#[test]
+fn optional_prop_additions_account_for_inherited_keys() {
+    for (key, globals, safe) in [
+        ("tone", "", true),
+        ("toString", "", false),
+        ("tone", "interface Object { tone: number }", false),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let before = "export function Panel(p: { label: string }) { return p.label; }\n";
+        repo.write("panel.ts", before);
+        repo.write("globals.d.ts", globals);
+        repo.write(
+            "home.ts",
+            "import { Panel } from './panel';\nPanel({ label: 'x' });\n",
+        );
+        repo.commit_all("base");
+        repo.write(
+            "panel.ts",
+            before.replace("label: string", &format!("label: string; {key}?: string")),
+        );
+        let (output, result) = run_review(&repo, false);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!safe)),
+            "{key}/{globals}: {result}"
+        );
+        assert_eq!(compatible(&result), safe, "{result}");
+    }
+}
+
+#[test]
+fn optional_prop_additions_check_named_function_expression_recursion() {
+    for (argument, safe) in [("bad", false), ("{label:'x'}", true)] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let before = format!(
+            "const bad = {{label:'x',tone:1}};\nexport const Panel = function inner(p: {{label:string}}): number {{ return p.label==='x'?1:inner({argument}); }};\n"
+        );
+        repo.write("panel.ts", &before);
+        repo.write(
+            "home.ts",
+            "import { Panel } from './panel';\nPanel({label:'x'});\n",
+        );
+        repo.commit_all("base");
+        repo.write(
+            "panel.ts",
+            before.replace("label:string", "label:string;tone?:string"),
+        );
+        let (output, result) = run_review(&repo, false);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!safe)),
+            "{argument}: {result}"
+        );
+        assert_eq!(compatible(&result), safe, "{result}");
+    }
+}
+
+#[test]
 fn unannotated_object_parameters_report_inferred_contract_changes() {
     for (extension, before, after, argument, changes) in [
         (

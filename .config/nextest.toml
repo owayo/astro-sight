@@ -10,7 +10,7 @@ slow-timeout = { period = "60s" }
 
 # TS の分割代入引数で型・束縛・整形の違いを作業ツリーと index から検査する。
 [[profile.default.overrides]]
-filter = 'test(=integration::destructured_optional_defaults::unannotated_object_parameters_report_inferred_contract_changes)'
+filter = 'test(=integration::destructured_optional_defaults::unannotated_object_parameters_report_inferred_contract_changes) | test(integration::destructured_optional_defaults::optional_prop_additions_check_)'
 priority = 50
 threads-required = 2
 
@@ -89,7 +89,7 @@ threads-required = 2
 # 数万段の入れ子を解析するストレステスト。ほかのテストと違って CPU を長く使い、各コマンドに 300 秒の期限がある。
 # 最初に始めて最後まで残らないようにし、2 スレッド分を割り当てて CPU の取り合いを減らす
 [[profile.default.overrides]]
-filter = 'binary_id(astro-sight::integration) & (test(=integration::deep_nesting::rust_impact_proofs_handle_deep_nesting) | test(=integration::deep_nesting::rust_visibility_paths_handle_deep_nesting))'
+filter = 'binary_id(astro-sight::integration) & (test(=integration::deep_nesting::rust_impact_proofs_handle_deep_nesting) | test(=integration::deep_nesting::rust_visibility_paths_handle_deep_nesting) | test(=integration::deep_nesting::api_optional_object_extension_handles_deep_union))'
 priority = 100
 threads-required = 2
 
