@@ -100,12 +100,14 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
         { "name": "extract_symbols", "old_signature": "fn extract_symbols(...)", "new_signature": "fn extract_symbols(..., include_refs: bool)" }
       ],
       "impacted_callers": [
-        { "path": "src/commands.rs", "name": "cmd_symbols", "line": 166 }
+        { "path": "src/commands.rs", "name": "cmd_symbols", "line": 166, "symbols": ["extract_symbols"] }
       ]
     }
   ]
 }
 ```
+
+名前のある関数・メソッド内の呼び出しでは、`name` に呼び出し元の名前、`symbols` にその行が参照する変更シンボルが入る。たとえば Python の `plain()` が `total(1)` を呼ぶと、`name` は `"plain"`、`symbols` は `["total"]` になる。モジュール直下など、囲む呼び出し元がない行では変更シンボルの名前を使う。同じ行にある2つの関数がそれぞれ影響を受ける場合、`name` はその項目に最初に記録した参照を囲む関数名になり、`symbols` には両方の変更シンボルが入る。
 
 Rust の `affected_symbols[].kind` は、impl ヘッダの変更・メソッドのない impl の追加・メソッド宣言を削除した可能性のある差分では `impl` になる。行削除を伴わないメソッド追加はメソッドだけを報告し、所有型の宣言変更としては報告しない。削除行がある場合は変更後の構文木だけではメソッド削除を否定できないため、`impl` の記録を残す。属性だけの変更もメソッドシンボルの範囲外なので `impl` として残す。`symbols` コマンドには、メソッドの所有元を解決するための impl owner を引き続き含める。
 

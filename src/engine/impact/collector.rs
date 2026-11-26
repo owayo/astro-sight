@@ -3,8 +3,7 @@
 //! - `WorkerState`: rayon fold の local state。chunk 内で再利用され、chunk 終了時に
 //!   merge → drop される。
 //! - `RefEventMini`: 1 件の reference event を最小サイズで保持する内部 struct。
-//!   `on_ref` 時点で import 判定と caller_name intern まで済ませておき、context の
-//!   文字列コピーを廃して per-file バッファの heap を削減する。
+//!   import 判定や呼び出し元の名前をフラグ・ID で持ち、参照行の文字列を複製しない。
 //! - `ImpactCollector`: `refs::RefVisitor` を実装し、per-file visit の callback を
 //!   直接受け取って `finish_file` で参照位置ごとのフィルタを適用する。
 use lru::LruCache;
@@ -22,7 +21,7 @@ use super::import_facts::{
     rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
     should_route_ts_importless_ref_low,
 };
-use super::signature::{extract_function_from_context, same_top_level_arity};
+use super::signature::same_top_level_arity;
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
 use super::{FileContext, ParsedFile, ci_key, filters, lang_compat_group};
@@ -50,7 +49,7 @@ pub(super) struct WorkerState {
 
 /// 1 件の reference event を最小サイズで表現する。
 ///
-/// `on_ref` 時点で import 判定と caller_name 抽出・intern まで済ませておき、
+/// import 判定と、構文木から引いた呼び出し元名をフラグ・ID で持ち、
 /// `context` 文字列自体は保持しない（per-file buffer の heap を劇的に削減）。
 /// sym_ix / line / column / caller_name_id / is_import_flag / confidence の計 24 B 構造体 + 1 bit + 1 byte。
 pub(super) struct RefEventMini {
@@ -58,6 +57,7 @@ pub(super) struct RefEventMini {
     pub(super) sym_ix: u32,
     pub(super) line: u32,
     pub(super) column: u32,
+    /// 名前付きの関数の外では u32::MAX。出力時に変更シンボル名を使う。
     pub(super) caller_name_id: u32,
     pub(super) is_import: bool,
     pub(super) rust_alias_import_used: bool,
@@ -484,6 +484,24 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
     fn on_ref(&mut self, event: refs::RefVisitEvent<'_>) {
         self.collect_ref(event, None);
     }
+
+    fn finish_tree(&mut self, root: tree_sitter::Node<'_>, source: &[u8], lang: LangId) {
+        if self.ref_events.is_empty() {
+            return;
+        }
+        let callers = crate::engine::calls::EnclosingCallers::collect(root, source, lang);
+        let mut ids = HashMap::new();
+        for event in self.ref_events.iter_mut() {
+            if let Some(name) = callers.at(event.line as usize, event.column as usize) {
+                event.caller_name_id = *ids.entry(name).or_insert_with(|| {
+                    self.pool
+                        .lock()
+                        .expect("string pool mutex poisoned")
+                        .intern(name)
+                });
+            }
+        }
+    }
 }
 
 impl ImpactCollector<'_> {
@@ -593,15 +611,6 @@ impl ImpactCollector<'_> {
                             .is_some_and(|name| name.id() == node.id())
                 })
             });
-        let caller_name_fallback = || self.all_symbol_names.get(ix).cloned().unwrap_or_default();
-        let caller_name =
-            extract_function_from_context(context).unwrap_or_else(caller_name_fallback);
-        let caller_name_id = self
-            .pool
-            .lock()
-            .expect("string pool mutex poisoned")
-            .intern(&caller_name);
-
         // 対象のオブジェクトが無い参照では AST の追加走査も文字列確保もしない。
         let member_path = if self.ref_lang.is_some_and(lang_is_ts_family)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
@@ -1146,7 +1155,7 @@ impl ImpactCollector<'_> {
             sym_ix,
             line: line as u32,
             column: column as u32,
-            caller_name_id,
+            caller_name_id: u32::MAX,
             is_import,
             rust_alias_import_used,
             confidence: confidence_u8,
@@ -1454,7 +1463,7 @@ impl<'a> ImpactCollector<'a> {
         collector.def_events.sort_unstable();
 
         // References: 1 件ずつ参照位置ごとの filter を適用し local_maps へ流す。
-        // Stage 6 (import 判定) と caller_name の抽出は on_ref 時点で済ませてあるため、
+        // import 判定と呼び出し元の特定は参照ファイルの走査で済ませてあるため、
         // ここでは flag / ID で判定する。Phase 4: confidence == BareNameOnly + シンボル名が
         // generic (new/update/...) なら local_low_maps へ振り分け、強い impact 信号を汚染しない。
         // バッファは取り出して drain し、ヒープを次のファイルで再利用するため戻す。
@@ -2064,9 +2073,18 @@ impl<'a> ImpactCollector<'a> {
             .cloned()
             .unwrap_or_else(|| sym_key_canonical.clone());
 
-        let (path_id, sym_name_id) = {
+        let (path_id, sym_name_id, caller_name_id) = {
             let mut p = self.pool.lock().expect("string pool mutex poisoned");
-            (p.intern(self.path_str), p.intern(&affected_sym_name))
+            let caller = if e.caller_name_id == u32::MAX {
+                p.intern(sym_key_canonical)
+            } else {
+                e.caller_name_id
+            };
+            (
+                p.intern(self.path_str),
+                p.intern(&affected_sym_name),
+                caller,
+            )
         };
 
         let ix_u32 = e.sym_ix;
@@ -2078,7 +2096,7 @@ impl<'a> ImpactCollector<'a> {
         };
         let entry = target_map
             .entry(key)
-            .or_insert_with(|| (e.caller_name_id, SymEntries::new()));
+            .or_insert_with(|| (caller_name_id, SymEntries::new()));
         if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
             *existing_ix == ix_u32 && *existing_name_id == sym_name_id
         }) {

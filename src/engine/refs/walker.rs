@@ -183,6 +183,7 @@ pub(crate) trait RefVisitor {
     }
     fn on_tree(&mut self, _root: Node<'_>, _source: &[u8]) {}
     fn on_ref(&mut self, event: RefVisitEvent<'_>);
+    fn finish_tree(&mut self, _root: Node<'_>, _source: &[u8], _lang: LangId) {}
 }
 
 // ---------------------------------------------------------------------------

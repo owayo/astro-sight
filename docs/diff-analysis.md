@@ -101,12 +101,14 @@ Output:
         { "name": "extract_symbols", "old_signature": "fn extract_symbols(...)", "new_signature": "fn extract_symbols(..., include_refs: bool)" }
       ],
       "impacted_callers": [
-        { "path": "src/commands.rs", "name": "cmd_symbols", "line": 166 }
+        { "path": "src/commands.rs", "name": "cmd_symbols", "line": 166, "symbols": ["extract_symbols"] }
       ]
     }
   ]
 }
 ```
+
+For a call inside a named function or method, `name` identifies the caller and `symbols` lists the changed declarations used on that line. If Python's `plain()` calls `total(1)`, the entry has `name: "plain"` and `symbols: ["total"]`. At module scope, the changed symbol name is used when there is no enclosing caller. If two functions have affected references on the same line, the entry names the caller of the first reference recorded for the entry and lists the changed symbols for both.
 
 For Rust, `affected_symbols[].kind` is `impl` when an impl header changes, an impl without methods is added, or deleted lines may include a method declaration. Adding a method without deleting lines reports the method without reporting its owning type as changed. Edits with deleted lines keep the `impl` record because a removed method cannot be ruled out from the new tree alone. An attribute-only change also keeps the `impl` record because the method symbol does not include attributes. The `symbols` command still includes the impl owner for method ownership.
 
