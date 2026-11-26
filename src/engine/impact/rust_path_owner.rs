@@ -25,6 +25,7 @@ use crate::models::impact::DiffFile;
 mod enum_owner;
 mod format_owner;
 mod macro_copy;
+mod workspace_members;
 
 pub(super) use macro_copy::MacroCopy;
 
@@ -314,13 +315,18 @@ impl RustPathOwnerProjectProof {
                 crate::git_support::OmittedKind::Symlink(
                     crate::git_support::LinkTarget::RegularFile
                 )
-            ) || path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
-                && path.file_name().is_some_and(|name| {
-                    name.eq_ignore_ascii_case("config") || name.eq_ignore_ascii_case("config.toml")
-                })
+            ) || (!under_root_git_or_target(path)
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml")))
+                || path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
+                    && path.file_name().is_some_and(|name| {
+                        name.eq_ignore_ascii_case("config")
+                            || name.eq_ignore_ascii_case("config.toml")
+                    })
             {
                 return None;
             }
@@ -348,6 +354,10 @@ impl RustPathOwnerProjectProof {
                 }
                 if kind.is_dir() {
                     pending.push(path);
+                } else if name.eq_ignore_ascii_case("Cargo.toml") {
+                    let package = directory.strip_prefix(&root).ok()?;
+                    let manifest = self.alias_cache.manifest(&root, package)?;
+                    workspace_members::outside_unscanned(&root, package, &manifest)?;
                 }
             }
         }

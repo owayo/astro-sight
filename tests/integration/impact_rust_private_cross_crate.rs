@@ -1895,6 +1895,8 @@ fn impact_rust_private_type_keeps_files_compiled_by_unscanned_members() {
     dotted.members.push("a/../target/probe");
     let mut glob = probe(true);
     glob.members.push("targe?/level/*");
+    let mut class_glob = probe(true);
+    class_glob.members.push("targ[^e]t/level/*");
     let mut dot_glob = probe(true);
     dot_glob.members.push("./targe?/level/*");
     // 末尾の区切りはディレクトリの指定 (`targe?/level/*/`)。
@@ -1910,6 +1912,7 @@ fn impact_rust_private_type_keeps_files_compiled_by_unscanned_members() {
         ("around", around),
         ("dotted member", dotted),
         ("glob member", glob),
+        ("class glob member", class_glob),
         ("dot glob member", dot_glob),
         ("slash glob member", slash_glob),
         ("mid dot glob member", mid_dot_glob),
@@ -2031,6 +2034,82 @@ fn private_layout_checks_cargo_overrides_from_the_selected_tree() {
                 &["--git", "--staged"],
             );
             assert!(private_layout_reports_caller(&review), "{review}");
+        }
+    }
+}
+
+#[test]
+fn private_layout_checks_workspace_member_globs_at_each_manifest() {
+    for (nested, member, settings, expected) in [
+        (
+            false,
+            "targ[^e]t/level/*",
+            "default-members=['a','b']\n",
+            true,
+        ),
+        (false, "targ[!e]t/level/*", "", false),
+        (
+            false,
+            "targ[d-f]t/level/*",
+            "exclude=['target/level/probe']\n",
+            false,
+        ),
+        (
+            false,
+            "target/level/probe",
+            "exclude=['target/level/probe']\n",
+            true,
+        ),
+        (true, "../../target/level/probe", "", true),
+        (
+            true,
+            "../../targ[^e]t/level/*",
+            "exclude=['../../target/level/probe']\n",
+            true,
+        ),
+        (true, "target/level/probe", "", false),
+    ] {
+        let mut case = private_layout_case()
+            .file("target/level/probe/src/lib.rs", "include!(\"../../../../a/src/lib.rs\");\n#[path=\"../../../../b/src/calls.rs\"]\nmod calls;\n")
+            .file("targxt/level/regular/Cargo.toml", "[package]\nname='regular'\nversion='0.1.0'\nedition='2024'\n")
+            .file("targxt/level/regular/src/lib.rs", "");
+        case.a_old = "struct Settings<T>(T);\n".to_owned();
+        case.a_new = "struct Settings<T, U>(T, U);\n".to_owned();
+        let probe = "[package]\nname='probe'\nversion='0.1.0'\nedition='2024'\n";
+        if nested {
+            case = case
+                .file(
+                    "tools/ws/Cargo.toml",
+                    format!("[workspace]\nresolver='3'\nmembers=['{member}']\n{settings}"),
+                )
+                .file(
+                    "target/level/probe/Cargo.toml",
+                    format!("{probe}workspace='../../../tools/ws'\n"),
+                );
+            if member == "target/level/probe" {
+                case = case
+                    .file("tools/ws/target/level/probe/Cargo.toml", probe)
+                    .file("tools/ws/target/level/probe/src/lib.rs", "");
+            }
+        } else {
+            case.members.push(member);
+            case = case.file("target/level/probe/Cargo.toml", probe);
+            case.root_extra = settings;
+        }
+        let repo = case.changed_repo();
+        for staged in [false, true] {
+            let mut args = vec!["--git"];
+            if staged {
+                repo.stage_all();
+                repo.write("a/src/lib.rs", &case.a_old);
+                args.push("--staged");
+            }
+            let review = repo.run_json("review", &args);
+            assert_eq!(
+                private_layout_reports_caller(&review),
+                expected,
+                "nested={nested}, member={member}, settings={settings}, staged={staged}: {review}"
+            );
         }
     }
 }
