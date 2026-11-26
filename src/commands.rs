@@ -11,6 +11,7 @@ use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
 mod common;
+pub(crate) use api_changes::python_module_path::resolve as resolve_python_module;
 pub(crate) use git_input::index_module_paths;
 pub(crate) mod git_snapshot;
 mod host_entries;

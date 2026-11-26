@@ -22,6 +22,136 @@ fn callers(result: &serde_json::Value, path: &str) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn impact_python_from_import_alias_reports_the_call_and_preserves_refs() {
+    let repo = TestRepo::new();
+    repo.write("producer.py", "def total(x):\n    return x\n");
+    repo.write("other.py", "def total(x):\n    return x\n");
+    let runner = "from producer import (\n    total as calculate,\n)\n\ndef run():\n    return (calculate)(1)\n\ndef shadow(calculate):\n    return calculate(1)\n";
+    repo.write("runner.py", runner);
+    repo.write(
+        "elsewhere.py",
+        "from other import total as calculate\ncalculate(1)\n",
+    );
+    repo.write("unicode.py", "from producer import total as calculate\ndef run(ｃalculate=lambda x:x):\n    return calculate(1)\n");
+    repo.write(
+        "local.py",
+        "def run():\n    from producer import total as work\n    return work(2)\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("producer.py", "def total(x, required):\n    return x\n");
+    for args in [&["--git"][..], &["--git", "--staged"][..]] {
+        if args.contains(&"--staged") {
+            repo.stage_all();
+        }
+        let context = repo.run_json("context", args);
+        let mut actual = callers(&context, "producer.py");
+        actual.sort();
+        assert_eq!(
+            actual,
+            [("local.py".into(), 2), ("runner.py".into(), 5)],
+            "{context}"
+        );
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["symbols"][0] == "total" && row["name"] == "run")
+        );
+        let imports = context["changes"][0]["informational_callers"]
+            .as_array()
+            .unwrap();
+        assert!(
+            imports
+                .iter()
+                .any(|row| row["path"] == "runner.py" && row["line"] == 1)
+        );
+        let out = cargo_bin()
+            .args(["impact", "--dir"])
+            .arg(repo.root())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+    }
+    let refs = repo.run_json("refs", &["--name", "total"]);
+    let rows = refs["refs"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["path"] == "runner.py" && row["ln"] == 1)
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["path"] == "runner.py" && row["ln"] == 5)
+    );
+
+    repo.write(
+        "runner.py",
+        runner.replace("(calculate)(1)", "(calculate)(1, 2)"),
+    );
+    repo.write(
+        "local.py",
+        "def run():\n    from producer import total as work\n    return work(2, 3)\n",
+    );
+    let impact = cargo_bin()
+        .args(["impact", "--dir"])
+        .arg(repo.root())
+        .arg("--git")
+        .output()
+        .unwrap();
+    assert!(impact.status.success(), "{impact:?}");
+
+    repo.write("runner.py", runner.replace("(calculate)(1)", "calculate"));
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        callers(&context, "producer.py").contains(&("runner.py".into(), 1)),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_python_import_alias_uses_the_evaluation_scope_of_expressions() {
+    let repo = TestRepo::new();
+    repo.write("producer.py", "def total(x): return x\n");
+    let lines = [
+        "from producer import total as calculate",
+        "def run(other=lambda x: x, handles=()):",
+        "    [calculate(x) for x in [1]]",
+        "    (lambda: calculate(1))()",
+        "    def inner(x=calculate(1)): pass",
+        "    [calculate for calculate in [calculate(1)]]",
+        "    (lambda calculate: calculate(1))(other)",
+        "    [calculate(1) for calculate in handles]",
+        "    (lambda calculate=calculate(1): calculate)()",
+        "    other.calculate = other",
+        "    calculate(1)",
+        "    if handles:",
+        "        from producer import total as inside",
+        "        return inside(1)",
+        "    return other(1)",
+        "def fallback(other, handles):",
+        "    if handles:",
+        "        from producer import total as inside",
+        "    else:",
+        "        inside = other",
+        "        return inside(1)",
+    ];
+    repo.write("runner.py", lines.join("\n"));
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("producer.py", "def total(x, required): return x\n");
+    let context = repo.run_json("context", &["--git"]);
+    let mut rows: Vec<_> = callers(&context, "producer.py")
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect();
+    rows.sort();
+    assert_eq!(rows, [2, 3, 4, 5, 8, 10, 13], "{context}");
+}
+
+#[test]
 fn namespace_lookup_keeps_same_named_local_callers_in_worktree_and_index() {
     let repo = TestRepo::new();
     let producer = "def total(x):\n    return x\n\ndef inside():\n    total = globals()['total']\n    return total(10)\n";

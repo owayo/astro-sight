@@ -72,7 +72,7 @@ pub(super) struct RefEventMini {
     /// Barrel origin evidence only applies to a value/type use of the imported binding.
     pub(super) ts_import_binding_use: bool,
     ts_rebound_const_owner: u32,
-    ts_alias_owner: Option<u32>,
+    alias_owner: Option<u32>,
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
@@ -297,7 +297,7 @@ impl RouteDecisionContext<'_> {
                 should_route_ts_importless_ref_low(
                     true,
                     true,
-                    event.ts_alias_owner.is_some()
+                    event.alias_owner.is_some()
                         || has_direct_import
                         || (event.ts_import_binding_use
                             && !event.local_shadow_hint
@@ -306,7 +306,7 @@ impl RouteDecisionContext<'_> {
                                 symbol_name,
                                 &file_context.new_path,
                             )),
-                    event.ts_alias_owner.is_none() && event.local_shadow_hint,
+                    event.alias_owner.is_none() && event.local_shadow_hint,
                 )
             } else {
                 false
@@ -461,35 +461,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 let (fc, name) = barrels.alias_owner(path, module, imported)?;
                 Some((fc, *names.get(name)? as u32))
             },
-            |node, (fc, sym)| {
-                let index = lines.get_or_insert_with(|| refs::LineIndex::new(source));
-                let point = node.start_position();
-                let context = refs::extract_line_context_indexed(source, index, point.row);
-                self.collect_ref(
-                    refs::RefVisitEvent {
-                        sym_ix: sym,
-                        line: point.row,
-                        column: point.column,
-                        context_column: refs::context_column(
-                            point.column,
-                            source,
-                            index,
-                            point.row,
-                        ),
-                        context: &context,
-                        is_def: false,
-                        confidence: crate::models::reference::RefConfidence::ExactOwner,
-                        rust_macro_callee: false,
-                        usage: refs::RefUsageRole::Other,
-                        lexical_binding: LexicalBinding::Unknown,
-                        js_signature_site: JsSignatureSite::Unknown,
-                        node: Some(node),
-                        rust_format_capture: None,
-                        source,
-                    },
-                    Some(fc),
-                );
-            },
+            |node, (fc, sym)| self.collect_alias_ref(node, source, &mut lines, fc, sym),
         );
     }
 
@@ -498,6 +470,34 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
     }
 
     fn finish_tree(&mut self, root: tree_sitter::Node<'_>, source: &[u8], lang: LangId) {
+        if lang == LangId::Python && !self.ref_events.is_empty() {
+            let contexts = self.file_contexts;
+            let names = self.changed_names;
+            let sym_to_fc = self.sym_to_fc;
+            let cache = self.python_import_cache;
+            let (dir, path) = (self.dir, self.path_str);
+            let mut lines = None;
+            let import_sites = super::python_imports::aliases::visit_calls(
+                root,
+                source,
+                |module, remote| {
+                    let symbol = *names.get(remote)?;
+                    let owner = cache.alias_source(dir, path, module)?;
+                    let fc = sym_to_fc[symbol].iter().copied().find(|&fc| {
+                        let ctx = &contexts[fc as usize];
+                        ctx.new_path == owner
+                            && ctx.python_modified_direct_function_names.contains(remote)
+                    })?;
+                    Some((fc, symbol as u32))
+                },
+                |node, fc, sym| self.collect_alias_ref(node, source, &mut lines, fc, sym),
+            );
+            if !import_sites.is_empty() {
+                for event in self.ref_events.iter_mut() {
+                    event.is_import |= import_sites.contains(&(event.line, event.column));
+                }
+            }
+        }
         if self.ref_events.is_empty() {
             return;
         }
@@ -561,7 +561,39 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
 }
 
 impl ImpactCollector<'_> {
-    fn collect_ref(&mut self, event: refs::RefVisitEvent<'_>, ts_alias_owner: Option<u32>) {
+    fn collect_alias_ref(
+        &mut self,
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        lines: &mut Option<refs::LineIndex>,
+        fc: u32,
+        sym: u32,
+    ) {
+        let index = lines.get_or_insert_with(|| refs::LineIndex::new(source));
+        let point = node.start_position();
+        let context = refs::extract_line_context_indexed(source, index, point.row);
+        self.collect_ref(
+            refs::RefVisitEvent {
+                sym_ix: sym,
+                line: point.row,
+                column: point.column,
+                context_column: refs::context_column(point.column, source, index, point.row),
+                context: &context,
+                is_def: false,
+                confidence: crate::models::reference::RefConfidence::ExactOwner,
+                rust_macro_callee: false,
+                usage: refs::RefUsageRole::Other,
+                lexical_binding: LexicalBinding::Unknown,
+                js_signature_site: JsSignatureSite::Unknown,
+                node: Some(node),
+                rust_format_capture: None,
+                source,
+            },
+            Some(fc),
+        );
+    }
+
+    fn collect_ref(&mut self, event: refs::RefVisitEvent<'_>, alias_owner: Option<u32>) {
         let refs::RefVisitEvent {
             sym_ix,
             line,
@@ -1329,7 +1361,7 @@ impl ImpactCollector<'_> {
             local_shadow_hint,
             ts_import_binding_use,
             ts_rebound_const_owner,
-            ts_alias_owner,
+            alias_owner,
             ref_in_macro,
             rust_macro_evidence,
             rust_macro_callee,
@@ -1662,7 +1694,8 @@ impl<'a> ImpactCollector<'a> {
                     collector.candidate_decision(&e, &facts, fc_ix, &mut evidence)
                 {
                     collector.record_caller(&e, fc_ix, route);
-                    if e.ts_alias_owner.is_some() {
+                    if e.alias_owner.is_some() && collector.ref_lang.is_some_and(lang_is_ts_family)
+                    {
                         aliases.insert((fc_ix, e.sym_ix));
                     }
                 }
@@ -1793,8 +1826,7 @@ impl<'a> ImpactCollector<'a> {
         fc_ix: usize,
         evidence: &mut RefFileEvidence<'a>,
     ) -> CandidateDecision {
-        if e.ts_alias_owner
-            .is_some_and(|owner| owner as usize != fc_ix)
+        if e.alias_owner.is_some_and(|owner| owner as usize != fc_ix)
             || self.excluded_by_owner_evidence(e, facts, fc_ix, evidence)
         {
             return CandidateDecision::Exclude;
@@ -2357,7 +2389,7 @@ mod tests {
             local_shadow_hint: false,
             ts_import_binding_use: false,
             ts_rebound_const_owner: u32::MAX,
-            ts_alias_owner: None,
+            alias_owner: None,
             ref_in_macro: false,
             rust_macro_evidence: false,
             rust_macro_callee: false,
