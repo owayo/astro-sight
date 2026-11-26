@@ -757,6 +757,8 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 
 モジュール直下の関数を削除すると、`review` は Python の文字列を介した名前の参照も調べる。`globals()["total"]`、`getattr(module, "total")`、`mock.patch("pkg.module.total")` などが残ると、削除は `api.rm` に入り、hook は終了コード 1 を返す。通常の辞書キーやログに同じ文字列があるだけなら `api.rm_dead` にできる。ソースの読み取りや解析が失敗した場合、または1ファイル 2 MiB・合計 64 MiB の上限を超えた場合は、未確認の候補を blocking に残し、理由を `truncations` に出す。
 
+関数を改名した場合も同じ参照を調べる。たとえば `total` を `sum_values` に改名して直接の呼び出しを直しても、`mock.patch("tools.util.total")` は旧名を探して `AttributeError` になる。`review` は改名を `rename_candidates` に記録した場合も、残った参照が指す旧名を `api.rm` に出す。
+
 ### Python の受け手が未解決なメンバー削除
 
 `api_changes.removed_unresolved`（hook では `api.rm_unresolved`）は、削除が確定していても、残った属性参照の受け手を特定できず、使用位置の型要求だけが分かる候補を報告する。`confidence: "low"` の情報提供として扱い、hook を止めない。削除メンバーへの参照の有無は未確定で、`removed_dead` の証明条件は変えない。シェルの解析エラーで削除自体を確定できない `uncertain_removals` / `rm_unverified` も別区分のまま維持する。

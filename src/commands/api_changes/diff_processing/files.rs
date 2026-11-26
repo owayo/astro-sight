@@ -421,7 +421,17 @@ pub(super) fn collect_removed_symbols(
                         OldRefIndex::build(index_names, diff_files, prepared, base_blobs)
                     })
                     .has_surviving_old_reference(name);
+            let candidate = ApiSymbolCandidate {
+                inline_module,
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.old_path.clone(),
+                signature: sig.clone(),
+            };
             if new_unreferenced && (bash_pure_removal_skip || has_old_reference) {
+                if python_removed_references::module_function(&candidate) {
+                    state.buckets.python_renames.push(candidate);
+                }
                 continue;
             }
             // Python の @property → 同じクラスの field 置き換えなら removed 扱いせず
@@ -435,13 +445,7 @@ pub(super) fn collect_removed_symbols(
                 });
                 continue;
             }
-            state.buckets.removed.push(ApiSymbolCandidate {
-                inline_module,
-                name: name.clone(),
-                kind: kind.clone(),
-                file: df.old_path.clone(),
-                signature: sig.clone(),
-            });
+            state.buckets.removed.push(candidate);
         }
     }
 }

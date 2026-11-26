@@ -77,6 +77,8 @@ pub(crate) struct ApiChangeBuckets {
     pub(crate) added_reference_candidates: Vec<ApiSymbolCandidate>,
     pub(crate) added: Vec<ApiSymbolCandidate>,
     pub(crate) removed: Vec<ApiSymbolCandidate>,
+    /// 直接の利用が改名に追随した Python モジュール関数。旧名の文字列参照を別途確かめる。
+    pub(crate) python_renames: Vec<ApiSymbolCandidate>,
     pub(crate) uncertain_removals: Vec<crate::models::review::UncertainApiRemoval>,
     pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub(crate) modified: Vec<ApiSymbolChange>,

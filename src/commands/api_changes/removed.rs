@@ -40,8 +40,60 @@ pub(crate) fn partition_removed_dead_candidates(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     rust_packages: &super::removed_cargo::RemovedRustPackages<'_>,
     candidates: Vec<ApiSymbolCandidate>,
+    python_renames: Vec<ApiSymbolCandidate>,
     ambiguous_relation_keys: &HashSet<ApiRelationKey>,
     notices: &mut Vec<crate::models::truncation::TruncationInfo>,
+) -> (
+    Vec<ApiSymbolCandidate>,
+    Vec<ApiSymbolCandidate>,
+    Vec<UnresolvedApiRemoval>,
+) {
+    if candidates.is_empty() && python_renames.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let gitlinks = current_gitlinks(dir).unwrap_or_default();
+    let (mut removed_kept, mut removed_dead, removed_unresolved) = partition_identifier_references(
+        dir,
+        base_blobs,
+        rust_packages,
+        candidates,
+        ambiguous_relation_keys,
+        &gitlinks,
+    );
+    super::python_removed_references::retain_referenced(
+        dir,
+        &gitlinks,
+        &mut removed_kept,
+        &mut removed_dead,
+        python_renames,
+        notices,
+    );
+
+    // 対応付け不能な削除グループの区分が割れたときだけ、保守側に揃える。
+    if !ambiguous_relation_keys.is_empty() {
+        let split_keys: HashSet<ApiRelationKey> = removed_kept
+            .iter()
+            .map(api_relation_key)
+            .filter(|key| ambiguous_relation_keys.contains(key))
+            .collect();
+        if !split_keys.is_empty() {
+            let (promote, stay): (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) = removed_dead
+                .into_iter()
+                .partition(|c| split_keys.contains(&api_relation_key(c)));
+            removed_dead = stay;
+            removed_kept.extend(promote);
+        }
+    }
+    (removed_kept, removed_dead, removed_unresolved)
+}
+
+fn partition_identifier_references(
+    dir: &str,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+    rust_packages: &super::removed_cargo::RemovedRustPackages<'_>,
+    candidates: Vec<ApiSymbolCandidate>,
+    ambiguous_relation_keys: &HashSet<ApiRelationKey>,
+    gitlinks: &[std::path::PathBuf],
 ) -> (
     Vec<ApiSymbolCandidate>,
     Vec<ApiSymbolCandidate>,
@@ -85,7 +137,6 @@ pub(crate) fn partition_removed_dead_candidates(
 
     // Initialized submodules belong to another repository. Keep refs occurrence
     // output unchanged; omit those files only from this repository's API proof.
-    let gitlinks = current_gitlinks(dir).unwrap_or_default();
     if !gitlinks.is_empty() {
         for result in &mut batch_result {
             result.references.retain(|reference| {
@@ -440,32 +491,6 @@ pub(crate) fn partition_removed_dead_candidates(
             });
         removed_kept = kept;
         removed_dead.extend(follow);
-    }
-
-    super::python_removed_references::retain_referenced(
-        dir,
-        &gitlinks,
-        &mut removed_kept,
-        &mut removed_dead,
-        notices,
-    );
-
-    // 第 3 パス: 対応付け不能な削除グループの区分を揃える。
-    // 同一キーの候補が blocking と informational に割れていたら、保守側 (blocking) へ寄せる。
-    // 全員が informational で一致しているグループは触らない (上記 doc 参照)。
-    if !ambiguous_relation_keys.is_empty() {
-        let split_keys: HashSet<ApiRelationKey> = removed_kept
-            .iter()
-            .map(api_relation_key)
-            .filter(|key| ambiguous_relation_keys.contains(key))
-            .collect();
-        if !split_keys.is_empty() {
-            let (promote, stay): (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) = removed_dead
-                .into_iter()
-                .partition(|c| split_keys.contains(&api_relation_key(c)));
-            removed_dead = stay;
-            removed_kept.extend(promote);
-        }
     }
 
     (removed_kept, removed_dead, removed_unresolved)

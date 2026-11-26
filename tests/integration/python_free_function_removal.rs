@@ -68,6 +68,65 @@ const UTIL_OLD: &str = "def total(x):\n    return x\n\n\ndef keep():\n    return
 const UTIL_NEW: &str = "def keep():\n    return 1\n";
 
 #[test]
+fn python_renamed_function_checks_string_users_in_the_review_snapshot() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("tools");
+    repo.create_dir_all("tests");
+    let declaration = "def total(x):\n    return x\n";
+    let caller = "from tools.util import total\n\ndef run():\n    return total(1)\n";
+    let test = "from unittest import mock\n\ndef test_patch():\n    with mock.patch('tools.util.total'):\n        pass\n";
+    repo.write("tools/__init__.py", "");
+    repo.write("tools/util.py", declaration);
+    repo.write("tools/other.py", declaration);
+    repo.write("tools/run.py", caller);
+    repo.write("tests/test_util.py", test);
+    repo.commit_all("base");
+    repo.write("tools/util.py", declaration.replace("total", "sum_values"));
+    repo.write("tools/run.py", caller.replace("total", "sum_values"));
+    let followed = test.replace(
+        "with mock.patch('tools.util.total'):",
+        "print('tools.util.total')\n    with mock.patch('tools.other.total'), mock.patch('tools.util.sum_values'):",
+    );
+    repo.stage_all();
+    repo.write("tests/test_util.py", &followed);
+    for staged_stale in [true, false] {
+        if !staged_stale {
+            repo.stage_all();
+            repo.write("tests/test_util.py", test);
+        }
+        for staged in [true, false] {
+            let blocks = staged == staged_stale;
+            let mut args = vec!["--git"];
+            if staged {
+                args.push("--staged");
+            }
+            let hook = cargo_bin()
+                .args(["review", "--hook", "--dir"])
+                .arg(repo.root())
+                .args(&args)
+                .output()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+            assert_eq!(hook.status.code(), Some(i32::from(blocks)), "{value}");
+            let rename = &value["rename_candidates"][0];
+            assert_eq!(rename["old"]["name"], "total", "{value}");
+            assert_eq!(rename["new"]["name"], "sum_values", "{value}");
+            if blocks {
+                assert_eq!(
+                    value["api"]["rm"],
+                    serde_json::json!([{"f":"tools/util.py","n":"total"}]),
+                    "{value}"
+                );
+            } else {
+                assert!(value["api"].get("rm").is_none(), "{value}");
+            }
+            assert!(value["api"].get("rm_dead").is_none(), "{value}");
+        }
+    }
+}
+
+#[test]
 fn removal_preserves_reexported_and_rebound_module_receivers() {
     let repo = TestRepo::new();
     repo.init_git();
