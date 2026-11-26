@@ -58,6 +58,24 @@ fn nullable_input_direct_calls_and_inline_props_are_compatible() {
 }
 
 #[test]
+fn nullable_input_checks_expected_diagnostics_in_declarations_and_nested_arguments() {
+    let before = "// @ts-expect-error null default\nexport function word(text: string = null): string { return String(text); }\n";
+    let after = before.replace("text: string", "text: string | null");
+    let api = changes(before, &after, CALL, &[]);
+    assert!(api.modified.iter().any(|c| c.name == "word"), "{api:?}");
+
+    let before = "export function word(options: { text: string }): string { return String(options.text); }\n";
+    let after = before.replace("text: string", "text: string | null");
+    let caller = "import { word } from './render';\nword({\n// @ts-expect-error null was rejected\ntext: null });\n";
+    let api = changes(before, &after, caller, &[]);
+    assert!(api.modified.iter().any(|c| c.name == "word"), "{api:?}");
+
+    let other = "// Calling word with null used to fail.\n// @ts-expect-error number\nconst bad: string = 5;\n";
+    let api = changes(BEFORE, AFTER, CALL, &[("other.ts", other)]);
+    assert_eq!(api.compatible_modified[0].reason, "nullable_input_widening");
+}
+
+#[test]
 fn nullable_type_directions_do_not_imply_compatibility() {
     for (before, after, position, direction) in [
         (

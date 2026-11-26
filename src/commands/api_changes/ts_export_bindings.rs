@@ -130,6 +130,21 @@ fn visit_imports(statement: Node<'_>, source: &[u8], mut visit: impl FnMut(Strin
     });
 }
 
+/// 値の import のローカル名と公開名。namespace import の公開名は None。
+pub(super) fn visit_value_imports(
+    statement: Node<'_>,
+    source: &[u8],
+    mut visit: impl FnMut(String, Option<String>),
+) {
+    visit_imports(statement, source, |local, binding| {
+        if !binding.type_only
+            && let Target::Remote { name, .. } = binding.target
+        {
+            visit(local, name);
+        }
+    });
+}
+
 /// 元の公開名とローカル名が等しい、一意な named import。
 pub(super) fn same_name_imports(root: Node<'_>, source: &[u8]) -> HashMap<String, (String, bool)> {
     let mut named = HashMap::new();

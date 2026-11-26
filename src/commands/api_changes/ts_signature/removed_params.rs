@@ -336,6 +336,20 @@ impl<'a> InventoryView<'a> {
         })
     }
 
+    pub(super) fn import_target(
+        &self,
+        path: &str,
+        import: Node<'_>,
+        source: &[u8],
+    ) -> Option<String> {
+        dependency_target(
+            import.child_by_field_name("source")?,
+            source,
+            path,
+            &self.paths,
+        )
+    }
+
     /// 在庫に読んだ `path` の内容が `source` と同じか。
     pub(super) fn has_source(&self, path: &str, source: &[u8]) -> bool {
         self.base

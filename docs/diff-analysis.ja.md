@@ -814,6 +814,7 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 - React component の HOC ラップ
 - Rust の一意な root 関数のヘッダを、非 generic・制限なしの `pub type` で書き直す変更と、その別名を展開した型へ戻す変更（`transparent_rust_type_alias`）。旧新それぞれのファイルの別名と import 環境を確かめる。
 - 未参照の object member の削除
+- TypeScript の引数に union の要素を追加しても、既存の呼び出しは互換になる場合がある。宣言または呼び出しに `@ts-expect-error` が掛かる場合は、この指示自体がコンパイルエラーになり得るため blocking に残す。[引数の union 拡大](nullable-input.md)。
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）。引数リスト中の行コメント・ブロックコメント・JSDoc で既存の引数や追加する引数を説明できる。変更前後のどちらかの引数リストのコメントに `@internal` や `@ts-expect-error` などの型検査指示があると、この互換判定を見送る
   - 関数を宣言するファイルだけを変更したときは、既存引数の型に `import type { Session } from './session.js'` のような名前付きの型 import を使える。変更前後で同じファイルを指し、そのファイルが `export type Session = { id: string }` のように右辺が自己完結した型別名を直接公開していることを確かめる。再 export、宣言をマージできる interface、解決先が不明な import は保留する。staged のスナップショットでシンボリックリンクやサブモジュールを省略した場合、または省略の記録を読めない場合も保留する
 - TypeScript の inline object 引数型への optional プロパティ追加。リポジトリ内の呼び出しが追加キーを省略するか、渡す値の型を確認できる場合に限る。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
