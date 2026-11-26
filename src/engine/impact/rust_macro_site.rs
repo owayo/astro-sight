@@ -99,6 +99,56 @@ fn inner_attributes_safe(scope: Node<'_>, source: &[u8]) -> bool {
         .all(|attribute| builtin_attribute(attribute, source))
 }
 
+/// 未知の属性が書き換え得る範囲。前順で範囲全体を飛ばすので、範囲は整列済みで重ならない。
+pub(super) struct OpaqueAttributeScopes(Vec<std::ops::Range<usize>>);
+
+impl OpaqueAttributeScopes {
+    pub(super) fn build(mut root: Node<'_>, source: &[u8]) -> Self {
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+        use std::ops::ControlFlow;
+
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let mut spans = Vec::new();
+        if root.has_error() {
+            spans.push(root.byte_range());
+        } else if memchr::memchr(b'#', source).is_some() {
+            let mut pending = Vec::new();
+            let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+                pending.resize(depth + 1, false);
+                let action = match node.kind() {
+                    "attribute_item" => {
+                        pending[depth] |= !builtin_attribute(node, source);
+                        spans.push(node.byte_range());
+                        Walk::Skip
+                    }
+                    "inner_attribute_item" => {
+                        spans.push(node.byte_range());
+                        Walk::Skip
+                    }
+                    "line_comment" | "block_comment" => Walk::Skip,
+                    _ if std::mem::take(&mut pending[depth])
+                        || !inner_attributes_safe(node, source) =>
+                    {
+                        spans.push(node.byte_range());
+                        Walk::Skip
+                    }
+                    _ => Walk::Descend,
+                };
+                ControlFlow::Continue(action)
+            });
+        }
+        Self(spans)
+    }
+
+    pub(super) fn contains(&self, node: Node<'_>) -> bool {
+        let start = node.start_byte();
+        let after = self.0.partition_point(|span| span.end <= start);
+        self.0.get(after).is_some_and(|span| span.contains(&start))
+    }
+}
+
 /// token tree の列を 1 度たどり、マクロの右辺か、呼び出した場所で解決する既知の入力かを区別する。
 fn token_tree_site<'tree>(
     identifier: Node<'tree>,
@@ -676,6 +726,38 @@ mod tests {
             .unwrap();
         assert_eq!(node.utf8_text(source.as_bytes()).unwrap(), needle);
         macro_site(node, source.as_bytes())
+    }
+
+    #[test]
+    fn opaque_attribute_scopes_cover_only_the_attributed_item_or_scope() {
+        let source = concat!(
+            "#[transform]\n#[allow(unused)]\n// attached\nfn f() { x.outer(); }\n",
+            "fn g() { #![transform] x.inner(); }\n",
+            "#[allow(unused)] fn h() { #[transform] x.statement(); x.plain(); }\n",
+            "fn i() { x.sibling(); }\n",
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error());
+        let index = OpaqueAttributeScopes::build(root, source.as_bytes());
+        for (name, expected) in [
+            ("outer", true),
+            ("inner", true),
+            ("statement", true),
+            ("plain", false),
+            ("sibling", false),
+        ] {
+            let start = source.find(name).unwrap();
+            let node = root
+                .descendant_for_byte_range(start, start + name.len())
+                .unwrap();
+            assert_eq!(index.contains(node), expected, "{name}");
+            assert_eq!(
+                macro_site(node, source.as_bytes()) != MacroSite::Plain,
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

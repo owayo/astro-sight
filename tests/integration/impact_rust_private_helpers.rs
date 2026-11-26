@@ -3,6 +3,70 @@
 use super::support::*;
 
 #[test]
+fn rust_associated_function_changes_distinguish_dot_calls_from_paths() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"dot_calls\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod reader; mod changed;\n");
+    let before = "pub struct Item;\nimpl Item {\n    pub(super) fn add(value: u8) {}\n}\n";
+    repo.write("src/changed.rs", before);
+    repo.write(
+        "src/reader.rs",
+        concat!(
+            "use crate::changed::Item;\n",
+            "macro_rules! reroute { ($p:ident . $f:ident ($n:expr)) => { Item::$f($n) }; }\n",
+            "fn inspect(ptr: *const u8, n: u8) {\n",
+            "    let _ = unsafe { ptr.add(0) };\n",
+            "    Item::add(n);\n",
+            "    reroute!(ptr.add(n));\n",
+            "    let f: fn(u8) = Item::add;\n",
+            "    let _ = unsafe { ptr.add(0) }; Item::add(n);\n",
+            "}\n",
+        ),
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/changed.rs", before.replace("value: u8", "value: u16"));
+    for staged in [false, true] {
+        let args = if staged {
+            repo.stage_all();
+            repo.write("src/changed.rs", before);
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let context = repo.run_json("context", args);
+        let change = &context["changes"][0];
+        let lines: std::collections::BTreeSet<u64> = [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ]
+        .iter()
+        .flat_map(|bucket| {
+            change[bucket]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|caller| {
+                    caller["path"] == "src/reader.rs"
+                        && caller["symbols"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|name| name == "add")
+                })
+                .map(|caller| caller["line"].as_u64().unwrap() + 1)
+        })
+        .collect();
+        assert_eq!(lines, [5, 6, 7, 8].into_iter().collect(), "{context}");
+    }
+}
+
+#[test]
 fn impact_rust_independent_root_values_ignore_initializer_mentions() {
     for constant in [true, false] {
         let repo = TestRepo::new();

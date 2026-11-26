@@ -728,6 +728,8 @@ fn analyze_changed_file(
                 .python_modified_direct_function_names,
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
+            rust_receiverless_associated_names: declaration_proof
+                .rust_receiverless_associated_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,
             rust_private_root_names,
             rust_private_root_functions,
