@@ -253,6 +253,7 @@ pub(crate) enum PreparedDiffFile {
 
 /// Phase 0 の結果。diff ファイルごとの事実と、cross-file 参照判定で検索する名前。
 pub(crate) struct PreparedDiff {
+    pub(crate) retargeted_exports: super::ts_export_bindings::RetargetedExports,
     /// `diff_files` と同じ順に並ぶ。
     pub(crate) files: Vec<PreparedDiffFile>,
     /// `ApiRefIndex` で検索する名前。
@@ -354,6 +355,7 @@ impl PreparedDiff {
         rust_crates: &super::RustCrates<'_>,
     ) -> Self {
         let mut prepared = Self {
+            retargeted_exports: Default::default(),
             files: Vec::with_capacity(diff_files.len()),
             index_names: HashSet::new(),
             unverified_deleted_paths: HashSet::new(),
@@ -867,6 +869,14 @@ impl PreparedDiff {
                     new_shared_callables,
                 })
             });
+        if let (Some(old), Some(new)) = (&old_facts, &facts.exported) {
+            self.retargeted_exports.compare(
+                &df.old_path,
+                &df.new_path,
+                &old.ts_exports,
+                &new.ts_exports,
+            );
+        }
         let old_syms = old_facts.map(|facts| facts.symbols);
         let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;

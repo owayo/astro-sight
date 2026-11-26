@@ -109,6 +109,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     let rust_crates = RustCrates::new(dir, diff_files, renames, base_blobs);
     // Phase 0: diff ファイルごとの事実と、ApiRefIndex で検索する名前を先に集める。
     let PreparedDiff {
+        retargeted_exports,
         files: prepared,
         mut index_names,
         unverified_deleted_paths,
@@ -293,6 +294,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
     // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
     // `added` に乗らないケースでも `removed` を相殺できる。
+    retargeted_exports.filter_candidates(state.buckets);
     let all_new_candidates = std::mem::take(&mut state.buckets.all_new_candidates);
     let (verified_removed, unverified_removed): (Vec<_>, Vec<_>) =
         std::mem::take(&mut state.buckets.removed)
@@ -480,6 +482,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
                     .map(|(file, name)| (file, name)),
             ),
     );
+    retargeted_exports.record(&mut buckets.modified);
     fill_modification_diagnostics(&mut buckets.modified);
     let added_reference_summary = added_reference_summary::collect(
         &buckets.added_reference_candidates,
@@ -1023,6 +1026,7 @@ mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
 mod jsonc;
+mod ts_export_bindings;
 pub(crate) use jsonc::json_bytes as jsonc_bytes;
 mod moved_members;
 mod moved_symbols;

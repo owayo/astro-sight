@@ -298,21 +298,23 @@ pub(super) fn is_private_class_member_js_ts(node: Node, source: &[u8]) -> bool {
 /// TS/JS の named export clause specifier 1 件分。
 /// `export { local as exported }` (from 句なし) / `export { name } from "..."` (forwarding)
 /// の両形式を表す。
-struct JsTsExportClauseSpecifier<'a> {
+pub(crate) struct JsTsExportClauseSpecifier<'a, 'tree> {
+    pub(crate) statement: Node<'tree>,
+    pub(crate) specifier: Node<'tree>,
     /// export 元のローカル名 (`export { A as B }` の A)。
-    local_name: &'a str,
+    pub(crate) local_name: &'a str,
     /// 利用者から見える公開名 (`export { A as B }` の B、alias なしなら A)。
-    exported_name: &'a str,
+    pub(crate) exported_name: &'a str,
     /// from 句 (`export { X } from "..."`) の有無。
     has_source: bool,
 }
 
 /// root 直下の export_statement 内の export specifier を列挙して visit に渡す。
 /// `has_named_export` / `collect_js_ts_named_export_surface_names` の共通 AST walk。
-fn visit_js_ts_export_clause_specifiers<'a>(
-    root: Node,
+pub(crate) fn visit_js_ts_export_clause_specifiers<'a, 'tree>(
+    root: Node<'tree>,
     source: &'a [u8],
-    mut visit: impl FnMut(JsTsExportClauseSpecifier<'a>),
+    mut visit: impl FnMut(JsTsExportClauseSpecifier<'a, 'tree>),
 ) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
@@ -341,6 +343,8 @@ fn visit_js_ts_export_clause_specifiers<'a>(
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or(local_name);
                 visit(JsTsExportClauseSpecifier {
+                    statement: child,
+                    specifier: spec,
                     local_name,
                     exported_name,
                     has_source,

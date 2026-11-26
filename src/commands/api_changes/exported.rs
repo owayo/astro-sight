@@ -9,6 +9,7 @@ pub(crate) struct ExportedFileFacts {
     /// `symbols` と同じ順の、宣言の開始位置 (行, 列)。
     pub(crate) starts: Vec<(usize, usize)>,
     pub(crate) type_dependencies: Option<super::ts_signature::DependencySnapshot>,
+    pub(super) ts_exports: super::ts_export_bindings::Exports,
     rust_parameters: RustParameterContracts,
     /// Rust のとき、`symbols` と同じ順の宣言の文脈 (inline module の経路と cfg の条件)。同じ
     /// ファイルの同じ名前の項目を区別して旧新を組にするのに使う (Issue #282)。
@@ -1086,6 +1087,11 @@ fn filter_exported_with_metadata(
             crate::language::LangId::Typescript | crate::language::LangId::Tsx
         )
     {
+        result.ts_exports = super::ts_export_bindings::Exports::collect(
+            signature_root,
+            signature_source,
+            context.strip_internal,
+        );
         result.type_dependencies = Some(super::ts_signature::DependencySnapshot::collect(
             signature_root,
             signature_source,

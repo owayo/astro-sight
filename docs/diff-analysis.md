@@ -518,6 +518,10 @@ When a type-member proof stops at a direct type reference, `first_unproven` incl
 
 An unsupported value assertion such as `as Item` can produce the same reason even when type checking succeeds. Inspect the location and use the TypeScript checker when needed. Proven compatible or updated entries retain their informational buckets and omit this field.
 
+### Changes to a TypeScript named export
+
+If `export { f }` becomes `export { other as f } from './provider.js'`, importers of `f` receive `provider.other`. Review reports the change under the public name `f`, even when the original function stays in the file as `export { f as legacy }`. If the original function was callable and `other` is `false`, an unchanged call to `f()` now fails type checking.
+
 ### TypeScript signature type dependencies
 
 When an exported function returns a class declared in the same file, both `Key` and `Value` in the index signature `[key: Key]: Value` contribute to its return type. A change to `Key` that invalidates an existing lookup puts the function in `api.mod`. When `E['keep']` selects a property on a simple local object type, review follows the type of `keep` and its dependencies. The name `key` belongs to the index parameter, so a method with that name keeps its own dependencies.

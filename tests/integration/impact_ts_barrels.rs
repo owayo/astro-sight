@@ -394,3 +394,95 @@ fn ts_const_import_alias_requires_the_resolved_module() {
     );
     assert!(reads().is_empty());
 }
+
+#[test]
+fn ts_export_retarget_reports_changed_public_bindings() {
+    let repo = TestRepo::new();
+    let base = "function f(): number { return 1; }\ntype Shape = number;\nconst keep = 1;\nfunction localOnly() {}\nfunction actuallyRemoved() {}\n";
+    let old_exports = "export {f, keep, f as ns, localOnly as \"read-f\", actuallyRemoved, actuallyRemoved as copy};\nexport type {Shape as Item};\nexport {other as forwarded} from './provider.js';\nexport {other as stable, other as newLocal} from './provider.js';\n";
+    let new_exports = "export {f as legacy, keep as keep};\nexport * as ns from './provider.js';\nexport {other as \"read-f\", other as copy} from './provider.js';\nexport {other as f} from './provider.js';\nexport type {Shape as LegacyItem};\nexport type {Changed as Item} from './provider.js';\nexport {replacement as forwarded} from './provider.js';\nimport {other as unchanged} from './provider.js';\nexport {unchanged as stable};\nconst replacementLocal = 1;\nexport {replacementLocal as newLocal};\n";
+    repo.write("api.ts", format!("{base}{old_exports}"));
+    repo.write("provider.ts", "export const other = false;\nexport const replacement = 1;\nexport type Changed = string;\n");
+    repo.write("use.ts", "import {f, forwarded, type Item} from './api.js';\nexport const n: number = f();\nexport const check: false = forwarded;\nexport const item: Item = 1;\nimport {actuallyRemoved} from './api.js'; actuallyRemoved();\n");
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("api.ts", format!("{base}{new_exports}"));
+    repo.stage_all();
+    for staged in [false, true] {
+        if staged {
+            repo.write("api.ts", format!("{base}{old_exports}"));
+        }
+        let flags: &[&str] = if staged {
+            &["--git", "--staged"]
+        } else {
+            &["--git"]
+        };
+        let review = repo.run_json("review", flags);
+        let changed: Vec<_> = review["api_changes"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        for name in ["f", "Item", "forwarded", "read-f", "copy", "ns", "newLocal"] {
+            assert_eq!(
+                changed.iter().filter(|actual| **actual == name).count(),
+                1,
+                "{name}: {review}"
+            );
+        }
+        for name in ["keep", "stable", "legacy", "Shape"] {
+            assert!(!changed.contains(&name), "{name}: {review}");
+        }
+        assert!(
+            !review["api_changes"]["added"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "replacementLocal"),
+            "{review}"
+        );
+        for bucket in ["removed", "removed_dead"] {
+            assert!(
+                !review["api_changes"][bucket]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|item| item["name"] == "localOnly"),
+                "{review}"
+            );
+        }
+        assert!(
+            review["api_changes"]["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "actuallyRemoved"),
+            "{review}"
+        );
+        let output = cargo_bin()
+            .args(["review", "--hook", "--dir"])
+            .arg(repo.root())
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(
+            hook["blocking_categories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kind| kind == "api.mod"),
+            "{hook}"
+        );
+        assert!(
+            hook["api"]["mod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["n"] == "f"),
+            "{hook}"
+        );
+    }
+}
