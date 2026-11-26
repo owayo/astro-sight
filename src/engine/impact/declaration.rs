@@ -818,6 +818,8 @@ pub(super) struct DeclarationProof {
     pub(super) rust_function_names: HashSet<String>,
     /// 旧新とも同名宣言が自由関数だけの名前。メソッド位置の参照は指し得ない。
     pub(super) rust_free_function_names: HashSet<String>,
+    /// 旧新ともこのファイル直下にただ一つの pub(super) 自由関数がある名前。
+    pub(super) rust_super_functions: HashSet<String>,
     pub(super) rust_receiverless_associated_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
@@ -1382,6 +1384,8 @@ pub(super) fn reconcile_declaration_changes(
                 .all(|kind| matches!(kind, SymbolKind::Function | SymbolKind::Method))
         })
     });
+    let mut restricted_old = HashSet::new();
+    let mut restricted_new = HashSet::new();
     let mut old_free = HashMap::<&str, bool>::new();
     let mut new_free = HashMap::<&str, bool>::new();
     let mut associated: HashSet<_> = proof
@@ -1389,15 +1393,24 @@ pub(super) fn reconcile_declaration_changes(
         .iter()
         .map(|name| super::ci_key(LangId::Rust, name))
         .collect();
-    for (symbols, root, source, free) in [
+    for (symbols, root, source, free, restricted) in [
         (
             &old.symbols[..],
             old.tree.root_node(),
             old.source.as_slice(),
             &mut old_free,
+            &mut restricted_old,
         ),
-        (input.syms, input.root, input.source, &mut new_free),
+        (
+            input.syms,
+            input.root,
+            input.source,
+            &mut new_free,
+            &mut restricted_new,
+        ),
     ] {
+        let mut names_seen = HashSet::new();
+        let mut repeated = HashSet::new();
         let mut found = HashSet::new();
         let attributes = std::cell::OnceCell::new();
         for symbol in symbols {
@@ -1405,21 +1418,41 @@ pub(super) fn reconcile_declaration_changes(
             let key = crate::language::normalize_identifier(LangId::Rust, &symbol.name);
             if associated.contains(key.as_ref()) {
                 if rust_receiverless_associated_function(root, source, symbol, &attributes) {
-                    found.insert(key);
+                    found.insert(key.clone());
                 } else {
                     associated.remove(key.as_ref());
                 }
+            }
+            if !names_seen.insert(key.clone()) {
+                repeated.insert(key.to_string());
             }
             if !proof.rust_function_names.contains(&symbol.name) {
                 continue;
             }
             let is_free = rust_is_free_function(root, symbol);
+            if is_free
+                && let Some(node) = super::descendant_for_range(root, &symbol.range)
+                && node.parent() == Some(root)
+                && !super::rust_path_owner::has_attribute_prefix(node)
+                && node.named_child(0).is_some_and(|n| {
+                    n.kind() == "visibility_modifier" && n.utf8_text(source) == Ok("pub(super)")
+                })
+            {
+                restricted.insert(symbol.name.clone());
+            }
             free.entry(symbol.name.as_str())
                 .and_modify(|all_free| *all_free &= is_free)
                 .or_insert(is_free);
         }
         associated.retain(|name| found.contains(name.as_str()));
+        restricted.retain(|name| {
+            !repeated.contains(crate::language::normalize_identifier(LangId::Rust, name).as_ref())
+        });
     }
+    proof.rust_super_functions = restricted_old
+        .intersection(&restricted_new)
+        .cloned()
+        .collect();
     proof.rust_receiverless_associated_names = associated;
     proof.rust_free_function_names = proof
         .rust_function_names

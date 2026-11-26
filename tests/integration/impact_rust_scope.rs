@@ -1410,3 +1410,161 @@ fn impact_rust_scope_macro_arguments_keep_unproven_syntax_and_macro_origins() {
         );
     }
 }
+
+#[test]
+fn rust_private_function_callers_respect_the_defining_module_and_local_items() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/family");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='sample'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    repo.write("src/lib.rs", "mod family; mod outside;\n");
+    repo.write("src/family.rs", "mod source; mod caller; mod alternate; mod formatting; mod catalog; pub(crate) use catalog::*;\n");
+    repo.write(
+        "src/family/source.rs",
+        "pub(super) fn gather(value:u8)->u8 { value }\n",
+    );
+    repo.write(
+        "src/family/alternate.rs",
+        "pub(super) fn gather(value:u8)->u8 { value }\n",
+    );
+    repo.write(
+        "src/family/catalog.rs",
+        "use std::iter::*;\n#[derive(Clone, Debug)] struct Data;\npub(crate) const N: u8 = 1;\n",
+    );
+    repo.write(
+        "src/family/formatting.rs",
+        r#"use super::*;
+struct Data;
+impl Data { fn gather(self) -> u8 { N } }
+fn format_data(data: Data) -> String {
+    format!("{}",data.gather())
+}
+"#,
+    );
+    repo.write("src/outside.rs", "macro_rules! inspect { ($e:expr) => { $e }; }\npub fn read() { let _ = inspect!([1].into_iter().collect::<Vec<_>>().gather()); }\ntrait Local { fn gather(self); } impl Local for Vec<i32> {fn gather(self){}}\n#[macro_export] macro_rules! call_real { () => { crate::family::source::gather(1) }; }\n");
+    repo.write(
+        "src/family/caller.rs",
+        r#"use super::source as Actual;
+use super::alternate;
+#[derive(Debug)]
+struct Local;
+impl Local { fn gather(_:u8)->u8{0} fn nested()->u8{Self::gather(1)} }
+fn check() {
+    let _ = Local::gather(1);
+    let _ = alternate::gather(1);
+    fn gather(_: u8)->u8 {0}
+    let _ = gather(1);
+    let _ = Actual::gather(1);
+    let _ = crate::call_real!();
+}
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/family/source.rs", "pub(super) fn make()->u8 {0}\npub(super) fn gather(value:u8, offset:u8)->u8 { value+offset }\n");
+    for staged in [false, true] {
+        let mut args = vec!["--git"];
+        if staged {
+            repo.stage_all();
+            args.push("--staged");
+        }
+        let context = repo.run_json("context", &args);
+        let calls = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "src/family/source.rs")
+            .unwrap()["impacted_callers"]
+            .as_array()
+            .unwrap();
+        let lines: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == "gather")
+            })
+            .map(|c| (c["path"].as_str().unwrap(), c["line"].as_u64().unwrap() + 1))
+            .collect();
+        assert_eq!(
+            lines,
+            [("src/family/caller.rs", 11), ("src/outside.rs", 4)],
+            "{context}"
+        );
+    }
+}
+
+#[test]
+fn rust_private_function_checks_the_origin_of_json_macro_tokens() {
+    let manifest = "[package]\nname='sample'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nserde_json='1'\n";
+    for (cargo, expected) in [
+        (manifest.to_owned(), false),
+        (
+            format!(
+                "{manifest}\n[patch.crates-io]\nwrapper={{package='serde_json',path='vendor/json'}}\n"
+            ),
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/family");
+        repo.create_dir_all("vendor/json/src");
+        repo.write(
+            "vendor/json/Cargo.toml",
+            "[package]\nname='serde_json'\nversion='1.0.154'\nedition='2021'\n",
+        );
+        repo.write(
+            "vendor/json/src/lib.rs",
+            "#[macro_export] macro_rules! json {($($t:tt)*)=>{0};}\n",
+        );
+        repo.write("Cargo.toml", cargo);
+        let registry = "registry+https://github.com/rust-lang/crates.io-index";
+        let checksum = "a".repeat(64);
+        repo.write("Cargo.lock",format!("version=4\n[[package]]\nname='sample'\nversion='0.1.0'\ndependencies=['serde_json']\n[[package]]\nname='serde_json'\nversion='1.0.154'\nsource='{registry}'\nchecksum='{checksum}'\n"));
+        repo.write("src/lib.rs", "mod family; mod reader;\n");
+        repo.write("src/family.rs", "mod source;\n");
+        repo.write(
+            "src/family/source.rs",
+            "pub(super) fn collect(value:u8)->u8 {value}\n",
+        );
+        repo.write(
+            "src/reader.rs",
+            r#"pub fn read(items: Vec<u8>) -> Option<serde_json::Value> {
+    Some(serde_json::json!({"items": items.into_iter().collect::<Vec<_>>()}))
+}
+"#,
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/family/source.rs",
+            "pub(super) fn collect(value:u8,n:u8)->u8 {value+n}\n",
+        );
+        for staged in [false, true] {
+            let mut args = vec!["--git"];
+            if staged {
+                repo.stage_all();
+                args.push("--staged");
+            }
+            let context = repo.run_json("context", &args);
+            let change = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|change| change["path"] == "src/family/source.rs")
+                .unwrap();
+            let hit = change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| {
+                    callers
+                        .iter()
+                        .any(|caller| caller["path"] == "src/reader.rs" && caller["line"] == 1)
+                });
+            assert_eq!(hit, expected, "{context}");
+        }
+    }
+}

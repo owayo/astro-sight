@@ -113,7 +113,9 @@ impl OpaqueAttributeScopes {
         let mut spans = Vec::new();
         if root.has_error() {
             spans.push(root.byte_range());
-        } else if memchr::memchr(b'#', source).is_some() {
+        } else if memchr::memchr(b'#', source).is_some()
+            || memchr::memmem::find(source, b"macro_rules").is_some()
+        {
             let mut pending = Vec::new();
             let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
                 pending.resize(depth + 1, false);
@@ -123,7 +125,7 @@ impl OpaqueAttributeScopes {
                         spans.push(node.byte_range());
                         Walk::Skip
                     }
-                    "inner_attribute_item" => {
+                    "inner_attribute_item" | "macro_definition" => {
                         spans.push(node.byte_range());
                         Walk::Skip
                     }

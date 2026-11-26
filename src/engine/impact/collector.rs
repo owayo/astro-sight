@@ -99,6 +99,7 @@ pub(super) struct RefEventMini {
     /// Rust: 参照の名前を、参照元のクレートのそのモジュールで解決すると構文から言えるか
     /// ([`super::rust_macro_site::macro_site`])。言えなければ別のクレートの参照として除かない。
     pub(super) rust_name_site: super::rust_macro_site::MacroSite,
+    rust_module_scope_site: bool,
     /// AST and project evidence identify this Rust reference as a standard crate name.
     pub(super) rust_std_origin: bool,
     /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
@@ -393,6 +394,9 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) rust_owner_sources: &'a [super::rust_path_owner::OwnerSource],
     pub(super) rust_ref_module:
         std::cell::OnceCell<Option<std::sync::Arc<super::rust_path_owner::PrivateModule>>>,
+    /// この参照ファイルと一致する作業ツリーまたは index のモジュール配置。
+    pub(super) rust_binding_view:
+        std::cell::OnceCell<Option<&'a super::rust_path_owner::RustPathOwnerProjectProof>>,
     /// [`Self::owner_layout_proved`] の結果 (参照ファイルごと)。
     pub(super) rust_ref_unrelocated: std::cell::OnceCell<bool>,
     pub(super) rust_private_calls: std::cell::OnceCell<Option<HashMap<usize, u32>>>,
@@ -590,6 +594,24 @@ impl ImpactCollector<'_> {
         // token tree から作り、キャプチャ用の証明だけに使う。
         let rust_format_capture =
             rust_format_capture.filter(|_| self.ref_lang == Some(LangId::Rust));
+        let scoped_function = self.ref_lang == Some(LangId::Rust)
+            && self.sym_to_fc[ix].iter().any(|&fc| {
+                self.file_contexts[fc as usize]
+                    .rust_super_functions
+                    .contains(&self.all_symbol_names[ix])
+            });
+        if scoped_function {
+            self.rust_binding_view.get_or_init(|| {
+                if self.rust_path_owner_enabled {
+                    return Some(self.rust_path_owner_project);
+                }
+                let view = self.rust_path_owner_project.staged_bindings()?;
+                (crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str))?
+                    .as_slice()
+                    == source)
+                    .then_some(view)
+            });
+        }
         let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
             && self.rust_path_owner_enabled)
             .then(|| {
@@ -778,8 +800,10 @@ impl ImpactCollector<'_> {
         // この識別子自身が receiver の field 位置なら自由関数を指すことはない。
         // token_tree 内はマクロ展開で参照形が変わり得るため証明しない (標準のマクロの写しでは
         // 普通の式として確かめる)。
-        let rust_receiver_member =
-            self.ref_lang == Some(LangId::Rust) && owner_node.is_some_and(is_rust_receiver_member);
+        let rust_receiver_member = self.ref_lang == Some(LangId::Rust)
+            && (owner_node.is_some_and(is_rust_receiver_member)
+                || scoped_function
+                    && copied_site.is_some_and(|(_, site, _)| is_rust_receiver_member(site)));
         let rust_dot_call = rust_receiver_member && owner_node.is_some_and(rust_member_is_called);
         let rust_plain_dot_call = rust_dot_call
             && rust_macro_site.is_none()
@@ -1087,6 +1111,48 @@ impl ImpactCollector<'_> {
         } else {
             None
         };
+        let scoped_node = node.filter(|n| {
+            scoped_function
+                && !self
+                    .rust_opaque_attributes
+                    .get_or_init(|| {
+                        super::rust_macro_site::OpaqueAttributeScopes::build(*n, source)
+                    })
+                    .contains(*n)
+        });
+        let scoped_view = self.rust_binding_view.get().copied().flatten();
+        let rust_module_scope_site = scoped_function
+            && (copied_site.is_some()
+                || scoped_node.is_some_and(|node| {
+                    !node
+                        .parent()
+                        .is_some_and(|p| matches!(p.kind(), "token_tree" | "token_repetition"))
+                        || scoped_view.is_some_and(|view| {
+                            view.macro_tokens_stay_in_module()
+                                || self
+                                    .rust_path_owner
+                                    .get_or_init(|| {
+                                        super::rust_path_owner::RustPathOwnerIndex::build(
+                                            node, source,
+                                        )
+                                    })
+                                    .json_expression(node, source, Path::new(self.path_str), view)
+                        })
+                }));
+        let known_owner = scoped_node
+            .filter(|node| node.kind() == "identifier")
+            .zip(scoped_view)
+            .and_then(|(node, view)| {
+                self.rust_path_owner
+                    .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source))
+                    .qualified_call_owner(node, source, Path::new(self.path_str), view)
+            });
+        use super::rust_path_owner::QualifiedCallOwner;
+        let definite_type = matches!(known_owner, Some(QualifiedCallOwner::Type));
+        let rust_owner = rust_owner.or(match known_owner {
+            Some(QualifiedCallOwner::Function(path)) => Some((path, true)),
+            _ => None,
+        });
         let rust_owner_path_id = rust_owner
             .as_ref()
             .and_then(|(owner, _)| owner.to_str())
@@ -1107,17 +1173,18 @@ impl ImpactCollector<'_> {
                     self.rust_path_owner_project,
                 )
             });
-        let rust_non_function_path = owner_index.zip(owner_node).is_some_and(|(index, node)| {
-            super::rust_path_owner::RustPathOwnerIndex::is_nonterminal_path(node)
-                || index.is_local_associated_path(
-                    node,
-                    owner_source,
-                    Path::new(self.dir),
-                    self.path_str,
-                    self.rust_path_owner_project,
-                    self.rust_cargo_reachability,
-                )
-        });
+        let rust_non_function_path = definite_type
+            || owner_index.zip(owner_node).is_some_and(|(index, node)| {
+                super::rust_path_owner::RustPathOwnerIndex::is_nonterminal_path(node)
+                    || index.is_local_associated_path(
+                        node,
+                        owner_source,
+                        Path::new(self.dir),
+                        self.path_str,
+                        self.rust_path_owner_project,
+                        self.rust_cargo_reachability,
+                    )
+            });
         let rust_registry_qualified_call = !rust_non_function_path
             && rust_owner_index.zip(node).is_some_and(|(index, node)| {
                 index.is_registry_qualified_call(
@@ -1274,6 +1341,7 @@ impl ImpactCollector<'_> {
             rust_call_owner_id,
             rust_private_type_site,
             rust_name_site,
+            rust_module_scope_site,
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
@@ -1441,6 +1509,7 @@ struct RefFileEvidence<'a> {
     rust_private_function_unreachable: HashMap<usize, bool>,
     /// 参照ファイルの `define_class!` が objc2 0.6 のものか ([`ImpactCollector::define_class_verified`])。
     rust_define_class: std::cell::OnceCell<bool>,
+    outside_parent: HashMap<usize, bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
 }
 
@@ -1683,6 +1752,7 @@ impl<'a> ImpactCollector<'a> {
             rust_private_import_owners: HashMap::new(),
             rust_private_function_unreachable: HashMap::new(),
             rust_define_class: std::cell::OnceCell::new(),
+            outside_parent: Default::default(),
             rust_ref_source: std::cell::OnceCell::new(),
         }
     }
@@ -1773,6 +1843,21 @@ impl<'a> ImpactCollector<'a> {
         }
         if (e.rust_value_binding && rust_function_only(ctx, name))
             || (e.rust_scoped_value && ctx.rust_free_function_names.contains(name))
+        {
+            return true;
+        }
+        if e.rust_module_scope_site
+            && ctx.rust_super_functions.contains(name)
+            && ctx.rust_free_function_names.contains(name)
+            && *evidence.outside_parent.entry(fc_ix).or_insert_with(|| {
+                self.rust_binding_view
+                    .get()
+                    .copied()
+                    .flatten()
+                    .is_some_and(|view| {
+                        view.outside_parent(Path::new(&ctx.new_path), Path::new(self.path_str))
+                    })
+            })
         {
             return true;
         }
@@ -2284,6 +2369,7 @@ mod tests {
             rust_call_owner_id: u32::MAX,
             rust_private_type_site: false,
             rust_name_site: super::super::rust_macro_site::MacroSite::Plain,
+            rust_module_scope_site: false,
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
@@ -2430,6 +2516,7 @@ mod tests {
             lang_id: LangId::Rust,
             rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
             rust_free_function_names: Default::default(),
+            rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
             affected,
             sig_changes,

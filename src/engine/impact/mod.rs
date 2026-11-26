@@ -211,6 +211,7 @@ struct FileContext {
     /// 同名 affected がすべて Rust function/method の場合だけ値束縛を除外する。
     rust_function_names: HashSet<String>,
     rust_free_function_names: HashSet<String>,
+    rust_super_functions: HashSet<String>,
     rust_receiverless_associated_names: HashSet<String>,
     /// 旧新の種別が異なる名前では束縛と値渡しを降格しない。
     rust_kind_changes: HashSet<String>,

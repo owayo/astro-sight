@@ -473,6 +473,13 @@ pub(super) fn stream_caller_maps(
         rust_diff_input,
     );
     rust_path_owner_project.layout_checkout = checkout.to_owned();
+    if options.new_side == crate::models::impact::DiffNewSide::Index
+        && file_contexts
+            .iter()
+            .any(|ctx| !ctx.rust_super_functions.is_empty())
+    {
+        rust_path_owner_project.staged_binding_diff = Some(rust_diff_input.into());
+    }
     for ctx in file_contexts
         .iter()
         .filter(|ctx| !ctx.rust_inherent_method_owners.is_empty())
@@ -559,6 +566,7 @@ pub(super) fn stream_caller_maps(
                             rust_cargo_reachability: &rust_cargo_reachability,
                             rust_owner_sources: &rust_owner_sources,
                             rust_ref_module: Default::default(),
+                            rust_binding_view: Default::default(),
                             rust_ref_unrelocated: Default::default(),
                             rust_private_calls: Default::default(),
                             rust_method_bindings: Default::default(),
@@ -692,6 +700,7 @@ mod tests {
             jsx_prop_changes: HashMap::new(),
             rust_function_names: Default::default(),
             rust_free_function_names: Default::default(),
+            rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),

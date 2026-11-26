@@ -76,6 +76,34 @@ pub(super) fn environment_with_glob(
     approved: Option<usize>,
     imports_in_scope: bool,
 ) -> Option<(Environment, bool)> {
+    scope_environment(scope, source, approved, imports_in_scope, false)
+}
+
+/// serde の derive が crates.io のものと確認済みのモジュールでは、生成される impl が別の文のマクロを差し替えない。
+fn module_environment(
+    scope: Node<'_>,
+    source: &[u8],
+    file: &Path,
+    project: &RustPathOwnerProjectProof,
+    visible: bool,
+) -> Option<(Environment, bool)> {
+    environment_with_glob(scope, source, None, visible).or_else(|| {
+        if memchr::memmem::find(source, b"serde").is_none()
+            || !super::registry_macros::stock_dependency(project, file, "serde")
+        {
+            return None;
+        }
+        scope_environment(scope, source, None, visible, true)
+    })
+}
+
+fn scope_environment(
+    scope: Node<'_>,
+    source: &[u8],
+    approved: Option<usize>,
+    imports_in_scope: bool,
+    serde: bool,
+) -> Option<(Environment, bool)> {
     let mut result = Environment::default();
     let mut textual = HashSet::new();
     let mut glob = false;
@@ -108,9 +136,26 @@ pub(super) fn environment_with_glob(
                     result.attributes.insert("global_allocator".to_owned());
                     continue;
                 }
-                result
-                    .attributes
-                    .extend(super::super::rust_std_origin::safe_attribute(item, source)?);
+                if let Some(names) = super::super::rust_std_origin::safe_attribute(item, source) {
+                    result.attributes.extend(names);
+                } else if serde
+                    && let Some(names) =
+                        super::registry_macros::serde_attribute(scope, item, source)
+                {
+                    result.attributes.extend(names);
+                } else {
+                    return None;
+                }
+            }
+            "mod_item" | "type_item"
+                if serde
+                    && item.child_by_field_name("name").is_some_and(|n| {
+                        n.utf8_text(source).ok().is_none_or(|name| {
+                            !name.is_ascii() || name.trim_start_matches("r#") == "serde"
+                        })
+                    }) =>
+            {
+                return None;
             }
             "macro_definition" => {
                 let name = item.child_by_field_name("name")?.utf8_text(source).ok()?;
@@ -149,6 +194,149 @@ pub(super) fn environment_with_glob(
         return Some((result, false));
     }
     Some((result, glob))
+}
+
+/// 同じ crate の通常のモジュールからの glob で持ち込める公開名を集める。
+/// 非公開の import はそのモジュールから外へ出ない。別の glob は直接の mod 宣言だけを辿る。
+fn local_glob_names(
+    file: &Path,
+    root: Node<'_>,
+    source: &[u8],
+    project: &RustPathOwnerProjectProof,
+) -> Option<HashSet<String>> {
+    let start = project.ordinary_private_module(file)?;
+    let mut pending = Vec::new();
+    let mut names = HashSet::new();
+    let mut visited = HashSet::new();
+    let collect = |root: Node<'_>,
+                   bytes: &[u8],
+                   module: &[String],
+                   exported: bool,
+                   pending: &mut Vec<Vec<String>>,
+                   names: &mut HashSet<String>|
+     -> Option<()> {
+        let mut cursor = root.walk();
+        if root.has_error() {
+            return None;
+        }
+        for item in root.named_children(&mut cursor) {
+            if exported
+                && item
+                    .named_child(0)
+                    .is_some_and(|n| n.kind() == "visibility_modifier")
+                && let Some(name) = item
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+            {
+                names.insert(name.trim_start_matches("r#").to_owned());
+            }
+            if item.kind() != "use_declaration" {
+                continue;
+            }
+            if exported
+                && !item
+                    .named_child(0)
+                    .is_some_and(|n| n.kind() == "visibility_modifier")
+            {
+                continue;
+            }
+            if let Some(imports) = root_use_names(item, bytes) {
+                if exported {
+                    names.extend(imports);
+                }
+                continue;
+            }
+            if !exported && is_parent_glob(item) {
+                continue;
+            }
+            let arg = item.child_by_field_name("argument")?;
+            if arg.kind() != "use_wildcard" {
+                return None;
+            }
+            let text = arg.utf8_text(bytes).ok()?.strip_suffix("::*")?;
+            let mut path = module.to_vec();
+            let mut parts = text.split("::").peekable();
+            match parts.peek().copied()? {
+                "crate" => {
+                    path.clear();
+                    parts.next();
+                }
+                "self" => {
+                    parts.next();
+                }
+                "super" => {
+                    while parts.next_if_eq(&"super").is_some() {
+                        path.pop()?;
+                    }
+                }
+                first => {
+                    unique_module(root, first, bytes)?;
+                }
+            }
+            for part in parts {
+                if part.is_empty()
+                    || !part
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+                {
+                    return None;
+                }
+                path.push(part.to_owned());
+            }
+            pending.push(path);
+        }
+        Some(())
+    };
+    collect(root, source, &start.path, false, &mut pending, &mut names)?;
+    if let Some(old) = project.reexport_old_sources.get(file) {
+        let old = old.as_deref()?;
+        let tree = parser::parse_source(old, LangId::Rust).ok()?;
+        collect(
+            tree.root_node(),
+            old,
+            &start.path,
+            false,
+            &mut pending,
+            &mut names,
+        )?;
+    }
+    while let Some(module) = pending.pop() {
+        if !visited.insert(module.clone()) {
+            continue;
+        }
+        let child = project.declared_module_file(&start.src, &module)?;
+        if !project.unrelocated(&child) {
+            return None;
+        }
+        let bytes = read_input_file(&project.root.join(&child))?;
+        let previous = match project.reexport_old_sources.get(&child) {
+            Some(source) => Some(source.as_deref()?),
+            None => None,
+        };
+        // 変更された glob 元は旧版から持ち込めた名前・属性も調べる。
+        for source in std::iter::once(bytes.as_slice()).chain(previous) {
+            let tree = parser::parse_source(source, LangId::Rust).ok()?;
+            let (env, glob) = module_environment(tree.root_node(), source, &child, project, false)?;
+            // 通常の prelude の derive と同名の glob だけなら rustc は E0659 にする。
+            // 明示した import・字句上の定義との衝突は consistent で除く。
+            let glob_may_change_attributes = glob
+                && env.attributes.iter().any(|name| {
+                    name != "derive" && !super::super::rust_std_origin::builtin_derive(name)
+                });
+            if !env.consistent() || glob_may_change_attributes {
+                return None;
+            }
+            collect(
+                tree.root_node(),
+                source,
+                &module,
+                true,
+                &mut pending,
+                &mut names,
+            )?;
+        }
+    }
+    Some(names)
 }
 
 fn sibling(mut node: Node<'_>, previous: bool) -> Option<Node<'_>> {
@@ -484,7 +672,41 @@ impl RustPathOwnerIndex {
                     if root.has_error() {
                         return None;
                     }
-                    combined.merge(environment(root, &source, None, visible)?);
+                    let (mut local, glob) =
+                        module_environment(root, &source, file, project, visible)?;
+                    if (glob || memchr::memmem::find(&source, b"serde").is_some())
+                        && let Some(old) = project.reexport_old_sources.get(file)
+                    {
+                        let old = old.as_deref()?;
+                        let tree = parser::parse_source(old, LangId::Rust).ok()?;
+                        let previous = tree.root_node();
+                        let (env, old_glob) =
+                            module_environment(previous, old, file, project, visible)?;
+                        if old_glob != glob || has_parent_glob(previous) != has_parent_glob(root) {
+                            return None;
+                        }
+                        local.merge(env);
+                    }
+                    if glob {
+                        let cached = project
+                            .macro_glob_names
+                            .lock()
+                            .expect("macro glob cache poisoned")
+                            .get(file)
+                            .cloned();
+                        let names = cached.unwrap_or_else(|| {
+                            let names =
+                                local_glob_names(file, root, &source, project).map(Arc::new);
+                            project
+                                .macro_glob_names
+                                .lock()
+                                .expect("macro glob cache poisoned")
+                                .insert(file.to_owned(), names.clone());
+                            names
+                        })?;
+                        local.imports.extend(names.iter().cloned());
+                    }
+                    combined.merge(local);
                     // crate root は module の連鎖の最上位の親。root どうしは持ち込まない。
                     if index < chain.len() {
                         visible = visible && has_parent_glob(root);

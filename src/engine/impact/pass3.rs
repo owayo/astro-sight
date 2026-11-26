@@ -208,6 +208,7 @@ mod tests {
             jsx_prop_changes: std::collections::HashMap::new(),
             rust_function_names: Default::default(),
             rust_free_function_names: Default::default(),
+            rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),

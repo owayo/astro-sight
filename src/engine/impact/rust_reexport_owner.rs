@@ -12,7 +12,7 @@ use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_us
 use crate::language::LangId;
 
 use super::rust_path_owner::{
-    RustPathOwnerProjectProof, has_attribute_prefix, has_uncertain_ancestor,
+    QualifiedCallOwner, RustPathOwnerProjectProof, has_attribute_prefix, has_uncertain_ancestor,
     is_allowed_expression_macro, path_segments, private_module_file, scope_can_rebind_import_name,
     scope_can_rebind_name, source_module_path,
 };
@@ -714,12 +714,144 @@ fn resolve_name(
     owner
 }
 
+pub(super) struct BindingVersions {
+    current: Arc<ModuleBindings>,
+    old: Option<ModuleBindings>,
+}
+
+#[derive(PartialEq, Eq)]
+enum CallPathStep<'a> {
+    Type,
+    Function,
+    Module,
+    Import(&'a [String], &'a str),
+}
+
+impl ModuleBindings {
+    fn call_path_step<'a>(&'a self, name: &'a str, remaining: usize) -> Option<CallPathStep<'a>> {
+        if self.unknown_types.contains(name) || self.unknown_functions.contains(name) {
+            return None;
+        }
+        if remaining == 1 && self.types.contains_key(name) {
+            return Some(CallPathStep::Type);
+        }
+        if remaining == 0 && self.functions.contains_key(name) {
+            return Some(CallPathStep::Function);
+        }
+        if self
+            .modules
+            .iter()
+            .filter(|(child, _)| child == name)
+            .count()
+            == 1
+        {
+            return Some(CallPathStep::Module);
+        }
+        let mut imports = self.named.iter().filter(|i| i.name == name);
+        if let Some(edge) = imports.next() {
+            return imports
+                .next()
+                .is_none()
+                .then_some(CallPathStep::Import(&edge.target_module, &edge.target_name));
+        }
+        if !self.opaque
+            && let [glob] = &self.globs[..]
+        {
+            return Some(CallPathStep::Import(&glob.target_module, name));
+        }
+        None
+    }
+}
+
+/// 修飾パスの各部分を、旧新で同じ明示宣言か import まで辿る。
+pub(super) fn declared_call_owner(
+    project: &RustPathOwnerProjectProof,
+    file: &Path,
+    path: &[String],
+) -> Option<QualifiedCallOwner> {
+    let current = project.ordinary_private_module(file)?;
+    let root = &project.root;
+    if project
+        .declared_module_file(&current.src, &current.path)
+        .as_deref()
+        != Some(file)
+    {
+        return None;
+    }
+    let mut module = current.path.clone();
+    let mut tail = std::collections::VecDeque::from(path.to_owned());
+    match tail.front()?.as_str() {
+        "crate" => {
+            tail.pop_front();
+            module.clear();
+        }
+        "self" => {
+            tail.pop_front();
+        }
+        "super" => {
+            while tail.front().is_some_and(|n| n == "super") {
+                tail.pop_front();
+                module.pop()?;
+            }
+        }
+        _ => {}
+    }
+    let mut seen = HashSet::new();
+    while let Some(name) = tail.pop_front() {
+        if !seen.insert((module.clone(), name.clone())) {
+            return None;
+        }
+        let owner = if module.is_empty() && current.library_only {
+            current.src.join("lib.rs")
+        } else {
+            project.declared_module_file(&current.src, &module)?
+        };
+        let versions = binding_versions(root, &owner, &module, project)?;
+        let step = versions.current.call_path_step(&name, tail.len())?;
+        if versions
+            .old
+            .as_ref()
+            .is_some_and(|old| old.call_path_step(&name, tail.len()).as_ref() != Some(&step))
+        {
+            return None;
+        }
+        match step {
+            CallPathStep::Type => {
+                return project
+                    .unrelocated(&owner)
+                    .then_some(QualifiedCallOwner::Type);
+            }
+            CallPathStep::Function => {
+                return project
+                    .unrelocated(&owner)
+                    .then_some(QualifiedCallOwner::Function(owner));
+            }
+            CallPathStep::Module => module.push(name),
+            CallPathStep::Import(next, item) => {
+                module = next.to_vec();
+                tail.push_front(item.to_owned());
+            }
+        }
+    }
+    None
+}
+
 fn load_bindings(
     dir: &Path,
     file: &Path,
     module: &[String],
     project: &RustPathOwnerProjectProof,
 ) -> Option<Arc<ModuleBindings>> {
+    let bindings = binding_versions(dir, file, module, project)?;
+    bindings.old.is_none().then(|| bindings.current.clone())
+}
+
+fn binding_versions(
+    dir: &Path,
+    file: &Path,
+    module: &[String],
+    project: &RustPathOwnerProjectProof,
+) -> Option<Arc<BindingVersions>> {
     if let Some(cached) = project
         .reexport_files
         .lock()
@@ -740,15 +872,18 @@ fn load_bindings(
         let source = read_input_file(&full)?;
         let tree = parser::parse_source(&source, LangId::Rust).ok()?;
         let bindings = parse_bindings(tree.root_node(), &source, module)?;
-        if let Some(old_source) = project.reexport_old_sources.get(file) {
+        let old = if let Some(old_source) = project.reexport_old_sources.get(file) {
             let old_source = old_source.as_ref()?;
             let old_tree = parser::parse_source(old_source, LangId::Rust).ok()?;
             let old_bindings = parse_bindings(old_tree.root_node(), old_source, module)?;
-            if old_bindings != bindings {
-                return None;
-            }
-        }
-        Some(Arc::new(bindings))
+            (old_bindings != bindings).then_some(old_bindings)
+        } else {
+            None
+        };
+        Some(Arc::new(BindingVersions {
+            current: Arc::new(bindings),
+            old,
+        }))
     })();
     project
         .reexport_files
