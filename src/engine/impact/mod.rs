@@ -295,6 +295,19 @@ pub fn analyze_impact_streaming<F>(
     diff_input: &str,
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
+    on_file_impact: F,
+) -> Result<()>
+where
+    F: FnMut(FileImpact) -> Result<()>,
+{
+    analyze_impact_at_checkout(diff_input, dir, options, dir, on_file_impact)
+}
+
+pub(crate) fn analyze_impact_at_checkout<F>(
+    diff_input: &str,
+    dir: &Path,
+    options: &crate::models::impact::ContextAnalysisOptions,
+    checkout: &Path,
     mut on_file_impact: F,
 ) -> Result<()>
 where
@@ -387,6 +400,7 @@ where
         dir,
         Pass2Evidence {
             options,
+            checkout,
             reexport_moves: &reexport_moves,
             cargo_graph_enabled,
             rust_module_wiring_unchanged: cargo_graph_enabled

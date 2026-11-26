@@ -96,6 +96,7 @@ struct Pass2Scan {
 }
 
 pub(super) struct Pass2Evidence<'a> {
+    pub(super) checkout: &'a Path,
     pub(super) options: &'a crate::models::impact::ContextAnalysisOptions,
     pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
     pub(super) cargo_graph_enabled: bool,
@@ -317,6 +318,7 @@ pub(super) fn stream_caller_maps(
 ) -> Result<StreamCallerMaps> {
     let Pass2Evidence {
         options,
+        checkout,
         reexport_moves,
         cargo_graph_enabled,
         rust_module_wiring_unchanged,
@@ -400,6 +402,7 @@ pub(super) fn stream_caller_maps(
         rust_diff_files,
         rust_diff_input,
     );
+    rust_path_owner_project.layout_checkout = checkout.to_owned();
     for ctx in file_contexts
         .iter()
         .filter(|ctx| !ctx.rust_inherent_method_owners.is_empty())

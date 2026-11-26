@@ -1419,6 +1419,7 @@ impl<'a> ImpactCollector<'a> {
                         && self
                             .rust_cargo_reachability
                             .proves_unreachable(self.path_str, &context.new_path)
+                        && self.rust_path_owner_project.layout_cargo_settings_known()
                 })
                 .collect::<Vec<_>>()
         } else {

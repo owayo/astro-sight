@@ -61,7 +61,10 @@ impl<'a> Case<'a> {
     }
 
     fn changed_repo(&self) -> TestRepo {
-        let repo = TestRepo::new();
+        self.write_changes_to(TestRepo::new())
+    }
+
+    fn write_changes_to(&self, repo: TestRepo) -> TestRepo {
         let members = self
             .members
             .iter()
@@ -1822,6 +1825,94 @@ fn impact_rust_private_type_keeps_files_mounted_by_assembled_attributes() {
             .any(|line| line.starts_with("→ b/src/calls.rs:1 [")),
         "{lines:?}"
     );
+}
+
+fn private_layout_case() -> Case<'static> {
+    let mut case = Case::new(A_OLD).file("b/src/calls.rs", "fn take(_: &crate::Settings<u8>) {}\n");
+    case.a_old = "mod child;\nstruct Settings<T>(T);\n".to_owned();
+    case.a_new = "mod child;\nstruct Settings<T, U>(T, U);\n".to_owned();
+    case.b_lib = "mod calls;\nstruct Settings<T>(T);\n";
+    case.files[0].1.clear();
+    case
+}
+
+fn private_layout_reports_caller(review: &serde_json::Value) -> bool {
+    review["impact"]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|change| change["impacted_callers"].as_array())
+        .flatten()
+        .any(|caller| caller["path"] == "b/src/calls.rs" && caller["line"] == 0)
+}
+
+#[test]
+fn private_layout_checks_attributes_reassembled_by_macros() {
+    let macro_body = "macro_rules! emit { ($h:tt, $br:tt) => { $h $br mod copied; }; }\nmacro_rules! wrap { ($h:tt $b:tt, $p:ident) => { emit!($h, [$p = \"../../b/src/calls.rs\"]); }; }\n";
+    for (source, expected) in [
+        (format!("{macro_body}wrap!(#[doc], path);\n"), true),
+        (format!("{macro_body}wrap!(/// note\n, path);\n"), true),
+        ("macro_rules! keep { ($i:item) => { $i }; }\nkeep! { #[doc = \"caption\"] pub struct Marker; }\n".to_owned(), false),
+    ] {
+        let mut case = private_layout_case();
+        case.files[0].1 = source;
+        let repo = case.changed_repo();
+        assert_eq!(private_layout_reports_caller(&repo.run_json("review", &["--git"])), expected);
+        repo.stage_all();
+        repo.write("a/src/lib.rs", &case.a_old);
+        assert_eq!(private_layout_reports_caller(&repo.run_json("review", &["--git", "--staged"])), expected);
+    }
+}
+
+#[test]
+fn private_layout_checks_cargo_overrides_from_the_selected_tree() {
+    let redirect = "[patch.crates-io]\nprobe={path='target/probe'}\n";
+    let benign = "[build]\njobs=1\n";
+    for (path, index, worktree) in [
+        (".cargo/config.toml", redirect, benign),
+        (".cargo/config.toml", benign, redirect),
+        (
+            "target/invoke/.cargo/config.toml",
+            "[patch.crates-io]\nprobe={path='../probe'}\n",
+            benign,
+        ),
+    ] {
+        let mut case = private_layout_case()
+            .depends("b", "probe='=0.1.0'\n")
+            .file(path, index)
+            .file("target/probe/Cargo.toml", "[package]\nname='probe'\nversion='0.1.0'\nedition='2024'\n")
+            .file("target/probe/src/lib.rs", "include!(\"../../../a/src/lib.rs\");\n#[path=\"../../../b/src/calls.rs\"]\nmod calls;\n");
+        case.a_old = "struct Settings<T>(T);\n".to_owned();
+        case.a_new = "struct Settings<T, U>(T, U);\n".to_owned();
+        let outer = TestRepo::new();
+        let repo = case.write_changes_to(TestRepo::new_in(outer.root()));
+        assert_eq!(
+            private_layout_reports_caller(&repo.run_json("review", &["--git"])),
+            index != benign
+        );
+        repo.stage_all();
+        repo.write(path, worktree);
+        assert_eq!(
+            private_layout_reports_caller(&repo.run_json("review", &["--git", "--staged"])),
+            index != benign
+        );
+        if index == benign {
+            repo.write(path, benign);
+            let package = repo.root().file_name().unwrap().to_str().unwrap();
+            outer.create_dir_all(".cargo");
+            outer.write(
+                ".cargo/config.toml",
+                format!("[patch.crates-io]\nprobe={{path='{package}/target/probe'}}\n"),
+            );
+            let review = outer.run_json_in(
+                repo.root(),
+                std::iter::empty::<(&str, &str)>(),
+                "review",
+                &["--git", "--staged"],
+            );
+            assert!(private_layout_reports_caller(&review), "{review}");
+        }
+    }
 }
 
 /// 普通のマクロ (`println!`) と組み込みの derive だけの `#[path]` のモジュールは、別のクレートの

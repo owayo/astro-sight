@@ -748,8 +748,18 @@ impl AppService {
         dir: &str,
         options: &crate::models::impact::ContextAnalysisOptions,
     ) -> Result<ContextResult> {
+        self.analyze_context_at_checkout(diff, dir, options, dir)
+    }
+
+    pub(crate) fn analyze_context_at_checkout(
+        &self,
+        diff: &str,
+        dir: &str,
+        options: &crate::models::impact::ContextAnalysisOptions,
+        checkout: &str,
+    ) -> Result<ContextResult> {
         let mut changes = Vec::new();
-        self.analyze_context_streaming(diff, dir, options, |impact| {
+        self.analyze_context_streaming_at_checkout(diff, dir, options, checkout, |impact| {
             changes.push(impact);
             Ok(())
         })?;
@@ -788,6 +798,20 @@ impl AppService {
         diff: &str,
         dir: &str,
         options: &crate::models::impact::ContextAnalysisOptions,
+        on_file_impact: F,
+    ) -> Result<()>
+    where
+        F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
+    {
+        self.analyze_context_streaming_at_checkout(diff, dir, options, dir, on_file_impact)
+    }
+
+    fn analyze_context_streaming_at_checkout<F>(
+        &self,
+        diff: &str,
+        dir: &str,
+        options: &crate::models::impact::ContextAnalysisOptions,
+        checkout: &str,
         mut on_file_impact: F,
     ) -> Result<()>
     where
@@ -808,19 +832,27 @@ impl AppService {
         let mut callers_count = 0usize;
         let mut affected_count = 0usize;
 
-        impact::analyze_impact_streaming(diff, &canonical_dir, options, |mut impact| {
-            // impacted_callers 内の絶対パスを相対パス (`/` 区切り、diff のパスと同じ表記) へ変換する。
-            for caller in &mut impact.impacted_callers {
-                if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
-                    caller.path =
-                        crate::git_support::normalize_workspace_separators(&rel.to_string_lossy());
+        impact::analyze_impact_at_checkout(
+            diff,
+            &canonical_dir,
+            options,
+            &self.workspace_candidate(checkout),
+            |mut impact| {
+                // impacted_callers 内の絶対パスを相対パス (`/` 区切り、diff のパスと同じ表記) へ変換する。
+                for caller in &mut impact.impacted_callers {
+                    if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir)
+                    {
+                        caller.path = crate::git_support::normalize_workspace_separators(
+                            &rel.to_string_lossy(),
+                        );
+                    }
                 }
-            }
-            changes_count += 1;
-            affected_count += impact.affected_symbols.len();
-            callers_count += impact.impacted_callers.len();
-            on_file_impact(impact)
-        })?;
+                changes_count += 1;
+                affected_count += impact.affected_symbols.len();
+                callers_count += impact.impacted_callers.len();
+                on_file_impact(impact)
+            },
+        )?;
 
         debug!(
             dir = dir,
