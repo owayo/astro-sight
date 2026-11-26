@@ -169,6 +169,8 @@ JS / TS / TSX のトップレベル関数について、別ファイルの同名
 
 ### TypeScript の named import の別名
 
+`import { palette as palette }` や `import { "palette" as palette }` は、公開名と手元で使う名前が同じなので、`import { palette }` と同じく宣言行を情報提供に分ける。変更したプロパティの読み取りや、引数を変えた関数の呼び出しは引き続き影響先になる。利用側の識別子が Unicode エスケープで書かれ、参照検索でその行を特定できない場合は、import 行を影響候補に残すことがある。
+
 `export const VALUE` の型や値を変更すると、`import { VALUE as TMP } from './values'` を通して `TMP` を読む行も `VALUE` の影響先に含まれる。相対パスの再エクスポートで名前が変わっても、元の定数を特定できれば追跡する。`import type` の別名を使う `typeof TMP` も対象になる。同名の引数を読む行や `obj.TMP` のプロパティ名は、この定数の利用には数えない。
 
 TS/TSX の一意な通常直下関数では、直接の相対 `import { total as sum } from './pricing'` を通した呼び出しも `api.mod_closed` に数えられる。解決先は変更した宣言ファイル1つに限り、競合する候補があれば証明しない。別名の全利用が同じ import に束縛される直接 call であることを求める。内側で同名の引数やローカルを宣言した利用は別束縛として除く。元の名前と別名の両方について、変更後の引数数と既存の実変更行の条件を照合する。複数行の call も扱い、`review --staged` は完全な index snapshot の中の証拠だけを使う。

@@ -589,7 +589,9 @@ impl ImpactCollector<'_> {
             {
                 node.is_some_and(|node| {
                     self.import_spans
-                        .get_or_init(|| filters::ImportSpans::build(node, self.ref_lang.unwrap()))
+                        .get_or_init(|| {
+                            filters::ImportSpans::build(node, self.ref_lang.unwrap(), source)
+                        })
                         .contains(node)
                         || (self.ref_lang.is_some_and(lang_is_ts_family)
                             && filters::is_commonjs_require_binding(node, source))
@@ -602,15 +604,9 @@ impl ImpactCollector<'_> {
         };
         let unproven_module_ref = is_import
             && self.ref_lang.is_some_and(lang_is_ts_family)
-            && !node.is_some_and(|node| {
-                node.parent().is_some_and(|parent| {
-                    matches!(parent.kind(), "import_specifier" | "export_specifier")
-                        && parent.child_by_field_name("alias").is_none()
-                        && parent
-                            .child_by_field_name("name")
-                            .is_some_and(|name| name.id() == node.id())
-                })
-            });
+            && !node
+                .zip(self.import_spans.get())
+                .is_some_and(|(node, spans)| spans.same_named_specifier(node, source));
         // 対象のオブジェクトが無い参照では AST の追加走査も文字列確保もしない。
         let member_path = if self.ref_lang.is_some_and(lang_is_ts_family)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {

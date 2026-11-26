@@ -170,6 +170,8 @@ When one property of an exported object literal changes, a direct read of an unc
 
 ### TypeScript Named Import Aliases
 
+An import such as `import { palette as palette }` or `import { "palette" as palette }` keeps the exported name. Its declaration is informational just like `import { palette }`. Reading a changed property or calling a function with a changed signature can still be blocking. If a use spells the local name with a Unicode escape that the reference search cannot match, the import line can remain a possible impact.
+
 Changing the type or value of `export const VALUE` can affect a line that reads `TMP` through `import { VALUE as TMP } from './values'`. The impact appears under `VALUE`, including when a relative re-export renames the constant and its origin can be resolved. A `typeof TMP` query also counts when the alias comes from `import type`. A same-name function parameter or the property name in `obj.TMP` refers to a separate binding.
 
 For a unique ordinary top-level TS/TSX function, a direct relative `import { total as sum } from './pricing'` can contribute calls to `api.mod_closed`. The import must resolve to the changed declaration's file with no competing candidate. Every use of the local alias must resolve to that import and be a direct call. Inner parameters and local declarations that shadow the alias are independent. Both the original-name callers and alias callers must satisfy the changed function's argument count and the existing changed-line checks, including multiline calls. A complete index snapshot supplies the evidence for `review --staged`.

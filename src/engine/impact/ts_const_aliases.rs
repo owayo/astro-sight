@@ -23,14 +23,11 @@ fn has_type_keyword(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "type")
 }
 
-fn import_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<Cow<'a, str>> {
+pub(super) fn import_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<Cow<'a, str>> {
     let raw = node.utf8_text(source).ok()?;
     match node.kind() {
         "identifier" => decoded(raw),
-        "string" => {
-            let quote = raw.chars().next().filter(|q| matches!(q, '\'' | '"'))?;
-            decoded(raw.strip_prefix(quote)?.strip_suffix(quote)?)
-        }
+        "string" => decoded(crate::engine::js_string::quoted_contents(raw)?),
         _ => None,
     }
 }
