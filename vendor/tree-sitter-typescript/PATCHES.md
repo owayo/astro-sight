@@ -100,6 +100,24 @@ import type. The CLI regression checks that adding an optional property to
 another interface in the same file is compatible, and that adding a required
 property still reports a breaking change when an existing value lacks it.
 
+## Escapes in template literal types (#552)
+
+The shared `template_literal_type` rule accepts escapes in fixed text and
+exposes each as an `escape_sequence` child. For example, the dollar sign in
+`\${name}` belongs to the fixed text, while a subsequent unescaped substitution
+produces a `template_type` node.
+
+The lexer accepts identity escapes, line continuations, fixed-width hex escapes
+and braced Unicode escapes through U+10FFFF. The external scanner checks the
+character after `\0`, which can end an escape only before a non-digit or EOF.
+
+TypeScript also accepts raw spellings such as `\8` or `\xG0` in a template
+literal type without substitutions. After a raw escape the grammar accepts
+fixed text and more escapes. After a substitution it accepts standard escapes
+and more substitutions. This preserves the syntax error when a raw escape
+occurs on either side of a substitution. Value expressions continue to use
+their existing tagged and untagged template grammar.
+
 ## Regenerate
 
 Use tree-sitter CLI **0.26.6**, with grammar ABI **14**, and Node.js/npm:
