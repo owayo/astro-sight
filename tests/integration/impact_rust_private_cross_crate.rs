@@ -1014,6 +1014,126 @@ fn impact_rust_private_function_keeps_calls_expanded_elsewhere() {
     }
 }
 
+fn macro_caller_case<'a>(child: &str) -> Case<'a> {
+    let mut case = Case::new(A_OLD);
+    case.files[0].1.clear();
+    case.a_old = format!(
+        "{child}fn translate(_: u8) {{}}\npub mod api {{\n    pub const CALL: fn(u8) = super::translate;\n    pub use CALL as translate;\n}}\n"
+    );
+    case.a_new = case
+        .a_old
+        .replace("_: u8)", "_: u8, _: u8)")
+        .replace("fn(u8)", "fn(u8, u8)");
+    case
+}
+
+fn assert_macro_caller_lines(case: &Case<'_>, expected: &[u64]) {
+    let repo = case.changed_repo();
+    for staged in [false, true] {
+        let mut args = vec!["--git"];
+        if staged {
+            repo.stage_all();
+            repo.write("a/src/lib.rs", &case.a_old);
+            args.push("--staged");
+        }
+        let review = repo.run_json("review", &args);
+        let changed = review["impact"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "a/src/lib.rs")
+            .unwrap();
+        let lines: Vec<_> = changed["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|caller| {
+                caller["path"] == "b/src/lib.rs"
+                    && caller["symbols"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|name| name == "translate")
+            })
+            .map(|caller| caller["line"].as_u64().unwrap() + 1)
+            .collect();
+        assert_eq!(lines, expected, "staged={staged}: {changed}");
+    }
+}
+
+#[test]
+fn private_function_macro_body_uses_the_expansion_scope() {
+    for child in ["mod child;\n", ""] {
+        let mut case = macro_caller_case(child)
+            .depends("client", "a = { path = '../a' }\nb = { path = '../b' }\n")
+            .file(
+                "client/src/lib.rs",
+                "use a::api::*;\npub fn run() { b::call_translate!(); }\n",
+            );
+        case.members.push("client");
+        case.b_lib = "#[macro_export]\nmacro_rules! call_translate {\n    () => { translate(1) };\n}\nfn translate(_: u8) {}\npub fn local() { translate(1); }\n";
+        assert_macro_caller_lines(&case, &[3]);
+    }
+}
+
+#[test]
+fn private_function_macro_body_checks_other_local_expansions() {
+    for (other_scope, lines) in [
+        ("", &[][..]),
+        (
+            "mod child { use a::api::translate; pub fn run() { call_translate!(); } }",
+            &[2][..],
+        ),
+        (
+            "pub(crate) use call_translate as invoke;\nmod child { use a::api::translate; pub fn run() { crate::invoke!(); } }",
+            &[2][..],
+        ),
+    ] {
+        let mut case = macro_caller_case("").depends("b", "a = { path = '../a' }\n");
+        let source = format!(
+            "macro_rules! call_translate {{\n    () => {{ translate(1) }};\n}}\nfn translate(_: u8) {{}}\npub fn local() {{ call_translate!(); }}\n{other_scope}\n"
+        );
+        case.b_lib = &source;
+        assert_macro_caller_lines(&case, lines);
+    }
+}
+
+#[test]
+fn private_function_macro_body_keeps_definition_crate_paths() {
+    for (binding, lines) in [
+        ("pub fn translate(_: u8) {}", &[][..]),
+        ("pub use a::api::translate;", &[3][..]),
+    ] {
+        let mut case = macro_caller_case("mod child;\n")
+            .depends("b", "a = { path = '../a' }\n")
+            .depends("client", "b = { path = '../b' }\n")
+            .file(
+                "client/src/lib.rs",
+                "pub fn run() { b::call_translate!(); }\n",
+            );
+        case.members.push("client");
+        if lines.is_empty() {
+            case.a_old = "fn translate(_: u8) {}\n".to_owned();
+            case.a_new = "fn translate(_: u8, _: u8) {}\n".to_owned();
+        }
+        let source = format!(
+            "#[macro_export]\nmacro_rules! call_translate {{\n    () => {{ $crate::translate(1) }};\n}}\n{binding}\n"
+        );
+        case.b_lib = &source;
+        assert_macro_caller_lines(&case, lines);
+    }
+}
+
+#[test]
+fn private_function_macro_body_distinguishes_members_from_value_references() {
+    let mut case = macro_caller_case("mod child;\n")
+        .depends("client", "a = { path = '../a' }\nb = { path = '../b' }\n")
+        .file("client/src/lib.rs", "use a::api::*;\nstruct S { translate: fn(u8) }\nimpl S { fn translate(&self, _: u8) {} }\nfn helper(_: u8) {}\nfn sample() -> S { S { translate: helper } }\npub fn run() { b::call_translate!(method); b::call_translate!(field); b::call_translate!(label); b::call_translate!(shorthand); b::call_translate!(value); }\n");
+    case.members.push("client");
+    case.b_lib = "#[macro_export]\nmacro_rules! call_translate {\n    (method) => { sample().translate(1) };\n    (field) => { sample().translate };\n    (label) => { S { translate: helper } };\n    (shorthand) => { S { translate } };\n    (value) => {{ let f = translate; f(1) }};\n}\n";
+    assert_macro_caller_lines(&case, &[6, 7]);
+}
+
 /// `b` が registry の `c` に依存し、`c` の取得元を差し替えて、`a` に依存するローカルの `c`
 /// (`pub use a::api::*`) にすると、`b` の `translate(..)` は `a` の公開の別名に着く。差し替えが無ければ
 /// registry の `c` は作業ツリーの `a` をコンパイルしないので除く。

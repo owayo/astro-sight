@@ -119,6 +119,7 @@ pub(super) struct RustPathOwnerIndex {
     direct_imports: HashMap<String, Vec<String>>,
     local_type_names: HashSet<String>,
     local_value_names: HashSet<String>,
+    closed_local_rule: OnceLock<Option<usize>>,
     module_context: OnceLock<Option<(PathBuf, PathBuf, Vec<String>)>>,
     resolved_paths: RefCell<HashMap<Vec<String>, Option<PathBuf>>>,
     enum_files: RefCell<HashMap<PathBuf, Option<enum_owner::EnumFile>>>,
@@ -1924,6 +1925,16 @@ impl RustPathOwnerIndex {
         true
     }
 
+    pub(super) fn closed_local_rule_calls(&self, mut node: Node<'_>, source: &[u8]) -> bool {
+        let position = node.start_byte();
+        *self.closed_local_rule.get_or_init(|| {
+            while let Some(parent) = node.parent() {
+                node = parent;
+            }
+            super::rust_macro_site::closed_local_rule_call(node, source)
+        }) == Some(position)
+    }
+
     /// 直下の一意な関数・定数・static の束縛を、利用位置の再束縛と区別する。
     pub(super) fn plain_local_value_owner(
         &self,
@@ -2140,6 +2151,7 @@ impl RustPathOwnerIndex {
             direct_imports,
             local_type_names,
             local_value_names,
+            closed_local_rule: OnceLock::new(),
             module_context: OnceLock::new(),
             resolved_paths: RefCell::new(HashMap::new()),
             enum_files: RefCell::new(HashMap::new()),
