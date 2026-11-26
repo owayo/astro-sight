@@ -1228,12 +1228,18 @@ pub(crate) fn extract_object_member_keys(
 ) -> Option<ObjectMemberKeys> {
     let tree = parser::parse_source(source, lang_id).ok()?;
     let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
     let decls = find_toplevel_decls_named(root, name, source);
     if decls.len() != 1 {
         return None;
     }
     let value = decls[0].child_by_field_name("value")?;
     let (obj, wrappers) = unwrap_to_object_literal_with_wrappers(value, source)?;
+    if !crate::engine::js_string::quoted_strings_are_valid(obj, source) {
+        return None;
+    }
     // 型注釈は object literal の外にある公開契約なので、member キーとは別に持って比較する。
     let declarator_type = match decls[0].child_by_field_name("type") {
         Some(annotation) => {

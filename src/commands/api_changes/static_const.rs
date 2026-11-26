@@ -510,16 +510,8 @@ fn property_key(node: Node<'_>, source: &[u8]) -> Option<String> {
             (!text.contains('\\')).then(|| text.to_string())
         }
         "string" => {
-            let mut result = String::new();
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                match child.kind() {
-                    "\"" | "'" => {}
-                    "string_fragment" => result.push_str(child.utf8_text(source).ok()?),
-                    _ => return None,
-                }
-            }
-            Some(result)
+            let inner = crate::engine::js_string::quoted_contents(node.utf8_text(source).ok()?)?;
+            (!inner.contains('\\')).then(|| inner.to_owned())
         }
         // 数値キーの Number→String 変換は推測しない。
         _ => None,
