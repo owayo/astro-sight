@@ -300,8 +300,10 @@ pub fn analyze_impact_streaming<F>(
 where
     F: FnMut(FileImpact) -> Result<()>,
 {
-    analyze_impact_at_checkout(diff_input, dir, options, dir, on_file_impact)
+    analyze_impact_at_checkout(diff_input, dir, options, dir, on_file_impact).map(drop)
 }
+
+pub(crate) type QueriedObjects = HashMap<String, HashSet<String>>;
 
 pub(crate) fn analyze_impact_at_checkout<F>(
     diff_input: &str,
@@ -309,7 +311,7 @@ pub(crate) fn analyze_impact_at_checkout<F>(
     options: &crate::models::impact::ContextAnalysisOptions,
     checkout: &Path,
     mut on_file_impact: F,
-) -> Result<()>
+) -> Result<QueriedObjects>
 where
     F: FnMut(FileImpact) -> Result<()>,
 {
@@ -324,7 +326,7 @@ where
     // 判定対象が違うので片方に寄せて統合しないこと (多層防御)。
     if should_skip_ci_only_diff(&diff_files) {
         log_phase("context.skip_ci_only", "applied", 0);
-        return Ok(());
+        return Ok(QueriedObjects::new());
     }
 
     // `--staged` では変更ファイルを index の内容で解析する (`NewSideSource` 参照)。
@@ -336,7 +338,7 @@ where
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
     let pass1::AffectedSymbolCollection {
-        file_contexts,
+        mut file_contexts,
         search_names: all_symbol_names,
         method_parent_types,
         included_count,
@@ -373,7 +375,7 @@ where
             on_file_impact(change)?;
         }
         log_phase("context.assemble_no_cross", "end", t.elapsed().as_millis());
-        return Ok(());
+        return Ok(QueriedObjects::new());
     }
 
     let mut sym_ix: HashMap<String, usize> = HashMap::with_capacity(all_symbol_names.len());
@@ -393,7 +395,7 @@ where
     let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
         && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, false);
     let pass2_maps = stream_caller_maps(
-        &file_contexts,
+        &mut file_contexts,
         &all_symbol_names,
         &sym_ix,
         &method_parent_types,
@@ -428,7 +430,16 @@ where
     // さらに streaming callback で呼び出し側（CLI）へ即渡し、`Vec<FileImpact>` の累積も廃止する。
     let t = std::time::Instant::now();
     log_phase("context.pass34", "start", 0);
+    let mut queried = QueriedObjects::new();
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
+        for (name, change) in &ctx.object_member_changes {
+            if change.queried_type {
+                queried
+                    .entry(ctx.new_path.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
         let typed_map = std::mem::take(&mut caller_maps[fc_ix]);
         let typed_low_map = std::mem::take(&mut low_caller_maps[fc_ix]);
         let typed_informational_map = std::mem::take(&mut informational_caller_maps[fc_ix]);
@@ -453,7 +464,7 @@ where
     drop(string_pool);
     log_phase("context.pass34", "end", t.elapsed().as_millis());
 
-    Ok(())
+    Ok(queried)
 }
 
 /// 出力する検出が 1 つも無い FileImpact (affected_symbols・impacted_callers・signature_changes・

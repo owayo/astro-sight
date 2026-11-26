@@ -749,6 +749,7 @@ impl AppService {
         options: &crate::models::impact::ContextAnalysisOptions,
     ) -> Result<ContextResult> {
         self.analyze_context_at_checkout(diff, dir, options, dir)
+            .map(|(context, _)| context)
     }
 
     pub(crate) fn analyze_context_at_checkout(
@@ -757,18 +758,22 @@ impl AppService {
         dir: &str,
         options: &crate::models::impact::ContextAnalysisOptions,
         checkout: &str,
-    ) -> Result<ContextResult> {
+    ) -> Result<(ContextResult, impact::QueriedObjects)> {
         let mut changes = Vec::new();
-        self.analyze_context_streaming_at_checkout(diff, dir, options, checkout, |impact| {
-            changes.push(impact);
-            Ok(())
-        })?;
-        Ok(ContextResult {
-            changes,
-            skipped: None,
-            // 打ち切りは diff 取得層 (git_input) が持つ情報なので、CLI 側で結果に載せる。
-            truncations: Vec::new(),
-        })
+        let queried =
+            self.analyze_context_streaming_at_checkout(diff, dir, options, checkout, |impact| {
+                changes.push(impact);
+                Ok(())
+            })?;
+        Ok((
+            ContextResult {
+                changes,
+                skipped: None,
+                // 打ち切りは diff 取得層 (git_input) が持つ情報なので、CLI 側で結果に載せる。
+                truncations: Vec::new(),
+            },
+            queried,
+        ))
     }
 
     /// context 解析の入力検証だけを行う。
@@ -804,6 +809,7 @@ impl AppService {
         F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
     {
         self.analyze_context_streaming_at_checkout(diff, dir, options, dir, on_file_impact)
+            .map(drop)
     }
 
     fn analyze_context_streaming_at_checkout<F>(
@@ -813,7 +819,7 @@ impl AppService {
         options: &crate::models::impact::ContextAnalysisOptions,
         checkout: &str,
         mut on_file_impact: F,
-    ) -> Result<()>
+    ) -> Result<impact::QueriedObjects>
     where
         F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
     {
@@ -832,7 +838,7 @@ impl AppService {
         let mut callers_count = 0usize;
         let mut affected_count = 0usize;
 
-        impact::analyze_impact_at_checkout(
+        let queried = impact::analyze_impact_at_checkout(
             diff,
             &canonical_dir,
             options,
@@ -861,7 +867,7 @@ impl AppService {
             total_callers = callers_count,
             "analyze_context_streaming completed"
         );
-        Ok(())
+        Ok(queried)
     }
 
     /// blame ベースの共変更パターンを解析する。

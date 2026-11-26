@@ -599,6 +599,12 @@ fn accumulate_hook_impacts(
     }
 }
 
+#[derive(Default)]
+pub(super) struct HookImpactEvidence {
+    pub compatible: BTreeMap<String, BTreeSet<String>>,
+    pub queried: crate::engine::impact::QueriedObjects,
+}
+
 /// api の判定に合わせて、Stop hook の impact の参照を振り分けるための `(ファイル, 名前)` の集合。
 ///
 /// api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、Stop hook の impact
@@ -622,7 +628,7 @@ impl<'a> HookImpactPolicy<'a> {
     fn new(
         api: &'a ApiChanges,
         strict_const_values: bool,
-        compatible_info: &'a BTreeMap<String, BTreeSet<String>>,
+        evidence: &'a HookImpactEvidence,
     ) -> Self {
         let annotation_info: HashSet<(&str, &str)> = api
             .type_annotation_changes
@@ -663,7 +669,13 @@ impl<'a> HookImpactPolicy<'a> {
             informational_modified.extend(
                 api.const_value_changes
                     .iter()
-                    .map(|m| (m.file.as_str(), m.name.as_str())),
+                    .map(|m| (m.file.as_str(), m.name.as_str()))
+                    .filter(|(file, name)| {
+                        !evidence
+                            .queried
+                            .get(*file)
+                            .is_some_and(|names| names.contains(*name))
+                    }),
             );
         }
         let import_rebinding_info = api
@@ -687,7 +699,7 @@ impl<'a> HookImpactPolicy<'a> {
             .map(|m| (m.file.as_str(), m.name.as_str()))
             .collect();
         Self {
-            compatible_info,
+            compatible_info: &evidence.compatible,
             informational_modified,
             annotation_info,
             import_rebinding_info,
@@ -915,7 +927,7 @@ pub(crate) fn build_review_hook_json_for_diff(
         strict_type_annotations,
         diff_input,
         diff_files,
-        &BTreeMap::new(),
+        &HookImpactEvidence::default(),
     )
 }
 
@@ -926,9 +938,9 @@ fn build_review_hook_json_with_compatibility(
     strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
-    compatible_info: &BTreeMap<String, BTreeSet<String>>,
+    evidence: &HookImpactEvidence,
 ) -> HookJsonBuild {
-    let policy = HookImpactPolicy::new(&result.api_changes, strict_const_values, compatible_info);
+    let policy = HookImpactPolicy::new(&result.api_changes, strict_const_values, evidence);
     // 呼び出し側が diff 内で解決済みかは `impact --hook` と同じ判定 (`DiffCallerResolution`) にする。
     // 影響分析の結果 (`impact.changes`) だけで判定すると、トップレベルの呼び出しだけを更新した
     // ファイルが diff 外扱いになり誤ってブロックする。
@@ -1186,14 +1198,14 @@ fn hook_dead_symbols(symbols: &[crate::models::review::DeadSymbol]) -> Vec<HookD
 ///
 /// ここで `process::exit` しないのは、exit がデストラクタを走らせないため。staged review の
 /// 一時スナップショット (`TempDir`) が消えずに残り、Stop hook が止めるたびに増えていた。
-pub(crate) fn review_hook_output(
+pub(super) fn review_hook_output(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
     strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
-    compatible_info: &BTreeMap<String, BTreeSet<String>>,
+    evidence: &HookImpactEvidence,
 ) -> Result<bool> {
     let build = build_review_hook_json_with_compatibility(
         result,
@@ -1202,7 +1214,7 @@ pub(crate) fn review_hook_output(
         strict_type_annotations,
         diff_input,
         diff_files,
-        compatible_info,
+        evidence,
     );
     let Some(hook_output) = build.value else {
         return Ok(false);

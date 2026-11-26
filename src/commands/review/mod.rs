@@ -372,7 +372,7 @@ fn review_attempt_with_swift_protocols(
         snapshot.is_some(),
     );
 
-    let mut impact = timed_ok("context", || {
+    let (mut impact, queried_objects) = timed_ok("context", || {
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
         // 両方に作用させる (v26.5.117 で挙動を統一)。
         // staged は changed file / refs / API / dead-code を同じ raw index tree から読む。
@@ -388,6 +388,17 @@ fn review_attempt_with_swift_protocols(
         };
         service.analyze_context_at_checkout(&diff_input, analysis_dir, &context_options, dir)
     })?;
+    let queried_removals = api_changes.compatible_modified.extract_if(.., |change| {
+        change.reason == "unused_object_members"
+            && queried_objects
+                .get(&change.file)
+                .is_some_and(|names| names.contains(&change.name))
+    });
+    let previous = api_changes.modified.len();
+    api_changes
+        .modified
+        .extend(queried_removals.map(unverified_modification));
+    super::api_changes::fill_modification_diagnostics(&mut api_changes.modified[previous..]);
     attach_contract_evidence(&api_changes, &mut impact);
     if matches!(new_side, crate::models::impact::DiffNewSide::Index) && snapshot.is_none() {
         invalidate_staged_syntax_evidence(&mut api_changes, &mut impact);
@@ -512,7 +523,10 @@ fn review_attempt_with_swift_protocols(
             strict_public_type_annotations,
             &diff_input,
             &diff_files,
-            &compatible_impacts,
+            &hook::HookImpactEvidence {
+                compatible: compatible_impacts,
+                queried: queried_objects,
+            },
         )?;
         // `process::exit` はデストラクタを走らせないため、staged の一時スナップショットを
         // exit の前に片付ける (Drop 任せにすると blocking のたびに一時ディレクトリが残る)。
@@ -652,17 +666,7 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
     api.modified.extend(closed);
     let compatible = std::mem::take(&mut api.compatible_modified);
     api.modified
-        .extend(compatible.into_iter().map(|change| ApiSymbolChange {
-            change_evidence: change.change_evidence,
-            inline_module: change.inline_module,
-            ..ApiSymbolChange::new(
-                change.name,
-                change.kind,
-                change.file,
-                change.old_signature,
-                change.new_signature,
-            )
-        }));
+        .extend(compatible.into_iter().map(unverified_modification));
     let dead = std::mem::take(&mut api.removed_dead);
     api.removed.extend(dead);
     let unresolved = std::mem::take(&mut api.removed_unresolved);
@@ -673,6 +677,22 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
         change.unverified = None;
     }
     super::api_changes::fill_modification_diagnostics(&mut api.modified);
+}
+
+fn unverified_modification(
+    change: crate::models::review::CompatibleApiModification,
+) -> ApiSymbolChange {
+    ApiSymbolChange {
+        change_evidence: change.change_evidence,
+        inline_module: change.inline_module,
+        ..ApiSymbolChange::new(
+            change.name,
+            change.kind,
+            change.file,
+            change.old_signature,
+            change.new_signature,
+        )
+    }
 }
 
 /// API で特定した型依存を、同じ宣言に由来する impact の根拠にも載せる。
