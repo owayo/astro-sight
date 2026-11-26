@@ -153,7 +153,31 @@ impl CargoConfigProof {
             .all(|directory| self.directory_keeps_sources(&directory))
     }
 
-    fn directory_keeps_sources(&self, directory: &Path) -> bool {
+    /// 木の中の設定は配置の走査で読む。外側の設定は、index の一時ディレクトリではなく
+    /// 起動元の checkout の字句上と実体の祖先、および CARGO_HOME から読む。
+    pub(super) fn for_layout(checkout: &Path) -> Option<Self> {
+        let checkout = absolute_package_root(checkout)?;
+        let physical = checkout.canonicalize().ok()?;
+        let proof = Self::capture(&checkout);
+        let home = proof.home()?;
+        let physical_home = home.canonicalize().unwrap_or_else(|_| home.to_owned());
+        for root in [&checkout, &physical] {
+            if root.starts_with(home)
+                || home.starts_with(root)
+                || root.starts_with(&physical_home)
+                || physical_home.starts_with(root)
+                || !proof
+                    .ancestors(root)
+                    .skip(1)
+                    .all(|ancestor| proof.directory_keeps_sources(&ancestor.join(".cargo")))
+            {
+                return None;
+            }
+        }
+        proof.directory_keeps_sources(home).then_some(proof)
+    }
+
+    pub(super) fn directory_keeps_sources(&self, directory: &Path) -> bool {
         let verdict = self
             .directories
             .lock()

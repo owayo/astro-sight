@@ -12,6 +12,9 @@ pub(super) fn static_layout(
     project: &RustPathOwnerProjectProof,
     literal_includes: bool,
 ) -> Option<(Vec<PathBuf>, bool, bool)> {
+    if !project.layout_cargo_settings_known() {
+        return None;
+    }
     let root = root.canonicalize().ok()?;
     if root
         .ancestors()
@@ -70,6 +73,7 @@ pub(super) fn static_layout(
     let mut included_files: Vec<PathBuf> = Vec::new();
     // 属性の角括弧の前でない `#` (`mount!(#, path)`) の、(マクロの定義の中か, 渡す先のマクロの名前)。
     let mut bare_hashes: Vec<(bool, Option<String>)> = Vec::new();
+    let mut assembled = AttributeInputs::default();
     // マクロの本体か引数の中に `macro_rules` がある (マクロがマクロを定義する。`install!(mount)` が
     // `macro_rules! mount { .. }` を作る、`factory!(macro_rules, install)`)。作られる名前は分からない。
     let mut generates_macros = false;
@@ -174,6 +178,11 @@ pub(super) fn static_layout(
                     && memchr::memmem::find(&source, b"macro").is_none()
                     && memchr::memmem::find(&source, b"#!").is_none()
                     && !may_have_bare_hash(&source)
+                    && !(memchr::memchr(b'!', &source).is_some()
+                        && (memchr::memchr(b'#', &source).is_some()
+                            || [b"mod".as_slice(), b"///", b"//!", b"/**", b"/*!"]
+                                .iter()
+                                .any(|word| memchr::memmem::find(&source, word).is_some())))
                 {
                     continue;
                 }
@@ -189,10 +198,12 @@ pub(super) fn static_layout(
                 open |= hidden_shebang(tree.root_node(), &source)
                     || reads_rust_source_as_text(tree.root_node(), &source);
                 let mut offsets = Vec::new();
+                let mut macro_scopes = Vec::new();
                 let result = crate::engine::tree_walk::walk_preorder(
                     tree.root_node(),
                     crate::engine::tree_walk::Children::All,
-                    |node, _| {
+                    |node, depth| {
+                        assembled.observe(node, depth, &mut macro_scopes, &source);
                         if node.kind() == "macro_definition"
                             && let Some(name) = node
                                 .child_by_field_name("name")
@@ -322,10 +333,12 @@ pub(super) fn static_layout(
         open |= hidden_inner_attribute(&source)
             || hidden_shebang(tree.root_node(), &source)
             || reads_rust_source_as_text(tree.root_node(), &source);
+        let mut macro_scopes = Vec::new();
         let result = crate::engine::tree_walk::walk_preorder(
             tree.root_node(),
             crate::engine::tree_walk::Children::All,
-            |node, _| {
+            |node, depth| {
+                assembled.observe(node, depth, &mut macro_scopes, &source);
                 if node.kind() == "macro_definition"
                     && let Some(name) = node
                         .child_by_field_name("name")
@@ -372,6 +385,9 @@ pub(super) fn static_layout(
     // `#[path]` で読んだファイルは名前によらず mod.rs と同じく、子の `mod` を自分のディレクトリから
     // 探す (`bridge.rs` の `mod calls;` は隣の `calls.rs`)。子の `mod` を持ち得るなら、取り込み先の
     // ディレクトリごと保留する。マクロの定義は木の全体を読んでから決める。
+    if assembled.path && assembled.module {
+        bare_hashes.append(&mut assembled.hashes);
+    }
     let mut capable = module_macros(&macro_definitions, &macro_aliases);
     // `quote!` の生成するコードの `#x` は属性にならない。ただし同じ名前を木の中のマクロに付けて
     // いれば (別名を含む)、そのマクロへ渡る。
@@ -882,6 +898,87 @@ fn may_have_bare_hash(source: &[u8]) -> bool {
         Some(at) if source[at] == b'!' => next(at + 1).is_none_or(|after| source[after] != b'['),
         _ => true,
     })
+}
+
+/// マクロの本体・引数の中にある属性の `#` と、別の角括弧から `#[path] mod` を組み直すのに
+/// 必要な語。matcher が `tt` を別々に受け取れば `#[doc]` の `#` だけも転送できる。
+#[derive(Default)]
+struct AttributeInputs {
+    hashes: Vec<(bool, Option<String>)>,
+    path: bool,
+    module: bool,
+}
+
+struct AttributeMacroScope {
+    depth: usize,
+    in_definition: bool,
+    destination: Option<String>,
+    recorded_hash: bool,
+}
+
+impl AttributeInputs {
+    fn observe(
+        &mut self,
+        node: Node<'_>,
+        depth: usize,
+        macro_scopes: &mut Vec<AttributeMacroScope>,
+        source: &[u8],
+    ) {
+        while macro_scopes
+            .last()
+            .is_some_and(|scope| depth <= scope.depth)
+        {
+            macro_scopes.pop();
+        }
+        if matches!(node.kind(), "macro_invocation" | "macro_definition") {
+            let enclosing = macro_scopes.last();
+            let destination = if node.kind() == "macro_invocation" {
+                last_macro_identifier(node, source).map(str::to_owned)
+            } else {
+                enclosing.and_then(|scope| scope.destination.clone())
+            };
+            macro_scopes.push(AttributeMacroScope {
+                depth,
+                in_definition: node.kind() == "macro_definition"
+                    || enclosing.is_some_and(|scope| scope.in_definition),
+                destination,
+                recorded_hash: false,
+            });
+        }
+        let Some(scope) = macro_scopes.last_mut() else {
+            return;
+        };
+        if !token_list(node) {
+            return;
+        }
+        let mut cursor = node.walk();
+        let mut hash = false;
+        for child in node.children(&mut cursor) {
+            hash |= child.kind() == "#"
+                || (matches!(child.kind(), "line_comment" | "block_comment") && {
+                    let mut cursor = child.walk();
+                    child
+                        .named_children(&mut cursor)
+                        .any(|part| part.kind() == "doc_comment")
+                });
+            for word in word_token(child, source)
+                .into_iter()
+                .chain(hidden_words(child, source))
+            {
+                self.path |= word == "path";
+                self.module |= word == "mod";
+            }
+        }
+        for word in hidden_words(node, source) {
+            self.path |= word == "path";
+            self.module |= word == "mod";
+        }
+        if hash && !scope.recorded_hash {
+            self.hashes
+                .push((scope.in_definition, scope.destination.clone()));
+            scope.recorded_hash = true;
+        }
+    }
 }
 
 /// token tree の中に、属性の角括弧 (`#[`・`#![`) の前でない `#` があるか (`mount!(#, path)`)。

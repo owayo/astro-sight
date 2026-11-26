@@ -386,7 +386,7 @@ fn review_attempt_with_swift_protocols(
                 new_side
             },
         };
-        service.analyze_context(&diff_input, analysis_dir, &context_options)
+        service.analyze_context_at_checkout(&diff_input, analysis_dir, &context_options, dir)
     })?;
     attach_contract_evidence(&api_changes, &mut impact);
     if matches!(new_side, crate::models::impact::DiffNewSide::Index) && snapshot.is_none() {

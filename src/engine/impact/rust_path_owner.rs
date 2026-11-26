@@ -176,6 +176,9 @@ pub(super) struct PrivateModule {
 
 pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
+    /// staged のときも、Cargo の外部設定は元の checkout の祖先にある。
+    pub(super) layout_checkout: PathBuf,
+    layout_cargo_settings: OnceLock<bool>,
     pub(super) canonical_root: Option<PathBuf>,
     ordinary_sources: OnceLock<bool>,
     private_scope_sources: OnceLock<bool>,
@@ -252,6 +255,8 @@ impl RustPathOwnerProjectProof {
         }
         Self {
             root: root.to_owned(),
+            layout_checkout: root.to_owned(),
+            layout_cargo_settings: OnceLock::new(),
             canonical_root: root.canonicalize().ok(),
             ordinary_sources: OnceLock::new(),
             private_scope_sources: OnceLock::new(),
@@ -290,8 +295,67 @@ impl RustPathOwnerProjectProof {
         }
     }
 
+    pub(super) fn layout_cargo_settings_known(&self) -> bool {
+        *self
+            .layout_cargo_settings
+            .get_or_init(|| self.scan_layout_cargo_settings().is_some())
+    }
+
+    /// 木の中の Cargo の設定は解析対象 (staged では index)、外側の設定は元の checkout から確かめる。
+    fn scan_layout_cargo_settings(&self) -> Option<()> {
+        let config = super::rust_cargo_config::CargoConfigProof::for_layout(&self.layout_checkout)?;
+        let root = self.root.canonicalize().ok()?;
+        let view = crate::git_support::tree_view(&root);
+        for (path, kind) in view.omitted()? {
+            // 省かれた設定や、設定ディレクトリを含み得るリンクは読めない。
+            if !matches!(
+                kind,
+                crate::git_support::OmittedKind::Symlink(
+                    crate::git_support::LinkTarget::RegularFile
+                )
+            ) || path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
+                && path.file_name().is_some_and(|name| {
+                    name.eq_ignore_ascii_case("config") || name.eq_ignore_ascii_case("config.toml")
+                })
+            {
+                return None;
+            }
+        }
+        if !self.skipped_cargo_inputs_known(false, |directory| {
+            config.directory_keeps_sources(directory)
+        }) {
+            return None;
+        }
+        let mut pending = vec![root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).ok()? {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                if directory == root && matches!(name.to_str(), Some("target" | ".git")) {
+                    continue;
+                }
+                let path = entry.path();
+                let kind = entry.file_type().ok()?;
+                if name.eq_ignore_ascii_case(".cargo") && !config.directory_keeps_sources(&path) {
+                    return None;
+                }
+                if kind.is_symlink() && !std::fs::metadata(&path).ok()?.is_file() {
+                    return None;
+                }
+                if kind.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        Some(())
+    }
+
     fn allows_module_paths(&self) -> bool {
         self.module_wiring_unchanged
+            && self.layout_cargo_settings_known()
             && *self
                 .ordinary_sources
                 .get_or_init(|| scan_ordinary_sources(&self.root))
@@ -873,9 +937,11 @@ impl RustPathOwnerProjectProof {
         }
         // root の直下の `.git`・`target` は配置の走査が読まないが、その下のディレクトリから Cargo を
         // 起動すると、そこの `.cargo` の設定を読む (Cargo の作るディレクトリと Git の object は除く)。
-        if !self.unscanned_cargo_configs_keep_sources(".git", &[])
-            || !self.unscanned_cargo_configs_keep_sources("target", &CARGO_OUTPUTS)
-        {
+        if !self.skipped_cargo_inputs_known(true, |directory| {
+            directory
+                .parent()
+                .is_some_and(|parent| self.cargo_configs.keeps_dependency_sources(parent))
+        }) {
             return false;
         }
         let mut pending = vec![PathBuf::new()];
@@ -942,11 +1008,31 @@ impl RustPathOwnerProjectProof {
         true
     }
 
+    fn skipped_cargo_inputs_known(
+        &self,
+        reject_packages: bool,
+        check_config: impl Fn(&Path) -> bool,
+    ) -> bool {
+        self.unscanned_cargo_configs_keep_sources(".git", &[], reject_packages, &check_config)
+            && self.unscanned_cargo_configs_keep_sources(
+                "target",
+                &CARGO_OUTPUTS,
+                reject_packages,
+                &check_config,
+            )
+    }
+
     /// root の直下の `top` (`target`・`.git`) の下の `.cargo` の設定が取得元を差し替えないか。Cargo と
     /// Git が作るディレクトリは読まない: `top` の直下の `skipped_children`、Cargo の profile
     /// (`.cargo-lock` を持つ) の中の `PROFILE_OUTPUTS`、Git のディレクトリ ([`git_directory_shape`]) の
     /// 中の `objects`・`lfs`。symlink のディレクトリと、たどる要素が多すぎるときは偽。
-    fn unscanned_cargo_configs_keep_sources(&self, top: &str, skipped_children: &[&str]) -> bool {
+    fn unscanned_cargo_configs_keep_sources(
+        &self,
+        top: &str,
+        skipped_children: &[&str],
+        reject_packages: bool,
+        check_config: &impl Fn(&Path) -> bool,
+    ) -> bool {
         const PROFILE_OUTPUTS: [&str; 5] =
             ["build", "deps", "incremental", ".fingerprint", "examples"];
         let mut pending = vec![PathBuf::from(top)];
@@ -987,7 +1073,7 @@ impl RustPathOwnerProjectProof {
                     return false;
                 };
                 if name.eq_ignore_ascii_case(".cargo") {
-                    if !self.cargo_configs.keeps_dependency_sources(&full) {
+                    if !check_config(&entry.path()) {
                         return false;
                     }
                     // `.cargo` の中のディレクトリから起動した Cargo も、その下の `.cargo` を読む。
@@ -997,7 +1083,8 @@ impl RustPathOwnerProjectProof {
                 // 走査が読まないディレクトリの manifest・lockfile は、走査が読まない package や別の
                 // workspace (別の lockfile の解決) になり得る (Cargo の profile の直下にも無い)。
                 // Cargo は symlink の manifest もたどって読む。
-                if !kind.is_dir()
+                if reject_packages
+                    && !kind.is_dir()
                     && (name.eq_ignore_ascii_case("Cargo.toml")
                         || name.eq_ignore_ascii_case("Cargo.lock"))
                 {
@@ -1175,6 +1262,7 @@ impl RustPathOwnerProjectProof {
 
     fn allows_private_scope_paths(&self) -> bool {
         self.private_scope_wiring_unchanged
+            && self.layout_cargo_settings_known()
             && self.has_safe_private_import_environment()
             && (*self
                 .private_scope_sources
@@ -1184,6 +1272,7 @@ impl RustPathOwnerProjectProof {
 
     pub(super) fn allows_reexport_paths(&self) -> bool {
         self.reexport_cargo_enabled
+            && self.layout_cargo_settings_known()
             && *self
                 .reexport_sources
                 .get_or_init(|| scan_reexport_sources(&self.root))
@@ -1493,6 +1582,7 @@ impl RustPathOwnerProjectProof {
     /// project-wide before using the local declaration as a leaf proof.
     pub(super) fn private_source_is_leaf(&self, source_path: &str) -> bool {
         if !self.private_scope_wiring_unchanged
+            || !self.layout_cargo_settings_known()
             || !*self
                 .no_source_inclusion
                 .get_or_init(|| scan_no_source_inclusion(&self.root))
