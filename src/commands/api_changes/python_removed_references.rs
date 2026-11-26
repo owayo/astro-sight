@@ -18,7 +18,7 @@ use crate::models::truncation::TruncationInfo;
 const MAX_SOURCE: u64 = 2 * 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-fn module_function(candidate: &ApiSymbolCandidate) -> bool {
+pub(super) fn module_function(candidate: &ApiSymbolCandidate) -> bool {
     candidate.kind == "function"
         && !candidate.name.contains('.')
         && super::removed_attribution::path_lang(&candidate.file) == Some(LangId::Python)
@@ -29,10 +29,11 @@ pub(super) fn retain_referenced(
     gitlinks: &[PathBuf],
     removed: &mut Vec<ApiSymbolCandidate>,
     dead: &mut Vec<ApiSymbolCandidate>,
+    renames: Vec<ApiSymbolCandidate>,
     notices: &mut Vec<TruncationInfo>,
 ) {
     let mut uses = Uses::default();
-    for c in dead.iter().filter(|c| module_function(c)) {
+    for c in dead.iter().filter(|c| module_function(c)).chain(&renames) {
         let file = Path::new(&c.file).with_extension("");
         let path = crate::git_support::normalize_workspace_separators(&file.to_string_lossy());
         let module = path
@@ -47,7 +48,7 @@ pub(super) fn retain_referenced(
     if uses.wanted.is_empty() {
         return;
     }
-    if let Err(notice) = uses.scan(Path::new(dir), gitlinks, dead) {
+    if let Err(notice) = uses.scan(Path::new(dir), gitlinks) {
         notices.push(notice);
         uses.any.unknown = true;
     }
@@ -55,6 +56,7 @@ pub(super) fn retain_referenced(
         .into_iter()
         .partition(|c| module_function(c) && uses.may_refer(c));
     removed.extend(live);
+    removed.extend(renames.into_iter().filter(|c| uses.may_refer(c)));
     *dead = unused;
 }
 
@@ -81,12 +83,7 @@ struct Uses {
 }
 
 impl Uses {
-    fn scan(
-        &mut self,
-        root: &Path,
-        gitlinks: &[PathBuf],
-        dead: &[ApiSymbolCandidate],
-    ) -> Result<(), TruncationInfo> {
+    fn scan(&mut self, root: &Path, gitlinks: &[PathBuf]) -> Result<(), TruncationInfo> {
         let failed = |path: &str, reason: &str| {
             TruncationInfo::source_analysis_failed(
                 path,
@@ -109,10 +106,11 @@ impl Uses {
         }
         let mut files = inventory.files;
         // 隠しディレクトリ等にある、diff で明示された削除元ファイルも調べる。
-        let mut extra = dead
-            .iter()
-            .filter(|c| module_function(c))
-            .map(|c| PathBuf::from(&c.file))
+        let mut extra = self
+            .wanted
+            .values()
+            .flatten()
+            .map(|(file, _)| PathBuf::from(file))
             .collect::<Vec<_>>();
         extra.sort_unstable();
         extra.dedup();
@@ -697,6 +695,7 @@ mod tests {
             &[],
             &mut live,
             &mut dead,
+            Vec::new(),
             &mut notices,
         );
         (!live.is_empty(), notices)

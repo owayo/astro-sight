@@ -753,6 +753,8 @@ For an attribute call such as `u.total()`, `review` resolves `u` in the scope co
 
 When a module-level function is removed, `review` also checks uses of its name in Python strings. A remaining `globals()["total"]`, `getattr(module, "total")` or `mock.patch("pkg.module.total")` can keep the removal in `api.rm` and make the hook exit with status 1. Ordinary dictionary keys and log messages can still produce `api.rm_dead`. If the scan cannot read or parse a source, or exceeds 2 MiB per file or 64 MiB in total, it keeps the remaining candidates blocking and reports the reason in `truncations`.
 
+The same check applies when a function is renamed. For example, after `total` becomes `sum_values`, a direct caller can use the new name while `mock.patch("tools.util.total")` still fails with `AttributeError`. Review reports the old name in `api.rm` even when it also lists the rename in `rename_candidates`.
+
 ### Python member removals with unresolved receivers
 
 `api_changes.removed_unresolved` (`api.rm_unresolved` in hook output) reports confirmed removals whose remaining member reads have unresolved receivers and a restricted type demand. These entries have `confidence: "low"` and do not block the hook. They do not establish that the removed member has no callers; `removed_dead` keeps its existing proof requirements. Shell parse recovery continues to use the separate `uncertain_removals` / `rm_unverified` category.

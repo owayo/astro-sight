@@ -411,6 +411,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         base_blobs,
         &rust_packages,
         removed,
+        std::mem::take(&mut state.buckets.python_renames),
         &ambiguous_relation_keys,
         &mut state.buckets.parse_truncations,
     );
