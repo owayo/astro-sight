@@ -7,6 +7,7 @@ module.exports = function defineGrammar(dialect) {
     externals: ($, previous) => previous.concat([
       $._function_signature_automatic_semicolon,
       $.__error_recovery,
+      $._template_type_null_escape,
     ]),
 
     supertypes: ($, previous) => previous.concat([
@@ -786,14 +787,24 @@ module.exports = function defineGrammar(dialect) {
 
       template_type: $ => seq('${', choice($.primary_type, $.infer_type), '}'),
 
-      template_literal_type: $ => seq(
-        '`',
-        repeat(choice(
+      template_literal_type: $ => {
+        const text = choice(
           alias($._template_chars, $.string_fragment),
-          $.template_type,
-        )),
-        '`',
-      ),
+          alias($._template_type_null_escape, $.escape_sequence),
+          alias(token.immediate(seq('\\', choice(
+            /[^0-9xu]/,
+            '\r\n',
+            /x[0-9a-fA-F]{2}/,
+            /u[0-9a-fA-F]{4}/,
+            /u\{0*([0-9a-fA-F]{1,5}|10[0-9a-fA-F]{4})\}/,
+          ))), $.escape_sequence),
+        );
+        const rawEscape = alias(token.immediate(/\\[0-9xu]/), $.escape_sequence);
+        return seq('`', repeat(text), optional(choice(
+          seq($.template_type, repeat(choice(text, $.template_type))),
+          seq(rawEscape, repeat(choice(text, rawEscape))),
+        )), '`');
+      },
 
       infer_type: $ => prec.right(seq(
         'infer',

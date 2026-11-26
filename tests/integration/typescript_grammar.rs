@@ -68,6 +68,50 @@ fn assert_typescript_cli_clean(ast: &Value, source: &str) {
 }
 
 #[test]
+fn typescript_template_literal_type_escape_keeps_the_breaking_api_and_consumer() {
+    let source = r#"export const LABEL: `a\${x} b${string}` = `a\${x} b/old`;
+"#;
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let file = format!("values.{extension}");
+        let caller = format!("use.{extension}");
+        repo.write(&file, source);
+        repo.write(
+            &caller,
+            r#"import { LABEL } from "./values";
+export const old: `a\${x} b${string}` = LABEL;
+"#,
+        );
+        repo.commit_all("initial");
+        repo.write(&file, source.replace("} b", "}  b").replace("/old", "/new"));
+        for staged in [false, true] {
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"]);
+            if staged {
+                repo.stage_all();
+                repo.write(&file, source);
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let hook: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{hook}");
+            assert_eq!(hook["api"]["mod"][0]["n"], "LABEL", "{hook}");
+            assert!(hook["api"]["const_value"].is_null(), "{hook}");
+            let references = hook["impacts"][0]["refs"].as_array().unwrap();
+            assert!(
+                references.iter().any(|r| r["p"] == caller
+                    && r["ln"] == 1
+                    && r["s"] == serde_json::json!(["LABEL"])),
+                "{hook}"
+            );
+        }
+    }
+}
+
+#[test]
 fn typescript_type_query_cli_preserves_reported_parse_and_locations() {
     for (extension, source, language) in [
         ("ts", TYPESCRIPT_TYPE_QUERY_SOURCE, "typescript"),

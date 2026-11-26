@@ -13,6 +13,7 @@ enum TokenType {
     JSX_TEXT,
     FUNCTION_SIGNATURE_AUTOMATIC_SEMICOLON,
     ERROR_RECOVERY,
+    TEMPLATE_TYPE_NULL_ESCAPE,
 };
 
 static void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
@@ -318,6 +319,15 @@ static inline bool external_scanner_scan(void *payload, TSLexer *lexer, const bo
     if (valid_symbols[TEMPLATE_CHARS]) {
         if (valid_symbols[AUTOMATIC_SEMICOLON]) {
             return false;
+        }
+        if (valid_symbols[TEMPLATE_TYPE_NULL_ESCAPE] && lexer->lookahead == '\\') {
+            advance(lexer);
+            if (lexer->lookahead != '0') {
+                return false;
+            }
+            advance(lexer);
+            lexer->result_symbol = TEMPLATE_TYPE_NULL_ESCAPE;
+            return lexer->lookahead < '0' || lexer->lookahead > '9';
         }
         return scan_template_chars(lexer);
     }

@@ -9442,11 +9442,259 @@
                 "value": "string_fragment"
               },
               {
-                "type": "SYMBOL",
-                "name": "template_type"
+                "type": "ALIAS",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_template_type_null_escape"
+                },
+                "named": true,
+                "value": "escape_sequence"
+              },
+              {
+                "type": "ALIAS",
+                "content": {
+                  "type": "IMMEDIATE_TOKEN",
+                  "content": {
+                    "type": "SEQ",
+                    "members": [
+                      {
+                        "type": "STRING",
+                        "value": "\\"
+                      },
+                      {
+                        "type": "CHOICE",
+                        "members": [
+                          {
+                            "type": "PATTERN",
+                            "value": "[^0-9xu]"
+                          },
+                          {
+                            "type": "STRING",
+                            "value": "\r\n"
+                          },
+                          {
+                            "type": "PATTERN",
+                            "value": "x[0-9a-fA-F]{2}"
+                          },
+                          {
+                            "type": "PATTERN",
+                            "value": "u[0-9a-fA-F]{4}"
+                          },
+                          {
+                            "type": "PATTERN",
+                            "value": "u\\{0*([0-9a-fA-F]{1,5}|10[0-9a-fA-F]{4})\\}"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "named": true,
+                "value": "escape_sequence"
               }
             ]
           }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "template_type"
+                    },
+                    {
+                      "type": "REPEAT",
+                      "content": {
+                        "type": "CHOICE",
+                        "members": [
+                          {
+                            "type": "CHOICE",
+                            "members": [
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "_template_chars"
+                                },
+                                "named": true,
+                                "value": "string_fragment"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "_template_type_null_escape"
+                                },
+                                "named": true,
+                                "value": "escape_sequence"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "IMMEDIATE_TOKEN",
+                                  "content": {
+                                    "type": "SEQ",
+                                    "members": [
+                                      {
+                                        "type": "STRING",
+                                        "value": "\\"
+                                      },
+                                      {
+                                        "type": "CHOICE",
+                                        "members": [
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "[^0-9xu]"
+                                          },
+                                          {
+                                            "type": "STRING",
+                                            "value": "\r\n"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "x[0-9a-fA-F]{2}"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "u[0-9a-fA-F]{4}"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "u\\{0*([0-9a-fA-F]{1,5}|10[0-9a-fA-F]{4})\\}"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                },
+                                "named": true,
+                                "value": "escape_sequence"
+                              }
+                            ]
+                          },
+                          {
+                            "type": "SYMBOL",
+                            "name": "template_type"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "ALIAS",
+                      "content": {
+                        "type": "IMMEDIATE_TOKEN",
+                        "content": {
+                          "type": "PATTERN",
+                          "value": "\\\\[0-9xu]"
+                        }
+                      },
+                      "named": true,
+                      "value": "escape_sequence"
+                    },
+                    {
+                      "type": "REPEAT",
+                      "content": {
+                        "type": "CHOICE",
+                        "members": [
+                          {
+                            "type": "CHOICE",
+                            "members": [
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "_template_chars"
+                                },
+                                "named": true,
+                                "value": "string_fragment"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "_template_type_null_escape"
+                                },
+                                "named": true,
+                                "value": "escape_sequence"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "IMMEDIATE_TOKEN",
+                                  "content": {
+                                    "type": "SEQ",
+                                    "members": [
+                                      {
+                                        "type": "STRING",
+                                        "value": "\\"
+                                      },
+                                      {
+                                        "type": "CHOICE",
+                                        "members": [
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "[^0-9xu]"
+                                          },
+                                          {
+                                            "type": "STRING",
+                                            "value": "\r\n"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "x[0-9a-fA-F]{2}"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "u[0-9a-fA-F]{4}"
+                                          },
+                                          {
+                                            "type": "PATTERN",
+                                            "value": "u\\{0*([0-9a-fA-F]{1,5}|10[0-9a-fA-F]{4})\\}"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                },
+                                "named": true,
+                                "value": "escape_sequence"
+                              }
+                            ]
+                          },
+                          {
+                            "type": "ALIAS",
+                            "content": {
+                              "type": "IMMEDIATE_TOKEN",
+                              "content": {
+                                "type": "PATTERN",
+                                "value": "\\\\[0-9xu]"
+                              }
+                            },
+                            "named": true,
+                            "value": "escape_sequence"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -11970,6 +12218,10 @@
     {
       "type": "SYMBOL",
       "name": "__error_recovery"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "_template_type_null_escape"
     }
   ],
   "inline": [

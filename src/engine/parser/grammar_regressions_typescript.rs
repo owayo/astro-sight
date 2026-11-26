@@ -22,7 +22,7 @@ fn assert_typescript_parse_clean(source: &[u8], lang: LangId) -> Tree {
     let tree = parse_source(source, lang).unwrap();
     assert!(
         !tree.root_node().has_error(),
-        "有効な型引数の type query が構文エラーになった ({lang:?}): {}",
+        "有効な宣言が構文エラーになった ({lang:?}): {}",
         tree.root_node().to_sexp()
     );
     assert!(
@@ -43,6 +43,91 @@ fn typescript_node_with_text<'a>(
         .into_iter()
         .find(|node| node.kind() == kind && node.utf8_text(source).unwrap() == text)
         .unwrap_or_else(|| panic!("ノードがない: {kind} {text}: {}", root.to_sexp()))
+}
+
+#[test]
+fn typescript_template_literal_type_escapes_preserve_text_and_interpolation() {
+    let source = br#"type Label = `a\u0061\${x}\`\t b${string}z`;
+const value = `a\u0061\${x}\`\t b${input}z`;
+"#;
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let tree = assert_typescript_parse_clean(source, lang);
+        for (kind, literal, interpolation) in [
+            (
+                "template_literal_type",
+                r"`a\u0061\${x}\`\t b${string}z`",
+                ("template_type", "${string}"),
+            ),
+            (
+                "template_string",
+                r"`a\u0061\${x}\`\t b${input}z`",
+                ("template_substitution", "${input}"),
+            ),
+        ] {
+            let node = typescript_node_with_text(tree.root_node(), source, kind, literal);
+            let mut cursor = node.walk();
+            let parts: Vec<_> = node
+                .named_children(&mut cursor)
+                .map(|child| (child.kind(), child.utf8_text(source).unwrap()))
+                .collect();
+            assert_eq!(
+                parts,
+                [
+                    ("string_fragment", "a"),
+                    ("escape_sequence", r"\u0061"),
+                    ("escape_sequence", r"\$"),
+                    ("string_fragment", "{x}"),
+                    ("escape_sequence", r"\`"),
+                    ("escape_sequence", r"\t"),
+                    ("string_fragment", " b"),
+                    interpolation,
+                    ("string_fragment", "z"),
+                ],
+                "{lang:?} {kind}"
+            );
+        }
+        for valid in [r"`\0a\x20\u{000010FFFF}\\8${string}`", "`a\\\r\nb`"] {
+            let declaration = format!("type Valid = {valid};");
+            assert_typescript_parse_clean(declaration.as_bytes(), lang);
+        }
+        for raw in [
+            r"\xG0",
+            r"\uZZZZ",
+            r"\8",
+            r"\1",
+            r"\08",
+            r"\u{110000}",
+            r"\u{}",
+        ] {
+            let standalone = format!(r"type Raw = `\x41{raw}\u0061\${{x}}`;");
+            let tree = assert_typescript_parse_clean(standalone.as_bytes(), lang);
+            assert!(
+                !typescript_nodes(tree.root_node())
+                    .iter()
+                    .any(|node| node.kind() == "template_type")
+            );
+            for body in [format!(r"{raw}${{string}}"), format!(r"${{string}}{raw}")] {
+                let declaration = format!("type Broken = `{body}`;");
+                assert!(
+                    parse_source(declaration.as_bytes(), lang)
+                        .unwrap()
+                        .root_node()
+                        .has_error(),
+                    "{lang:?} {declaration}"
+                );
+            }
+        }
+        for malformed in [r"`a\`", "`a${}`"] {
+            let declaration = format!("type Broken = {malformed};");
+            assert!(
+                parse_source(declaration.as_bytes(), lang)
+                    .unwrap()
+                    .root_node()
+                    .has_error(),
+                "{lang:?} {declaration}"
+            );
+        }
+    }
 }
 
 #[test]
