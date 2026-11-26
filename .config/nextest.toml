@@ -92,9 +92,9 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::rust_private_
 priority = 50
 threads-required = 2
 
-# 1 万件を超える Rust の private import・未知の経路・実際の再公開を対比する。
+# Rust の再公開を、複数の Git 差分や 1 万件を超える名前で検証する。
 [[profile.default.overrides]]
-filter = 'test(=commands::tests::api_changes::rust_reexport_names::private_glob_additions_do_not_expand_unrelated_path_names) | test(=commands::tests::api_changes::rust_reexport_names::unknown_path_prefixes_keep_the_reexport_name_limit) | test(=commands::tests::api_changes::rust_reexport_names::actual_public_reexports_keep_the_reexport_name_limit)'
+filter = 'test(=commands::tests::api_changes::rust_reexport_names::private_module_beside_unchanged_external_macro_preserves_generated_names) | test(=commands::tests::api_changes::rust_reexport_names::private_glob_additions_do_not_expand_unrelated_path_names) | test(=commands::tests::api_changes::rust_reexport_names::unknown_path_prefixes_keep_the_reexport_name_limit) | test(=commands::tests::api_changes::rust_reexport_names::actual_public_reexports_keep_the_reexport_name_limit)'
 priority = 50
 threads-required = 2
 
