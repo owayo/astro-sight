@@ -220,3 +220,177 @@ fn ts_barrel_ambiguity_and_local_export_do_not_prove_origin() {
     assert!(!impacted.contains(&"src/g.ts".to_owned()), "{context}");
     assert!(!impacted.contains(&"src/h.ts".to_owned()), "{context}");
 }
+#[test]
+fn ts_const_import_alias_reports_only_reads_of_the_resolved_binding() {
+    let repo = TestRepo::new();
+    let old = "export const VALUE: string = 'old';\n";
+    let new = "export const VALUE: number = 42;\n";
+    let consumer = "import { VALUE as TMP } from './values.js';\nexport const use: string = TMP;\nexport function inner(TMP: string) { return TMP; }\n{ const TMP = 'local'; console.log(TMP); }\nexport const obj = { TMP: 1 };\nexport const field = obj.TMP;\nexport const shorthand = { TMP };\n";
+    repo.write("values.ts", old);
+    repo.write("use.tsx", consumer);
+    repo.write(
+        "escapes.ts",
+        r#"import { "V\u0041LUE" as \u0054MP } from './values';
+export const read: string = \u0054MP;
+export function shadow(\u0054MP: string) { return TMP; }
+export namespace Nested { export const read: string = TMP; }
+declare function local(TMP: string): typeof TMP;
+type Fn = (TMP: string) => typeof TMP;
+export function readDefault(x: typeof TMP = TMP) { return x; }
+"#,
+    );
+
+    repo.write("other.ts", "export const VALUE: string = 'other';\n");
+    repo.write(
+        "other-use.ts",
+        "import {VALUE as TMP} from './other';\nexport const value = TMP;\n",
+    );
+    repo.write(
+        "external.ts",
+        "import { VALUE as TMP } from 'external';\nexport const value = TMP;\n",
+    );
+    repo.write(
+        "types.ts",
+        "import type {VALUE as TMP} from './values';\nexport type Current = typeof TMP;\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("values.ts", new);
+    repo.stage_all();
+    for staged in [false, true] {
+        if staged {
+            repo.write("values.ts", old);
+            repo.write("use.tsx", "export const use = 1;\n");
+        }
+        let args: &[&str] = if staged {
+            &["--git", "--staged"]
+        } else {
+            &["--git"]
+        };
+        let review = repo.run_json("review", args);
+        let changes = review["impact"]["changes"].as_array().unwrap();
+        let file = changes
+            .iter()
+            .find(|file| file["path"] == "values.ts")
+            .unwrap();
+        let reads: Vec<_> = file["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|caller| {
+                caller["symbols"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|n| n == "VALUE"))
+            })
+            .map(|caller| {
+                (
+                    caller["path"].as_str().unwrap(),
+                    caller["line"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                ("escapes.ts", 1),
+                ("escapes.ts", 3),
+                ("escapes.ts", 6),
+                ("types.ts", 1),
+                ("use.tsx", 1),
+                ("use.tsx", 6)
+            ],
+            "{review}"
+        );
+        assert_ne!(
+            review["api_changes"]["modified"][0]["no_resolved_internal_callers"], true,
+            "{review}"
+        );
+        let mut cmd = cargo_bin();
+        let output = cmd
+            .args(["review", "--hook", "--dir"])
+            .arg(repo.root())
+            .args(args)
+            .output()
+            .unwrap();
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(
+            hook["impacts"][0]["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["p"] == "use.tsx" && r["ln"] == 1),
+            "{hook}"
+        );
+        assert_ne!(hook["api"]["mod"][0]["no_callers"], true, "{hook}");
+        if !staged {
+            let refs = repo.run_json("refs", &["--name", "VALUE", "--max-results", "unlimited"]);
+            assert!(
+                !refs["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["path"] == "use.tsx" && r["ln"] == 1),
+                "{refs}"
+            );
+            let impact = cargo_bin()
+                .args(["impact", "--git", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            assert_eq!(impact.status.code(), Some(1));
+        }
+    }
+}
+
+#[test]
+fn ts_const_import_alias_requires_the_resolved_module() {
+    let repo = TestRepo::new();
+    let config = r#"{"compilerOptions":{"paths":{"@values":["./values"]}}}"#;
+    repo.write("tsconfig.json", config);
+    repo.write("values.ts", "export const VALUE: string = 'old';\n");
+    repo.write(
+        "values.ios.ts",
+        "export const VALUE: string = 'untouched';\n",
+    );
+    repo.write("barrel.ts", "export {VALUE} from '@values';\n");
+    for (file, module) in [
+        ("relative.ts", "./values"),
+        ("mapped.ts", "@values"),
+        ("forwarded.ts", "./barrel"),
+    ] {
+        repo.write(
+            file,
+            format!(
+                "import {{VALUE as LOCAL}} from '{module}';\nexport const use: string = LOCAL;\n"
+            ),
+        );
+    }
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("values.ts", "export const VALUE: number = 42;\n");
+    let reads = || {
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "values.ts")
+            .unwrap();
+        change["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["line"] == 1)
+            .map(|r| r["path"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reads(), ["forwarded.ts", "mapped.ts", "relative.ts"]);
+    repo.write(
+        "tsconfig.json",
+        config.replace(
+            "\"paths\":",
+            "\"moduleSuffixes\":[\".ios\",\"\"],\"paths\":",
+        ),
+    );
+    assert!(reads().is_empty());
+}

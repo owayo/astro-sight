@@ -72,6 +72,7 @@ pub(super) struct RefEventMini {
     /// Barrel origin evidence only applies to a value/type use of the imported binding.
     pub(super) ts_import_binding_use: bool,
     ts_rebound_const_owner: u32,
+    ts_alias_owner: Option<u32>,
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
@@ -291,7 +292,8 @@ impl RouteDecisionContext<'_> {
                 should_route_ts_importless_ref_low(
                     true,
                     true,
-                    has_direct_import
+                    event.ts_alias_owner.is_some()
+                        || has_direct_import
                         || (event.ts_import_binding_use
                             && !event.local_shadow_hint
                             && self.ts_barrels.proves_origin(
@@ -299,7 +301,7 @@ impl RouteDecisionContext<'_> {
                                 symbol_name,
                                 &file_context.new_path,
                             )),
-                    event.local_shadow_hint,
+                    event.ts_alias_owner.is_none() && event.local_shadow_hint,
                 )
             } else {
                 false
@@ -391,7 +393,7 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) rust_method_bindings:
         std::cell::OnceCell<Option<super::rust_owner_alias::MethodBindings>>,
     pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
-    pub(super) python_changed_names: &'a std::collections::HashMap<String, usize>,
+    pub(super) changed_names: &'a std::collections::HashMap<String, usize>,
     pub(super) sym_to_fc: &'a [Vec<u32>],
     pub(super) file_contexts: &'a [FileContext],
     pub(super) all_symbol_names: &'a [String],
@@ -428,7 +430,64 @@ pub(super) struct ImpactCollector<'a> {
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
+    fn needs_alias_scan(&self, lang: LangId, source: &[u8]) -> bool {
+        self.ts_barrels.has_changed_variables()
+            && matches!(lang, LangId::Typescript | LangId::Tsx | LangId::Javascript)
+            && memchr::memmem::find(source, b"import").is_some()
+            && memchr::memmem::find(source, b"as").is_some()
+    }
+
+    fn on_tree(&mut self, root: tree_sitter::Node<'_>, source: &[u8]) {
+        let barrels = self.ts_barrels;
+        let path = self.path_str;
+        let names = self.changed_names;
+        let mut lines = None;
+        super::ts_const_aliases::visit(
+            root,
+            source,
+            |module, imported| {
+                let (fc, name) = barrels.alias_owner(path, module, imported)?;
+                Some((fc, *names.get(name)? as u32))
+            },
+            |node, (fc, sym)| {
+                let index = lines.get_or_insert_with(|| refs::LineIndex::new(source));
+                let point = node.start_position();
+                let context = refs::extract_line_context_indexed(source, index, point.row);
+                self.collect_ref(
+                    refs::RefVisitEvent {
+                        sym_ix: sym,
+                        line: point.row,
+                        column: point.column,
+                        context_column: refs::context_column(
+                            point.column,
+                            source,
+                            index,
+                            point.row,
+                        ),
+                        context: &context,
+                        is_def: false,
+                        confidence: crate::models::reference::RefConfidence::ExactOwner,
+                        rust_macro_callee: false,
+                        usage: refs::RefUsageRole::Other,
+                        lexical_binding: LexicalBinding::Unknown,
+                        js_signature_site: JsSignatureSite::Unknown,
+                        node: Some(node),
+                        rust_format_capture: None,
+                        source,
+                    },
+                    Some(fc),
+                );
+            },
+        );
+    }
+
     fn on_ref(&mut self, event: refs::RefVisitEvent<'_>) {
+        self.collect_ref(event, None);
+    }
+}
+
+impl ImpactCollector<'_> {
+    fn collect_ref(&mut self, event: refs::RefVisitEvent<'_>, ts_alias_owner: Option<u32>) {
         let refs::RefVisitEvent {
             sym_ix,
             line,
@@ -821,7 +880,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                             source,
                             self.dir,
                             self.path_str,
-                            self.python_changed_names,
+                            self.changed_names,
                             self.python_import_cache,
                             self.new_side_is_worktree,
                         )
@@ -1094,6 +1153,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             local_shadow_hint,
             ts_import_binding_use,
             ts_rebound_const_owner,
+            ts_alias_owner,
             ref_in_macro,
             rust_macro_evidence,
             rust_macro_callee,
@@ -1401,6 +1461,7 @@ impl<'a> ImpactCollector<'a> {
         let mut events = std::mem::take(&mut *collector.ref_events);
         let mut evidence = collector.prepare_file_evidence(&events);
         let sym_to_fc = collector.sym_to_fc;
+        let mut aliases = std::collections::HashSet::new();
         for e in events.drain(..) {
             let fc_ixs = &sym_to_fc[e.sym_ix as usize];
             if fc_ixs.is_empty() {
@@ -1413,8 +1474,24 @@ impl<'a> ImpactCollector<'a> {
                     collector.candidate_decision(&e, &facts, fc_ix, &mut evidence)
                 {
                     collector.record_caller(&e, fc_ix, route);
+                    if e.ts_alias_owner.is_some() {
+                        aliases.insert((fc_ix, e.sym_ix));
+                    }
                 }
             }
+        }
+        if !aliases.is_empty() {
+            let mut reads = collector
+                .ts_barrels
+                .const_alias_reads
+                .lock()
+                .expect("TS aliases");
+            reads.extend(aliases.into_iter().map(|(fc, sym)| {
+                (
+                    collector.file_contexts[fc].new_path.clone(),
+                    collector.all_symbol_names[sym as usize].clone(),
+                )
+            }));
         }
         *collector.ref_events = events;
         collector.def_events.clear();
@@ -1527,7 +1604,10 @@ impl<'a> ImpactCollector<'a> {
         fc_ix: usize,
         evidence: &mut RefFileEvidence<'a>,
     ) -> CandidateDecision {
-        if self.excluded_by_owner_evidence(e, facts, fc_ix, evidence) {
+        if e.ts_alias_owner
+            .is_some_and(|owner| owner as usize != fc_ix)
+            || self.excluded_by_owner_evidence(e, facts, fc_ix, evidence)
+        {
             return CandidateDecision::Exclude;
         }
         let Some(scope) = self.private_scope_evidence(e, facts, fc_ix, evidence) else {
@@ -2034,6 +2114,7 @@ mod tests {
             local_shadow_hint: false,
             ts_import_binding_use: false,
             ts_rebound_const_owner: u32::MAX,
+            ts_alias_owner: None,
             ref_in_macro: false,
             rust_macro_evidence: false,
             rust_macro_callee: false,

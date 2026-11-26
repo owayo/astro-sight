@@ -11,12 +11,17 @@ use crate::language::LangId;
 
 use super::FileContext;
 
+type OriginKey = (String, String, String, String, bool);
+
 #[derive(Default)]
 pub(super) struct TsBarrelIndex {
+    pub(super) const_alias_reads: Mutex<HashSet<(String, String)>>,
+    const_candidates: Vec<(String, String, u32)>,
     root: PathBuf,
     files: HashSet<String>,
     modules: Mutex<HashMap<String, Option<Arc<Module>>>>,
-    memo: Mutex<HashMap<(String, String, String, String), Origin>>,
+    memo: Mutex<HashMap<OriginKey, Origin>>,
+    alias_modules: Mutex<HashMap<(String, String), Option<String>>>,
     proofs: Mutex<HashMap<(String, String, String), bool>>,
     reachability: Mutex<HashMap<(String, String), bool>>,
     paths: Vec<(String, String, String, bool)>,
@@ -29,6 +34,7 @@ struct Module {
     stars: Vec<String>,
     local_exports: HashSet<String>,
     literal_exports: HashSet<String>,
+    const_exports: HashSet<String>,
     dependencies: Vec<String>,
     opaque: bool,
 }
@@ -47,6 +53,17 @@ impl TsBarrelIndex {
             return Self::default();
         }
         Self {
+            const_candidates: changes
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| is_ts(c.lang_id))
+                .flat_map(|(fc, c)| {
+                    c.affected
+                        .iter()
+                        .filter(|s| s.change_type == "modified" && s.kind == "variable")
+                        .map(move |s| (c.new_path.clone(), s.name.clone(), fc as u32))
+                })
+                .collect(),
             root: dir.to_path_buf(),
             files: files
                 .iter()
@@ -56,6 +73,32 @@ impl TsBarrelIndex {
             paths: read_paths(dir),
             ..Self::default()
         }
+    }
+
+    pub(super) fn has_changed_variables(&self) -> bool {
+        !self.const_candidates.is_empty()
+    }
+
+    pub(super) fn alias_owner(
+        &self,
+        caller: &str,
+        specifier: &str,
+        imported: &str,
+    ) -> Option<(u32, &str)> {
+        let target = self.resolve_for::<true>(caller, specifier)?;
+        let module = self.module(&target)?;
+        if module.opaque {
+            return None;
+        }
+        self.const_candidates.iter().find_map(|(path, name, fc)| {
+            if module.local_exports.contains(imported) && (path != &target || name != imported) {
+                return None;
+            }
+            let mut visiting = HashSet::new();
+            (self.origin::<true>(&target, imported, path, name, &mut visiting) == Origin::Changed
+                && self.module(path)?.const_exports.contains(name))
+            .then_some((*fc, name.as_str()))
+        })
     }
 
     pub(super) fn proves_origin(&self, caller: &str, name: &str, changed: &str) -> bool {
@@ -157,7 +200,7 @@ impl TsBarrelIndex {
             return false;
         };
         let mut visiting = HashSet::new();
-        self.origin(&path, name, changed, name, &mut visiting) == Origin::Changed
+        self.origin::<false>(&path, name, changed, name, &mut visiting) == Origin::Changed
     }
 
     fn module(&self, path: &str) -> Option<Arc<Module>> {
@@ -213,7 +256,7 @@ impl TsBarrelIndex {
         Some(Arc::new(module))
     }
 
-    fn origin(
+    fn origin<const CONST_ALIAS: bool>(
         &self,
         path: &str,
         name: &str,
@@ -226,6 +269,7 @@ impl TsBarrelIndex {
             name.to_owned(),
             changed.to_owned(),
             changed_name.to_owned(),
+            CONST_ALIAS,
         );
         if let Ok(memo) = self.memo.lock()
             && let Some(&result) = memo.get(&memo_key)
@@ -236,7 +280,7 @@ impl TsBarrelIndex {
         if !visiting.insert(visit_key.clone()) {
             return Origin::Unknown;
         }
-        let result = self.origin_inner(path, name, changed, changed_name, visiting);
+        let result = self.origin_inner::<CONST_ALIAS>(path, name, changed, changed_name, visiting);
         visiting.remove(&visit_key);
         if result != Origin::Unknown
             && let Ok(mut memo) = self.memo.lock()
@@ -246,7 +290,7 @@ impl TsBarrelIndex {
         result
     }
 
-    fn origin_inner(
+    fn origin_inner<const CONST_ALIAS: bool>(
         &self,
         path: &str,
         name: &str,
@@ -272,17 +316,23 @@ impl TsBarrelIndex {
                 return Origin::Unknown;
             }
             let (specifier, source_name) = &edges[0];
-            let Some(target) = self.resolve(path, specifier) else {
+            let Some(target) = self.resolve_for::<CONST_ALIAS>(path, specifier) else {
                 return Origin::Unknown;
             };
-            return self.origin(&target, source_name, changed, changed_name, visiting);
+            return self.origin::<CONST_ALIAS>(
+                &target,
+                source_name,
+                changed,
+                changed_name,
+                visiting,
+            );
         }
         let mut found = Origin::Absent;
         for specifier in &module.stars {
-            let Some(target) = self.resolve(path, specifier) else {
+            let Some(target) = self.resolve_for::<CONST_ALIAS>(path, specifier) else {
                 return Origin::Unknown;
             };
-            match self.origin(&target, name, changed, changed_name, visiting) {
+            match self.origin::<CONST_ALIAS>(&target, name, changed, changed_name, visiting) {
                 Origin::Unknown => return Origin::Unknown,
                 Origin::Absent => {}
                 result if found == Origin::Absent => found = result,
@@ -290,6 +340,71 @@ impl TsBarrelIndex {
             }
         }
         found
+    }
+
+    fn path_alias_bases(&self, from: &str, specifier: &str) -> Option<Vec<String>> {
+        if !self.root_config_applies(from) {
+            return None;
+        }
+        let mut best = 0;
+        let mut matches = Vec::new();
+        for (prefix, suffix, replacement, exact) in &self.paths {
+            if *exact && specifier != prefix {
+                continue;
+            }
+            let Some(rest) = specifier
+                .strip_prefix(prefix)
+                .and_then(|s| s.strip_suffix(suffix))
+            else {
+                continue;
+            };
+            let specificity = if *exact { usize::MAX } else { prefix.len() };
+            if specificity > best {
+                best = specificity;
+                matches.clear();
+            }
+            if specificity == best {
+                matches.push(replacement.replace('*', rest));
+            }
+        }
+        Some(matches)
+    }
+
+    fn resolve_for<const CONST_ALIAS: bool>(&self, from: &str, specifier: &str) -> Option<String> {
+        if !CONST_ALIAS {
+            return self.resolve(from, specifier);
+        }
+        // 同じディレクトリの import は相対パス・設定・package.json の証明を共用する。
+        let key = (
+            Path::new(from).parent()?.to_str()?.to_owned(),
+            specifier.to_owned(),
+        );
+        if let Some(cached) = self.alias_modules.lock().ok()?.get(&key).cloned() {
+            return cached;
+        }
+        let result = (|| {
+            let mapped;
+            let relative = if specifier.starts_with('.') {
+                specifier
+            } else {
+                let bases = self.path_alias_bases(from, specifier)?;
+                let [base] = bases.as_slice() else {
+                    return None;
+                };
+                // paths の置換先はプロジェクトのルート基準。参照ファイル基準へ戻し、
+                // 拡張子・package.json・設定を相対 import と同じ条件で確認する。
+                let up = "../".repeat(Path::new(from).parent()?.components().count());
+                mapped = format!("./{up}{base}");
+                &mapped
+            };
+            crate::commands::ts_const_rebinding::resolved_const_import(
+                self.root.to_str()?,
+                from,
+                relative,
+            )
+        })();
+        self.alias_modules.lock().ok()?.insert(key, result.clone());
+        result
     }
 
     fn resolve(&self, from: &str, specifier: &str) -> Option<String> {
@@ -308,31 +423,7 @@ impl TsBarrelIndex {
                 format!("{parent}/{specifier}")
             }]
         } else {
-            if !self.root_config_applies(from) {
-                return None;
-            }
-            let mut best = 0;
-            let mut matches = Vec::new();
-            for (prefix, suffix, replacement, exact) in &self.paths {
-                if *exact && specifier != prefix {
-                    continue;
-                }
-                let Some(rest) = specifier
-                    .strip_prefix(prefix)
-                    .and_then(|s| s.strip_suffix(suffix))
-                else {
-                    continue;
-                };
-                let specificity = if *exact { usize::MAX } else { prefix.len() };
-                if specificity > best {
-                    best = specificity;
-                    matches.clear();
-                }
-                if specificity == best {
-                    matches.push(replacement.replace('*', rest));
-                }
-            }
-            matches
+            self.path_alias_bases(from, specifier)?
         };
         let mut found = None;
         for base in bases {
@@ -572,6 +663,12 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
                         pattern,
                         &mut |binding| {
                             if let Ok(name) = binding.utf8_text(source) {
+                                if declaration
+                                    .child_by_field_name("kind")
+                                    .is_some_and(|kind| kind.kind() == "const")
+                                {
+                                    module.const_exports.insert(name.to_owned());
+                                }
                                 module.local_exports.insert(name.to_owned());
                             }
                             ControlFlow::Continue(())
@@ -767,7 +864,7 @@ mod tests {
             ..TsBarrelIndex::default()
         };
         assert_eq!(
-            index.origin(
+            index.origin::<false>(
                 "barrel.ts",
                 "LIMIT",
                 "barrel.ts",
@@ -777,7 +874,7 @@ mod tests {
             Origin::Other
         );
         assert_eq!(
-            index.origin(
+            index.origin::<false>(
                 "destructured.ts",
                 "LIMIT",
                 "real.ts",

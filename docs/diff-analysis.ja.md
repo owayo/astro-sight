@@ -159,6 +159,8 @@ JS / TS / TSX のトップレベル関数について、別ファイルの同名
 
 ### TypeScript の named import の別名
 
+`export const VALUE` の型や値を変更すると、`import { VALUE as TMP } from './values'` を通して `TMP` を読む行も `VALUE` の影響先に含まれる。相対パスの再エクスポートで名前が変わっても、元の定数を特定できれば追跡する。`import type` の別名を使う `typeof TMP` も対象になる。同名の引数を読む行や `obj.TMP` のプロパティ名は、この定数の利用には数えない。
+
 TS/TSX の一意な通常直下関数では、直接の相対 `import { total as sum } from './pricing'` を通した呼び出しも `api.mod_closed` に数えられる。解決先は変更した宣言ファイル1つに限り、競合する候補があれば証明しない。別名の全利用が同じ import に束縛される直接 call であることを求める。内側で同名の引数やローカルを宣言した利用は別束縛として除く。元の名前と別名の両方について、変更後の引数数と既存の実変更行の条件を照合する。複数行の call も扱い、`review --staged` は完全な index snapshot の中の証拠だけを使う。
 
 再 export、type-only import、関数値の持ち出し、`typeof`、値をさらに別名へ束縛する形、未対応の call、不確定な解決は blocking に残す。さらに同じ範囲の JS/TS/TSX を監査し、元名の索引に現れない escaped identifier と module object 経由の輸送を確かめる。namespace/default import、export star、直接の require・動的 import は、別の相対ファイルへ一意に到達する場合だけ許す。無関係でも解決不能な輸送があれば閉じない。rootDirs/moduleSuffixes/extends、config の escape、読取・解析失敗、リンク、動的コードの手掛かりでも保留する。名前は ASCII の単純な識別子に限り、型メンバー変更の義務は従来の方針を維持する。

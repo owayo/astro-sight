@@ -73,6 +73,7 @@ const IMPACT_DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 ];
 
 pub(super) struct StreamCallerMaps {
+    pub(super) const_alias_reads: std::collections::HashSet<(String, String)>,
     pub(super) caller_maps: Vec<TypedCallerMap>,
     pub(super) low_caller_maps: Vec<TypedCallerMap>,
     pub(super) informational_caller_maps: Vec<TypedCallerMap>,
@@ -332,6 +333,7 @@ pub(super) fn stream_caller_maps(
 
     // CI 言語 skip で解析を打ち切るときに返す空結果。
     let empty_result = || StreamCallerMaps {
+        const_alias_reads: Default::default(),
         caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
@@ -499,7 +501,7 @@ pub(super) fn stream_caller_maps(
                             rust_private_calls: Default::default(),
                             rust_method_bindings: Default::default(),
                             python_import_cache: &python_import_cache,
-                            python_changed_names: sym_ix,
+                            changed_names: sym_ix,
                             sym_to_fc: &sym_to_fc,
                             file_contexts,
                             all_symbol_names,
@@ -560,6 +562,10 @@ pub(super) fn stream_caller_maps(
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
     Ok(StreamCallerMaps {
+        const_alias_reads: ts_barrels
+            .const_alias_reads
+            .into_inner()
+            .expect("TS aliases"),
         caller_maps: global_maps,
         low_caller_maps: global_low_maps,
         informational_caller_maps: global_informational_maps,
