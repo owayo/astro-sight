@@ -934,12 +934,7 @@ fn object_type_members<'a>(
     ty: tree_sitter::Node<'a>,
     source: &[u8],
 ) -> Option<Vec<(SigTokens, tree_sitter::Node<'a>)>> {
-    if crate::engine::tree_walk::any_node(ty, crate::engine::tree_walk::Children::Named, |node| {
-        node.kind() == "comment"
-            && node
-                .utf8_text(source)
-                .is_ok_and(|text| text.contains("@internal") || text.contains("@ts-"))
-    }) {
+    if has_ts_signature_directive(ty, source) {
         return None;
     }
     let mut cursor = ty.walk();
@@ -951,6 +946,15 @@ fn object_type_members<'a>(
             Some((tokens, member))
         })
         .collect()
+}
+
+fn has_ts_signature_directive(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    crate::engine::tree_walk::any_node(root, crate::engine::tree_walk::Children::Named, |node| {
+        node.kind() == "comment"
+            && node
+                .utf8_text(source)
+                .is_ok_and(|text| text.contains("@internal") || text.contains("@ts-"))
+    })
 }
 
 /// property_signature が optional (`?` トークン付き) か。`?` は named child に現れない
@@ -1064,11 +1068,22 @@ pub(crate) fn ts_function_signature_parts(
     fn_node: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<TsFunctionSignatureParts> {
+    function_signature_parts(fn_node, source, false)
+}
+
+fn function_signature_parts(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    allow_parameter_comments: bool,
+) -> Option<TsFunctionSignatureParts> {
     let (params_node, params) = match (
         fn_node.child_by_field_name("parameters"),
         fn_node.child_by_field_name("parameter"),
     ) {
-        (Some(list), None) => (list, ts_function_params(list, source)?),
+        (Some(list), None) => (
+            list,
+            ts_function_params(list, source, allow_parameter_comments)?,
+        ),
         // `x => ...` は引数なしではなく、必須引数が 1 個ある。
         (None, Some(identifier)) if identifier.kind() == "identifier" => (
             identifier,
@@ -1095,17 +1110,24 @@ pub(crate) fn ts_function_signature_parts(
 
 /// formal_parameters 直下の実引数ノードを抽出する。判定不能な kind や
 /// rest の後続引数・省略可能な rest は blocking を維持する。
-pub(crate) fn ts_function_params(
+fn ts_function_params(
     params: tree_sitter::Node<'_>,
     source: &[u8],
+    allow_parameter_comments: bool,
 ) -> Option<Vec<TsFunctionParam>> {
-    if params.kind() != "formal_parameters" || params.has_error() {
+    if params.kind() != "formal_parameters"
+        || params.has_error()
+        || (allow_parameter_comments && has_ts_signature_directive(params, source))
+    {
         return None;
     }
     let mut result = Vec::new();
     let mut saw_rest = false;
     let mut cursor = params.walk();
     for child in params.named_children(&mut cursor) {
+        if allow_parameter_comments && child.kind() == "comment" {
+            continue;
+        }
         if saw_rest {
             return None;
         }
@@ -1130,6 +1152,21 @@ pub(crate) fn ts_function_params(
         }
     }
     Some(result)
+}
+
+/// 実引数の番号で追加部分を確認する。ほかの互換判定は従来どおりコメントも含めて比較する。
+fn trailing_optional_prefix_len(
+    old_fn: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_fn: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> Option<usize> {
+    let old = function_signature_parts(old_fn, old_source, true)?;
+    let new = function_signature_parts(new_fn, new_source, true)?;
+    (old.head == new.head
+        && old.tail == new.tail
+        && ts_params_prefix_same_with_optional_tail(&old.params, &new.params))
+    .then_some(old.params.len())
 }
 
 /// 引数が呼び出し側から省略可能かを AST 上で判定する。

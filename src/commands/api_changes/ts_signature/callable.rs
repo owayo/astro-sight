@@ -413,6 +413,67 @@ mod tests {
     }
 
     #[test]
+    fn documented_trailing_parameters_preserve_parameter_contracts() {
+        for (old, new, compatible) in [
+            (
+                "a: string",
+                "/** name */ a: string, /** options */ { quiet = false } = {}",
+                true,
+            ),
+            (
+                "/* name */ a: string",
+                "a: string, // optional\n b?: number",
+                true,
+            ),
+            (
+                "a: string",
+                "a: string, /** @deprecated */ b = '@ts-ignore'",
+                true,
+            ),
+            ("a: string", "/** name */ a: string", false),
+            ("a: string", "a: number, /** options */ b = false", false),
+            ("a: string", "a: string, /** options */ b: boolean", false),
+            ("a = 0", "a = 1, /** options */ b = false", false),
+            (
+                "...a: string[]",
+                "...a: string[], // options\n b = false",
+                false,
+            ),
+            ("a: string", "/** @internal */ a: string, b = false", false),
+            ("// @ts-ignore\n a: string", "a: string, b = false", false),
+            (
+                "a: string",
+                "a: string, // @ts-expect-error\n b = false",
+                false,
+            ),
+            (
+                "a: string",
+                "a: string, /** options */ b: { /** @internal */ x?: string } = {}",
+                false,
+            ),
+        ] {
+            let old = format!("export function f({old}) {{}}");
+            let new = format!("export function f({new}) {{}}");
+            let old_tree = parser::parse_source(old.as_bytes(), LangId::Typescript).unwrap();
+            let new_tree = parser::parse_source(new.as_bytes(), LangId::Typescript).unwrap();
+            let find = super::super::find_top_level_function_by_name;
+            let old_fn = find(old_tree.root_node(), old.as_bytes(), "f").unwrap();
+            let new_fn = find(new_tree.root_node(), new.as_bytes(), "f").unwrap();
+            assert_eq!(
+                super::super::trailing_optional_prefix_len(
+                    old_fn,
+                    old.as_bytes(),
+                    new_fn,
+                    new.as_bytes()
+                )
+                .is_some(),
+                compatible,
+                "{old} -> {new}"
+            );
+        }
+    }
+
+    #[test]
     fn bare_arrow_is_one_required_parameter_not_an_empty_list() {
         let old = parts("value => value").unwrap();
         assert_eq!(old.params.len(), 1);

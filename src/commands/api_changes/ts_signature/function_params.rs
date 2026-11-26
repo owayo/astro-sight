@@ -12,17 +12,7 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
         constructor_params::trailing_optional_constructor_parameters(site, sources)?;
         return Some(site.compatible("trailing_optional_params"));
     }
-    with_resolved_ts_callable_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
-        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
-            return None;
-        }
-        if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
-            return None;
-        }
-        Some(())
-    })?;
+    with_resolved_ts_callable_pair(site, sources, trailing_optional_prefix_len)?;
     Some(site.compatible("trailing_optional_params"))
 }
 
