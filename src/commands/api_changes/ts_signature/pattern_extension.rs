@@ -8,7 +8,7 @@ use tree_sitter::Node;
 mod alias_defaults;
 
 pub(super) struct AddedBinding {
-    name: String,
+    pub(super) name: String,
     node_id: usize,
 }
 
