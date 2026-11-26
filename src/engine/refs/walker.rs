@@ -178,6 +178,10 @@ pub(crate) struct RefVisitEvent<'a> {
 /// Rust attribute 文字列内参照の場合も、ヒットしたすべての sym_ix について
 /// 1 回ずつ `on_ref` が呼ばれる。
 pub(crate) trait RefVisitor {
+    fn needs_alias_scan(&self, _lang: LangId, _source: &[u8]) -> bool {
+        false
+    }
+    fn on_tree(&mut self, _root: Node<'_>, _source: &[u8]) {}
     fn on_ref(&mut self, event: RefVisitEvent<'_>);
 }
 

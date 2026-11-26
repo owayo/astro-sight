@@ -25,6 +25,7 @@ mod rust_visibility_scope;
 mod signature;
 pub(crate) mod test_context;
 mod ts_barrels;
+mod ts_const_aliases;
 mod types;
 
 use std::collections::{HashMap, HashSet};
@@ -305,13 +306,19 @@ where
 
 pub(crate) type QueriedObjects = HashMap<String, HashSet<String>>;
 
+#[derive(Default)]
+pub(crate) struct ReviewImpactEvidence {
+    pub(crate) queried_objects: QueriedObjects,
+    pub(crate) const_alias_reads: HashSet<(String, String)>,
+}
+
 pub(crate) fn analyze_impact_at_checkout<F>(
     diff_input: &str,
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
     checkout: &Path,
     mut on_file_impact: F,
-) -> Result<QueriedObjects>
+) -> Result<ReviewImpactEvidence>
 where
     F: FnMut(FileImpact) -> Result<()>,
 {
@@ -326,7 +333,7 @@ where
     // 判定対象が違うので片方に寄せて統合しないこと (多層防御)。
     if should_skip_ci_only_diff(&diff_files) {
         log_phase("context.skip_ci_only", "applied", 0);
-        return Ok(QueriedObjects::new());
+        return Ok(ReviewImpactEvidence::default());
     }
 
     // `--staged` では変更ファイルを index の内容で解析する (`NewSideSource` 参照)。
@@ -375,7 +382,7 @@ where
             on_file_impact(change)?;
         }
         log_phase("context.assemble_no_cross", "end", t.elapsed().as_millis());
-        return Ok(QueriedObjects::new());
+        return Ok(ReviewImpactEvidence::default());
     }
 
     let mut sym_ix: HashMap<String, usize> = HashMap::with_capacity(all_symbol_names.len());
@@ -422,6 +429,7 @@ where
         mut low_caller_maps,
         mut informational_caller_maps,
         string_pool,
+        const_alias_reads,
     } = pass2_maps;
 
     // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → callback → drop。
@@ -464,7 +472,10 @@ where
     drop(string_pool);
     log_phase("context.pass34", "end", t.elapsed().as_millis());
 
-    Ok(queried)
+    Ok(ReviewImpactEvidence {
+        queried_objects: queried,
+        const_alias_reads,
+    })
 }
 
 /// 出力する検出が 1 つも無い FileImpact (affected_symbols・impacted_callers・signature_changes・

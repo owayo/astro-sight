@@ -14,6 +14,7 @@ pub mod imports;
 pub(crate) mod js_binding_pattern;
 pub(crate) mod js_occurrence;
 pub(crate) mod js_scope;
+pub(crate) mod js_string;
 pub(crate) mod jsx;
 pub mod lexer;
 pub(crate) mod lexical_binding;

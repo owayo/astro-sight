@@ -33,6 +33,11 @@ pub(crate) fn visit_pattern_bindings<'a>(
     while let Some(node) = stack.pop() {
         match node.kind() {
             "identifier" | "shorthand_property_identifier_pattern" => visit(node)?,
+            // 型注釈・default 値は、その引数が宣言する束縛ではない。
+            "required_parameter" | "optional_parameter" => stack.extend(
+                node.child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("name")),
+            ),
             "pair_pattern" => stack.extend(node.child_by_field_name("value")),
             "assignment_pattern" | "object_assignment_pattern" => {
                 stack.extend(node.child_by_field_name("left"));

@@ -15,6 +15,14 @@ use crate::engine::{diff, parser};
 use crate::language::LangId;
 use crate::models::impact::DiffFile;
 
+/// ディレクトリの package.json と設定を含め、別名が一意なファイルを指すか確かめる。
+pub(crate) fn resolved_const_import(dir: &str, from: &str, specifier: &str) -> Option<String> {
+    if super::removed_attribution::relative_directory_has_manifest(dir, from, specifier) {
+        return None;
+    }
+    super::ref_index::resolved_relative_source(dir, from, specifier)
+}
+
 #[derive(Default)]
 pub(crate) struct AddedExports {
     by_name: HashMap<String, HashMap<String, Literal>>,
@@ -193,14 +201,8 @@ impl AddedExports {
                 {
                     continue;
                 }
-                let Some(target) = target.get_or_init(|| {
-                    if super::removed_attribution::relative_directory_has_manifest(
-                        dir, path, module,
-                    ) {
-                        return None;
-                    }
-                    super::ref_index::resolved_relative_source(dir, path, module)
-                }) else {
+                let Some(target) = target.get_or_init(|| resolved_const_import(dir, path, module))
+                else {
                     continue;
                 };
                 let Some(literal) = origins.get(target) else {

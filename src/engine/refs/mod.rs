@@ -37,7 +37,10 @@ pub use files::{
 pub(crate) use files::{
     detect_source_lang, generated_undetermined_truncations, is_unanalyzable_source_ext,
 };
-pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
+pub(crate) use line_index::{
+    LineIndex, absolute_position, byte_offset_to_row_col, context_column,
+    extract_line_context_indexed,
+};
 pub(crate) use role::RefUsageRole;
 pub(crate) use walker::{RefVisitEvent, RefVisitor};
 
@@ -1067,12 +1070,20 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 
     let mut present_indices = ac_present_indices(ac, source.as_bytes(), num);
     extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
-    if present_indices.is_empty() {
+    let alias_scan =
+        LangId::from_path(path).is_ok_and(|lang| visitor.needs_alias_scan(lang, source.as_bytes()));
+    if present_indices.is_empty() && !alias_scan {
         return Ok(());
     }
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
     let root = tree.root_node();
+    if alias_scan {
+        visitor.on_tree(root, source.as_bytes());
+        if present_indices.is_empty() {
+            return Ok(());
+        }
+    }
     let definition_kinds = definition_node_kinds(lang_id);
 
     let name_index = build_name_index(lang_id, symbol_names, &present_indices);

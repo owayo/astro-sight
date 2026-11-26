@@ -137,7 +137,7 @@ fn enclosing_scope(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn is_scope_node(kind: &str) -> bool {
+pub(crate) fn is_scope_node(kind: &str) -> bool {
     matches!(
         kind,
         "program"
@@ -160,7 +160,7 @@ fn is_scope_node(kind: &str) -> bool {
 /// `var` の hoisting / block 内宣言を漏らさないため、ネスト scope の境界までは再帰で潜る
 /// (function 系の内側の宣言はその scope のものなので潜らない。ただし function 自身の名前は
 /// 現 scope の binding として拾う)。
-fn find_binding_in_scope<'tree>(
+pub(crate) fn find_binding_in_scope<'tree>(
     scope: Node<'tree>,
     source: &[u8],
     name: &str,

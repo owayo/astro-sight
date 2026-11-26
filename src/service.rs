@@ -758,7 +758,7 @@ impl AppService {
         dir: &str,
         options: &crate::models::impact::ContextAnalysisOptions,
         checkout: &str,
-    ) -> Result<(ContextResult, impact::QueriedObjects)> {
+    ) -> Result<(ContextResult, impact::ReviewImpactEvidence)> {
         let mut changes = Vec::new();
         let queried =
             self.analyze_context_streaming_at_checkout(diff, dir, options, checkout, |impact| {
@@ -819,7 +819,7 @@ impl AppService {
         options: &crate::models::impact::ContextAnalysisOptions,
         checkout: &str,
         mut on_file_impact: F,
-    ) -> Result<impact::QueriedObjects>
+    ) -> Result<impact::ReviewImpactEvidence>
     where
         F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
     {

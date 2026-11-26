@@ -372,7 +372,7 @@ fn review_attempt_with_swift_protocols(
         snapshot.is_some(),
     );
 
-    let (mut impact, queried_objects) = timed_ok("context", || {
+    let (mut impact, impact_evidence) = timed_ok("context", || {
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
         // 両方に作用させる (v26.5.117 で挙動を統一)。
         // staged は changed file / refs / API / dead-code を同じ raw index tree から読む。
@@ -388,6 +388,17 @@ fn review_attempt_with_swift_protocols(
         };
         service.analyze_context_at_checkout(&diff_input, analysis_dir, &context_options, dir)
     })?;
+    let queried_objects = impact_evidence.queried_objects;
+    for change in &mut api_changes.modified {
+        if change.no_resolved_internal_callers
+            && impact_evidence
+                .const_alias_reads
+                .contains(&(change.file.clone(), change.name.clone()))
+        {
+            change.no_resolved_internal_callers = false;
+            change.reference_evidence = None;
+        }
+    }
     let queried_removals = api_changes.compatible_modified.extract_if(.., |change| {
         change.reason == "unused_object_members"
             && queried_objects
