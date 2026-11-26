@@ -2989,6 +2989,110 @@ fn external_macro_arguments_that_are_not_macros_are_not_inputs() {
 }
 
 #[test]
+fn private_module_beside_unchanged_external_macro_preserves_generated_names() {
+    let workspace = "[workspace]\nmembers=['commands','viewer']\nresolver='3'\n";
+    let commands = "#[macro_export]\nmacro_rules! register { ($name:ident, [$($command:ident),*]) => { pub mod $name { $(pub struct $command;)* } pub use $name::*; }; }\npub mod prelude { pub const PALETTE_SIZE: u8 = 3; }\n";
+    let display = "use commands::prelude::*;\nmod colors;\n#[cfg(target_os=\"macos\")]\ncommands::register!(window, [Raise, Lower]);\npub fn show() -> u8 { PALETTE_SIZE + colors::palette() }\n";
+    let changed = display
+        .replace("mod colors;", "mod colors;\nmod layout;")
+        .replace("colors::palette()", "colors::palette() + layout::padding()");
+    let files = [
+        (
+            "commands/Cargo.toml",
+            "[package]\nname='commands'\nversion='0.1.0'\nedition='2024'\n",
+        ),
+        ("commands/src/lib.rs", commands),
+        (
+            "viewer/Cargo.toml",
+            "[package]\nname='viewer'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ncommands={path='../commands'}\n[features]\nnative=[]\n",
+        ),
+        (
+            "viewer/src/lib.rs",
+            "#[cfg(feature=\"native\")]\npub mod display;\n",
+        ),
+        ("viewer/src/display.rs", display),
+        (
+            "viewer/src/display/colors.rs",
+            "pub(super) fn palette() -> u8 {1}\n",
+        ),
+    ];
+    let layout = (
+        "viewer/src/display/layout.rs",
+        "pub(super) fn padding() -> u8 {2}\n",
+    );
+    let api = api_changes_with(
+        workspace,
+        &files,
+        &[("viewer/src/display.rs", &changed), layout],
+    );
+    for name in ["Raise", "Lower", "window"] {
+        assert_eq!(classify(&api, name).0, "none", "{name}: {api:?}");
+    }
+    let narrowed = changed.replace(
+        "#[cfg(target_os=\"macos\")]",
+        "#[cfg(all(target_os=\"macos\", feature=\"native\", target_feature=\"sse2\"))]",
+    );
+    let api = api_changes_with(
+        workspace,
+        &files,
+        &[("viewer/src/display.rs", &narrowed), layout],
+    );
+    assert!(unverified(&api, "Raise"), "{api:?}");
+    for body in [
+        "pub type $command = [u8; line!() as usize];",
+        "pub type $command = super::layout::Style;",
+    ] {
+        let provider = commands.replace("pub struct $command;", body).replace(
+            "pub const PALETTE_SIZE",
+            "pub mod layout { pub type Style = u8; } pub const PALETTE_SIZE",
+        );
+        let mut version = files;
+        version[1].1 = &provider;
+        let child = if body.contains("Style") {
+            "pub(super) fn padding() -> u8 {2}\npub type Style = u16;\n"
+        } else {
+            layout.1
+        };
+        let api = api_changes_with(
+            workspace,
+            &version,
+            &[("viewer/src/display.rs", &changed), (layout.0, child)],
+        );
+        assert!(unverified(&api, "Raise"), "{body}: {api:?}");
+    }
+
+    let provider = commands.replace("$(pub struct $command;)*", "pub struct Raise;");
+    let api = api_changes_with(
+        workspace,
+        &files,
+        &[
+            ("viewer/src/display.rs", &changed),
+            layout,
+            ("commands/src/lib.rs", &provider),
+        ],
+    );
+    assert!(unverified(&api, "Lower"), "{api:?}");
+
+    let mut siblings = files.to_vec();
+    siblings[3].1 = "pub mod display;\npub mod second;\n";
+    siblings.extend([
+        ("viewer/src/second.rs", display),
+        ("viewer/src/second/colors.rs", files[5].1),
+    ]);
+    let api = api_changes_with(
+        workspace,
+        &siblings,
+        &[
+            ("viewer/src/display.rs", &changed),
+            layout,
+            ("viewer/src/second.rs", &changed),
+            ("viewer/src/second/layout.rs", layout.1),
+        ],
+    );
+    assert!(api.modified.is_empty(), "{api:?}");
+}
+
+#[test]
 fn unrelated_private_macro_modules_do_not_recheck_external_calls() {
     let manifest = format!("{CARGO}\n[dependencies]\ntree-sitter = \"0.27\"\n");
     let lib = "pub mod parser;\nmod first;\nmod second;\n";

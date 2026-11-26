@@ -23,6 +23,7 @@
 
 mod display;
 mod index;
+mod private_module;
 mod resolve;
 
 use super::rust_cfg_predicate::{Atoms, Predicate};
@@ -975,6 +976,8 @@ impl ReexportNames {
     /// 差分の中の package の lib crate のうち、名前を作る入力が変わったものの再公開した名前を比べる。
     pub(crate) fn new(
         dir: &str,
+        checkout: &str,
+        base: &crate::commands::git_input::GitBlobBatch,
         rust_crates: &RustCrates<'_>,
         diff_files: &[crate::models::impact::DiffFile],
         renames: &[crate::models::impact::DiffFile],
@@ -988,8 +991,9 @@ impl ReexportNames {
             .chain(renames)
             .map(|df| (df.old_path.clone(), df.new_path.clone()))
             .collect();
+        let project = private_module::Project::new(dir, checkout, base);
         for (root, pair) in rust_crates.reexport_pairs() {
-            this.compare_crate(dir, &root, pair, &pairs);
+            this.compare_crate(&project, &root, pair, &pairs);
         }
         this
     }
@@ -1018,7 +1022,7 @@ impl ReexportNames {
 
     fn compare_crate(
         &mut self,
-        dir: &str,
+        project: &private_module::Project<'_>,
         root: &str,
         pair: &super::rust_dependencies::crates::CratePair<'_>,
         pairs: &[(String, String)],
@@ -1059,7 +1063,7 @@ impl ReexportNames {
             return;
         }
         let (seeds, mut gaps) = timed("reexport_names.seeds", || {
-            seeds(dir, pair, &versions, pairs)
+            seeds(project, pair, &versions, pairs)
         });
         // 呼び出しの入力の閉包も、マクロの名前の予算から払う。
         if versions.iter().any(|version| version.macro_over()) {
@@ -1513,7 +1517,7 @@ fn may_be_public_import(versions: &[&Index<'_>; 2], name: &Key) -> bool {
 /// 差分のファイルの、変わった名前を作るもの・glob・列挙できない項目・マクロの本体と、置き場・edition の
 /// 変化から、比べる名前の種と、列挙できない持ち込みを集める。
 fn seeds(
-    dir: &str,
+    project: &private_module::Project<'_>,
     pair: &super::rust_dependencies::crates::CratePair<'_>,
     versions: &[&Index<'_>; 2],
     pairs: &[(String, String)],
@@ -1521,13 +1525,16 @@ fn seeds(
     let mut seeds: BTreeSet<Key> = BTreeSet::new();
     let mut gaps: BTreeSet<Gap> = BTreeSet::new();
     let in_package = |path: &str| {
-        super::rust_dependencies::crates::package_of(dir, path).as_deref()
+        super::rust_dependencies::crates::package_of(project.dir, path).as_deref()
             == Some(pair.package.as_str())
     };
+    let project_changes = pairs.len();
     let pairs: Vec<&(String, String)> = pairs
         .iter()
         .filter(|(old_path, new_path)| in_package(old_path) || in_package(new_path))
         .collect();
+    let local_changes = pairs.len() == project_changes;
+    let independent = std::cell::OnceCell::new();
     let paths: [HashSet<&str>; 2] = [
         pairs
             .iter()
@@ -1590,6 +1597,10 @@ fn seeds(
                 // 定義の指紋に入るので、それを呼ぶほかの呼び出しは、下の入力の比較で拾う)。
                 if let Some(order) = macro_order_entry(&scope.exports)
                     && !other.contains(&order)
+                    && !(local_changes
+                        && independent
+                            .get_or_init(|| project.independent_additions(pair, versions, &pairs))
+                            .contains(module))
                 {
                     for position in 0..scope.exports.opaque.len() {
                         opaque_seeds(version, module, *scope_index, position, &mut seeds);

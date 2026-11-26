@@ -1,11 +1,10 @@
 //! Clap 4 の Parser derive が Command::about に渡す文字列だけを比較から外す。
 use super::*;
+use crate::commands::api_changes::cargo_files::{Files, external_settings_known};
 use crate::commands::api_changes::rust_dependencies::crates::Located;
-use crate::commands::git_input::GitBlobBatch;
-use crate::engine::bounded_read::read_input_text_file;
-use crate::engine::impact::rust_cargo_config::{CargoConfigProof, config_keeps_sources};
+use crate::engine::impact::rust_cargo_config::config_keeps_sources;
 use crate::engine::rust_edition::RustEdition;
-use crate::git_support::{TreeView, normalize_workspace_separators, tree_view};
+use crate::git_support::tree_view;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
@@ -81,53 +80,6 @@ pub(super) fn compare(
             })
         {
             new.declarations.get_mut(key).unwrap()[0].fingerprint = before.fingerprint;
-        }
-    }
-}
-
-// 旧 tree と新しい解析対象のファイルの不在を、読み取り失敗や snapshot が省いたリンクと区別する。
-enum Files<'a> {
-    Base(&'a GitBlobBatch),
-    Current(&'a Path, &'a TreeView),
-}
-
-impl Files<'_> {
-    fn directory(&self, path: &Path) -> bool {
-        match self {
-            Self::Base(base) => matches!(
-                base.tree_mode(&normalize_workspace_separators(&path.to_string_lossy())),
-                Some(0 | 0o040000)
-            ),
-            Self::Current(root, view) => {
-                !view.hides(path)
-                    && match std::fs::symlink_metadata(root.join(path)) {
-                        Ok(meta) => meta.file_type().is_dir(),
-                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-                    }
-            }
-        }
-    }
-
-    fn text(&self, path: &Path) -> Option<Option<String>> {
-        match self {
-            Self::Base(base) => {
-                let relative = normalize_workspace_separators(path.to_str()?);
-                match base.tree_mode(&relative)? {
-                    0 => Some(None),
-                    0o100644 | 0o100755 => {
-                        Some(Some(String::from_utf8(base.read(&relative)?).ok()?))
-                    }
-                    _ => None,
-                }
-            }
-            Self::Current(root, view) if !view.hides(path) => {
-                match std::fs::symlink_metadata(root.join(path)) {
-                    Ok(meta) if meta.is_file() => read_input_text_file(&root.join(path)).map(Some),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
-                    _ => None,
-                }
-            }
-            _ => None,
         }
     }
 }
@@ -302,22 +254,7 @@ fn registry_clap(
         }
     }
     let root = Path::new(inputs.dir);
-    let checkout = std::path::absolute(inputs.checkout).ok()?;
-    let config = CargoConfigProof::capture(&checkout);
-    // snapshot の外の設定は実際の checkout の祖先と CARGO_HOME で確かめる。
-    for checkout in [&checkout, &std::fs::canonicalize(&checkout).ok()?] {
-        let parent = checkout.parent()?;
-        if !config.keeps_dependency_sources(parent)
-            || parent.ancestors().any(|dir| {
-                match std::fs::symlink_metadata(dir.join("Cargo.toml")) {
-                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-                    Ok(_) => true,
-                }
-            })
-        {
-            return None;
-        }
-    }
+    external_settings_known(Path::new(inputs.checkout))?;
     let package = PathBuf::from(package);
     let old = uses_clap(&Files::Base(inputs.base_blobs), &package)?;
     let new = uses_clap(&Files::Current(root, &tree_view(root)), &package)?;

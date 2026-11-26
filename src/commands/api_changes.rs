@@ -127,8 +127,14 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     // 再公開に効く `use` が変わった lib crate で、再公開した名前の有る設定を比べ直す (Issue #306・
     // #318)。module の比べ直しは、消した (足した) module の名前をこの比較が取り込みの束縛として比べたかを
     // 使うので先に作る (Issue #314)。
-    let reexport_names =
-        rust_reexport_names::ReexportNames::new(dir, &rust_crates, diff_files, renames);
+    let reexport_names = rust_reexport_names::ReexportNames::new(
+        dir,
+        checkout,
+        base_blobs,
+        &rust_crates,
+        diff_files,
+        renames,
+    );
     // module の宣言の条件 (`#[cfg] mod m;` など) が変わった lib crate で、配下の公開の項目の有る設定を
     // 比べ直す (Issue #305)。追加の候補の名前は索引で引けるよう先に足す。
     let module_availability = rust_module_availability::ModuleAvailability::new(
@@ -1005,6 +1011,7 @@ pub(crate) fn fill_modification_diagnostics(changes: &mut [ApiSymbolChange]) {
 
 pub(crate) mod added_reference_summary;
 mod candidate;
+mod cargo_files;
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
