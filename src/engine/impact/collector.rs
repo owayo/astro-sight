@@ -85,6 +85,8 @@ pub(super) struct RefEventMini {
     pub(super) rust_macro_callee: bool,
     /// `receiver.name` の field 位置。自由関数はこの構文で参照できない。
     pub(super) rust_receiver_member: bool,
+    /// 関連関数を名指し得ない、マクロの外のドット呼び出し。
+    rust_plain_dot_call: bool,
     /// Receiver member, associated path, or macro token that could name a method.
     pub(super) rust_method_syntax: bool,
     /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
@@ -372,6 +374,8 @@ pub(super) struct ImpactCollector<'a> {
         std::cell::OnceCell<Option<super::rust_std_origin::RustStdOriginIndex>>,
     /// 参照ファイルが差し替える標準マクロの名前 (`rust_const_value::LocalMacros`)。
     pub(super) rust_local_macros: std::cell::OnceCell<super::rust_const_value::LocalMacros>,
+    pub(super) rust_opaque_attributes:
+        std::cell::OnceCell<super::rust_macro_site::OpaqueAttributeScopes>,
     pub(super) rust_path_owner: std::cell::OnceCell<super::rust_path_owner::RustPathOwnerIndex>,
     /// 標準のマクロの呼び出しを普通の式に書き換えた写し (`rust_path_owner::MacroCopy`)。
     /// 引数の中の参照の所有元の証明だけに使う。
@@ -741,6 +745,24 @@ impl ImpactCollector<'_> {
         // 普通の式として確かめる)。
         let rust_receiver_member =
             self.ref_lang == Some(LangId::Rust) && owner_node.is_some_and(is_rust_receiver_member);
+        let rust_dot_call = rust_receiver_member && owner_node.is_some_and(rust_member_is_called);
+        let rust_plain_dot_call = rust_dot_call
+            && rust_macro_site.is_none()
+            && self.sym_to_fc.get(ix).is_some_and(|contexts| {
+                contexts.iter().any(|&fc_ix| {
+                    self.file_contexts[fc_ix as usize]
+                        .rust_receiverless_associated_names
+                        .contains(&self.all_symbol_names[ix])
+                })
+            })
+            && node.is_some_and(|node| {
+                !self
+                    .rust_opaque_attributes
+                    .get_or_init(|| {
+                        super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
+                    })
+                    .contains(node)
+            });
         let private_method_target = self.ref_lang == Some(LangId::Rust)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
                 contexts.iter().any(|&fc_ix| {
@@ -755,7 +777,7 @@ impl ImpactCollector<'_> {
         // 部分木・葉モジュールの判定へ進める (判定できなければ低確信度)。
         let rust_method_syntax = private_method_target
             && owner_node.is_none_or(|node| {
-                is_rust_method_call_member(node)
+                rust_dot_call
                     || node.parent().is_some_and(|parent| {
                         parent.kind() == "scoped_identifier"
                             && parent
@@ -1210,6 +1232,7 @@ impl ImpactCollector<'_> {
             rust_macro_evidence,
             rust_macro_callee,
             rust_receiver_member,
+            rust_plain_dot_call,
             rust_method_syntax,
             rust_explicit_method_owner_id,
             rust_private_call_target,
@@ -1266,10 +1289,8 @@ fn is_rust_receiver_member(node: tree_sitter::Node<'_>) -> bool {
     true
 }
 
-fn is_rust_method_call_member(node: tree_sitter::Node<'_>) -> bool {
-    if !is_rust_receiver_member(node) {
-        return false;
-    }
+/// `is_rust_receiver_member` で確認したフィールドが呼び出し先か。
+fn rust_member_is_called(node: tree_sitter::Node<'_>) -> bool {
     let Some(field) = node.parent() else {
         return false;
     };
@@ -1709,6 +1730,9 @@ impl<'a> ImpactCollector<'a> {
             return true;
         }
         if e.rust_receiver_member && ctx.rust_free_function_names.contains(name) {
+            return true;
+        }
+        if e.rust_plain_dot_call && ctx.rust_receiverless_associated_names.contains(name) {
             return true;
         }
         if e.rust_std_origin && ctx.lang_id == LangId::Rust {
@@ -2206,6 +2230,7 @@ mod tests {
             rust_macro_evidence: false,
             rust_macro_callee: false,
             rust_receiver_member: false,
+            rust_plain_dot_call: false,
             rust_method_syntax: false,
             rust_explicit_method_owner_id: u32::MAX,
             rust_private_call_target: u32::MAX,
@@ -2357,6 +2382,7 @@ mod tests {
             lang_id: LangId::Rust,
             rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
             rust_free_function_names: Default::default(),
+            rust_receiverless_associated_names: Default::default(),
             affected,
             sig_changes,
             compatible_signature_keys: Default::default(),

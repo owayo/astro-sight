@@ -547,6 +547,14 @@ pub(super) fn rust_inherent_method_owner<'a>(
     source: &'a [u8],
     symbol: &Symbol,
 ) -> Option<&'a str> {
+    rust_inherent_method(root, source, symbol).map(|(_, owner)| owner)
+}
+
+fn rust_inherent_method<'tree, 'src>(
+    root: Node<'tree>,
+    source: &'src [u8],
+    symbol: &Symbol,
+) -> Option<(Node<'tree>, &'src str)> {
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
         return None;
     }
@@ -578,9 +586,32 @@ pub(super) fn rust_inherent_method_owner<'a>(
     } else {
         owner
     };
-    (owner.kind() == "type_identifier")
-        .then(|| owner.utf8_text(source).ok())
-        .flatten()
+    (owner.kind() == "type_identifier").then_some((method, owner.utf8_text(source).ok()?))
+}
+
+/// マクロや属性を介さず、通常の引数だけを持つ inherent 関連関数。
+fn rust_receiverless_associated_function(
+    root: Node<'_>,
+    source: &[u8],
+    symbol: &Symbol,
+    attributes: &std::cell::OnceCell<super::rust_macro_site::OpaqueAttributeScopes>,
+) -> bool {
+    let Some((method, _)) = rust_inherent_method(root, source, symbol) else {
+        return false;
+    };
+    let Some(params) = method.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = params.walk();
+    params.named_children(&mut cursor).all(|param| {
+        matches!(param.kind(), "line_comment" | "block_comment")
+            || (param.kind() == "parameter"
+                && param
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| matches!(pattern.kind(), "identifier" | "_")))
+    }) && !attributes
+        .get_or_init(|| super::rust_macro_site::OpaqueAttributeScopes::build(root, source))
+        .contains(method)
 }
 
 /// ファイル直下の inherent impl に直接属する、実体のあるメソッドだけを追加候補にする。
@@ -787,6 +818,7 @@ pub(super) struct DeclarationProof {
     pub(super) rust_function_names: HashSet<String>,
     /// 旧新とも同名宣言が自由関数だけの名前。メソッド位置の参照は指し得ない。
     pub(super) rust_free_function_names: HashSet<String>,
+    pub(super) rust_receiverless_associated_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
     /// 宣言ヘッダの違いが関数に `const` を足したことだけの名前。シグネチャ変更は残し、
@@ -1352,11 +1384,32 @@ pub(super) fn reconcile_declaration_changes(
     });
     let mut old_free = HashMap::<&str, bool>::new();
     let mut new_free = HashMap::<&str, bool>::new();
-    for (symbols, root, free) in [
-        (&old.symbols[..], old.tree.root_node(), &mut old_free),
-        (input.syms, input.root, &mut new_free),
+    let mut associated: HashSet<_> = proof
+        .rust_function_names
+        .iter()
+        .map(|name| super::ci_key(LangId::Rust, name))
+        .collect();
+    for (symbols, root, source, free) in [
+        (
+            &old.symbols[..],
+            old.tree.root_node(),
+            old.source.as_slice(),
+            &mut old_free,
+        ),
+        (input.syms, input.root, input.source, &mut new_free),
     ] {
+        let mut found = HashSet::new();
+        let attributes = std::cell::OnceCell::new();
         for symbol in symbols {
+            // r#name と name は同じメソッド名。旧新どちらかで receiver を取り得れば保留する。
+            let key = crate::language::normalize_identifier(LangId::Rust, &symbol.name);
+            if associated.contains(key.as_ref()) {
+                if rust_receiverless_associated_function(root, source, symbol, &attributes) {
+                    found.insert(key);
+                } else {
+                    associated.remove(key.as_ref());
+                }
+            }
             if !proof.rust_function_names.contains(&symbol.name) {
                 continue;
             }
@@ -1365,7 +1418,9 @@ pub(super) fn reconcile_declaration_changes(
                 .and_modify(|all_free| *all_free &= is_free)
                 .or_insert(is_free);
         }
+        associated.retain(|name| found.contains(name.as_str()));
     }
+    proof.rust_receiverless_associated_names = associated;
     proof.rust_free_function_names = proof
         .rust_function_names
         .iter()
@@ -2476,6 +2531,29 @@ mod tests {
                 .rust_free_function_names
                 .is_empty()
         );
+        let associated = "struct B;\nimpl B {\n    fn comments(n: u8) {}\n}\n";
+        let widened = associated.replace("u8", "u16");
+        assert!(
+            proof(associated, &widened, false)
+                .rust_receiverless_associated_names
+                .contains("comments")
+        );
+        for uncertain in [
+            associated.replace("n: u8", "&self, n: u8"),
+            associated.replace("n: u8", "mut self: Box<Self>, n: u8"),
+            associated.replace("n: u8", "#[cfg(feature = \"x\")] n: u8"),
+            associated.replace("    fn", "    #[rewrite]\n    fn"),
+            format!("{associated}trait Other {{ fn r#comments(&self); }}\n"),
+        ] {
+            for (old, new) in [(&uncertain, &widened), (&widened, &uncertain)] {
+                assert!(
+                    proof(old, new, false)
+                        .rust_receiverless_associated_names
+                        .is_empty(),
+                    "{old} -> {new}"
+                );
+            }
+        }
         for (old, new) in [
             ("pub const comments: usize = 1;\n", new),
             (
