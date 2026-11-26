@@ -2,83 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
 
 use tree_sitter::Node;
 
-use super::ObjectMemberChange;
-use crate::engine::impact::{FileContext, NewSideSource, ts_barrels::TsBarrelIndex};
-use crate::engine::parser;
+use super::project::Candidate;
+use crate::engine::impact::ts_barrels::TsBarrelIndex;
 use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
-use crate::language::LangId;
-use crate::models::impact::DiffNewSide;
-
-struct Candidate<'a> {
-    path: &'a str,
-    name: &'a str,
-    change: &'a mut ObjectMemberChange,
-}
-
-pub(in crate::engine::impact) fn check(
-    dir: &Path,
-    files: &[PathBuf],
-    contexts: &mut [FileContext],
-    barrels: &TsBarrelIndex,
-    side: DiffNewSide,
-) {
-    let mut candidates: Vec<_> = contexts
-        .iter_mut()
-        .flat_map(|ctx| {
-            let path = ctx.new_path.as_str();
-            ctx.object_member_changes
-                .iter_mut()
-                .filter(|(_, change)| !change.type_changes.is_empty())
-                .map(move |(name, change)| Candidate { path, name, change })
-        })
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    let inputs = NewSideSource::open(side, dir);
-    for path in files {
-        let Some(path_str) = path.to_str() else {
-            continue;
-        };
-        let Ok(lang @ (LangId::Typescript | LangId::Tsx)) =
-            LangId::from_path(camino::Utf8Path::new(path_str))
-        else {
-            continue;
-        };
-        let Some(relative) = path.strip_prefix(dir).ok().and_then(Path::to_str) else {
-            continue;
-        };
-        let caller = crate::git_support::normalize_workspace_separators(relative);
-        let complete = inputs.read(path, &caller).is_some_and(|source| {
-            if memchr::memmem::find(&source, b"typeof").is_none() {
-                return true;
-            }
-            let Ok(tree) = parser::parse_source(&source, lang) else {
-                return false;
-            };
-            let root = tree.root_node();
-            if root.has_error() {
-                return false;
-            }
-            check_file(root, &source, &caller, barrels, &mut candidates);
-            true
-        });
-        if !complete {
-            for candidate in &mut candidates {
-                candidate.change.queried_type = true;
-            }
-            return;
-        }
-        candidates.retain(|c| !c.change.queried_type);
-        if candidates.is_empty() {
-            return;
-        }
-    }
-}
 
 fn text<'s>(node: Node<'_>, source: &'s [u8]) -> Option<&'s str> {
     node.utf8_text(source).ok().filter(|s| !s.contains('\\'))
@@ -199,7 +128,7 @@ fn query_path<'tree, 's>(
     Some((root, path))
 }
 
-fn member_path<'tree, 's>(
+pub(super) fn member_path<'tree, 's>(
     mut root: Node<'tree>,
     source: &'s [u8],
 ) -> Option<(Node<'tree>, Vec<&'s str>)> {
@@ -305,7 +234,7 @@ fn aliases<'s>(
     aliases
 }
 
-fn check_file(
+pub(super) fn check_file(
     root: Node<'_>,
     source: &[u8],
     caller: &str,
@@ -324,6 +253,9 @@ fn check_file(
             });
             let Some((base, path)) = query_path(node, &ancestors, source) else {
                 for candidate in &mut *candidates {
+                    if candidate.change.type_changes.is_empty() {
+                        continue;
+                    }
                     candidate.change.queried_type |=
                         barrels.module_may_reach(caller, candidate.path);
                 }
@@ -344,6 +276,9 @@ fn check_file(
                     && !seen.insert(name)
                 {
                     for candidate in &mut *candidates {
+                        if candidate.change.type_changes.is_empty() {
+                            continue;
+                        }
                         candidate.change.queried_type |=
                             barrels.module_may_reach(caller, candidate.path);
                     }
@@ -367,6 +302,7 @@ fn check_file(
                 let member = members.join(".");
                 for candidate in &mut *candidates {
                     if !candidate.change.queried_type
+                        && !candidate.change.type_changes.is_empty()
                         && match import {
                             Some((specifier, _)) => barrels.query_observes_change(
                                 caller,

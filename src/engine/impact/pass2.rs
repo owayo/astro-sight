@@ -93,6 +93,7 @@ struct SymIndexes {
 struct Pass2Scan {
     ac: aho_corasick::AhoCorasick,
     files: Vec<std::path::PathBuf>,
+    extra_writer_paths: Vec<String>,
     pool: rayon::ThreadPool,
 }
 
@@ -169,10 +170,11 @@ fn build_sym_indexes(
 /// 証拠ではないので、空結果として続けると `impact --hook` が未解決の呼び出し元を黙って
 /// 通してしまう (読めないディレクトリが 1 つあるだけで exit 0 になっていた)。
 /// `refs` / `dead-code` と同じく、走査のエラー (権限・不正な除外 glob 等) はそのまま返す。
-fn prepare_scan(
+fn prepare_scan<'a>(
     all_symbol_names: &[String],
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
+    extra_writers: impl Iterator<Item = &'a str>,
 ) -> Result<Pass2Scan> {
     let ac = refs::build_ac_case_insensitive(all_symbol_names)?;
 
@@ -218,6 +220,25 @@ fn prepare_scan(
         });
     }
 
+    // 削除済み、または index だけにある書き込み元にも同じ探索範囲を適用する。
+    let overrides = refs::scan_overrides(dir, None, &excluded_globs)?;
+    let mut roots = HashMap::new();
+    let extra_writer_paths = extra_writers
+        .filter(|raw| {
+            let p = Path::new(raw);
+            super::is_safe_diff_path(raw)
+                && !p
+                    .components()
+                    .any(|c| c.as_os_str().to_str().is_none_or(|s| s.starts_with('.')))
+                && !refs::path_has_excluded_segment(p, &excluded_dirs)
+                && !(cargo_aware_bin_exclusion && is_excluded_bin_path(p, dir, &mut roots))
+                && !overrides
+                    .as_ref()
+                    .is_some_and(|o| o.matched(dir.join(p), false).is_ignore())
+        })
+        .map(str::to_owned)
+        .collect();
+
     // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
     // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
     // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
@@ -227,7 +248,12 @@ fn prepare_scan(
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build impact worker pool: {e}"))?;
 
-    Ok(Pass2Scan { ac, files, pool })
+    Ok(Pass2Scan {
+        ac,
+        files,
+        extra_writer_paths,
+        pool,
+    })
 }
 
 /// 既定の除外リストの `bin` に当たるか (パスのどこかに `bin` セグメントがあるか)。
@@ -381,22 +407,40 @@ pub(super) fn stream_caller_maps(
         parent_ix_by_sym,
     } = build_sym_indexes(file_contexts, sym_ix, method_parent_types, n_sym);
 
+    let objects = file_contexts
+        .iter()
+        .any(|c| !c.object_member_changes.is_empty());
+    let index_writers = (objects && options.new_side == crate::models::impact::DiffNewSide::Index)
+        .then(|| TsBarrelIndex::for_index_writes(dir));
+    let extra_writers = rust_diff_files
+        .iter()
+        .filter(|f| objects && f.new_path == "/dev/null")
+        .map(|f| f.old_path.as_str())
+        .chain(
+            index_writers
+                .iter()
+                .flat_map(|index| index.snapshot_paths())
+                .filter(|p| !dir.join(p).is_file()),
+        );
     let Pass2Scan {
         ac,
         files,
         pool: rayon_pool,
-    } = prepare_scan(all_symbol_names, dir, options)?;
+        extra_writer_paths,
+    } = prepare_scan(all_symbol_names, dir, options, extra_writers)?;
     let ts_barrels = if options.new_side == crate::models::impact::DiffNewSide::WorkingTree {
         TsBarrelIndex::build(dir, &files, file_contexts)
     } else {
         TsBarrelIndex::default()
     };
-    super::object_members::type_queries::check(
+    super::object_members::project::check(
         dir,
-        &files,
+        (&files, &extra_writer_paths),
         file_contexts,
         &ts_barrels,
+        index_writers.as_ref(),
         options.new_side,
+        (rust_diff_input, rust_diff_files),
     );
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。

@@ -13,9 +13,9 @@ use crate::engine::js_string::decoded;
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
 #[derive(Clone, Copy)]
-struct Binding<T> {
-    target: T,
-    type_only: bool,
+pub(super) struct Binding<T> {
+    pub(super) target: T,
+    pub(super) type_only: bool,
 }
 
 fn has_type_keyword(node: Node<'_>) -> bool {
@@ -35,26 +35,15 @@ fn import_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<Cow<'a, str>> {
     }
 }
 
-fn imports<'a, T: Copy>(
+pub(super) fn module_imports<'s>(
     root: Node<'_>,
-    source: &'a [u8],
-    mut resolve: impl FnMut(&str, &str) -> Option<T>,
-) -> HashMap<Cow<'a, str>, Binding<T>> {
-    let mut names = HashSet::new();
-    let mut duplicates = HashSet::new();
-    let mut result = HashMap::new();
+    source: &'s [u8],
+    mut visit: impl FnMut(&str, Cow<'s, str>, Option<Cow<'s, str>>, bool, bool),
+) {
     for statement in root
         .named_children(&mut root.walk())
         .filter(|n| n.kind() == "import_statement")
     {
-        visit_import_bindings(statement, source, |name| {
-            if let Some(name) = decoded(name)
-                && !names.insert(name.to_string())
-            {
-                duplicates.insert(name.into_owned());
-            }
-            false
-        });
         let Some(module) = statement
             .child_by_field_name("source")
             .and_then(|s| import_name(s, source))
@@ -63,27 +52,69 @@ fn imports<'a, T: Copy>(
         };
         let type_only = has_type_keyword(statement);
         let _ = walk_preorder(statement, Children::Named, |node, _| {
-            if node.kind() == "import_specifier"
-                && let Some(local) = node
-                    .child_by_field_name("alias")
-                    .and_then(|n| import_name(n, source))
-                && let Some(imported) = node
-                    .child_by_field_name("name")
-                    .and_then(|n| import_name(n, source))
-                && local != imported
-                && let Some(target) = resolve(&module, &imported)
+            let spec = match node.kind() {
+                "import_specifier" => node.child_by_field_name("name").and_then(|name| {
+                    Some((
+                        node.child_by_field_name("alias").unwrap_or(name),
+                        Some(import_name(name, source)?),
+                    ))
+                }),
+                "namespace_import" => node
+                    .named_children(&mut node.walk())
+                    .find(|n| n.kind() == "identifier")
+                    .map(|n| (n, None)),
+                "import_clause" => node
+                    .named_children(&mut node.walk())
+                    .find(|n| n.kind() == "identifier")
+                    .map(|n| (n, Some(Cow::Borrowed("default")))),
+                _ => None,
+            };
+            if let Some((name, exported)) = spec
+                && let Some(local) = import_name(name, source)
             {
-                result.insert(
+                visit(
+                    &module,
                     local,
-                    Binding {
-                        target,
-                        type_only: type_only || has_type_keyword(node),
-                    },
+                    exported,
+                    type_only || has_type_keyword(node),
+                    node.kind() == "import_specifier",
                 );
             }
             ControlFlow::<(), Walk>::Continue(Walk::Descend)
         });
     }
+}
+
+fn imports<'a, T: Copy>(
+    root: Node<'_>,
+    source: &'a [u8],
+    mut resolve: impl FnMut(&str, &str) -> Option<T>,
+) -> HashMap<Cow<'a, str>, Binding<T>> {
+    let mut names = HashSet::new();
+    let mut duplicates = HashSet::new();
+    let mut result = HashMap::new();
+    for stmt in root
+        .named_children(&mut root.walk())
+        .filter(|n| n.kind() == "import_statement")
+    {
+        visit_import_bindings(stmt, source, |name| {
+            if let Some(name) = decoded(name)
+                && !names.insert(name.to_string())
+            {
+                duplicates.insert(name.into_owned());
+            }
+            false
+        });
+    }
+    module_imports(root, source, |module, local, exported, type_only, named| {
+        if let Some(imported) = exported
+            && local != imported
+            && named
+            && let Some(target) = resolve(module, &imported)
+        {
+            result.insert(local, Binding { target, type_only });
+        }
+    });
     result.retain(|name, _| !duplicates.contains(name.as_ref()));
     result
 }
@@ -145,6 +176,17 @@ pub(super) fn visit<'tree, T: Copy>(
         return;
     }
     let bindings = imports(root, source, resolve);
+    visit_bindings(root, source, &bindings, |node, _, _, binding| {
+        read(node, *binding)
+    });
+}
+
+pub(super) fn visit_bindings<'tree, T>(
+    root: Node<'tree>,
+    source: &[u8],
+    bindings: &HashMap<Cow<'_, str>, Binding<T>>,
+    mut read: impl FnMut(Node<'tree>, &[Node<'tree>], bool, &T),
+) {
     if bindings.is_empty() {
         return;
     }
@@ -167,7 +209,9 @@ pub(super) fn visit<'tree, T: Copy>(
     }
     let mut scopes = Vec::<Scope<'_, '_>>::new();
     let mut type_query_depth = None;
+    let mut ancestors = Vec::new();
     let _ = walk_preorder(root, Children::Named, |node, depth| {
+        ancestors.truncate(depth);
         while scopes.last().is_some_and(|scope| scope.depth >= depth) {
             scopes.pop();
         }
@@ -207,15 +251,23 @@ pub(super) fn visit<'tree, T: Copy>(
         if kind == "type_query" {
             type_query_depth = Some(depth);
         }
-        if matches!(kind, "identifier" | "shorthand_property_identifier")
-            && let Ok(text) = node.utf8_text(source)
+        if matches!(
+            kind,
+            "identifier" | "shorthand_property_identifier" | "import"
+        ) && let Ok(text) = node.utf8_text(source)
             && let Some(text) = decoded(text)
             && let Some((name, binding)) = bindings.get_key_value(text.as_ref())
             && (!binding.type_only || type_query_depth.is_some())
             && visible(&mut scopes, source, name, escaped.get(name.as_ref()))
         {
-            read(node, binding.target);
+            read(
+                node,
+                &ancestors,
+                type_query_depth.is_some(),
+                &binding.target,
+            );
         }
+        ancestors.push(node);
         ControlFlow::<(), Walk>::Continue(Walk::Descend)
     });
 }

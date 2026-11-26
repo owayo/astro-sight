@@ -36,6 +36,7 @@ pub use files::{
 };
 pub(crate) use files::{
     detect_source_lang, generated_undetermined_truncations, is_unanalyzable_source_ext,
+    path_has_excluded_segment, scan_overrides,
 };
 pub(crate) use line_index::{
     LineIndex, absolute_position, byte_offset_to_row_col, context_column,

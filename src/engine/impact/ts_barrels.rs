@@ -16,10 +16,11 @@ type OriginKey = (String, String, String, String, bool);
 #[derive(Default)]
 pub(super) struct TsBarrelIndex {
     pub(super) const_alias_reads: Mutex<HashSet<(String, String)>>,
+    index_reader: Option<Mutex<crate::commands::GitBlobBatch>>,
     const_candidates: Vec<(String, String, u32)>,
     root: PathBuf,
     files: HashSet<String>,
-    modules: Mutex<HashMap<String, Option<Arc<Module>>>>,
+    modules: Mutex<Modules>,
     memo: Mutex<HashMap<OriginKey, Origin>>,
     alias_modules: Mutex<HashMap<(String, String), Option<String>>>,
     proofs: Mutex<HashMap<(String, String, String), bool>>,
@@ -27,13 +28,17 @@ pub(super) struct TsBarrelIndex {
     paths: Vec<(String, String, String, bool)>,
 }
 
-#[derive(Default)]
+type Modules = HashMap<String, Option<Arc<Module>>>;
+
+#[derive(Clone, Default)]
 struct Module {
+    possible_commonjs: bool,
     imports: HashMap<String, Vec<String>>,
     named: HashMap<String, Vec<(String, String)>>,
     stars: Vec<String>,
     local_exports: HashSet<String>,
     literal_exports: HashSet<String>,
+    declared_functions: HashSet<String>,
     const_exports: HashSet<String>,
     dependencies: Vec<String>,
     opaque: bool,
@@ -73,6 +78,28 @@ impl TsBarrelIndex {
             paths: read_paths(dir),
             ..Self::default()
         }
+    }
+
+    pub(super) fn for_index_writes(dir: &Path) -> Self {
+        let Some((dir, files)) = dir
+            .to_str()
+            .and_then(|dir| Some((dir, crate::commands::plain_index_module_paths(dir)?)))
+        else {
+            return Self::default();
+        };
+        Self {
+            root: dir.into(),
+            files,
+            index_reader: Some(Mutex::new(crate::commands::GitBlobBatch::index(dir))),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn snapshot_paths(&self) -> impl Iterator<Item = &str> {
+        self.files.iter().map(String::as_str)
+    }
+    pub(super) fn omits_index_path(&self, path: &str) -> bool {
+        self.index_reader.is_some() && !self.files.contains(path)
     }
 
     pub(super) fn has_changed_variables(&self) -> bool {
@@ -145,13 +172,18 @@ impl TsBarrelIndex {
     }
 
     pub(super) fn module_may_reach(&self, from: &str, changed: &str) -> bool {
+        self.reaches::<false>(from, changed, None, &self.reachability)
+    }
+
+    fn reaches<const WRITE: bool>(
+        &self,
+        from: &str,
+        changed: &str,
+        overrides: Option<&Modules>,
+        cache: &Mutex<HashMap<(String, String), bool>>,
+    ) -> bool {
         let key = (from.to_owned(), changed.to_owned());
-        if let Some(result) = self
-            .reachability
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&key).copied())
-        {
+        if let Some(result) = cache.lock().ok().and_then(|cache| cache.get(&key).copied()) {
             return result;
         }
         let mut seen = HashSet::new();
@@ -166,23 +198,34 @@ impl TsBarrelIndex {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            let Some(module) = self.module(&path) else {
+            let Some(module) = self.module_with_overrides(&path, overrides) else {
                 break true;
             };
-            if module.opaque {
+            if module.opaque || WRITE && module.possible_commonjs {
                 break true;
             }
             for specifier in &module.dependencies {
-                let Some(target) = self.resolve(&path, specifier) else {
+                let Some(target) = self.resolve_for::<WRITE>(&path, specifier) else {
                     break 'search true;
                 };
                 pending.push(target);
             }
         };
-        if let Ok(mut cache) = self.reachability.lock() {
+        if let Ok(mut cache) = cache.lock() {
             cache.insert(key, result);
         }
         result
+    }
+
+    fn module_with_overrides(
+        &self,
+        path: &str,
+        overrides: Option<&Modules>,
+    ) -> Option<Arc<Module>> {
+        overrides
+            .and_then(|o| o.get(path))
+            .cloned()
+            .unwrap_or_else(|| self.module(path))
     }
 
     fn proves_origin_uncached(&self, caller: &str, name: &str, changed: &str) -> bool {
@@ -224,36 +267,15 @@ impl TsBarrelIndex {
         if !is_ts(lang) {
             return None;
         }
-        let source = crate::engine::bounded_read::read_input_file(&self.root.join(path))?;
-        let tree = parser::parse_source(&source, lang).ok()?;
-        if tree.root_node().has_error() {
-            return None;
-        }
-        let mut module = Module {
-            dependencies: crate::engine::imports::extract_imports(tree.root_node(), &source, lang)
+        let source = if let Some(index) = &self.index_reader {
+            index
+                .lock()
                 .ok()?
-                .into_iter()
-                .map(|edge| edge.source)
-                .collect(),
-            opaque: source
-                .windows(b"module.exports".len())
-                .any(|window| window == b"module.exports")
-                || source
-                    .windows(b"exports.".len())
-                    .any(|window| window == b"exports."),
-            ..Module::default()
+                .read_limited(path, crate::commands::MAX_INPUT_SIZE)?
+        } else {
+            crate::engine::bounded_read::read_input_file(&self.root.join(path))?
         };
-        let mut cursor = tree.root_node().walk();
-        for node in tree.root_node().named_children(&mut cursor) {
-            match node.kind() {
-                "import_statement" => collect_import(node, &source, &mut module),
-                "export_statement" => collect_export(node, &source, &mut module),
-                _ => {}
-            }
-        }
-        module.dependencies.sort_unstable();
-        module.dependencies.dedup();
-        Some(Arc::new(module))
+        module_from_source(&source, lang)
     }
 
     fn origin<const CONST_ALIAS: bool>(
@@ -371,6 +393,17 @@ impl TsBarrelIndex {
     }
 
     fn resolve_for<const CONST_ALIAS: bool>(&self, from: &str, specifier: &str) -> Option<String> {
+        if self.index_reader.is_some() {
+            if !specifier.starts_with('.') || specifier.contains(['?', '#', '\\']) {
+                return None;
+            }
+            let here = Path::new(from).parent()?.join(specifier);
+            let base = normalize(here.to_str()?)?;
+            if self.files.contains(&format!("{base}/package.json")) {
+                return None;
+            }
+            return self.resolve(from, specifier);
+        }
         if !CONST_ALIAS {
             return self.resolve(from, specifier);
         }
@@ -472,7 +505,10 @@ impl TsBarrelIndex {
     fn unique_existing(&self, candidates: Vec<String>) -> Option<Option<String>> {
         let mut found = None;
         for candidate in candidates {
-            if self.root.join(&candidate).is_file() {
+            if self.index_reader.as_ref().map_or_else(
+                || self.root.join(&candidate).is_file(),
+                |_| self.files.contains(&candidate),
+            ) {
                 if found.is_some() {
                     return None;
                 }
@@ -498,6 +534,143 @@ impl TsBarrelIndex {
         }
         true
     }
+}
+
+pub(super) struct WriteOrigins<'a> {
+    index: &'a TsBarrelIndex,
+    versions: Modules,
+    resolution_changed: bool,
+    reachability: Mutex<HashMap<(String, String), bool>>,
+}
+
+impl<'a> WriteOrigins<'a> {
+    pub(super) fn new(index: &'a TsBarrelIndex) -> Self {
+        Self {
+            index,
+            versions: Modules::new(),
+            resolution_changed: false,
+            reachability: Mutex::default(),
+        }
+    }
+    pub(super) fn observe_change(&mut self, path: &str, old: impl FnOnce() -> Option<Vec<u8>>) {
+        if let Ok(lang) = LangId::from_path(camino::Utf8Path::new(path))
+            && is_ts(lang)
+        {
+            // どちらかの版で依存するモジュールを辿る。独立した公開値は両版での証明が要る。
+            let summary = old()
+                .and_then(|s| module_from_source(&s, lang))
+                .zip(self.index.module(path))
+                .map(|(old, new)| {
+                    let mut combined = Arc::unwrap_or_clone(old);
+                    combined
+                        .dependencies
+                        .extend(new.dependencies.iter().cloned());
+                    combined.dependencies.sort_unstable();
+                    combined.dependencies.dedup();
+                    combined
+                        .literal_exports
+                        .retain(|name| new.literal_exports.contains(name));
+                    combined
+                        .declared_functions
+                        .retain(|name| new.declared_functions.contains(name));
+                    combined.opaque |= new.opaque;
+                    combined.possible_commonjs |= new.possible_commonjs;
+                    Arc::new(combined)
+                });
+            self.versions.insert(path.to_owned(), summary);
+        } else if path.ends_with("package.json") || path.ends_with("config.json") {
+            self.resolution_changed = true;
+        }
+    }
+    pub(super) fn may_call(
+        &self,
+        caller: &str,
+        module: &str,
+        called: &str,
+        file: &str,
+        getter: &str,
+    ) -> bool {
+        if !self.resolution_changed
+            && let Some(path) = self.index.resolve_for::<true>(caller, module)
+            && path == file
+            && called != getter
+            && self
+                .index
+                .module_with_overrides(&path, Some(&self.versions))
+                .is_some_and(|m| {
+                    !m.opaque && !m.possible_commonjs && m.declared_functions.contains(called)
+                })
+        {
+            return false;
+        }
+        self.may_target(caller, module, Some(called), file, getter)
+    }
+
+    pub(super) fn may_target(
+        &self,
+        caller: &str,
+        specifier: &str,
+        exported: Option<&str>,
+        file: &str,
+        name: &str,
+    ) -> bool {
+        if self.resolution_changed {
+            return true;
+        }
+        let Some(path) = self.index.resolve_for::<true>(caller, specifier) else {
+            return true;
+        };
+        if path == file && exported == Some(name) {
+            return true;
+        }
+        if let Some(export) = exported
+            && self
+                .index
+                .module_with_overrides(&path, Some(&self.versions))
+                .is_some_and(|m| {
+                    !m.opaque && !m.possible_commonjs && m.literal_exports.contains(export)
+                })
+        {
+            return false;
+        }
+        self.index
+            .reaches::<true>(&path, file, Some(&self.versions), &self.reachability)
+    }
+}
+
+fn module_from_source(source: &[u8], lang: LangId) -> Option<Arc<Module>> {
+    let tree = parser::parse_source(source, lang).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut module = Module {
+        possible_commonjs: [b"exports".as_slice(), br"\u"]
+            .into_iter()
+            .any(|word| memchr::memmem::find(source, word).is_some()),
+        dependencies: crate::engine::imports::extract_imports(tree.root_node(), source, lang)
+            .ok()?
+            .into_iter()
+            .map(|edge| edge.source)
+            .collect(),
+        opaque: source
+            .windows(b"module.exports".len())
+            .any(|window| window == b"module.exports")
+            || source
+                .windows(b"exports.".len())
+                .any(|window| window == b"exports."),
+        ..Module::default()
+    };
+    let mut cursor = tree.root_node().walk();
+    for node in tree.root_node().named_children(&mut cursor) {
+        match node.kind() {
+            "import_statement" => collect_import(node, source, &mut module),
+            "export_statement" => collect_export(node, source, &mut module),
+            _ => {}
+        }
+    }
+    module.dependencies.sort_unstable();
+    module.dependencies.dedup();
+    Some(Arc::new(module))
 }
 
 fn is_ts(lang: LangId) -> bool {
@@ -679,6 +852,9 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
         } else if let Some(name) = declaration.child_by_field_name("name")
             && let Ok(name) = name.utf8_text(source)
         {
+            if declaration.kind() == "function_declaration" {
+                module.declared_functions.insert(name.to_owned());
+            }
             module.local_exports.insert(name.to_owned());
         } else {
             module.opaque = true;

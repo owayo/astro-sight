@@ -304,11 +304,11 @@ where
     analyze_impact_at_checkout(diff_input, dir, options, dir, on_file_impact).map(drop)
 }
 
-pub(crate) type QueriedObjects = HashMap<String, HashSet<String>>;
+pub(crate) type UnverifiedObjectMembers = HashMap<String, HashSet<String>>;
 
 #[derive(Default)]
 pub(crate) struct ReviewImpactEvidence {
-    pub(crate) queried_objects: QueriedObjects,
+    pub(crate) unverified_object_members: UnverifiedObjectMembers,
     pub(crate) const_alias_reads: HashSet<(String, String)>,
 }
 
@@ -438,11 +438,11 @@ where
     // さらに streaming callback で呼び出し側（CLI）へ即渡し、`Vec<FileImpact>` の累積も廃止する。
     let t = std::time::Instant::now();
     log_phase("context.pass34", "start", 0);
-    let mut queried = QueriedObjects::new();
+    let mut unverified = UnverifiedObjectMembers::new();
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
         for (name, change) in &ctx.object_member_changes {
-            if change.queried_type {
-                queried
+            if change.queried_type || change.written {
+                unverified
                     .entry(ctx.new_path.clone())
                     .or_default()
                     .insert(name.clone());
@@ -473,7 +473,7 @@ where
     log_phase("context.pass34", "end", t.elapsed().as_millis());
 
     Ok(ReviewImpactEvidence {
-        queried_objects: queried,
+        unverified_object_members: unverified,
         const_alias_reads,
     })
 }

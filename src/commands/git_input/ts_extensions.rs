@@ -501,6 +501,24 @@ fn git_output(dir: &str, args: &[&str], max: usize) -> Option<Vec<u8>> {
     bytes.ok()
 }
 
+pub(crate) fn plain_index_module_paths(dir: &str) -> Option<HashSet<String>> {
+    let prefix = git_output(dir, &["rev-parse", "--show-prefix"], 4096)?;
+    let prefix = std::str::from_utf8(&prefix)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    if !plain_external_configs(dir, prefix, false).ok()? {
+        return None;
+    }
+    let paths = list_git_files(dir, None, prefix)?;
+    let reader = GitBlobBatch::index(dir);
+    for path in paths.iter().filter(|path| is_config(path)) {
+        if !plain_config(&read_source(dir, Some(&reader), path)?) {
+            return None;
+        }
+    }
+    Some(paths)
+}
+
 fn list_git_files(dir: &str, revision: Option<&str>, prefix: &str) -> Option<HashSet<String>> {
     let bytes = match revision {
         Some(revision) => git_output(
