@@ -71,6 +71,42 @@ fn constructor_trailing_optional_and_default_parameters_are_compatible() {
 }
 
 #[test]
+fn constructor_documentation_keeps_existing_parameter_property_positions() {
+    let old = "export class Box { constructor(public value: string) {} }\n";
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"declaration":true,"stripInternal":true}}"#,
+    );
+    repo.write("box.ts", old);
+    repo.write(
+        "use.ts",
+        "import { Box } from './box';\nexport const value = new Box('x').value;\n",
+    );
+    repo.commit_all("initial");
+    for (doc, expected) in [("Value.", 0), ("@internal", 1)] {
+        repo.write(
+            "box.ts",
+            old.replace(
+                "public value: string",
+                &format!("/** {doc} */ public value: string, /** Flag. */ quiet = false"),
+            ),
+        );
+        let (output, json) = hook(&repo, false);
+        assert_eq!(output.status.code(), Some(expected), "{json}");
+        if expected == 0 {
+            assert_eq!(
+                json["api"]["mod_compat"][0]["reason"], "trailing_optional_params",
+                "{json}"
+            );
+        } else {
+            assert_eq!(json["api"]["mod"][0]["n"], "Box", "{json}");
+        }
+    }
+}
+
+#[test]
 fn constructor_non_optional_or_other_contract_changes_stay_blocking() {
     let old = "export class FetchError extends Error { code: number = 1; constructor(message: string) { super(message); } }\n";
     for new in [
@@ -115,6 +151,10 @@ fn constructor_parameter_properties_and_overloads_are_not_proven_compatible() {
         old.replace(
             "message: string)",
             "message: string, private retryable = false)",
+        ),
+        old.replace(
+            "message: string)",
+            "/** Message. */ message: string, /** Field. */ readonly retryable = false)",
         ),
         old.replace(
             "constructor(message: string)",

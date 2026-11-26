@@ -60,17 +60,14 @@ pub(super) fn trailing_optional_constructor_parameters(
     )?;
     old.child_by_field_name("body")?;
     new.child_by_field_name("body")?;
-    let old_parts = ts_function_signature_parts(old, &src.old)?;
-    let new_parts = ts_function_signature_parts(new, &src.new)?;
-    if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
-        return None;
-    }
+    let retained = trailing_optional_prefix_len(old, &src.old, new, &src.new)?;
     let old_params = old.child_by_field_name("parameters")?;
     let new_params = new.child_by_field_name("parameters")?;
     let mut cursor = new_params.walk();
     if new_params
         .named_children(&mut cursor)
-        .skip(old_parts.params.len())
+        .filter(|child| child.kind() != "comment")
+        .skip(retained)
         .any(parameter_is_property)
     {
         return None;

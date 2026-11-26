@@ -810,7 +810,7 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 - React component の HOC ラップ
 - Rust の一意な root 関数のヘッダを、非 generic・制限なしの `pub type` で書き直す変更と、その別名を展開した型へ戻す変更（`transparent_rust_type_alias`）。旧新それぞれのファイルの別名と import 環境を確かめる。
 - 未参照の object member の削除
-- TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
+- TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）。引数リスト中の行コメント・ブロックコメント・JSDoc で既存の引数や追加する引数を説明できる。変更前後のどちらかの引数リストのコメントに `@internal` や `@ts-expect-error` などの型検査指示があると、この互換判定を見送る
 - TypeScript の inline object 引数型への optional プロパティ追加。リポジトリ内の呼び出しが追加キーを省略するか、渡す値の型を確認できる場合に限る。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
 - export した TS/TSX のトップレベル関数の、唯一の引数の object 型からの optional プロパティの削除。型は inline またはこの props だけに使う同じファイルの非公開の別名とし、解析したリポジトリのどの JSX 要素・直接呼び出しも、削除したキーを渡さないことが条件（`optional_object_props_removed`）。リポジトリ内の証拠に基づく分類なので、リポジトリの外の利用者には破壊的な変更になり得る
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する

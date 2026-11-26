@@ -883,6 +883,44 @@ fn review_hook_non_direct_const_values_keep_priority_with_companion_types_and_co
 }
 
 #[test]
+fn review_hook_trailing_optional_params_allow_parameter_documentation() {
+    let repo = TestRepo::new();
+    let before = "export function send(\n    // Recipient\n    to: string, retries = 0,\n) { return `${to}:${retries}`; }\n";
+    repo.write("mailer.ts", before);
+    repo.write("greeter.ts", "import { send } from './mailer';\nexport const first = send('a');\nexport const second = send('b', 2);\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("mailer.ts", "export function send(\n    to: string,\n    // Retry count\n    retries = 0,\n    /** Skip sending. */\n    quiet = false,\n) { return quiet ? '' : `${to}:${retries}`; }\n");
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("mailer.ts", before);
+        }
+        let (code, hook) = review_hook_result(&repo, staged);
+        assert_eq!(code, Some(0), "{hook}");
+        assert_eq!(
+            hook["api"]["mod_compat"][0]["reason"], "trailing_optional_params",
+            "{hook}"
+        );
+        assert!(hook["impacts"].is_null(), "{hook}");
+        for line in [1, 2] {
+            assert!(
+                hook["impact_info"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|group| group["refs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r["p"] == "greeter.ts" && r["ln"] == line)),
+                "{hook}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_hook_direct_const_callables_accept_compatible_parameter_extensions() {
     for (before, after, usage, reason) in [
         (
