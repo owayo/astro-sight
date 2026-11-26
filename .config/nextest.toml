@@ -20,9 +20,9 @@ filter = 'test(=integration::destructured_optional_defaults::unannotated_object_
 priority = 50
 threads-required = 2
 
-# TypeScript の型問い合わせと値の読み取りを、通常・index の複数の構成で検証する。
+# TypeScript の型問い合わせ・書き込みと値の読み取りを、通常・index の複数の構成で検証する。
 [[profile.default.overrides]]
-filter = 'test(=integration::impact_object_members::impact_object_members_keep_reads_checked_against_type_queries_blocking)'
+filter = 'test(=integration::impact_object_members::impact_object_members_keep_reads_checked_against_type_queries_blocking) | test(=integration::impact_object_members::impact_object_members_keep_reads_blocking_across_writers)'
 priority = 50
 threads-required = 2
 

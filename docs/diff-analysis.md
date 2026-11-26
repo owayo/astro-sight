@@ -160,6 +160,10 @@ Parse errors, clues for `with` or `eval`, ambient declarations, and declaration 
 
 A raw LF or CR inside a single- or double-quoted property name makes the module invalid. Reads of other properties can fail when the module is loaded, so review keeps the change blocking even if the edited property has no readers. A backslash followed by a line break is a valid line continuation. The two-character escape `\n` is also valid and adds a newline to the property name.
 
+### Writes to exported JavaScript and TypeScript objects
+
+Changing `SETTINGS.endpoint` can affect a reader of `SETTINGS.label` when another module assigns `SETTINGS.label = SETTINGS.endpoint`. The same dependency can arise when the declaring module writes through its own namespace import or replaces its CommonJS export. In these cases `impact` and `review` keep the read of `label` among the possible impacts.
+
 ### TypeScript object members used in types
 
 When one property of an exported object literal changes, a direct read of an unchanged property can be informational. A type query can connect the two properties. For example, if `type Out = typeof SETTINGS.other` is the return type of a function that returns `SETTINGS.label`, changing `other` from a string to a number makes the return statement fail type checking. This also applies when `as const` makes the property's literal value part of its type. Since another file can import `Out`, `impact` and `review` keep reads of that object across files as possible impacts, even when an individual read still type-checks.

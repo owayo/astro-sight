@@ -602,7 +602,7 @@ fn accumulate_hook_impacts(
 #[derive(Default)]
 pub(super) struct HookImpactEvidence {
     pub compatible: BTreeMap<String, BTreeSet<String>>,
-    pub queried: crate::engine::impact::QueriedObjects,
+    pub unverified_object_members: crate::engine::impact::UnverifiedObjectMembers,
 }
 
 /// api の判定に合わせて、Stop hook の impact の参照を振り分けるための `(ファイル, 名前)` の集合。
@@ -672,7 +672,7 @@ impl<'a> HookImpactPolicy<'a> {
                     .map(|m| (m.file.as_str(), m.name.as_str()))
                     .filter(|(file, name)| {
                         !evidence
-                            .queried
+                            .unverified_object_members
                             .get(*file)
                             .is_some_and(|names| names.contains(*name))
                     }),

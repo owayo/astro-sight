@@ -388,7 +388,7 @@ fn review_attempt_with_swift_protocols(
         };
         service.analyze_context_at_checkout(&diff_input, analysis_dir, &context_options, dir)
     })?;
-    let queried_objects = impact_evidence.queried_objects;
+    let unverified_object_members = impact_evidence.unverified_object_members;
     for change in &mut api_changes.modified {
         if change.no_resolved_internal_callers
             && impact_evidence
@@ -399,16 +399,16 @@ fn review_attempt_with_swift_protocols(
             change.reference_evidence = None;
         }
     }
-    let queried_removals = api_changes.compatible_modified.extract_if(.., |change| {
+    let unverified_removals = api_changes.compatible_modified.extract_if(.., |change| {
         change.reason == "unused_object_members"
-            && queried_objects
+            && unverified_object_members
                 .get(&change.file)
                 .is_some_and(|names| names.contains(&change.name))
     });
     let previous = api_changes.modified.len();
     api_changes
         .modified
-        .extend(queried_removals.map(unverified_modification));
+        .extend(unverified_removals.map(unverified_modification));
     super::api_changes::fill_modification_diagnostics(&mut api_changes.modified[previous..]);
     attach_contract_evidence(&api_changes, &mut impact);
     if matches!(new_side, crate::models::impact::DiffNewSide::Index) && snapshot.is_none() {
@@ -536,7 +536,7 @@ fn review_attempt_with_swift_protocols(
             &diff_files,
             &hook::HookImpactEvidence {
                 compatible: compatible_impacts,
-                queried: queried_objects,
+                unverified_object_members,
             },
         )?;
         // `process::exit` はデストラクタを走らせないため、staged の一時スナップショットを

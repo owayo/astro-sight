@@ -9,8 +9,10 @@ use crate::language::LangId;
 use crate::models::impact::AffectedSymbol;
 use crate::models::symbol::Symbol;
 
+pub(super) mod project;
 mod templates;
 pub(super) mod type_queries;
+mod writes;
 use templates::{LiteralIds, TemplateBindings};
 
 #[derive(PartialEq)]
@@ -27,12 +29,14 @@ pub(super) struct ObjectMemberChange {
     type_changes: Vec<usize>,
     pub(super) escaped: bool,
     pub(super) queried_type: bool,
+    pub(super) written: bool,
 }
 
 impl ObjectMemberChange {
     pub(super) fn read_is_unchanged(&self, path: &str) -> bool {
         !self.queried_type
             && !self.escaped
+            && !self.written
             && !path.is_empty()
             && has_own_path(&self.old, path)
             && has_own_path(&self.new, path)
@@ -389,6 +393,7 @@ pub(super) fn collect_object_member_changes(
                 type_changes,
                 escaped: false,
                 queried_type: false,
+                written: false,
             },
         );
     }
@@ -400,11 +405,9 @@ pub(super) fn collect_object_member_changes(
         &old_declarations,
         true,
     ));
-    changes.retain(|name, change| {
+    for (name, change) in &mut changes {
         change.escaped = escaped.contains(name);
-        // 宣言元で値を持ち出しても、型問い合わせに依存する契約は別に調べる。
-        !change.escaped || !change.type_changes.is_empty()
-    });
+    }
     changes
 }
 
@@ -699,8 +702,14 @@ mod tests {
         ] {
             let escaped_before = format!("{before} {escape}");
             let escaped_after = format!("{after} {escape}");
-            assert!(evidence(&escaped_before, after).is_empty(), "old: {escape}");
-            assert!(evidence(before, &escaped_after).is_empty(), "new: {escape}");
+            assert!(
+                evidence(&escaped_before, after)["layout"].escaped,
+                "old: {escape}"
+            );
+            assert!(
+                evidence(before, &escaped_after)["layout"].escaped,
+                "new: {escape}"
+            );
         }
     }
 
@@ -716,7 +725,12 @@ mod tests {
         ] {
             let before = format!("{prefix} = {{ key: 1, level: 10 }};");
             let after = format!("{prefix} = {{ key: 1, level: 20 }};");
-            assert!(evidence(&before, &after).is_empty(), "{prefix}");
+            assert!(
+                !evidence(&before, &after)
+                    .get("layout")
+                    .is_some_and(|object| object.read_is_unchanged("key")),
+                "{prefix}"
+            );
         }
         let before = "/** Layout documentation. */ export const layout = { key: 1, level: 10 };";
         let after = "/** Layout documentation. */ export const layout = { key: 1, level: 20 };";
@@ -728,8 +742,8 @@ mod tests {
         ] {
             let old_tag = format!("{before} /** {tag} */");
             let new_tag = format!("{after} /** {tag} */");
-            assert!(evidence(&old_tag, after).is_empty(), "old: {tag}");
-            assert!(evidence(before, &new_tag).is_empty(), "new: {tag}");
+            assert!(evidence(&old_tag, after)["layout"].escaped, "old: {tag}");
+            assert!(evidence(before, &new_tag)["layout"].escaped, "new: {tag}");
         }
     }
 

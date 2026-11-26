@@ -9,6 +9,7 @@ use super::common::{
     read_paths_file_limited,
 };
 mod ts_extensions;
+pub(crate) use ts_extensions::plain_index_module_paths;
 
 pub use crate::git_support::DEFAULT_BLAME_BASE;
 pub(crate) use crate::git_support::validate_git_revision;

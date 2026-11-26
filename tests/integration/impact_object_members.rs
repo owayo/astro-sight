@@ -48,6 +48,193 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn impact_object_members_keep_reads_blocking_across_writers() {
+    let cases = [
+        (
+            "own",
+            "Object.assign(self.NAME, {label: NAME.endpoint});",
+            "",
+            true,
+        ),
+        ("consumer", "", "NAME.label = NAME.endpoint;", true),
+        (
+            "alias",
+            "",
+            "Object.assign(NAME, {label: NAME.endpoint});",
+            true,
+        ),
+        (
+            "common",
+            "Object.defineProperty(exports, 'NAME', {value: {label: NAME.endpoint}});",
+            "",
+            true,
+        ),
+        (
+            "bracket",
+            "module['exports']['NAME'] = {label: NAME.endpoint};",
+            "",
+            true,
+        ),
+        ("barrelSwitch", "", "", true),
+        ("plain", "", "", false),
+        ("plainGetter", "", "", false),
+        ("writtenGetter", "", "", true),
+        ("forwardedGetter", "", "", true),
+        ("foreignGetter", "", "", false),
+        (
+            "purePromise",
+            "",
+            "export const ready=import('./NAME.js').then(({NAME})=>NAME.label);",
+            false,
+        ),
+        ("deleted", "", "NAME.label = NAME.endpoint;", true),
+        ("newWriter", "", "NAME.label = NAME.endpoint;", true),
+        (
+            "readAlias",
+            "",
+            "const clone=NAME; void clone.label;",
+            false,
+        ),
+        (
+            "required",
+            "",
+            "const {NAME: local} = require('./NAME.js'); local.label = local.endpoint;",
+            true,
+        ),
+        (
+            "requiredRead",
+            "",
+            "const {NAME: local} = require('./NAME.js'); void local.label;",
+            false,
+        ),
+        ("contextual", "", "NAME.label = NAME.endpoint;", true),
+        ("foreign", "", "other.NAME.label = NAME.endpoint;", false),
+        (
+            "shadow",
+            "",
+            "function act(NAME: {label:string,endpoint:string}) { NAME.label = NAME.endpoint; }",
+            false,
+        ),
+        (
+            "copy",
+            "",
+            "const clone = {...NAME}; clone.label = NAME.endpoint;",
+            false,
+        ),
+    ];
+    let repo = TestRepo::new();
+    repo.init_git();
+    let config = |name: &str, suffix: &str, value: &str| {
+        let own = if name == "own" {
+            format!("import * as self from './{name}.js';\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "{own}export const {name} = {{label: 'keep', endpoint: '{value}'}};\n{}\n",
+            suffix.replace("NAME", name)
+        )
+    };
+    for (name, suffix, writer, _) in cases {
+        repo.write(format!("{name}.ts"), config(name, suffix, "a"));
+        repo.write(format!("read_{name}.ts"), format!("import {{ {name} }} from './{name}.js';\nexport function read_{name}() {{ return {name}.label; }}\n"));
+        let remap = if name == "alias" {
+            format!("{name} as local")
+        } else {
+            name.to_owned()
+        };
+        let foreign = if name == "foreign" {
+            "import * as other from './other.js';\n"
+        } else {
+            ""
+        };
+        if name == "newWriter" {
+            continue;
+        }
+        let default = if name == "contextual" { "type , " } else { "" };
+        repo.write(
+            format!("write_{name}.ts"),
+            format!(
+                "import {default}{{ {remap} }} from './{name}.js';\n{foreign}{}\n",
+                writer.replace("NAME", if name == "alias" { "local" } else { name })
+            ),
+        );
+    }
+    repo.write("other.ts", "export const foreign = {label:'untouched'};\n");
+    repo.write(
+        "barrel.ts",
+        "export {barrelSwitch} from './barrelSwitch.js';\n",
+    );
+    repo.write(
+        "write_barrelSwitch.ts",
+        "import {barrelSwitch as data} from './barrel.js';\ndata.label=data.endpoint;\n",
+    );
+    for (name, usage) in [
+        ("plainGetter", "void get().label;"),
+        ("writtenGetter", "get().label=get().endpoint;"),
+        ("forwardedGetter", "forward().label=forward().endpoint;"),
+        (
+            "foreignGetter",
+            "independent().label=independent().endpoint;",
+        ),
+    ] {
+        repo.write(format!("get_{name}.ts"),format!(
+            "import {{ {name} }} from './{name}.js';\nexport function get() {{return {name};}}\nexport function forward() {{return get();}}\nexport function independent() {{return {{label:'z',endpoint:'x'}};}}\n"
+        ));
+        repo.write(
+            format!("write_{name}.ts"),
+            format!("import {{ get, forward, independent }} from './get_{name}.js';\n{usage}\n"),
+        );
+    }
+    repo.commit_all("base");
+    repo.write(
+        "barrel.ts",
+        "export {foreign as barrelSwitch} from './other.js';\n",
+    );
+    for (name, suffix, _, _) in cases {
+        repo.write(format!("{name}.ts"), config(name, suffix, "b"));
+    }
+    std::fs::remove_file(repo.root().join("write_deleted.ts")).unwrap();
+    repo.write(
+        "write_newWriter.ts",
+        "import { newWriter } from './newWriter.js';\nnewWriter.label = newWriter.endpoint;\n",
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            for (name, suffix, _, _) in cases {
+                repo.write(format!("{name}.ts"), config(name, suffix, "a"));
+                repo.write(format!("write_{name}.ts"), "export {};\n");
+            }
+        }
+        let mut cmd = cargo_bin();
+        cmd.args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"]);
+        if staged {
+            cmd.arg("--staged");
+        }
+        let output = cmd.output().unwrap();
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        for (name, _, _, blocking) in cases {
+            let has = |category: &str| {
+                hook[category]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|group| group["refs"].as_array().unwrap())
+                    .any(|r| r["p"] == format!("read_{name}.ts") && r["ln"] == 1)
+            };
+            assert_eq!(
+                (has("impacts"), has("impact_info")),
+                (blocking, !blocking),
+                "{name}, staged={staged}: {hook}"
+            );
+        }
+    }
+}
+
+#[test]
 fn invalid_quoted_object_keys_keep_the_object_and_unchanged_read_blocking() {
     let cases = [
         ("rawLf", "endpoint\n", "'ok'", false),
@@ -902,15 +1089,19 @@ fn impact_object_members_keep_aliased_module_consumers_blocking() {
                 .unwrap()
                 .iter()
                 .any(|caller| caller["path"] == writer_path && caller["line"] == blocking_line),
-            "{result}"
+            "{writer}: {result}"
         );
         assert!(
-            layout["informational_callers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|caller| caller["path"] == consumer_path && caller["line"] == 1),
-            "{result}"
+            layout[if writer.starts_with("export") {
+                "informational_callers"
+            } else {
+                "impacted_callers"
+            }]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caller| caller["path"] == consumer_path && caller["line"] == 1),
+            "{writer}: {result}"
         );
         if let Some(line) = other_import_line {
             assert!(
@@ -919,7 +1110,7 @@ fn impact_object_members_keep_aliased_module_consumers_blocking() {
                     .unwrap()
                     .iter()
                     .any(|caller| caller["path"] == writer_path && caller["line"] == line),
-                "{result}"
+                "{writer}: {result}"
             );
         }
         let references = repo.run_json(

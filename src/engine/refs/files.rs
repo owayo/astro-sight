@@ -373,26 +373,8 @@ pub fn collect_files_scan_with_excludes(
     let mut builder = WalkBuilder::new(dir);
     builder.hidden(true).git_ignore(true).git_global(true);
 
-    // glob フィルタと除外 glob を同じ OverrideBuilder にまとめる。
-    // ignore::overrides は「ポジティブパターンがある → その中だけ許可 / ネガティブ (`!`
-    // 接頭辞) → 除外」なので、glob_pattern が None のときも `**/*` を足してから
-    // `!excluded_globs...` を重ねることで「全体許可 + 指定分だけ除外」を実現する。
-    if glob_pattern.is_some() || !excluded_globs.is_empty() {
-        let mut ob = ignore::overrides::OverrideBuilder::new(dir);
-        if let Some(pattern) = glob_pattern {
-            ob.add(pattern)?;
-        } else if !excluded_globs.is_empty() {
-            ob.add("**/*")?;
-        }
-        for pat in excluded_globs {
-            let negated = if pat.starts_with('!') {
-                pat.to_string()
-            } else {
-                format!("!{pat}")
-            };
-            ob.add(&negated)?;
-        }
-        builder.overrides(ob.build()?);
+    if let Some(overrides) = scan_overrides(dir, glob_pattern, excluded_globs)? {
+        builder.overrides(overrides);
     }
 
     // walk 自体は逐次で候補パスだけを集め、ファイル内容を読む判定 (generated マーカー /
@@ -654,8 +636,29 @@ fn detect_lang_from_shebang_head(head: &[u8]) -> Option<LangId> {
     LangId::from_shebang_source(head)
 }
 
+/// 指定範囲の glob と明示除外を、探索時と同じ優先順で組み立てる。
+pub(crate) fn scan_overrides(
+    dir: &Path,
+    pattern: Option<&str>,
+    excluded: &[&str],
+) -> Result<Option<ignore::overrides::Override>> {
+    if pattern.is_none() && excluded.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = ignore::overrides::OverrideBuilder::new(dir);
+    builder.add(pattern.unwrap_or("**/*"))?;
+    for glob in excluded {
+        if glob.starts_with('!') {
+            builder.add(glob)?;
+        } else {
+            builder.add(&format!("!{glob}"))?;
+        }
+    }
+    Ok(Some(builder.build()?))
+}
+
 /// パスのいずれかの中間ディレクトリ名が除外対象と完全一致するかを判定する。
-fn path_has_excluded_segment(path: &Path, excluded: &[&str]) -> bool {
+pub(crate) fn path_has_excluded_segment(path: &Path, excluded: &[&str]) -> bool {
     path.components().any(|c| match c.as_os_str().to_str() {
         Some(name) => excluded.contains(&name),
         None => false,

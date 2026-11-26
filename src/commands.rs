@@ -11,6 +11,7 @@ use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
 mod common;
+pub(crate) use git_input::plain_index_module_paths;
 mod git_snapshot;
 mod host_entries;
 pub(crate) mod metrics;
