@@ -375,17 +375,22 @@ pub(super) fn import_context_at(context: Option<&str>, column: usize) -> ImportC
 
 /// Rust / JS / TS の import の宣言の範囲。参照ごとの祖先走査を避け、ファイルごとに一度作る。
 #[derive(Default)]
-pub(super) struct ImportSpans(Vec<std::ops::Range<usize>>);
+pub(super) struct ImportSpans {
+    spans: Vec<std::ops::Range<usize>>,
+    escaped_names: HashSet<String>,
+}
 
 impl ImportSpans {
-    pub(super) fn build(mut node: tree_sitter::Node<'_>, lang: LangId) -> Self {
+    pub(super) fn build(mut node: tree_sitter::Node<'_>, lang: LangId, source: &[u8]) -> Self {
         while let Some(parent) = node.parent() {
             node = parent;
         }
         if node.has_error() {
             return Self::default();
         }
-        let mut spans = Vec::new();
+        let mut index = Self::default();
+        let check_escapes = matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
+            && source.contains(&b'\\');
         let _ = crate::engine::tree_walk::walk_preorder(
             node,
             crate::engine::tree_walk::Children::Named,
@@ -417,22 +422,59 @@ impl ImportSpans {
                     | LangId::Zig
                     | LangId::Xojo => false,
                 };
-                std::ops::ControlFlow::<(), _>::Continue(if is_import {
-                    spans.push(node.byte_range());
-                    crate::engine::tree_walk::Walk::Skip
-                } else {
-                    crate::engine::tree_walk::Walk::Descend
-                })
+                if is_import {
+                    index.spans.push(node.byte_range());
+                    if !check_escapes || node.kind() == "import_statement" {
+                        return std::ops::ControlFlow::Continue(
+                            crate::engine::tree_walk::Walk::Skip,
+                        );
+                    }
+                }
+                // refs は元の綴りで探すため、import の外で escape された名前は追跡を証明できない。
+                if check_escapes
+                    && node.named_child_count() == 0
+                    && crate::engine::js_occurrence::identifier_kind(node.kind())
+                    && let Ok(raw) = node.utf8_text(source)
+                    && raw.contains('\\')
+                    && let Some(name) = crate::engine::js_string::decoded(raw)
+                {
+                    index.escaped_names.insert(name.into_owned());
+                }
+                std::ops::ControlFlow::<(), _>::Continue(crate::engine::tree_walk::Walk::Descend)
             },
         );
-        Self(spans)
+        index
     }
 
     pub(super) fn contains(&self, node: tree_sitter::Node<'_>) -> bool {
-        self.0
+        self.spans
             .partition_point(|span| span.start <= node.start_byte())
             .checked_sub(1)
-            .is_some_and(|index| node.end_byte() <= self.0[index].end)
+            .is_some_and(|index| node.end_byte() <= self.spans[index].end)
+    }
+
+    pub(super) fn same_named_specifier(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+        let Some(spec) = node.parent() else {
+            return false;
+        };
+        if !matches!(spec.kind(), "import_specifier" | "export_specifier") {
+            return false;
+        }
+        let Some(name) = spec.child_by_field_name("name") else {
+            return false;
+        };
+        let Some(alias) = spec.child_by_field_name("alias") else {
+            return name == node;
+        };
+        if spec.kind() != "import_specifier" || (node != name && node != alias) {
+            return false;
+        }
+        let Some(local) = super::ts_const_aliases::import_name(alias, source) else {
+            return false;
+        };
+        !self.escaped_names.contains(local.as_ref())
+            && super::ts_const_aliases::import_name(name, source)
+                .is_some_and(|imported| imported == local)
     }
 }
 
@@ -1145,7 +1187,7 @@ mod tests {
                 .root_node()
                 .descendant_for_byte_range(last, last + 6)
                 .unwrap();
-            let spans = ImportSpans::build(last, lang);
+            let spans = ImportSpans::build(last, lang, source.as_bytes());
             assert!(spans.contains(first), "{source}");
             assert!(!spans.contains(last), "{source}");
         }
@@ -1167,7 +1209,10 @@ mod tests {
                 .root_node()
                 .descendant_for_byte_range(start, start + 6)
                 .unwrap();
-            assert!(!ImportSpans::build(node, lang).contains(node), "{source}");
+            assert!(
+                !ImportSpans::build(node, lang, source.as_bytes()).contains(node),
+                "{source}"
+            );
         }
     }
 

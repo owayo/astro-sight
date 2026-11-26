@@ -149,6 +149,72 @@ fn callers(value: &serde_json::Value, bucket: &str) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn equivalent_named_imports_keep_only_actual_uses_blocking() {
+    let repo = TestRepo::new();
+    let before = "export const palette = { stable: 1, code: 2 };\nexport function render(text) { return text; }\n";
+    repo.init_git();
+    repo.write("layout.js", before);
+    for (file, imported) in [
+        ("plain.js", "palette"),
+        ("same.ts", "palette as palette"),
+        ("quoted.tsx", "\"palette\" as palette"),
+        ("escaped.js", r#""\u0070alette" as palette"#),
+    ] {
+        repo.write(file, format!("import {{ {imported} }} from './layout';\nimport {{ \"render\" as render }} from './layout';\nexport const a = palette.stable;\nexport const b = palette.code;\nexport const c = render('a');\n"));
+    }
+    repo.write(
+        "renamed.ts",
+        "import { palette as other } from './layout';\nexport const b = other.code;\n",
+    );
+    repo.write(
+        "escaped_read.ts",
+        "import { palette as palette } from './layout';\nexport const b = \\u0070alette.code;\n",
+    );
+    repo.commit_all("base");
+    repo.write(
+        "layout.js",
+        before
+            .replace("code: 2", "code: 3")
+            .replace("render(text)", "render(text, extra)"),
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("layout.js", before);
+        }
+        let args: &[&str] = if staged {
+            &["--git", "--staged"]
+        } else {
+            &["--git"]
+        };
+        let context = repo.run_json("context", args);
+        let blocking = callers(&context, "impacted_callers");
+        let info = callers(&context, "informational_callers");
+        for file in ["plain.js", "same.ts", "quoted.tsx", "escaped.js"] {
+            for line in 0..=2 {
+                let site = (file.to_owned(), line);
+                assert!(
+                    info.contains(&site) && !blocking.contains(&site),
+                    "{site:?}: {context}"
+                );
+            }
+            for line in [3, 4] {
+                assert!(
+                    blocking.contains(&(file.to_owned(), line)),
+                    "{file}:{line}: {context}"
+                );
+            }
+        }
+        for file in ["renamed.ts", "escaped_read.ts"] {
+            assert!(
+                blocking.contains(&(file.to_owned(), 0)),
+                "{file}: {context}"
+            );
+        }
+    }
+}
+
+#[test]
 fn impact_rust_import_context_ignores_literal_and_comment_semicolons() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
