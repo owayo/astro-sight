@@ -105,6 +105,18 @@ pub(crate) struct TsAliasResolver {
     relative_unchanged: bool,
 }
 
+/// 作業ツリーまたは index の設定をすべて読め、どれも相対指定子の探索先を変えない。
+pub(super) fn ordinary_relative_imports(dir: &str) -> bool {
+    let Some(root) = Path::new(dir).canonicalize().ok() else {
+        return false;
+    };
+    let Some(walked) = walk(&root) else {
+        return false;
+    };
+    load_projects(&root, &walked.configs, ConfigFs::Current)
+        .is_some_and(|(projects, ordinary)| ordinary && projects.iter().all(Option::is_some))
+}
+
 impl TsAliasResolver {
     pub(crate) fn load(dir: &str, removed_files: HashSet<String>) -> Self {
         let root = std::path::absolute(Path::new(dir))

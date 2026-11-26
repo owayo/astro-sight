@@ -10,7 +10,7 @@ use super::super::git_input::{git_show_blob, validate_git_revision};
 use super::{PreparedDiffFile, bare_name};
 
 mod ts_import_alias;
-pub(super) use ts_import_alias::resolved_relative_source;
+pub(super) use ts_import_alias::{inventory, resolved_relative_source, unique_relative_file};
 
 /// Old-side references used only to distinguish a rename from an already unused removal.
 /// All changed sources are parsed once, and references inside declarations removed by the

@@ -532,6 +532,8 @@ blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` �
 
 `export { f }` を `export { other as f } from './provider.js'` に変えると、`f` を import した側には `provider.other` が渡る。元の関数を同じファイルに残して `export { f as legacy }` で公開しても、`review` は公開名 `f` の変更を報告する。たとえば `other` が `false` なら、利用側に残った `f()` は型検査でエラーになる。
 
+元の関数を別ファイルへ移しても、利用側は以前のモジュールから `f` を import し続けることがある。たとえば `export { other as "f" } from './provider.js'` と `export * from './provider.js'` は、どちらも別の値を `f` として公開できる。元の公開名がその値を指すようになった場合、`review` は変更を blocking に残す。
+
 ### TypeScript の宣言を既存のモジュールへ移す場合
 
 組み込みの `Date` を返す関数 `read()` があるモジュールへ `export const Date = 1` を移すと、従来の `return Date` は数値を返すようになる。それまで `new (read())()` で日付を生成していた呼び出しは型検査でエラーになる。移動先の既存の参照が同じ束縛を保つと確認できない場合、`review` はその移動を未検証の `api.mod` として報告する。`globalThis.Date` のようにオブジェクトを明示したプロパティ参照は、移動後も同じ値を指す。

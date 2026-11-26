@@ -12,7 +12,7 @@ use crate::engine::js_scope::{
 use crate::language::LangId;
 use crate::models::reference::{RefKind, SymbolReference};
 
-mod inventory;
+pub(in crate::commands::api_changes) mod inventory;
 
 pub(super) struct AliasedCall {
     pub(super) local_name: String,
@@ -221,6 +221,16 @@ pub(in crate::commands::api_changes) fn resolved_relative_source(
     from: &str,
     spec: &str,
 ) -> Option<String> {
+    let target = unique_relative_file(dir, from, spec)?;
+    plain_configs(Path::new(dir), from).then_some(target)
+}
+
+/// TypeScript の相対指定子について、通常の解決で候補ファイルが一つだけか確かめる。
+pub(in crate::commands::api_changes) fn unique_relative_file(
+    dir: &str,
+    from: &str,
+    spec: &str,
+) -> Option<String> {
     if spec.contains('\\') {
         return None;
     }
@@ -239,8 +249,7 @@ pub(in crate::commands::api_changes) fn resolved_relative_source(
     let [target] = existing.as_slice() else {
         return None;
     };
-    (plain_path(root, from) && plain_path(root, target) && plain_configs(root, from))
-        .then(|| target.clone())
+    (plain_path(root, from) && plain_path(root, target)).then(|| target.clone())
 }
 
 fn plain_path(root: &Path, relative: &str) -> bool {

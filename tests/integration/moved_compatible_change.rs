@@ -15,6 +15,180 @@ fn contains(hook: &serde_json::Value, bucket: &str, name: &str) -> bool {
 }
 
 #[test]
+fn typescript_move_checks_source_reexports() {
+    for blocking in [true, false] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let cases: &[(&str, &str)] = if blocking {
+            &[
+                (
+                    "quoted",
+                    r#"export { other as "NAME" } from './provider.js';"#,
+                ),
+                ("star", "export * from './provider.js';"),
+                ("named", "export { NAME } from './provider.js';"),
+                ("typeOnly", "export type { NAME } from './moved.js';"),
+                (
+                    "ambiguous",
+                    "export * from './moved.js'; export * from './provider.js';",
+                ),
+                ("missing", "export * from './empty.js';"),
+                ("missingQuoted", "export * from './empty.js';"),
+            ]
+        } else {
+            &[
+                ("quoted", r#"export { NAME as "NAME" } from './moved.js';"#),
+                ("star", "export * from './moved.js';"),
+                (
+                    "explicit",
+                    "export * from './provider.js'; export { NAME } from './moved.js';",
+                ),
+                (
+                    "diamond",
+                    "export * from './one.js'; export * from './two.js';",
+                ),
+                ("updated", "export * from './empty.js';"),
+                ("sibling", "export * from './empty.js';"),
+            ]
+        };
+        let declaration = |name| format!("export function {name}(): number {{ return 1; }}\n");
+        let consumer = |name, path| match name {
+            "missing" => {
+                format!("import * as api from './{path}.js';\nexport const n = api['{name}']();\n")
+            }
+            "updated" => format!(
+                "import * as api from './{path}.js';\nexport const n = api['\\u0075pdated']();\n"
+            ),
+            "sibling" => {
+                format!("import * as api from './{path}.js';\nexport const n = api.other;\n")
+            }
+            "missingQuoted" => format!(
+                "import {{ '{name}' as read }} from './{path}.js';\nexport const n = read();\n"
+            ),
+            _ => format!(
+                "import {{ {name} }} from './{path}.js';\nexport const n: number = {name}();\n"
+            ),
+        };
+        for &(name, _) in cases {
+            repo.create_dir_all(name);
+            let mut api = declaration(name);
+            if name == "sibling" {
+                api.push_str("export { other } from './empty.js';\n");
+            }
+            repo.write(format!("{name}/api.ts"), api);
+            repo.write(format!("{name}/moved.ts"), "export {};\n");
+            repo.write(format!("{name}/empty.ts"), "export const other = false;\n");
+            repo.write(
+                format!("{name}/provider.ts"),
+                format!("export const other = false, {name} = false;\n"),
+            );
+            repo.write(format!("{name}/use.ts"), consumer(name, "api"));
+            if matches!(name, "sibling" | "updated") {
+                repo.write(
+                    format!("{name}/direct.ts"),
+                    format!(
+                        "import {{ {name} }} from './api.js';\nexport const direct = {name}();\n"
+                    ),
+                );
+            }
+            for forwarder in ["one", "two"] {
+                repo.write(format!("{name}/{forwarder}.ts"), "export {};\n");
+            }
+        }
+        repo.commit_all("base");
+        for &(name, source) in cases {
+            repo.write(format!("{name}/api.ts"), source.replace("NAME", name));
+            repo.write(format!("{name}/moved.ts"), declaration(name));
+            if matches!(name, "sibling" | "updated") {
+                repo.write(
+                    format!("{name}/direct.ts"),
+                    format!(
+                        "import {{ {name} }} from './moved.js';\nexport const direct = {name}();\n"
+                    ),
+                );
+            }
+            if name == "updated" {
+                repo.write(format!("{name}/use.ts"), consumer(name, "moved"));
+            }
+            if name == "diamond" {
+                for forwarder in ["one", "two"] {
+                    repo.write(
+                        format!("{name}/{forwarder}.ts"),
+                        "export * from './moved.js';\n",
+                    );
+                }
+            }
+        }
+        for staged in [false, true] {
+            if staged {
+                repo.stage_all();
+                for &(name, _) in cases {
+                    repo.write(format!("{name}/api.ts"), declaration(name));
+                }
+            }
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--git", "--hook", "--dir"])
+                .arg(repo.root());
+            if staged {
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            for &(name, _) in cases {
+                assert_eq!(
+                    contains(&hook, "mod", name) || contains(&hook, "rm", name),
+                    blocking,
+                    "{name}, staged={staged}: {hook}"
+                );
+                assert_eq!(
+                    contains(&hook, "moved", name),
+                    !blocking,
+                    "{name}, staged={staged}: {hook}"
+                );
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(blocking)),
+                "staged={staged}: {hook}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typescript_move_uses_the_current_projects_relative_resolution() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let decl = "export function f(): number { return 1; }\n";
+    repo.write("api.ts", decl);
+    repo.write("moved.ts", "export {};\n");
+    repo.write("moved.alt.ts", "export const f = false;\n");
+    repo.write(
+        "consumer.ts",
+        "import { f } from './api.js';\nexport const n = f();\n",
+    );
+    let ordinary = r#"{"compilerOptions":{"moduleSuffixes":[""]}}"#;
+    let alternate = r#"{"compilerOptions":{"moduleSuffixes":[".alt",""]}}"#;
+    repo.write("tsconfig.json", ordinary);
+    repo.commit_all("base");
+    repo.write("moved.ts", decl);
+    repo.write("api.ts", "export * from './moved.js';\n");
+    repo.write("tsconfig.json", alternate);
+    repo.stage_all();
+    repo.write("tsconfig.json", ordinary);
+    for (staged, args) in [(false, vec!["--git"]), (true, vec!["--git", "--staged"])] {
+        let review = repo.run_json("review", &args);
+        let has = |bucket: &str| {
+            review["api_changes"][bucket]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|r| r["name"] == "f"))
+        };
+        assert_eq!(has("modified"), staged, "{review}");
+        assert_eq!(has("moved"), !staged, "{review}");
+    }
+}
+
+#[test]
 fn typescript_move_keeps_destination_name_capture_blocking() {
     let repo = TestRepo::new();
     repo.init_git();
