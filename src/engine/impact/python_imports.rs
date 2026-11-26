@@ -10,6 +10,7 @@ use tree_sitter::Node;
 use crate::engine::parser;
 use crate::language::LangId;
 
+pub(super) mod aliases;
 pub(super) mod non_method;
 
 struct ImportBinding {
@@ -27,9 +28,35 @@ pub(super) struct PythonImportIndex {
 pub(super) struct PythonImportCache {
     workspace: OnceLock<Option<PathBuf>>,
     packages: Mutex<HashMap<PathBuf, bool>>,
+    absolute_modules: Mutex<HashMap<String, Option<String>>>,
     owners: Mutex<HashMap<PathBuf, Option<HashSet<String>>>>,
     namespace_directories: non_method::NamespaceCache,
     pub(super) source_paths: OnceLock<Vec<Option<String>>>,
+}
+
+impl PythonImportCache {
+    pub(super) fn alias_source(&self, dir: &str, path: &str, module: &str) -> Option<String> {
+        if !module.starts_with('.') {
+            let mut modules = self
+                .absolute_modules
+                .lock()
+                .expect("Python module cache poisoned");
+            return modules
+                .entry(module.to_owned())
+                .or_insert_with(|| crate::commands::resolve_python_module(dir, module))
+                .clone();
+        }
+        let workspace = self
+            .workspace
+            .get_or_init(|| Path::new(dir).canonicalize().ok())
+            .as_ref()?;
+        let mut packages = self.packages.lock().expect("Python package cache poisoned");
+        let owner =
+            resolve_relative_module(workspace, &workspace.join(path), module, &mut packages)?;
+        Some(crate::git_support::normalize_workspace_separators(
+            owner.strip_prefix(workspace).ok()?.to_str()?,
+        ))
+    }
 }
 
 impl PythonImportIndex {
@@ -579,6 +606,9 @@ mod tests {
             "dotted_name",
             "import_from_statement",
             "import_statement",
+            "aliased_import",
+            "parenthesized_expression",
+            "for_in_clause",
             "attribute",
             "keyword_argument",
             "type",

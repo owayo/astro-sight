@@ -15,6 +15,10 @@ const OPAQUE_SCOPES: &[&str] = &[
     "dictionary_comprehension",
     "generator_expression",
 ];
+
+pub(super) fn is_comprehension(kind: &str) -> bool {
+    kind != "lambda" && OPAQUE_SCOPES.contains(&kind)
+}
 const TARGET_WRAPPERS: &[&str] = &[
     "pattern_list",
     "tuple_pattern",
@@ -223,14 +227,7 @@ fn collect_bindings(
     if let Some(parameters) = function.child_by_field_name("parameters") {
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
-            let target = match parameter.kind() {
-                "default_parameter" | "typed_default_parameter" => {
-                    parameter.child_by_field_name("name")
-                }
-                "typed_parameter" => parameter.named_child(0),
-                _ => Some(parameter),
-            };
-            if let Some(target) = target {
+            if let Some(target) = parameter_target(parameter) {
                 bind(target, &mut bindings);
                 parameter_positions.extend(target_identifiers(target).into_iter().map(|n| n.id()));
             }
@@ -305,7 +302,15 @@ fn is_mangled_name(name: &str) -> bool {
     name.starts_with("__") && !name.ends_with("__")
 }
 
-fn collect_targets(node: Node<'_>, source: &[u8], names: &mut HashSet<String>) {
+pub(super) fn parameter_target(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "default_parameter" | "typed_default_parameter" => parameter.child_by_field_name("name"),
+        "typed_parameter" => parameter.named_child(0),
+        _ => Some(parameter),
+    }
+}
+
+pub(super) fn collect_targets(node: Node<'_>, source: &[u8], names: &mut HashSet<String>) {
     for node in target_identifiers(node) {
         if let Ok(name) = node.utf8_text(source) {
             names.insert(name.to_owned());

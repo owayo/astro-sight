@@ -117,6 +117,8 @@ Python でも、既存の同一パスのファイル 1 つだけを変更し、�
 
 Python の呼び出し元は、別ファイルに同名宣言があることや、参照ファイルに所有クラス名が無いことだけでは捨てない。一意で再束縛の無い局所関数、文字列リテラルのメンバー、root/alias の束縛が安定した厳密な import 先の外部 module 名前空間の呼び出しを区別する。module の証明では、参照ファイルのディレクトリから workspace root までの各祖先と、標準の workspace `src` root に、同名のローカルソース・bytecode・native module・package が無いことを調べる。観測した import path・cwd の変更、import hook、反射的なアクセス、再束縛があれば証明しない。観測した workspace 内の名前空間の帰属を調べるもので、外部依存を実行・解析したり、任意の実行時の別名を否定したりはしない。確認するディレクトリに `pyproject.toml`・`setup.cfg`・`setup.py` があれば、module 名前空間の帰属は証明しない。この証明では packaging 設定の独自 root を解決しない。リテラルと局所関数の証明は引き続き使える。不明な受け手とローカル module の別名は blocking に残す。証明は参照ファイルごとにソース 1 MiB、確認する root のディレクトリエントリ合計 4096 件までとし、照合・解析の失敗も参照を消す根拠にしない。直接の staged impact は呼び出し元を作業ツリーから読むため、この追加の束縛証明を使わない。staged review は index snapshot を使う。
 
+Python で `from producer import total as calculate` と書くと、`producer.total` のシグネチャ変更に対して `impacted_callers` は `calculate(1)` の行を示す。別名が未使用の場合や直接の呼び出しにだけ使う場合、import の宣言行は `informational_callers` に載る。別名を値として渡す場合は、複数行の import が blocking に残ることがある。条件分岐内で import した場合は、同じブロックで import の後にある呼び出しを照合する。`refs --name total` と `refs --name calculate` はそれぞれ指定した綴りの出現を返す。
+
 宣言を複数行に折り返している場合、`signature_changes` の署名は本体を除いたヘッダ全体を正規化した文字列になる (新旧の宣言を 1 つずつ確認でき、契約も違うときに限る)。行の差分だけでは宣言の名前がある行しか取れず、`def f(` のように途中で切れるため。1 行の宣言は従来どおり差分の行をそのまま載せる。
 
 Rust の `extern` ブロックにある関数宣言は `symbols` に出る。公開宣言を `pub fn translate(x: u8);` から `pub fn translate();` に変えると、`review` は変更前後の署名を、`impact` は別クレートの `api::translate(1)` などの呼び出し元を報告する。
