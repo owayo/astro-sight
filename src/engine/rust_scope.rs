@@ -38,6 +38,8 @@ struct BlockFacts {
     lets: HashMap<String, Vec<LetBinding>>,
     barrier: bool,
     non_expression_macro_barrier: bool,
+    // 呼び出し位置で新しい let を生成し得る文。既に終わった文は後の let を隠さない。
+    dynamic_statements: Vec<usize>,
 }
 
 struct LetBinding {
@@ -50,6 +52,8 @@ pub(crate) struct RustScopeIndex {
     parameters: HashMap<usize, HashSet<String>>,
     assignment_names: HashMap<usize, HashSet<String>>,
     for_pattern_names: HashMap<usize, HashSet<String>>,
+    scoped_patterns: HashMap<usize, HashSet<String>>,
+    closure_patterns: HashSet<usize>,
     pattern_positions: HashSet<usize>,
     unknown_positions: HashSet<usize>,
 }
@@ -68,6 +72,8 @@ impl RustScopeIndex {
             parameters: HashMap::new(),
             assignment_names: HashMap::new(),
             for_pattern_names: HashMap::new(),
+            scoped_patterns: HashMap::new(),
+            closure_patterns: HashSet::new(),
             pattern_positions: HashSet::new(),
             unknown_positions: HashSet::new(),
         };
@@ -78,6 +84,39 @@ impl RustScopeIndex {
                 return None;
             }
             match node.kind() {
+                "closure_expression" => {
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        let mut names = HashSet::new();
+                        let mut cursor = params.walk();
+                        let mut known = true;
+                        for param in params.named_children(&mut cursor) {
+                            let pattern = param.child_by_field_name("pattern").unwrap_or(param);
+                            if matches!(param.kind(), "attribute_item" | "macro_invocation")
+                                || subtree_names(pattern, source).1
+                            {
+                                known = false;
+                                break;
+                            }
+                            for target in pattern_targets(pattern) {
+                                if let Ok(name) = target.utf8_text(source) {
+                                    names.insert(binding_name(name).to_owned());
+                                    index.closure_patterns.insert(target.id());
+                                }
+                            }
+                        }
+                        if known {
+                            index.scoped_patterns.insert(node.id(), names);
+                        }
+                    }
+                }
+                "match_arm" | "let_condition" => {
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        let (names, opaque) = subtree_names(pattern, source);
+                        if !opaque && names.iter().all(|name| name.is_ascii()) {
+                            index.scoped_patterns.insert(node.id(), names);
+                        }
+                    }
+                }
                 "assignment_expression" => {
                     if let (Some(left), Some(right)) = (
                         node.child_by_field_name("left"),
@@ -188,6 +227,9 @@ impl RustScopeIndex {
             } else {
                 None
             };
+            if attributed || invocation.is_some() {
+                facts.dynamic_statements.push(statement.start_byte());
+            }
             if statement.kind().ends_with("_item")
                 || matches!(
                     statement.kind(),
@@ -245,10 +287,25 @@ impl RustScopeIndex {
     }
 
     pub(crate) fn resolve(&self, node: Node<'_>, source: &[u8]) -> LexicalBinding {
+        self.resolve_inner(node, source, false)
+    }
+
+    pub(crate) fn impact_binding(&self, node: Node<'_>, source: &[u8]) -> LexicalBinding {
+        let binding = self.resolve(node, source);
+        if binding != LexicalBinding::RustValueBinding
+            && self.resolve_inner(node, source, true) == LexicalBinding::RustValueBinding
+        {
+            return LexicalBinding::RustScopedValue;
+        }
+        binding
+    }
+
+    fn resolve_inner(&self, node: Node<'_>, source: &[u8], scoped: bool) -> LexicalBinding {
         if self.unknown_positions.contains(&node.id()) {
             return LexicalBinding::Unknown;
         }
-        let pattern_position = self.pattern_positions.contains(&node.id());
+        let pattern_position = self.pattern_positions.contains(&node.id())
+            || (scoped && self.closure_patterns.contains(&node.id()));
         if !pattern_position && !is_rust_shadowable_value_identifier(node) {
             return LexicalBinding::Unknown;
         }
@@ -262,6 +319,28 @@ impl RustScopeIndex {
             return LexicalBinding::Unknown;
         };
         let name = binding_name(name);
+        let parent = node.parent();
+        let direct_call =
+            scoped && parent.is_some_and(|p| p.child_by_field_name("function") == Some(node));
+        let closure_data = parent.is_some_and(|parent| match parent.kind() {
+            "field_expression" => {
+                parent.child_by_field_name("value") == Some(node)
+                    && parent.parent().is_some_and(|call| {
+                        call.kind() == "call_expression"
+                            && call.child_by_field_name("function") == Some(parent)
+                    })
+            }
+            "binary_expression" => true,
+            _ => false,
+        });
+        let unbound = |scope: Node<'_>| {
+            scoped
+                && name.is_ascii()
+                && self
+                    .scoped_patterns
+                    .get(&scope.id())
+                    .is_some_and(|names| !names.contains(name))
+        };
         let macro_argument = is_lone_expression_macro_argument(node, source);
         let mut requires_macro_validation = macro_argument;
         let mut proven = pattern_position;
@@ -270,6 +349,13 @@ impl RustScopeIndex {
             // match の値には arm の束縛が届かない。for の本体は同名の束縛が無い場合だけ通す。
             let opaque_scope = OPAQUE_SCOPES.contains(&parent.kind())
                 && !(parent.kind() == "match_expression" && field_contains(parent, "value", node))
+                && !(parent.kind() == "match_expression" && scoped)
+                && !(parent.kind() == "match_arm"
+                    && unbound(parent)
+                    && field_contains(parent, "value", node))
+                && !(parent.kind() == "let_condition"
+                    && scoped
+                    && field_contains(parent, "value", node))
                 && !(parent.kind() == "for_expression"
                     && name.is_ascii()
                     && field_contains(parent, "body", node)
@@ -305,6 +391,7 @@ impl RustScopeIndex {
                             .child_by_field_name("condition")
                             .is_some_and(|condition| {
                                 matches!(condition.kind(), "let_condition" | "let_chain")
+                                    && !unbound(condition)
                             }) =>
                 {
                     return LexicalBinding::Unknown;
@@ -313,8 +400,16 @@ impl RustScopeIndex {
                     return LexicalBinding::Unknown;
                 }
                 "closure_expression" => {
-                    // 引数を持つ closure は初版の証明対象外。空引数の capture だけを通す。
-                    if parent
+                    if scoped && let Some(names) = self.scoped_patterns.get(&parent.id()) {
+                        if names.contains(name) && field_contains(parent, "body", node) {
+                            if !proven && !closure_data {
+                                return LexicalBinding::Unknown;
+                            }
+                            proven = true;
+                        } else if !proven && !field_contains(parent, "body", node) {
+                            return LexicalBinding::Unknown;
+                        }
+                    } else if parent
                         .child_by_field_name("parameters")
                         .is_some_and(|parameters| parameters.named_child_count() != 0)
                     {
@@ -326,21 +421,32 @@ impl RustScopeIndex {
                         return LexicalBinding::Unknown;
                     };
                     // 型付き let の宣言位置は、別の文の巻き上げやマクロに左右されない。
-                    if facts.barrier && !typed_let_pattern {
+                    let latest = facts.lets.get(name).and_then(|bindings| {
+                        let end =
+                            bindings.partition_point(|binding| binding.start <= node.start_byte());
+                        end.checked_sub(1).map(|i| &bindings[i])
+                    });
+                    // 束縛と利用の間の文マクロ・属性は、隠れた再束縛を生成できる。
+                    let after_binding = latest.is_some_and(|binding| {
+                        let end = facts
+                            .dynamic_statements
+                            .partition_point(|&start| start < node.start_byte());
+                        end == 0 || facts.dynamic_statements[end - 1] < binding.start
+                    });
+                    if facts.barrier && !typed_let_pattern && !(scoped && (proven || after_binding))
+                    {
                         if facts.non_expression_macro_barrier {
                             return LexicalBinding::Unknown;
                         }
                         requires_macro_validation = true;
                     }
-                    if let Some(bindings) = facts.lets.get(name) {
-                        let latest =
-                            bindings.partition_point(|binding| binding.start <= node.start_byte());
-                        if latest != 0 {
-                            if !bindings[latest - 1].proven {
-                                return LexicalBinding::Unknown;
-                            }
-                            proven = true;
+                    if let Some(binding) = latest
+                        && !(scoped && proven)
+                    {
+                        if !binding.proven {
+                            return LexicalBinding::Unknown;
                         }
+                        proven = true;
                     }
                 }
                 "function_item" => {
@@ -350,6 +456,11 @@ impl RustScopeIndex {
                         .get(&parent.id())
                         .is_some_and(|names| names.contains(name))
                     {
+                        return LexicalBinding::Unknown;
+                    }
+                    // 新たにたどったスコープで let の値が関数として使われるときは、
+                    // コールバックの実体を推定しない。関数の明示的な引数は本体全体で束縛する。
+                    if direct_call && proven {
                         return LexicalBinding::Unknown;
                     }
                     if field_contains(parent, "body", node)

@@ -7,6 +7,8 @@ pub(crate) enum LexicalBinding {
     FunctionLocal,
     /// Rust の値束縛または定数等のパターン。関数・メソッドだけを除外できる。
     RustValueBinding,
+    /// 字句スコープで確かめた束縛。囲む属性の書き換えを impact 側で確認する。
+    RustScopedValue,
     /// 標準マクロの再束縛検査が必要な値束縛候補。
     RustMacroValueBinding,
 }

@@ -164,6 +164,122 @@ fn sibling(mut node: Node<'_>, previous: bool) -> Option<Node<'_>> {
     }
 }
 
+/// tests/target.rs の inline module が tests/target/leaf.rs を直接宣言する配置。
+/// 親の字句マクロと、兄弟 module から glob で取り込み得る名前を合わせる。
+fn integration_macro_base(
+    dir: &Path,
+    path: &Path,
+    project: &RustPathOwnerProjectProof,
+) -> Option<Environment> {
+    let folder = path.parent()?;
+    let tests = folder.parent()?;
+    if tests.file_name()? != "tests" || path.extension()? != "rs" {
+        return None;
+    }
+    let package = tests.parent()?;
+    let manifest = project.alias_cache.manifest(dir, package)?;
+    let targets = RustTargets::from_manifest(&manifest, package)?;
+    if !targets.has_package
+        || !targets.roots_complete
+        || targets.has_explicit_roots()
+        || manifest.get("test").is_some()
+        || manifest
+            .get("package")?
+            .get("autotests")
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+        || !matches!(
+            manifest.get("package")?.get("edition")?.as_str()?,
+            "2018" | "2021" | "2024"
+        )
+        || !project
+            .cargo_configs
+            .keeps_dependency_sources(&dir.join(package))
+        || super::super::rust_std_origin::has_sysroot_dependency(&manifest, false)
+    {
+        return None;
+    }
+    let root = folder.with_extension("rs");
+    if !project.allows_static_source_path(&root) {
+        return None;
+    }
+    let root_source = read_input_file(&dir.join(&root))?;
+    let root_tree = parser::parse_source(&root_source, LangId::Rust).ok()?;
+    let root = root_tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut combined = environment(root, &root_source, None, true)?;
+    let module = unique_module(root, folder.file_name()?.to_str()?, &root_source)?;
+    let body = module.child_by_field_name("body")?;
+    combined.merge(environment(body, &root_source, None, true)?);
+    let ordinary_leaf = |name: &str| -> Option<PathBuf> {
+        let declaration = unique_module(body, name, &root_source)?;
+        let leaf = folder.join(name).with_extension("rs");
+        (declaration.child_by_field_name("body").is_none()
+            && !checked_is_file(dir, &folder.join(name).join("mod.rs"))?
+            && project.allows_static_source_path(&leaf))
+        .then_some(leaf)
+    };
+    if ordinary_leaf(path.file_stem()?.to_str()?)? != path {
+        return None;
+    }
+    let source = read_input_file(&dir.join(path))?;
+    let tree = parser::parse_source(&source, LangId::Rust).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let (local, glob) = environment_with_glob(tree.root_node(), &source, None, true)?;
+    combined.merge(local);
+    if glob {
+        let mut cursor = tree.root_node().walk();
+        for item in tree
+            .root_node()
+            .named_children(&mut cursor)
+            .filter(|item| item.kind() == "use_declaration")
+        {
+            if root_use_names(item, &source).is_some() || is_parent_glob(item) {
+                continue;
+            }
+            let argument = item.child_by_field_name("argument")?;
+            if argument.kind() != "use_wildcard" {
+                return None;
+            }
+            let name = argument
+                .utf8_text(&source)
+                .ok()?
+                .strip_prefix("super::")?
+                .strip_suffix("::*")?;
+            if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return None;
+            }
+            let file = ordinary_leaf(name)?;
+            let bytes = read_input_file(&dir.join(file))?;
+            let tree = parser::parse_source(&bytes, LangId::Rust).ok()?;
+            if tree.root_node().has_error() {
+                return None;
+            }
+            combined.merge(environment(tree.root_node(), &bytes, None, true)?);
+        }
+    }
+    Some(combined)
+}
+
+fn unique_module<'a>(root: Node<'a>, name: &str, source: &[u8]) -> Option<Node<'a>> {
+    let mut cursor = root.walk();
+    let mut modules = root.named_children(&mut cursor).filter(|node| {
+        node.kind() == "mod_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                == Some(name)
+    });
+    let module = modules.next()?;
+    (modules.next().is_none()
+        && sibling(module, true).is_none_or(|prev| prev.kind() != "attribute_item"))
+    .then_some(module)
+}
+
 fn argument_macro<'t>(node: Node<'t>, source: &[u8]) -> Option<(Node<'t>, Node<'t>)> {
     if node.kind() != "identifier"
         || sibling(node, true).is_some_and(|node| matches!(node.kind(), "::" | "."))
@@ -328,6 +444,18 @@ impl RustPathOwnerIndex {
             .get_or_init(|| {
                 if !project.allows_static_source_path(Path::new(ref_path)) {
                     return None;
+                }
+                if Path::new(ref_path)
+                    .parent()
+                    .and_then(Path::parent)
+                    .is_some_and(|parent| {
+                        parent.file_name().is_some_and(|name| name == "tests")
+                            && parent.parent().is_some_and(|package| {
+                                dir.join(package).join("Cargo.toml").is_file()
+                            })
+                    })
+                {
+                    return integration_macro_base(dir, Path::new(ref_path), project);
                 }
                 let (package, _, _) = source_module_path(dir, Path::new(ref_path))?;
                 if !project

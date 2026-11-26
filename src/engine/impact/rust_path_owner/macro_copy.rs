@@ -349,6 +349,7 @@ pub(in crate::engine::impact) struct MacroCopy {
     /// 写しの import・glob・経路の名前 (`import_facts::rust_ref_facts_of_tree`)。マクロの引数の
     /// 中の `use` は元の構文木では token tree に隠れるので、写しから集める。
     evidence: std::cell::OnceCell<(HashSet<String>, bool)>,
+    local_bindings: std::cell::OnceCell<Option<crate::engine::rust_scope::RustScopeIndex>>,
     /// 名前の束縛を確かめられないスコープと項目の id ([`uncertain_scopes`])。この中の参照は写しに
     /// 対応させない。
     uncertain: HashSet<usize>,
@@ -468,6 +469,7 @@ impl MacroCopy {
             spans,
             callees,
             evidence: std::cell::OnceCell::new(),
+            local_bindings: std::cell::OnceCell::new(),
             uncertain,
         })
     }
@@ -531,6 +533,24 @@ impl MacroCopy {
 
     pub(in crate::engine::impact) fn source(&self) -> &[u8] {
         &self.source
+    }
+
+    pub(in crate::engine::impact) fn local_binding(&self, site: Node<'_>) -> bool {
+        use crate::engine::lexical_binding::LexicalBinding;
+        self.local_bindings
+            .get_or_init(|| {
+                crate::engine::rust_scope::RustScopeIndex::build(
+                    self.tree.root_node(),
+                    &self.source,
+                )
+            })
+            .as_ref()
+            .is_some_and(|index| {
+                matches!(
+                    index.impact_binding(site, &self.source),
+                    LexicalBinding::RustValueBinding | LexicalBinding::RustScopedValue
+                )
+            })
     }
 
     pub(in crate::engine::impact) fn index(&self) -> &RustPathOwnerIndex {
