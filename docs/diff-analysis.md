@@ -522,6 +522,10 @@ An unsupported value assertion such as `as Item` can produce the same reason eve
 
 If `export { f }` becomes `export { other as f } from './provider.js'`, importers of `f` receive `provider.other`. Review reports the change under the public name `f`, even when the original function stays in the file as `export { f as legacy }`. If the original function was callable and `other` is `false`, an unchanged call to `f()` now fails type checking.
 
+### Moving a TypeScript declaration into an existing module
+
+Moving `export const Date = 1` into a module where `read()` already returns `Date` changes what that expression reads. A caller that previously constructed a date with `new (read())()` now receives a number from `read()`. When review cannot establish that the destination's existing references keep their bindings, it reports the proposed move as an unverified `api.mod`. A property access such as `globalThis.Date` keeps its original meaning.
+
 ### TypeScript signature type dependencies
 
 When an exported function returns a class declared in the same file, both `Key` and `Value` in the index signature `[key: Key]: Value` contribute to its return type. A change to `Key` that invalidates an existing lookup puts the function in `api.mod`. When `E['keep']` selects a property on a simple local object type, review follows the type of `keep` and its dependencies. The name `key` belongs to the index parameter, so a method with that name keeps its own dependencies.

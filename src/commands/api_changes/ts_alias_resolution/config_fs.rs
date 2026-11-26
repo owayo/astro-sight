@@ -154,6 +154,29 @@ impl BaseTree {
         relative
     }
 
+    /// 旧版の相対 import を標準の候補で解ける設定だけ、同じ版のファイルを返す。
+    pub(crate) fn for_relative_imports(dir: &str, rev: &str) -> Option<(PathBuf, ConfigFs)> {
+        let tree = Rc::new(Self::load(dir, rev)?);
+        let root = Path::new(dir).canonicalize().ok()?;
+        let mut configs = Vec::new();
+        for relative in tree.files.iter().chain(&tree.special) {
+            let path = tree.root.join(relative);
+            if path.starts_with(&root)
+                && !super::has_node_modules(&path)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(super::is_config_name)
+            {
+                configs.push(path);
+            }
+        }
+        configs.sort_unstable();
+        let fs = ConfigFs::Base(tree);
+        let (projects, ordinary) = super::load_projects(&root, &configs, fs.clone())?;
+        (ordinary && projects.iter().all(Option::is_some)).then_some((root, fs))
+    }
+
     /// `relative` が symlink・submodule か、その下か (ある・無いを確かめられない)。
     fn is_special(&self, relative: &str) -> bool {
         if self.special.is_empty() {

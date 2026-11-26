@@ -362,6 +362,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         &member_files,
     );
 
+    let moved = ts_move_capture::verify(&inputs, &member_files, moved, &mut state.buckets.modified);
     // 別のファイルへ移した Rust の項目も、移動元と移動先の宣言 (同じ場所の `#[cfg]` の分岐を
     // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
     // ことの証明にはしない。
@@ -1027,6 +1028,7 @@ mod js_ts_call_arity;
 mod js_ts_shadow;
 mod jsonc;
 mod ts_export_bindings;
+mod ts_move_capture;
 pub(crate) use jsonc::json_bytes as jsonc_bytes;
 mod moved_members;
 mod moved_symbols;

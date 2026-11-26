@@ -1,4 +1,4 @@
-//! Rust の互換な宣言変更と移動を、hook の出力と終了コードまで確かめる。
+//! 宣言の移動を、hook の出力と終了コードまで確かめる。
 
 use super::support::*;
 
@@ -12,6 +12,85 @@ fn contains(hook: &serde_json::Value, bucket: &str, name: &str) -> bool {
     hook["api"][bucket]
         .as_array()
         .is_some_and(|entries| entries.iter().any(|entry| entry["n"] == name))
+}
+
+#[test]
+fn typescript_move_keeps_destination_name_capture_blocking() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let read = "export function read() { return Date; }\n";
+    repo.write(
+        "api.ts",
+        "export const Date = 1;\nexport const Label = 2;\n",
+    );
+    let dest = format!("{read}export function local(Label: number) {{ return Label; }}\n");
+    repo.write("dest.ts", &dest);
+    repo.write(
+        "use.ts",
+        "import { read } from './dest.js';\nexport const made = new (read())();\n",
+    );
+    repo.commit_all("base");
+    repo.write("api.ts", "export {};\n");
+    repo.write(
+        "dest.ts",
+        format!("export const Date = 1;\nexport const Label = 2;\n{dest}"),
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("dest.ts", &dest);
+        }
+        let mut cmd = cargo_bin();
+        cmd.args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        if staged {
+            cmd.arg("--staged");
+        }
+        let output = cmd.output().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "staged={staged}: {json}");
+        assert!(contains(&json, "mod", "Date"), "{json}");
+        assert!(!contains(&json, "moved", "Date"), "{json}");
+        assert!(contains(&json, "moved", "Label"), "{json}");
+        assert!(!contains(&json, "mod", "Label"), "{json}");
+    }
+}
+
+#[test]
+fn typescript_move_checks_an_existing_import_in_the_base_project() {
+    for alternate in [false, true] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let read = "export function read() { return Date; }\n";
+        repo.write("api.ts", "export const Date = 1;\n");
+        repo.write("api.alt.ts", "export const Date = globalThis.Date;\n");
+        repo.write(
+            "dest.ts",
+            format!("import {{ Date }} from './api.js';\n{read}"),
+        );
+        repo.write("notes.md", "Before\n");
+        repo.write(
+            "tsconfig.json",
+            if alternate {
+                r#"{"compilerOptions":{"moduleSuffixes":[".alt",""]}}"#
+            } else {
+                "{}"
+            },
+        );
+        repo.commit_all("base");
+        repo.write("api.ts", "export {};\n");
+        repo.write("dest.ts", format!("export const Date = 1;\n{read}"));
+        repo.write("notes.md", "After\n");
+        repo.write("tsconfig.json", "{}");
+        let review = repo.run_json("review", &["--git"]);
+        let has = |bucket: &str| {
+            review["api_changes"][bucket]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|s| s["name"] == "Date"))
+        };
+        assert_eq!(has("modified"), alternate, "{review}");
+        assert_eq!(has("moved"), !alternate, "{review}");
+    }
 }
 
 #[test]

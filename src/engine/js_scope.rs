@@ -74,7 +74,7 @@ pub(crate) fn resolve_reference_binding(
 }
 
 /// 名前の名前空間。TS の型の位置 (`type_identifier`) は型の宣言だけに束縛される。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Namespace {
     Value,
     Type,

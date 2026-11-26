@@ -83,7 +83,7 @@ fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     name(node.utf8_text(source).ok()?)
 }
 
-fn imports(statement: Node<'_>, source: &[u8], locals: &mut HashMap<String, Binding>) {
+fn visit_imports(statement: Node<'_>, source: &[u8], mut visit: impl FnMut(String, Binding)) {
     let Some(module) = statement
         .child_by_field_name("source")
         .and_then(|n| node_name(n, source))
@@ -112,7 +112,7 @@ fn imports(statement: Node<'_>, source: &[u8], locals: &mut HashMap<String, Bind
         if let Some((local, remote)) = spec
             && let Some(local) = node_name(local, source)
         {
-            locals.insert(
+            visit(
                 local,
                 Binding {
                     target: Target::Remote {
@@ -125,6 +125,30 @@ fn imports(statement: Node<'_>, source: &[u8], locals: &mut HashMap<String, Bind
         }
         ControlFlow::<(), Walk>::Continue(Walk::Descend)
     });
+}
+
+/// 元の公開名とローカル名が等しい、一意な named import。
+pub(super) fn same_name_imports(root: Node<'_>, source: &[u8]) -> HashMap<String, (String, bool)> {
+    let mut named = HashMap::new();
+    let mut seen = HashSet::new();
+    for stmt in root
+        .named_children(&mut root.walk())
+        .filter(|n| n.kind() == "import_statement")
+    {
+        visit_imports(stmt, source, |local, binding| {
+            if !seen.insert(local.clone()) {
+                named.remove(&local);
+            } else if let Target::Remote {
+                module,
+                name: Some(remote),
+            } = binding.target
+                && local == remote
+            {
+                named.insert(local, (module, binding.type_only));
+            }
+        });
+    }
+    named
 }
 
 impl Exports {
@@ -152,7 +176,9 @@ impl Exports {
                 continue;
             }
             if stmt.kind() == "import_statement" {
-                imports(stmt, source, &mut locals);
+                visit_imports(stmt, source, |name, binding| {
+                    locals.insert(name, binding);
+                });
                 continue;
             }
             let exported = stmt.kind() == "export_statement";
