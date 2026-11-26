@@ -41,19 +41,21 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
                      new_fn: Node<'_>,
                      new_source: &[u8],
                      memo| {
-        let additions =
+        let extension =
             optional_object_props_extension(old_fn, old_source, new_fn, new_source, Some(site))?;
-        let safe = additions.is_empty()
-            || (!public_name_differs
-                && added_props::repository_accepts(
-                    index,
-                    site,
-                    &mut caches.optional_removal,
-                    new_fn,
-                    new_source,
-                    additions,
-                    memo,
-                ));
+        let safe =
+            added_props::preserves_return(old_fn, old_source, new_fn, new_source, &extension)
+                && (extension.parameters.is_empty()
+                    || (!public_name_differs
+                        && added_props::repository_accepts(
+                            index,
+                            site,
+                            &mut caches.optional_removal,
+                            new_fn,
+                            new_source,
+                            extension.parameters,
+                            memo,
+                        )));
         Some(
             safe.then(|| site.compatible("optional_object_props"))
                 .ok_or(()),
@@ -73,13 +75,18 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     })
 }
 
+pub(super) struct OptionalPropsExtension<'tree> {
+    pub(super) parameters: Vec<added_props::ParameterAddition<'tree>>,
+    pub(super) bindings: Vec<pattern_extension::AddedBinding>,
+}
+
 pub(super) fn optional_object_props_extension<'new>(
     old_fn: tree_sitter::Node<'_>,
     old_source: &[u8],
     new_fn: tree_sitter::Node<'new>,
     new_source: &[u8],
     site: Option<&CompatibleModSite<'_>>,
-) -> Option<Vec<added_props::ParameterAddition<'new>>> {
+) -> Option<OptionalPropsExtension<'new>> {
     let old_parts = ts_function_signature_parts(old_fn, old_source)?;
     let new_parts = ts_function_signature_parts(new_fn, new_source)?;
     if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
@@ -132,7 +139,10 @@ pub(super) fn optional_object_props_extension<'new>(
     }
     (any_extension
         && pattern_extension::signature_preserves_bindings(new_fn, new_source, &added_bindings))
-    .then_some(additions)
+    .then_some(OptionalPropsExtension {
+        parameters: additions,
+        bindings: added_bindings,
+    })
 }
 
 /// server component 関数への `async` 追加だけなら JSX 呼び出し互換とする。

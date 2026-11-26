@@ -10,6 +10,9 @@ use crate::engine::jsx::{caller_shape, jsx_name_opening_tag};
 use std::collections::HashMap;
 use tree_sitter::Node;
 
+mod return_contract;
+pub(super) use return_contract::preserves_return;
+
 #[derive(Default)]
 pub(super) struct PropertyTypes<'tree> {
     pub(super) named: HashMap<String, Node<'tree>>,

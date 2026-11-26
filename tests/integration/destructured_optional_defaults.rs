@@ -56,6 +56,234 @@ fn compatible(result: &serde_json::Value) -> bool {
 }
 
 #[test]
+fn optional_prop_additions_check_inferred_returns_and_outer_bindings() {
+    let before = "{ label }: { label: string }";
+    let added = "{ label, tone }: { label: string; tone?: 'plain' | 'muted' }";
+    let direct = "Panel({ label: 'a' })";
+    let mut failures = Vec::new();
+    for (case, new_param, old_body, new_body, caller, safe) in [
+        (
+            "outer binding",
+            added,
+            "return tone;",
+            "return tone;",
+            direct,
+            false,
+        ),
+        (
+            "new return",
+            added,
+            "return label.length;",
+            "return tone;",
+            direct,
+            false,
+        ),
+        (
+            "nested capture",
+            added,
+            "return () => tone;",
+            "return () => tone;",
+            direct,
+            false,
+        ),
+        (
+            "shorthand capture",
+            added,
+            "return {tone};",
+            "return {tone};",
+            direct,
+            false,
+        ),
+        (
+            "computed method name precedes its parameters",
+            added,
+            "return { [tone](tone: string) { return tone; } };",
+            "return { [tone](tone: string) { return tone; } };",
+            direct,
+            false,
+        ),
+        (
+            "branch literal",
+            added,
+            "if (label) return 'a'; return 'b';",
+            "if (label) return 'a'; return 'c';",
+            direct,
+            false,
+        ),
+        (
+            "return newline",
+            added,
+            "return 1;",
+            "return\n1;",
+            direct,
+            false,
+        ),
+        (
+            "generator",
+            added,
+            "yield 1; return true;",
+            "yield 's'; return true;",
+            direct,
+            false,
+        ),
+        (
+            "pragma",
+            added,
+            "return <p>{label}</p>;",
+            "return <p>{label}</p>;",
+            direct,
+            false,
+        ),
+        (
+            "removed pragma",
+            added,
+            "return <p>{label}</p>;",
+            "return <p>{label}</p>;",
+            direct,
+            false,
+        ),
+        (
+            "return newline before JSX",
+            added,
+            "return (<p>{label}</p>);",
+            "return\n(<p>{label}</p>);",
+            direct,
+            false,
+        ),
+        (
+            "prototype",
+            "{ label }: { label: string; toString?: 'plain' }",
+            "return label.length;",
+            "return label.length;",
+            direct,
+            false,
+        ),
+        (
+            "JSX key",
+            "{ label }: { label: string; key?: 'plain' }",
+            "return <p>{label}</p>;",
+            "return <p>{label}</p>;",
+            "<Panel label='a' key={1} />",
+            false,
+        ),
+        (
+            "old parameter",
+            added,
+            "return label.length;",
+            "return label.length;",
+            direct,
+            true,
+        ),
+        (
+            "property name",
+            added,
+            "return {tone: label};",
+            "return {tone: label};",
+            direct,
+            true,
+        ),
+        (
+            "JSX body",
+            added,
+            "return <p>{label}</p>;",
+            "return <p data-tone={tone}>{label}</p>;",
+            direct,
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let declaration = |param: &str, body: &str, pragma: &str| {
+            let star = if case == "generator" { "*" } else { "" };
+            format!(
+                "{pragma}const tone = 123;\nexport function{star} Panel({param}) {{ {body} }}\n"
+            )
+        };
+        let pragma = "/** @jsxImportSource other */\n";
+        let old_pragma = if case == "removed pragma" { pragma } else { "" };
+        repo.write("panel.tsx", declaration(before, old_body, old_pragma));
+        repo.write(
+            "home.tsx",
+            format!("import {{ Panel }} from './panel';\nexport const n = {caller};\n"),
+        );
+        repo.commit_all("base");
+        let new_pragma = if case == "pragma" { pragma } else { "" };
+        repo.write("panel.tsx", declaration(new_param, new_body, new_pragma));
+        let (output, result) = run_review(&repo, false);
+        let modified = result["api"]["mod"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|m| m["n"] == "Panel");
+        if output.status.success() != safe || compatible(&result) != safe || modified == safe {
+            failures.push(format!("{case}: {result}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn optional_prop_additions_check_returned_props_in_the_index() {
+    let cases = [
+        ("whole", "props", "", "return props;", false),
+        (
+            "throughDefault",
+            "props",
+            ", value = props",
+            "return value;",
+            false,
+        ),
+        ("rest", "{ ...props }", "", "return props;", false),
+        ("projection", "props", "", "return props.label;", true),
+        ("fixed", "props", "", "return 3;", true),
+    ];
+    let declarations = |ty: &str| {
+        cases
+            .iter()
+            .map(|(name, binding, tail, body, _)| {
+                format!("export function {name}({binding}: {ty}{tail}) {{ {body} }}\n")
+            })
+            .collect::<String>()
+    };
+    let repo = TestRepo::new();
+    repo.init_git();
+    let before = declarations("{ label: string }");
+    repo.write("api.ts", &before);
+    let names = cases
+        .iter()
+        .map(|case| case.0)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut caller = format!("import {{ {names} }} from './api';\n");
+    for (name, ..) in cases {
+        caller.push_str(&format!(
+            "export const {name}Result = {name}({{ label: 'a' }});\n"
+        ));
+    }
+    caller.push_str(
+        "export const checked: keyof typeof wholeResult extends 'label' ? true : false = true;\n",
+    );
+    repo.write("home.ts", caller);
+    repo.commit_all("base");
+    repo.write("api.ts", declarations("{ label: string; tone?: string }"));
+    repo.stage_all();
+    repo.write("api.ts", before);
+    let (output, result) = run_review(&repo, true);
+    assert_eq!(output.status.code(), Some(1), "{result}");
+    for (name, _, _, _, safe) in cases {
+        let contains = |bucket: &str| {
+            result["api"][bucket]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|m| m["n"] == name)
+        };
+        assert_eq!(contains("mod_compat"), safe, "{name}: {result}");
+        assert_eq!(contains("mod"), !safe, "{name}: {result}");
+    }
+}
+
+#[test]
 fn optional_prop_additions_check_each_caller_in_the_reviewed_snapshot() {
     let before = "export function Panel({ label }: { label: string }) { return <p>{label}</p>; }\n";
     let after = before.replace(
