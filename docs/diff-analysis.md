@@ -170,6 +170,8 @@ When one property of an exported object literal changes, a direct read of an unc
 
 For a direct read such as `SETTINGS.label`, the analyzer checks which declaration the name refers to. A class named `SETTINGS` can read its own static property, and a loop can introduce a local variable of the same name. The read stays a possible impact when its binding or the module entry point is uncertain. With `--staged`, the index supplies the reader and the files used to resolve its import.
 
+An insertion inside an existing property value triggers a search for readers, even when the diff contains no deleted lines. Adding a distinct top-level key can still skip that search.
+
 ### TypeScript Named Import Aliases
 
 An import such as `import { palette as palette }` or `import { "palette" as palette }` keeps the exported name. Its declaration is informational just like `import { palette }`. Reading a changed property or calling a function with a changed signature can still be blocking. If a use spells the local name with a Unicode escape that the reference search cannot match, the import line can remain a possible impact.
