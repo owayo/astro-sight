@@ -21,7 +21,9 @@ pub(super) enum MacroSite {
     /// マクロが objc2 のものかは [`define_class_imported`]・[`rebinds_objc2_names`] と依存の確認で
     /// 別に確かめる。
     DefineClassBody,
-    /// それ以外 (`macro_rules!` の本体・ほかのマクロの引数・属性マクロを付けた項目の中)。
+    /// `macro_rules!` の右辺。名前は定義ファイルではなく展開先で解決し得る。
+    RuleBody,
+    /// ほかのマクロの引数・属性マクロを付けた項目など。
     Unknown,
 }
 
@@ -31,10 +33,11 @@ pub(super) fn macro_site(identifier: Node<'_>, source: &[u8]) -> MacroSite {
     let mut current = identifier;
     if identifier
         .parent()
-        .is_some_and(|parent| parent.kind() == "token_tree")
+        .is_some_and(|parent| matches!(parent.kind(), "token_tree" | "token_repetition"))
     {
-        let Some(invocation) = define_class_body(identifier, source) else {
-            return MacroSite::Unknown;
+        let invocation = match token_tree_site(identifier, source) {
+            Ok(invocation) => invocation,
+            Err(site) => return site,
         };
         site = MacroSite::DefineClassBody;
         current = invocation;
@@ -96,22 +99,154 @@ fn inner_attributes_safe(scope: Node<'_>, source: &[u8]) -> bool {
         .all(|attribute| builtin_attribute(attribute, source))
 }
 
-/// 参照の識別子が、裸の名前で呼んだ `define_class!` の入力の `impl` のメソッドの本体にあれば、その
-/// 呼び出し。`objc2::define_class!` は扱わない (先頭の `objc2` はモジュールの束縛・glob の import・
-/// マクロが作る束縛で付け替えられ、import の経路のような曖昧さの検査が無い)。
-fn define_class_body<'tree>(identifier: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
-    // 参照から外へ、token tree の列 (内から外) と、それを引数にする呼び出し。
+/// token tree の列を 1 度たどり、マクロの右辺か、呼び出した場所で解決する既知の入力かを区別する。
+fn token_tree_site<'tree>(
+    identifier: Node<'tree>,
+    source: &[u8],
+) -> Result<Node<'tree>, MacroSite> {
     let mut chain = Vec::new();
     let mut current = identifier;
     let invocation = loop {
-        let parent = current.parent()?;
+        let parent = current.parent().ok_or(MacroSite::Unknown)?;
         match parent.kind() {
-            "token_tree" => chain.push(parent),
+            "token_tree" | "token_repetition" => chain.push(parent),
             "macro_invocation" => break parent,
-            _ => return None,
+            "macro_rule" if parent.child_by_field_name("right") == Some(current) => {
+                return Err(rule_name_site(identifier, source, &chain));
+            }
+            _ => return Err(MacroSite::Unknown),
         }
         current = parent;
     };
+    define_class_body(identifier, source, invocation, &chain).ok_or(MacroSite::Unknown)?;
+    Ok(invocation)
+}
+
+/// ファイル直下にあるただ一つの非公開マクロが、同じファイルの無条件の関数を呼ぶ位置。
+/// 外から使えるマクロや別の展開先を作り得る構文、展開先での名前の再束縛があれば証明しない。
+pub(super) fn closed_local_rule_call(root: Node<'_>, source: &[u8]) -> Option<usize> {
+    if root.has_error() {
+        return None;
+    }
+    let mut definition = None;
+    let mut functions = Vec::new();
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        match item.kind() {
+            "function_item" => functions.push(item),
+            "macro_definition" if definition.is_none() => definition = Some(item),
+            "line_comment" | "block_comment" => {}
+            _ => return None,
+        }
+    }
+    let definition = definition?;
+    let macro_name = definition
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()?;
+    let mut rules = definition
+        .named_children(&mut cursor)
+        .filter(|item| item.kind() == "macro_rule");
+    let rule = rules.next()?;
+    let pattern = rule.child_by_field_name("left")?;
+    if rules.next().is_some() || pattern.child_count() != 2 || pattern.child(0)?.kind() != "(" {
+        return None;
+    }
+    let body = delimited(rule.child_by_field_name("right")?, "{")?;
+    let [callee, arguments] = body.as_slice() else {
+        return None;
+    };
+    let name = callee.utf8_text(source).ok()?.trim_start_matches("r#");
+    if callee.kind() != "identifier"
+        || !delimited(*arguments, "(")?
+            .iter()
+            .all(|node| node.kind() == "," || node.kind().ends_with("_literal"))
+    {
+        return None;
+    }
+    let mut declarations = 0;
+    for function in functions {
+        let declared = function.child_by_field_name("name")?;
+        declarations +=
+            usize::from(declared.utf8_text(source).ok()?.trim_start_matches("r#") == name);
+        let open = crate::engine::tree_walk::any_node(
+            function,
+            crate::engine::tree_walk::Children::Named,
+            |node| match node.kind() {
+                "use_declaration"
+                | "extern_crate_declaration"
+                | "mod_item"
+                | "attribute_item"
+                | "inner_attribute_item"
+                | "macro_definition" => true,
+                "macro_invocation" => !node.child_by_field_name("macro").is_some_and(|callee| {
+                    callee.kind() == "identifier"
+                        && callee.utf8_text(source).ok() == Some(macro_name)
+                }),
+                kind => {
+                    kind.ends_with("identifier")
+                        && node != declared
+                        && node
+                            .utf8_text(source)
+                            .is_ok_and(|word| word.trim_start_matches("r#") == name)
+                }
+            },
+        );
+        if open {
+            return None;
+        }
+    }
+    (declarations == 1).then_some(callee.start_byte())
+}
+
+/// メンバー名・フィールドのラベルと `$crate` の固定パスは展開先の値の名前に解決しない。
+/// 別のマクロの入力にあるトークンは、受け手が修飾子や `.`・`:` を分離し得る。
+fn rule_name_site(identifier: Node<'_>, source: &[u8], chain: &[Node<'_>]) -> MacroSite {
+    let fixed = previous_token(identifier).is_some_and(|previous| previous.kind() == ".")
+        || next_token(identifier).is_some_and(|next| next.kind() == ":")
+        || definition_crate_path(identifier, source);
+    if fixed
+        && chain.split_last().is_some_and(|(_, nested)| {
+            !nested.iter().any(|tree| {
+                previous_token(*tree).is_some_and(|previous| {
+                    matches!(
+                        previous.kind(),
+                        "!" | "#" | "metavariable" | "token_repetition"
+                    )
+                })
+            })
+        })
+    {
+        MacroSite::Unknown
+    } else {
+        MacroSite::RuleBody
+    }
+}
+
+/// `$crate::module::name` の固定パスは、展開先の import を使わない。
+fn definition_crate_path(mut name: Node<'_>, source: &[u8]) -> bool {
+    while let Some(prefix) = previous_token(name)
+        .filter(|separator| separator.kind() == "::")
+        .and_then(previous_token)
+    {
+        if prefix.kind() != "identifier" {
+            return prefix.kind() == "metavariable"
+                && prefix.utf8_text(source).ok() == Some("$crate");
+        }
+        name = prefix;
+    }
+    false
+}
+
+/// 参照の識別子が、裸の名前で呼んだ `define_class!` の入力の `impl` のメソッドの本体にあれば、その
+/// 呼び出し。`objc2::define_class!` は扱わない (先頭の `objc2` はモジュールの束縛・glob の import・
+/// マクロが作る束縛で付け替えられ、import の経路のような曖昧さの検査が無い)。
+fn define_class_body(
+    identifier: Node<'_>,
+    source: &[u8],
+    invocation: Node<'_>,
+    chain: &[Node<'_>],
+) -> Option<()> {
     let name = invocation.child_by_field_name("macro")?;
     if name.kind() != "identifier" || name.utf8_text(source).ok()? != "define_class" {
         return None;
@@ -134,7 +269,7 @@ fn define_class_body<'tree>(identifier: Node<'tree>, source: &[u8]) -> Option<No
     if next_token(identifier).is_some_and(|next| next.kind() == "!") {
         return None;
     }
-    let [nested @ .., method_body, impl_body, _arguments] = chain.as_slice() else {
+    let [nested @ .., method_body, impl_body, _arguments] = chain else {
         return None;
     };
     if !braced(*impl_body) || !impl_header(*impl_body)? {
@@ -158,7 +293,7 @@ fn define_class_body<'tree>(identifier: Node<'tree>, source: &[u8]) -> Option<No
     }) {
         return None;
     }
-    Some(invocation)
+    Some(())
 }
 
 /// token tree が `{ .. }` か。
@@ -576,6 +711,46 @@ mod tests {
             ),
             (
                 "macro_rules! m { () => { translate(1) }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { ($($n:expr),*) => { $(translate($n);)* }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { () => { S.translate(1) }; }".to_owned(),
+                MacroSite::Unknown,
+            ),
+            (
+                "macro_rules! m { () => { S { translate: 1 } }; }".to_owned(),
+                MacroSite::Unknown,
+            ),
+            (
+                "macro_rules! m { () => { S { translate } }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { () => {{ let f: fn(u8) = translate; f(1) }}; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { () => { relay!(S.translate(1)) }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { () => { crate::translate(1) }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { () => { $crate /* origin */ :: api::translate(1) }; }".to_owned(),
+                MacroSite::Unknown,
+            ),
+            (
+                "macro_rules! m { ($module:ident) => { $module::translate(1) }; }".to_owned(),
+                MacroSite::RuleBody,
+            ),
+            (
+                "macro_rules! m { (translate(1)) => {}; }".to_owned(),
                 MacroSite::Unknown,
             ),
             (

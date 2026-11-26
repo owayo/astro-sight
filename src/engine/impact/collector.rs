@@ -306,6 +306,10 @@ impl RouteDecisionContext<'_> {
             // 自由関数は別moduleからbareで呼べないため、import/qualified path/globの証拠が
             // なければlowへ振り分ける。メソッドはbare呼び出しが正当なので対象外。
             let rust_route_low = if !self.filter_disabled
+                && !(event.rust_name_site == super::rust_macro_site::MacroSite::RuleBody
+                    && file_context
+                        .rust_private_root_functions
+                        .contains(symbol_name))
                 && !has_parent_type
                 && self.ref_lang == Some(LangId::Rust)
                 && file_context.lang_id == LangId::Rust
@@ -988,6 +992,15 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                         self.rust_path_owner_project,
                     )
                 });
+        let rust_local_owner = rust_local_owner
+            || (rust_name_site == super::rust_macro_site::MacroSite::RuleBody
+                && rust_owner_index
+                    .zip(node)
+                    .is_some_and(|(index, node)| index.closed_local_rule_calls(node, source))
+                && self
+                    .reference_module()
+                    .is_some_and(|module| module.path.is_empty() && module.library_only)
+                && self.owner_layout_proved());
         let rust_direct_import_site = rust_owner_index.zip(node).is_some_and(|(index, node)| {
             index.is_tracked_direct_import_site(node, source, &self.all_symbol_names[ix])
         });
@@ -1739,6 +1752,8 @@ impl<'a> ImpactCollector<'a> {
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)
             && ctx.rust_private_root_names.contains(name)
+            && !(e.rust_name_site == super::rust_macro_site::MacroSite::RuleBody
+                && ctx.rust_private_root_functions.contains(name))
         {
             if self
                 .rust_path_owner_project
