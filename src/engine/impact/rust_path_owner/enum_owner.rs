@@ -54,9 +54,6 @@ pub(super) fn static_layout(
     {
         return None;
     }
-    if !members_outside_unscanned(&root, project)? {
-        return None;
-    }
     let mut pending = vec![root.clone()];
     let mut relocated = Vec::new();
     let mut included = false;
@@ -659,124 +656,6 @@ fn hidden_inner_attribute(source: &[u8]) -> bool {
                 || memchr::memmem::find(line, b"/*").is_some()
                 || memchr::memmem::find(line, b"//").is_some()
         })
-}
-
-/// root の workspace の member が、走査しない root の直下の `target`・`.git` に無いか (`Some(true)`)。
-/// member を名指す (`target/probe`) か、先頭の要素の glob が `target`・`.git` に合い得れば
-/// `Some(false)`。manifest の形が違えば `None`。
-fn members_outside_unscanned(root: &Path, project: &RustPathOwnerProjectProof) -> Option<bool> {
-    let Some(manifest) = project.alias_cache.manifest(root, Path::new("")) else {
-        return Some(true);
-    };
-    let Some(members) = manifest
-        .get("workspace")
-        .and_then(|workspace| workspace.get("members"))
-    else {
-        return Some(true);
-    };
-    // 先頭の要素の glob が `target`・`.git` に合い得るか (`targe?/level/*` は深い package も選ぶ)。
-    let unscanned_glob = |first: &str| {
-        globset::GlobBuilder::new(first)
-            .case_insensitive(true)
-            .literal_separator(true)
-            .build()
-            .map_or(true, |glob| {
-                let matcher = glob.compile_matcher();
-                matcher.is_match("target") || matcher.is_match(".git")
-            })
-    };
-    for member in members.as_array()? {
-        // Cargo は末尾の区切り (`targe?/level/*/`) をディレクトリの指定として読む。
-        let member = member.as_str()?.trim_end_matches(['/', '\\']);
-        // `a/../target/probe` は字面で畳んでから先頭の要素を見る。`..` と glob を合わせた member、
-        // 絶対パス、root の外へ出る member は決めない。
-        let normalized;
-        let member = if Path::new(member).has_root()
-            || Path::new(member).is_absolute()
-            || member.split(['/', '\\']).any(|part| part == "..")
-        {
-            if member.contains(['*', '?', '[', '{']) {
-                return Some(false);
-            }
-            let Some(joined) = super::lexical_join(Path::new(""), Path::new(member)) else {
-                return Some(false);
-            };
-            normalized = joined.to_str()?.to_owned();
-            normalized.as_str()
-        } else {
-            member
-        };
-        let first = member
-            .split(['/', '\\'])
-            .find(|part| !part.is_empty() && *part != ".");
-        let Some(first) = first else {
-            continue;
-        };
-        if first.eq_ignore_ascii_case("target") || first.eq_ignore_ascii_case(".git") {
-            return Some(false);
-        }
-        if first.contains(['*', '?', '[', '{'])
-            && unscanned_glob(first)
-            && glob_selects_unscanned_package(root, member)
-        {
-            return Some(false);
-        }
-    }
-    Some(true)
-}
-
-/// member の glob (`targe?/level/*`・`*/plugin`) が、root の直下の `target`・`.git` の下の package
-/// (`Cargo.toml` のあるディレクトリ) を選ぶか。glob を読めない、たどる要素が多すぎるときは真。
-fn glob_selects_unscanned_package(root: &Path, member: &str) -> bool {
-    // Cargo は `./targe?/level/*` の `./` を root からのパスとして読み、途中の `./`
-    // (`targe?/./level/*`) と末尾の区切りは無視する。
-    let normalized = member
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect::<Vec<_>>()
-        .join("/");
-    let member = normalized.as_str();
-    let Ok(glob) = globset::GlobBuilder::new(member)
-        .case_insensitive(true)
-        .literal_separator(true)
-        .build()
-    else {
-        return true;
-    };
-    let matcher = glob.compile_matcher();
-    let depth = if member.contains("**") {
-        usize::MAX
-    } else {
-        member
-            .split(['/', '\\'])
-            .filter(|part| !part.is_empty() && *part != ".")
-            .count()
-    };
-    let mut budget = 10_000usize;
-    for top in ["target", ".git"] {
-        let mut pending = vec![(PathBuf::from(top), 1usize)];
-        while let Some((relative, level)) = pending.pop() {
-            if matcher.is_match(&relative) && root.join(&relative).join("Cargo.toml").exists() {
-                return true;
-            }
-            if level >= depth {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(root.join(&relative)) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Some(left) = budget.checked_sub(1) else {
-                    return true;
-                };
-                budget = left;
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    pending.push((relative.join(entry.file_name()), level + 1));
-                }
-            }
-        }
-    }
-    false
 }
 
 /// `#[path]` で読んだファイルが、別のソースを取り込み得るか (`include!`・`#[path]`・それを作り得る

@@ -329,6 +329,8 @@ For Rust, a private declaration directly in a source file can be used by child m
 
 The same Rust source file can be compiled into two crates, with its private references binding to a different declaration in each crate. Impact analysis keeps same-name references when a macro can reassemble attribute tokens into `#[path]`, or when a Cargo `[patch]` or `[source]` setting can select source files under `target/`.
 
+A Cargo workspace can also select a package under `target/` that compiles files from both crates. For example, the member pattern `targ[^e]t/level/*` matches `target/level/probe` under Cargo's glob rules. A nested workspace can select the same package with a path relative to its own `Cargo.toml`. In either case, `impact` keeps the reference.
+
 A consumer that imports a function pointer as `translate` can call it through `translate(1)` in a `macro_rules!` body defined in another crate. Adding a required parameter to the pointer then breaks the expansion. When the definition file does not establish which function is called, `impact` keeps the line in the macro body as a possible caller. If staged changes differ from the working tree, `review --staged` checks the callers using the index snapshot.
 
 When the only edit in a Rust source file adds `pub(crate)` or `pub` to a direct private item, unchanged references inside its former private subtree are informational. References outside that subtree are excluded because they could not have named the old item. This requires an unchanged ordinary Cargo module layout and proof that globs cannot introduce another binding of the changed name. Other edits in the same diff, uncertain ownership, and narrower visibility changes retain the normal blocking classification.

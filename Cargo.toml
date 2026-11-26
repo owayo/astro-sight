@@ -24,6 +24,7 @@ dirs = "7.0.0"
 # parallel はリポジトリと index をワーカー間で共有するため (無いと共有型が Rc になる)。
 # sha256 は SHA-256 のリポジトリを開くため
 gix = { version = "0.90.0", default-features = false, features = ["attributes", "parallel", "sha1", "sha256"] }
+glob = "0.3.4"
 globset = "0.4.21"
 hashbrown = "0.17.1"
 ignore = "0.4.34"
