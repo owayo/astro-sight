@@ -12,6 +12,7 @@ use crate::models::review::{
     ApiChanges, NullableTypeChange, TypeChangeDirection, TypeChangeEvidence, TypeChangePosition,
     TypeChangeUsage,
 };
+mod expected_errors;
 mod parameter_union;
 
 const NULLABLE: &str = "nullable_input_widening";
@@ -23,7 +24,7 @@ pub(crate) fn detect_nullable_input_compatible_mod(
     sources: &mut SignatureSourceCache<'_>,
     cache: &mut OptionalRemovalCache,
     diff_files: &[DiffFile],
-) -> Option<CompatibleApiModification> {
+) -> Option<Result<CompatibleApiModification, ()>> {
     let lang = nullable_site(site)?;
     let src = sources.get(site)?;
     let (old, new) = src.parse_pair(lang)?;
@@ -78,24 +79,8 @@ pub(crate) fn detect_nullable_input_compatible_mod(
     if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
-    // 以前は型エラーだった呼び出しが通ると、利用側の @ts-expect-error がエラーになる。
-    if analysis.extended_proof
-        && inventory.parsed().any(|(_, source, root, _)| {
-            memchr::memmem::find(source, b"@ts-expect-error").is_some()
-                && memchr::memmem::find(source, site.name.as_bytes()).is_some()
-                && crate::engine::tree_walk::any_node(
-                    root,
-                    crate::engine::tree_walk::Children::Named,
-                    |node| {
-                        node.kind() == "comment"
-                            && node
-                                .utf8_text(source)
-                                .is_ok_and(|text| text.contains("@ts-expect-error"))
-                    },
-                )
-        })
-    {
-        return None;
+    if expected_errors::affects_widening(&inventory, site.new_path, site.name)? {
+        return Some(Err(()));
     }
     prove_repository_uses(
         refs,
@@ -114,7 +99,7 @@ pub(crate) fn detect_nullable_input_compatible_mod(
     } else {
         PARAMETER_UNION
     };
-    Some(site.compatible(reason))
+    Some(Ok(site.compatible(reason)))
 }
 
 fn nullable_site(site: &CompatibleModSite<'_>) -> Option<crate::language::LangId> {
@@ -127,7 +112,6 @@ fn nullable_site(site: &CompatibleModSite<'_>) -> Option<crate::language::LangId
 struct Analysis<'tree> {
     changes: Vec<NullableTypeChange>,
     same_contract: bool,
-    extended_proof: bool,
     arity: usize,
     type_roots: Vec<Node<'tree>>,
 }
@@ -308,7 +292,6 @@ fn analyze<'new>(
     Some(Analysis {
         changes,
         same_contract,
-        extended_proof,
         arity: new_parameters.len(),
         type_roots: roots,
     })

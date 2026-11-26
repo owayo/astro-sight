@@ -281,7 +281,7 @@ pub(super) fn compatible_modification(
         return Ok(Some(compat));
     }
     if !public_name_differs
-        && let Some(compat) = super::ts_signature::detect_nullable_input_compatible_mod(
+        && let Some(result) = super::ts_signature::detect_nullable_input_compatible_mod(
             ref_index,
             site,
             sources,
@@ -289,7 +289,7 @@ pub(super) fn compatible_modification(
             diff_files,
         )
     {
-        return Ok(Some(compat));
+        return result.map(Some);
     }
     if !public_name_differs
         && let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(

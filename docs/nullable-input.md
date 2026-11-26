@@ -20,9 +20,14 @@ literal or an untagged template string. A returned template can interpolate a
 scalar parameter directly or with a literal fallback, as in `${prefix ?? ""}`.
 Returning the widened parameter itself, passing it to another function, or
 dereferencing it without a guard keeps the change under review.
-For the extended check, an `@ts-expect-error` comment in a source file that
-mentions the function also requires review. An old call that now accepts its
-argument can leave that directive unused.
+
+An `@ts-expect-error` on the declaration or a call to the function keeps the
+change blocking, including when the caller is edited in the same diff. For
+example, widening `word(text: string)` to `word(text: string | null)` makes
+the directive above `word(null)` a compiler error (TS2578). Review follows the
+directive to its target line, including calls through named or namespace
+imports and JSX uses. It leaves a call such as `word(14)` under review too,
+because another diagnostic on the same line can keep the directive in use.
 
 The proof scans repository consumers using the existing bounded source,
 configuration, dependency and ignored-file audits. Every use must be an ordinary

@@ -132,6 +132,115 @@ fn nullable_input_review_preserves_evidence_and_staged_scope() {
 }
 
 #[test]
+fn nullable_input_review_keeps_expected_errors_in_the_selected_caller() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"strict":true,"jsx":"preserve"}}"#,
+    );
+    repo.write("render.ts", BEFORE);
+    let import = "import { word } from './render';\n";
+    let original = "// @ts-expect-error null was rejected\nword(null);\n";
+    repo.write("call.tsx", format!("{import}{original}"));
+    repo.commit_all("initial");
+    repo.write("render.ts", AFTER);
+    repo.stage_all();
+
+    for (caller, blocking) in [
+        (original, true),
+        (
+            "const result = <>{word(\n// @ts-expect-error\n\n// null was rejected\nnull)}</>;\n",
+            true,
+        ),
+        (
+            "const count = 1; /* @ts-expect-error */\nword(null);\n",
+            true,
+        ),
+        ("/// @ts-expect-error\nword(null);\n", true),
+        (
+            "// @ts-expect-error\nconst bad: number = 'str';\nword('ok');\n",
+            false,
+        ),
+        (
+            "// Docs mention @ts-expect-error\nword('@ts-expect-error');\n",
+            false,
+        ),
+        ("// @ts-ignore\nword(null);\n", false),
+        ("word(null);\n", false),
+    ] {
+        repo.write("call.tsx", format!("{import}{caller}"));
+        let (out, result) = hook(&repo, false);
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(blocking)),
+            "{caller}: {result}"
+        );
+        if blocking {
+            assert_eq!(result["api"]["mod"][0]["n"], "word", "{result}");
+            assert_eq!(
+                result["api"]["type_change_evidence"][0]["usage"],
+                "unproven"
+            );
+        } else {
+            assert_eq!(
+                result["api"]["mod_compat"][0]["reason"],
+                "nullable_input_widening"
+            );
+        }
+    }
+    let (out, result) = hook(&repo, true);
+    assert_eq!(out.status.code(), Some(1), "{result}");
+    assert_eq!(result["api"]["mod"][0]["n"], "word");
+}
+
+#[test]
+fn nullable_input_keeps_expected_errors_on_edited_import_calls() {
+    for (import, call) in [
+        ("{ word as render }", "render(null)"),
+        ("* as api", "api.word(null)"),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("render.ts", BEFORE);
+        let prefix = format!("import {import} from './render';\n// @ts-expect-error\n");
+        repo.write("use.ts", format!("{prefix}{call};\n"));
+        repo.commit_all("initial");
+        repo.write("render.ts", AFTER);
+        repo.write("use.ts", format!("{prefix}export const result = {call};\n"));
+        let (out, result) = hook(&repo, false);
+        assert_eq!(out.status.code(), Some(1), "{call}: {result}");
+        assert_eq!(result["api"]["mod"][0]["n"], "word", "{result}");
+    }
+}
+
+#[test]
+fn nullable_input_keeps_expected_errors_on_edited_jsx_elements() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let before =
+        "export function Word(props: { text: string }): string { return String(props.text); }\n";
+    let prefix = "import { Word } from './render';\n// @ts-expect-error null prop\n";
+    repo.write("render.ts", before);
+    repo.write(
+        "call.tsx",
+        format!("{prefix}const view = <Word text={{null}}/>;\n"),
+    );
+    repo.commit_all("initial");
+    repo.write(
+        "render.ts",
+        before.replace("text: string", "text: string | null"),
+    );
+    repo.write(
+        "call.tsx",
+        format!("{prefix}export const view = <Word text={{null}}/>;\n"),
+    );
+    let (out, result) = hook(&repo, false);
+    assert_eq!(out.status.code(), Some(1), "{result}");
+    assert_eq!(result["api"]["mod"][0]["n"], "Word", "{result}");
+}
+
+#[test]
 fn nullable_input_review_keeps_return_and_type_extraction_blocking() {
     for (after, caller, position) in [
         (
