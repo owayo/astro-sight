@@ -731,6 +731,8 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 
 `u.total()` のような属性呼び出しでは、その参照位置から見える `u` の import を調べる。別の関数内に `import math as u` があっても、モジュール直下の `u` を使う呼び出しには影響しない。条件付きの import や同じスコープでの競合で参照先を特定できなければ、削除を blocking に残す。
 
+`from bridge import u` は、`bridge` が公開する値を取り込む。その値が削除元のモジュールでありうる場合、`u.total()` が残っていれば `total` の削除は `api.rm` になる。`globals()['u']` への代入でモジュール直下の `u` が差し替わりうる場合も同じ扱いになる。Python は識別子の `ｕ` と `u` を同じ名前として扱うが、辞書の文字列キー `'ｕ'` と `'u'` は区別する。
+
 ### Python の関数名を文字列で参照する場合
 
 モジュール直下の関数を削除すると、`review` は Python の文字列を介した名前の参照も調べる。`globals()["total"]`、`getattr(module, "total")`、`mock.patch("pkg.module.total")` などが残ると、削除は `api.rm` に入り、hook は終了コード 1 を返す。通常の辞書キーやログに同じ文字列があるだけなら `api.rm_dead` にできる。ソースの読み取りや解析が失敗した場合、または1ファイル 2 MiB・合計 64 MiB の上限を超えた場合は、未確認の候補を blocking に残し、理由を `truncations` に出す。

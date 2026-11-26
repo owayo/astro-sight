@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+mod python_globals;
 mod python_imports;
 use python_imports::PythonImports;
 
@@ -462,7 +463,7 @@ pub(crate) fn analyze_ref_attribution_facts(
             export_cache,
         ),
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
-        LangId::Python => analyze_python_facts(utf8, symbol),
+        LangId::Python => analyze_python_facts(utf8, symbol, dir),
         LangId::Rust => analyze_rust_facts(utf8, ref_path, symbol, member_proof, rust_paths),
         _ => RefAttributionFacts::opaque(),
     };
@@ -502,7 +503,7 @@ pub(super) fn is_js_ts_family(lang: LangId) -> bool {
 /// (`re.search` / `self.search` / `pkg.mod.search`) かどうかを判定する。
 ///
 /// すべて属性アクセスなら、レシーバの「実効モジュール名」集合を返す。実効モジュール名は
-/// 単純な識別子ならその位置で見える import 別名を解決し、属性連鎖なら末尾の属性名を使う。
+/// その位置で見える import 別名を解決し、from import と属性連鎖ではサブモジュールの実体を調べる。
 /// モジュールレベルの自由関数・クラスへ属性アクセスで
 /// 到達する経路は `<module>.<name>` (と再エクスポートした祖先パッケージの `<package>.<name>`)
 /// だけなので、この集合に削除モジュール名と祖先パッケージ名が無ければ削除シンボル由来では
@@ -510,7 +511,7 @@ pub(super) fn is_js_ts_family(lang: LangId) -> bool {
 ///
 /// bare identifier としての出現が 1 件でもあれば None を返し従来どおり残存参照として数える
 /// (`from core import search` の import 行や `search()` の直接呼び出しがこれに当たる)。
-fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFacts {
+fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str, dir: &str) -> RefAttributionFacts {
     let Ok(source) = parser::read_file(utf8) else {
         return RefAttributionFacts::opaque();
     };
@@ -528,14 +529,14 @@ fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttribution
     if root.has_error() {
         return facts;
     }
-    let aliases = PythonImports::collect(root, &source, symbol);
+    let mut aliases = PythonImports::collect(root, &source, symbol, dir);
     let mut receivers: HashSet<String> = HashSet::new();
     let mut import_only = HashMap::new();
     if !collect_python_attribute_receivers(
         root,
         &source,
         symbol,
-        &aliases,
+        &mut aliases,
         &mut import_only,
         &mut receivers,
     ) {
@@ -594,7 +595,7 @@ fn collect_python_attribute_receivers(
     root: tree_sitter::Node,
     source: &[u8],
     symbol: &str,
-    aliases: &PythonImports<'_>,
+    aliases: &mut PythonImports<'_>,
     import_only: &mut HashMap<String, bool>,
     out: &mut HashSet<String>,
 ) -> bool {
@@ -637,7 +638,7 @@ fn collect_python_attribute_receivers(
         if !bound_only_by_import {
             return ControlFlow::Break(());
         }
-        let Some(name) = python_receiver_effective_name(object, base_name, source, aliases) else {
+        let Some(name) = aliases.module_at(object, base_name, source) else {
             return ControlFlow::Break(());
         };
         out.insert(name);
@@ -725,29 +726,6 @@ fn python_import_binds_name(statement: tree_sitter::Node, source: &[u8], name: &
                 .is_some_and(|first| first.utf8_text(source).ok() == Some(name)),
             _ => false,
         })
-}
-
-/// レシーバ式の実効モジュール名。`re` → `re`、`pkg.core` → `core`、`c` (別名) → `core`。
-/// 添字・関数呼び出しなど識別子で終わらない式は None。
-fn python_receiver_effective_name(
-    object: tree_sitter::Node,
-    base: &str,
-    source: &[u8],
-    aliases: &PythonImports<'_>,
-) -> Option<String> {
-    let module = aliases.module_at(object, base)?;
-    match object.kind() {
-        "identifier" => Some(module.to_owned()),
-        // pkg.util の util は属性名なので、同じ綴りの import 別名に置き換えない。
-        "attribute" => Some(
-            object
-                .child_by_field_name("attribute")?
-                .utf8_text(source)
-                .ok()?
-                .to_owned(),
-        ),
-        _ => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1380,7 +1358,19 @@ mod tests {
         let path = dir.path().join("ref.py");
         std::fs::write(&path, src).expect("write");
         let utf8 = camino::Utf8Path::from_path(&path).expect("utf8");
-        analyze_python_facts(utf8, symbol)
+        // from import と属性連鎖には、初期化子と実在する子モジュールの根拠を置く。
+        for (package, module) in [
+            ("tools", "util"),
+            ("elsewhere", "other"),
+            ("pkg", "core"),
+            ("scripts", "core"),
+        ] {
+            let parent = dir.path().join(package);
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::write(parent.join("__init__.py"), "").unwrap();
+            std::fs::write(parent.join(format!("{module}.py")), "").unwrap();
+        }
+        analyze_python_facts(utf8, symbol, dir.path().to_str().unwrap())
     }
 
     /// 属性アクセスだけのファイルはレシーバ名を集め、bare 出現があれば証明を諦める。
@@ -1507,6 +1497,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn module_dictionary_writes_only_invalidate_possible_global_receivers() {
+        let caller = "\ndef run(): return u.total(1)\n";
+        for (write, independent) in [
+            ("globals()['u'] = module", false),
+            (r#"globals()['\u0075'] = module"#, false),
+            ("globals()[key] = module", false),
+            ("globals().update(u=module)", false),
+            ("globals().update({'u': module})", false),
+            ("ns = globals()\nns['u'] = module", false),
+            ("def change(): globals()['u'] = module", false),
+            ("(globals)()['u'] = module", false),
+            ("globals( # mapping\n)['u'] = module", false),
+            ("globals(*(), **{})['u'] = module", false),
+            ("globals()['other'] = module", true),
+            ("globals()['ｕ'] = module", true),
+            ("globals().update(other=module)", true),
+            ("print(globals()['u'])", true),
+            ("table['u'] = module", true),
+            ("configure(globals=13)", true),
+            ("model.globals = 7\nstyle = model.globals", true),
+            ("def apply(locals): return locals\nstyle = apply(7)", true),
+            (
+                "class Model: pass\nmodel = Model()\nvars(model)['u'] = 3",
+                true,
+            ),
+            ("import builtins as b\nb.globals()['u'] = module", false),
+            (
+                "from builtins import globals as env\nenv()['u'] = module",
+                false,
+            ),
+            ("modify(globals)", false),
+            (
+                "from builtins import globals as g\ndef other():\n    from builtins import locals as g\ndef change(): g()['u'] = module",
+                false,
+            ),
+            (
+                "def other():\n    from builtins import locals as globals\ndef change(): globals()['u'] = module",
+                false,
+            ),
+        ] {
+            let src = format!("import math as u\n{write}{caller}");
+            let proof = python_facts_for(&src, "total").python_attribute_receivers;
+            assert_eq!(proof.is_some(), independent, "{src}");
+        }
+        let shadow =
+            "globals()['u'] = module\ndef run():\n    import math as u\n    return u.total(1)\n";
+        assert!(
+            python_facts_for(shadow, "total")
+                .python_attribute_receivers
+                .is_some()
+        );
+    }
+
     /// モジュールは普通の値なので、辞書・変数・引数・呼び出し結果に入れたレシーバ
     /// (`BACKENDS[name].search(q)` / `backend.search(q)`) の名前からは削除モジュールかどうかを
     /// 決められない。レシーバの先頭が import 文だけに束縛された名前のときだけ証明に使う。
@@ -1583,7 +1627,7 @@ mod tests {
         node: tree_sitter::Node,
         source: &[u8],
         symbol: &str,
-        aliases: &PythonImports<'_>,
+        aliases: &mut PythonImports<'_>,
         import_only: &mut HashMap<String, bool>,
         out: &mut HashSet<String>,
     ) -> bool {
@@ -1621,8 +1665,7 @@ mod tests {
             if !bound_only_by_import {
                 return false;
             }
-            let Some(name) = python_receiver_effective_name(object, base_name, source, aliases)
-            else {
+            let Some(name) = aliases.module_at(object, base_name, source) else {
                 return false;
             };
             out.insert(name);
@@ -1645,7 +1688,10 @@ mod tests {
     /// 集めたレシーバ・import だけの束縛の判定キャッシュ) を返す。
     #[test]
     fn python_attribute_helpers_match_recursive_version() {
+        let dir = tempfile::tempdir().unwrap();
         let sources = [
+            "import re\nre.search(1)\n",
+            "import pkg.core as c\nc.search(1)\n",
             "import pkg.core as c\nimport re\nfrom pkg import core as c2\nimport other as c\n\
              re.search(x)\nc.search(y)\npkg.core.search(z)\nc2.search(1)\ns = 'search' # search\n",
             "from m import search\nsearch()\n",
@@ -1660,7 +1706,12 @@ mod tests {
             let tree = parser::parse_source(src.as_bytes(), LangId::Python).unwrap();
             let root = tree.root_node();
             for symbol in ["search", "attr", "re", "core", "missing"] {
-                let aliases = PythonImports::collect(root, src.as_bytes(), symbol);
+                let mut aliases = PythonImports::collect(
+                    root,
+                    src.as_bytes(),
+                    symbol,
+                    dir.path().to_str().unwrap(),
+                );
                 let mut import_only = HashMap::new();
                 let mut out = HashSet::new();
                 let mut import_only_recursive = HashMap::new();
@@ -1669,7 +1720,7 @@ mod tests {
                     root,
                     src.as_bytes(),
                     symbol,
-                    &aliases,
+                    &mut aliases,
                     &mut import_only,
                     &mut out,
                 );
@@ -1679,7 +1730,7 @@ mod tests {
                         root,
                         src.as_bytes(),
                         symbol,
-                        &aliases,
+                        &mut aliases,
                         &mut import_only_recursive,
                         &mut out_recursive,
                     ),

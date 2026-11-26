@@ -68,6 +68,71 @@ const UTIL_OLD: &str = "def total(x):\n    return x\n\n\ndef keep():\n    return
 const UTIL_NEW: &str = "def keep():\n    return 1\n";
 
 #[test]
+fn removal_preserves_reexported_and_rebound_module_receivers() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("tools");
+    repo.write("tools/__init__.py", "");
+    repo.write("tools/util.py", UTIL_OLD);
+    repo.write("tools/other.py", UTIL_OLD);
+    repo.write("bridge.py", "from tools import util as u\n");
+    repo.create_dir_all("reexport");
+    repo.write("reexport/__init__.py", "from tools import util as u\n");
+    repo.write("reexport/u.py", UTIL_OLD);
+    repo.write("report.py", "");
+    repo.commit_all("base");
+    repo.write("tools/util.py", UTIL_NEW);
+
+    let control = "from tools import other as u\ndef run(): return u.total(1)\n";
+    for (binding, receiver) in [
+        (
+            "from bridge import u\ndef other():\n    import spare.u as u\n    return u",
+            "u",
+        ),
+        ("import bridge as b", "b.u"),
+        (
+            "import tools as b\nimport tools.util as target\nb.other = target",
+            "b.other",
+        ),
+        ("from reexport import u", "u"),
+        (
+            "import math as u\nimport importlib\nglobals()['u'] = importlib.import_module('tools.util')",
+            "u",
+        ),
+        (
+            "import tools.util as ｕ\ndef other():\n    import math as u\n    return u.pi",
+            "u",
+        ),
+    ] {
+        repo.write(
+            "report.py",
+            format!("{binding}\ndef run(): return {receiver}.total(1)\n"),
+        );
+        repo.stage_all();
+        repo.write("report.py", control);
+        for (flags, bucket) in [
+            (vec!["--git", "--staged"], "removed"),
+            (vec!["--git"], "removed_dead"),
+        ] {
+            let review = repo.run_json("review", &flags);
+            assert_eq!(
+                review["api_changes"][bucket][0]["name"], "total",
+                "{binding}: {review}"
+            );
+        }
+    }
+    let refs = repo.run_json("refs", &["--name", "total"]);
+    assert!(
+        refs["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == "report.py" && r["ln"] == 1),
+        "{refs}"
+    );
+}
+
+#[test]
 fn removal_resolves_import_aliases_at_the_attribute_use() {
     let repo = TestRepo::new();
     repo.init_git();
