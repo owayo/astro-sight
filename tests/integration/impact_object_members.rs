@@ -48,6 +48,125 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn impact_object_members_scan_insertions_inside_existing_values() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let cases = [
+        (
+            "Template",
+            "ts",
+            "",
+            "",
+            "  endpoint:\n    'a'",
+            "  endpoint:\n    `v:${\n    'a'\n    }`",
+            true,
+        ),
+        (
+            "Quoted",
+            "js",
+            "(",
+            ")",
+            "  endpoint: 'a\\\nb',",
+            "  endpoint: 'a\\\nv\\\nb',",
+            true,
+        ),
+        (
+            "Asserted",
+            "tsx",
+            "(",
+            ") as const",
+            "  endpoint: [\n    'a',\n  ],",
+            "  endpoint: [\n    'a',\n    'b',\n  ],",
+            true,
+        ),
+        (
+            "Duplicate",
+            "js",
+            "",
+            "",
+            "  endpoint: 'a',",
+            "  endpoint: 'a',\n  'endpoint': 'b',",
+            true,
+        ),
+        (
+            "Addition",
+            "ts",
+            "",
+            "",
+            "  endpoint: 'a',",
+            "  endpoint: 'a',\n  added: {\n    flag: true,\n  },",
+            false,
+        ),
+        (
+            "Accessors",
+            "js",
+            "",
+            "",
+            "  get endpoint() { return 1; },\n  set endpoint(x) {},\n  0: 'old',",
+            "  get endpoint() { return 1; },\n  set endpoint(x) {},\n  0: 'old',\n  ['fresh']: 2,\n  9007199254740991: true,",
+            false,
+        ),
+    ];
+    let layout = |name: &str, prefix: &str, suffix: &str, body: &str, version: u8| {
+        let space = "\n".repeat(10);
+        format!(
+            "const before = {version};{space}export const {name} = {prefix}{{\n{body}\n}}{suffix};{space}const after = {version};\n"
+        )
+    };
+    for (name, ext, prefix, suffix, old, _, _) in cases {
+        repo.write(
+            format!("{name}.{ext}"),
+            layout(name, prefix, suffix, old, 1),
+        );
+        repo.write(
+            format!("read{name}.{ext}"),
+            format!(
+                "import {{ {name} }} from './{name}';\nexport const observed = {name}.endpoint;\n"
+            ),
+        );
+    }
+    repo.commit_all("base");
+    for (name, ext, prefix, suffix, _, new, _) in cases {
+        repo.write(
+            format!("{name}.{ext}"),
+            layout(name, prefix, suffix, new, 2),
+        );
+    }
+    repo.stage_all();
+    for flags in [&["--git"][..], &["--git", "--staged"][..]] {
+        let context = repo.run_json("context", flags);
+        for (name, ext, _, _, _, _, blocking) in cases {
+            let path = format!("{name}.{ext}");
+            let reader = format!("read{name}.{ext}");
+            let change = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["path"] == path)
+                .unwrap();
+            let found = |field: &str| {
+                change[field]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r["path"] == reader && r["line"] == 1)
+            };
+            assert_eq!(
+                found("impacted_callers"),
+                blocking,
+                "{path} {flags:?}: {change}"
+            );
+            if !blocking {
+                assert!(
+                    !found("informational_callers"),
+                    "{path} {flags:?}: {change}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn impact_object_members_verify_the_binding_of_each_read() {
     let repo = TestRepo::new();
     repo.init_git();

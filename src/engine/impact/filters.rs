@@ -123,22 +123,22 @@ impl CrossFileFilterContext<'_> {
         {
             return false;
         }
-        // 3c. オブジェクトリテラル変数の「メンバー追加のみ」変更をスキップ。
-        // `export const ns = { fnA, fnB }` 形式のファサードへ新メンバーを追加しても、
-        // 既存メンバーだけを使う参照側は壊れない (追加は後方互換)。宣言ヘッダ行が不変で、
-        // シンボル range 内の変更に削除 (`-` 行) を含まない場合は cross-file 検索から外す。
-        // メンバー削除・書き換え (`-` 行が range 内に出る) は従来どおり blocking 側に残す
-        // (Issue 2026-07-27-namespace-object-impact-granularity)。
-        if sym.kind == "variable"
-            && let Some(s) = overlapping
-            && !self.changed_new_lines.contains(&s.range.start.line)
-            && is_js_ts_object_literal_variable(self.root, self.lang_id, &s.range)
-            && !crate::engine::diff::has_deletion_in_new_range(
-                self.diff_input,
-                self.file_path,
-                s.range.start.line,
-                s.range.end.line,
-            )
+        // 3c. オブジェクト直下に重複しないメンバーを足しただけなら検索を省く。
+        // 式の内側の追加や削除は宣言名が差分に出なくても参照側に届く (5)。
+        let added_members_only = (sym.kind == "variable")
+            .then(|| js_ts_object_initializer(self.root, self.lang_id, &original.range))
+            .flatten()
+            .map(|object| {
+                adds_only_object_members(object, original, self.source, self.changed_new_lines)
+            });
+        if added_members_only == Some(true)
+            && (self.deletion_gaps.is_empty()
+                || !crate::engine::diff::has_deletion_in_new_range(
+                    self.diff_input,
+                    self.file_path,
+                    original.range.start.line,
+                    original.range.end.line,
+                ))
         {
             return false;
         }
@@ -162,11 +162,6 @@ impl CrossFileFilterContext<'_> {
         // ただしシグネチャ変更が検出済みのシンボルは除外しない。複数行の引数リストへの
         // 引数追加 (`+    b: u32,`) は変更行に名前が出ないが、宣言ヘッダの比較で呼び出し
         // 契約の変更と確定している (`declaration::reconcile_declaration_changes`)。
-        // JS/TS のオブジェクトリテラル変数で範囲内に削除 (メンバーの削除・値の書き換え) が
-        // あるものも除外しない。複数行のオブジェクトは名前が宣言ヘッダ行にしか無く、メンバーの
-        // 変更行には出ないため、名前の有無では呼び出し元への影響を判定できない
-        // (メンバー追加だけの変更は 3c で除外済み。`as const` / `satisfies` / 括弧で包んだ
-        // オブジェクトも同じ理由で除外しない)。
         // 初期値だけを変えた非公開の Rust の const / static も除外しない。名前の有無は同じ
         // ファイルのほかの差分 (テストの追加など) で変わるので使わず、参照の位置で振り分ける
         // (パターンや配列長などの値をコンパイル時に使う参照は blocking、関数の本体で読むだけの
@@ -174,17 +169,14 @@ impl CrossFileFilterContext<'_> {
         if !self.sig_changes.iter().any(|sc| sc.name == sym.name)
             && !self.rust_alias_changes.contains(&sym.name)
             && !self.rust_value_only_constants.contains_key(&sym.name)
-            && !(sym.kind == "variable"
-                && overlapping.is_some_and(|s| {
-                    is_js_ts_wrapped_object_literal_variable(self.root, self.lang_id, &s.range)
-                        // 削除はオブジェクトの範囲の内側に限る (直前の別の宣言の削除は含めない。
-                        // affected の判定と同じ規約)。
-                        && super::symbol_range_has_deletion(
-                            s.range.start.line,
-                            s.range.end.line,
-                            self.deletion_gaps,
-                        )
-                }))
+            && !added_members_only.is_some_and(|added_only| {
+                !added_only
+                    || super::symbol_range_has_deletion(
+                        original.range.start.line,
+                        original.range.end.line,
+                        self.deletion_gaps,
+                    )
+            })
             && !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id)
         {
             return false;
@@ -200,41 +192,111 @@ impl CrossFileFilterContext<'_> {
     }
 }
 
-/// variable シンボルの range (variable_declarator 全体) が JS/TS のオブジェクトリテラル
-/// 初期化子 (`const ns = { ... }`) を持つか判定する。フィルタ 3c の適用対象判定に使う。
-/// 対象言語外・ノード不一致・value 欠落はすべて false (= 従来どおり cross-file 検索) に倒す。
-///
-/// `as const` / `satisfies` 付き (`const ns = { ... } as const;`) は value が `as_expression` /
-/// `satisfies_expression` になるため false になり、フィルタは適用されず従来検索に落ちる。
-/// 検出漏れ側には倒れないため現状は unwrap しない。
-fn is_js_ts_object_literal_variable(
-    root: tree_sitter::Node<'_>,
+/// 括弧や TS の型表記を外した初期値がオブジェクトのとき、そのノードを返す。
+fn js_ts_object_initializer<'a>(
+    root: tree_sitter::Node<'a>,
     lang_id: LangId,
     range: &crate::models::location::Range,
-) -> bool {
-    js_ts_variable_value(root, lang_id, range).is_some_and(|v| v.kind() == "object")
-}
-
-/// `is_js_ts_object_literal_variable` と同じ判定を、`as const` / `satisfies` / 冗長括弧で
-/// 包んだ初期化子 (`const ns = { ... } as const;`) にも広げたもの。フィルタ 5 の除外を
-/// 外す側だけで使う (3c の「追加のみ」除外の対象は広げない)。既知の包みだけを外し、
-/// それ以外の式の中にあるオブジェクトは探さない。
-fn is_js_ts_wrapped_object_literal_variable(
-    root: tree_sitter::Node<'_>,
-    lang_id: LangId,
-    range: &crate::models::location::Range,
-) -> bool {
-    let mut value = js_ts_variable_value(root, lang_id, range);
-    while let Some(node) = value {
-        match node.kind() {
-            "object" => return true,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut value = js_ts_variable_value(root, lang_id, range)?;
+    loop {
+        match value.kind() {
+            "object" => return Some(value),
             "parenthesized_expression" | "as_expression" | "satisfies_expression" => {
-                value = node.named_child(0);
+                value = value
+                    .named_children(&mut value.walk())
+                    .find(|n| !n.is_extra())?;
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+}
+
+fn adds_only_object_members(
+    object: tree_sitter::Node<'_>,
+    symbol: &Symbol,
+    source: &[u8],
+    added: &HashSet<usize>,
+) -> bool {
+    let start = object.start_position().row;
+    let end = object.end_position().row;
+    // 宣言・括弧・as const・オブジェクトの境界も元の行にあることを確かめる。
+    if object.has_error()
+        || (symbol.range.start.line..=start)
+            .chain(end..=symbol.range.end.line)
+            .any(|line| added.contains(&line))
+    {
+        return false;
+    }
+    let rows = |node: tree_sitter::Node<'_>| node.start_position().row..=node.end_position().row;
+    let touches = |node| rows(node).any(|line| added.contains(&line));
+    let is_new = |node| rows(node).all(|line| added.contains(&line));
+    let mut existing = HashSet::new();
+    let mut inserted = HashSet::new();
+    for member in object.named_children(&mut object.walk()) {
+        if member.is_extra() {
+            // 追加したブロックコメントが既存の行を覆う場合は証明できない。
+            if touches(member) && !is_new(member) {
+                return false;
+            }
+            continue;
+        }
+        let Some(name) = object_member_name(member, source) else {
+            return false;
+        };
+        if is_new(member) {
+            inserted.insert(name);
+            continue;
+        }
+        // key と value の間のコメントや空行は値を変えない。
+        if touches(member)
+            && (member.kind() != "pair"
+                || member
+                    .children(&mut member.walk())
+                    .any(|part| touches(part) && !(part.is_extra() && is_new(part))))
+        {
+            return false;
+        }
+        existing.insert(name);
+    }
+    inserted.is_disjoint(&existing)
+}
+
+/// spread や計算されたキーは既存メンバーを上書きし得る。
+fn object_member_name<'a>(
+    member: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<std::borrow::Cow<'a, str>> {
+    let mut key = match member.kind() {
+        "pair" => member.child_by_field_name("key")?,
+        "method_definition" => member.child_by_field_name("name")?,
+        "shorthand_property_identifier" => member,
+        _ => return None,
+    };
+    if key.kind() == "computed_property_name" {
+        key = key
+            .named_children(&mut key.walk())
+            .find(|n| !n.is_extra())?;
+        if !matches!(key.kind(), "string" | "number") {
+            return None;
+        }
+    }
+    let raw = key.utf8_text(source).ok()?;
+    let raw = match key.kind() {
+        "property_identifier" | "shorthand_property_identifier" => raw,
+        "string" => crate::engine::js_string::quoted_contents(raw)?,
+        // Number の安全な整数範囲の正準 10 進表記は、文字列キーと直接比較できる。
+        "number"
+            if raw
+                .parse::<u64>()
+                .is_ok_and(|n| n < (1 << 53) && n.to_string() == raw) =>
+        {
+            raw
+        }
+        _ => return None,
+    };
+    let name = crate::engine::js_string::decoded(raw)?;
+    (name != "__proto__").then_some(name)
 }
 
 /// variable シンボルの range (variable_declarator 全体) から JS/TS の初期化子ノードを返す。
@@ -843,9 +905,7 @@ mod tests {
 
     // 5. 複数行のオブジェクトリテラル変数は、名前が変更行に無くてもメンバーの削除・値の書き換えが
     // あれば除外しない (名前が宣言ヘッダ行にしか無いため、フィルタ 5 では判定できない)。
-    // `as const` で包んだものも同じ。対照: メンバーを足しただけの変更は従来どおり除外する
-    // (包んでいないものは 3c、包んだものはフィルタ 5)。削除はオブジェクトの範囲の内側に限り、
-    // 直前の別の宣言を消しただけの削除では除外を外さない。
+    // `as const` で包んだものも同じ。直前の別宣言の削除と新しいメンバーの追加は除外する。
     #[test]
     fn cross_file_filter_keeps_multi_line_object_member_removal_without_name_on_changed_lines() {
         // (ラベル, 変更後のメンバー行, diff の hunk (ヘッダ込み), cross-file 検索に含めるか)
