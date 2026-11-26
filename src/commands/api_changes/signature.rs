@@ -360,61 +360,53 @@ pub(super) fn normalize_signature_dropping_comments(
 fn normalize_signature_eliding(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    keep_doc_comments: bool,
+    js: bool,
     elided: &[(usize, usize)],
 ) -> Option<String> {
-    let (start, end) = (node.start_byte(), node.end_byte());
-    // (開始, 終了, 置換文字列)。コメントは空白 1 個、省略する本体は `{}`。
-    let mut spans: Vec<(usize, usize, &[u8])> = elided
-        .iter()
-        .map(|&(s, e)| (s, e, b"{}".as_slice()))
-        .collect();
-    let mut cursor = node.walk();
-    let mut descend = true;
-    loop {
-        let current = cursor.node();
-        let is_comment = matches!(current.kind(), "comment" | "line_comment" | "block_comment");
-        if is_comment {
-            let keep = keep_doc_comments
-                && source
-                    .get(current.start_byte()..current.end_byte())
-                    .is_some_and(|b| b.starts_with(b"/**"));
-            if !keep {
-                spans.push((current.start_byte(), current.end_byte(), b" ".as_slice()));
-            }
-        }
-        // comment ノードは葉なので潜らない。
-        if descend && !is_comment && cursor.goto_first_child() {
-            continue;
-        }
-        if cursor.goto_next_sibling() {
-            descend = true;
-            continue;
-        }
-        if !cursor.goto_parent() || cursor.node().id() == node.id() {
-            break;
-        }
-        descend = false;
-    }
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
 
-    if spans.is_empty() {
-        return source.get(start..end).map(normalize_signature_whitespace);
-    }
-    spans.sort_unstable();
-    let mut out: Vec<u8> = Vec::with_capacity(end.saturating_sub(start));
-    let mut pos = start;
-    for (s, e, replacement) in spans {
-        // 走査順の乱れや範囲外を拾っても壊れないよう、進行方向だけを信じる。
-        // 省略した本体の内側にあるコメントは `s < pos` でここに落ちる。
-        if s < pos || e > end {
-            continue;
+    let bytes = source.get(node.byte_range())?;
+    let mut out = String::new();
+    let mut pos = node.start_byte();
+    // 本体の範囲も前順に並ぶので、内部の文字列・コメントは本体ごと飛ばせる。
+    let mut bodies = elided.iter().copied().peekable();
+    let result = walk_preorder(node, Children::All, |current, _| {
+        let range = current.byte_range();
+        let literal = js && super::signature_tokens::js_literal_text(current.kind());
+        let text = if bodies.next_if_eq(&(range.start, range.end)).is_some() {
+            "{}"
+        } else if literal {
+            let Ok(text) = current.utf8_text(source) else {
+                return ControlFlow::Break(());
+            };
+            text
+        } else if matches!(current.kind(), "comment" | "line_comment" | "block_comment") {
+            if js && source[range.clone()].starts_with(b"/**") {
+                return ControlFlow::Continue(Walk::Skip);
+            }
+            " "
+        } else {
+            return ControlFlow::Continue(Walk::Descend);
+        };
+        append_header_text(&mut out, &source[pos..range.start]);
+        if literal {
+            out.push_str(text);
+        } else {
+            append_header_text(&mut out, text.as_bytes());
         }
-        out.extend_from_slice(source.get(pos..s)?);
-        out.extend_from_slice(replacement);
-        pos = e;
+        pos = range.end;
+        ControlFlow::Continue(Walk::Skip)
+    });
+    if result.is_break() {
+        return None;
     }
-    out.extend_from_slice(source.get(pos..end)?);
-    Some(normalize_signature_whitespace(&out))
+    if pos == node.start_byte() {
+        return Some(normalize_signature_whitespace(bytes));
+    }
+    append_header_text(&mut out, &source[pos..node.end_byte()]);
+    out.truncate(out.trim_end().len());
+    Some(out)
 }
 
 /// 値バインディング 1 個 (`export const X = ...` / `const X: T = ...` / `static X: T = ...`)

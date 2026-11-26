@@ -6,6 +6,14 @@ use tree_sitter::Node;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct SigTokens(pub(super) Vec<(String, String)>);
 
+/// テンプレートは固定文字とエスケープだけを原文で扱い、型の補間式には降りる。
+pub(super) fn js_literal_text(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string" | "regex" | "string_fragment" | "escape_sequence"
+    )
+}
+
 pub(super) fn signature_tokens_in_range(
     node: Node<'_>,
     source: &[u8],
@@ -54,10 +62,8 @@ fn collect_signature_tokens(
             return None;
         }
         if current.child_count() == 0
-            || matches!(
-                current.kind(),
-                "string" | "template_string" | "template_literal_type" | "regex" | "comment"
-            )
+            || js_literal_text(current.kind())
+            || matches!(current.kind(), "template_string" | "comment")
             || current.kind().starts_with("jsx_")
             || keep_subtree(current.kind())
         {

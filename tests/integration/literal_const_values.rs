@@ -205,6 +205,82 @@ fn literal_const_values_interpolated_template_text_follows_ts_hook_policy() {
 }
 
 #[test]
+fn literal_const_values_compare_whitespace_in_public_literal_types() {
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let file = format!("values.{extension}");
+        let source = r#"declare function read(key: string): string;
+export const VALUE: `a b${string}` = `a b${read("k")}/old`;
+export const QUOTED: "x y" = "x y", FIRST_PEER = 1;
+export const FORMAT: `f${string}` = "fmt";
+export const STABLE: `s${string}` = `s${read("k")}/old`;
+export const SECOND_PEER = 2, NESTED: `x${`n b${number}`}` = null as unknown as `x${`n b${number}`}`;
+export const WIDE: string = "v w";
+"#;
+        repo.write(&file, source);
+        let caller = format!("use.{extension}");
+        repo.write(
+            &caller,
+            r#"import { VALUE, QUOTED, FORMAT, STABLE, NESTED, WIDE } from "./values";
+export const previous: `a b${string}` = VALUE;
+export const quoted: "x y" = QUOTED;
+export const nested: `x${`n b${number}`}` = NESTED;
+export const values = [FORMAT, STABLE, WIDE];
+"#,
+        );
+        repo.commit_all("initial");
+        repo.write(
+            &file,
+            source
+                .replace("a b", "a  b")
+                .replace("x y", "x  y")
+                .replace("n b", "n\tb")
+                .replace("v w", "v  w")
+                .replace("f${string}", "f${  string }")
+                .replace("s${string}", "s${ string  }")
+                .replace("/old", "/new"),
+        );
+        for staged in [false, true] {
+            if staged {
+                repo.stage_all();
+                repo.write(&file, source);
+            }
+            let (output, json) = hook(&repo, staged, false);
+            assert_eq!(output.status.code(), Some(1), "{json}");
+            let names = |bucket: &str| {
+                let mut names = json["api"][bucket]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|item| item["n"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                names
+            };
+            assert_eq!(names("mod"), ["NESTED", "QUOTED", "VALUE"], "{json}");
+            assert_eq!(names("const_value"), ["STABLE", "WIDE"], "{json}");
+            assert!(names("type_annotation").is_empty(), "{json}");
+            let impacts = json["impacts"].as_array().unwrap();
+            for (name, line) in [("VALUE", 1), ("QUOTED", 2), ("NESTED", 3)] {
+                assert!(
+                    impacts
+                        .iter()
+                        .any(
+                            |group| group["refs"].as_array().unwrap().iter().any(|reference| {
+                                reference["s"] == serde_json::json!([name])
+                                    && reference["ln"] == line
+                                    && reference["p"] == caller
+                            })
+                        ),
+                    "{json}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn literal_const_values_keep_different_kinds_dynamic_templates_and_containers_blocking() {
     for extension in ["js", "ts", "tsx"] {
         for (before, after) in [

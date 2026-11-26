@@ -98,20 +98,26 @@ fn type_annotation_only_area_uses_unverified_policy_and_independent_strict_flag(
 
 #[test]
 fn type_annotations_formatting_is_unreported_and_nonblocking() {
+    let dimensions = "{ width: 100 * 2, height: 50 * 2 }";
     for extension in ["ts", "tsx"] {
-        for (before, after) in [
-            (": Dim", ":    Dim"),
-            (": Dim", " : Dim"),
+        for (before, after, initializer) in [
+            (": Dim", ":    Dim", dimensions),
+            (": Dim", " : Dim", dimensions),
+            (": `a b${string}`", ": `a b${  string  }`", "'a b'"),
+            (": 'a b' | 'z'", ": 'a b'  |\n  'z'", "'a b'"),
             (
                 ": { width: number; height: number; }",
                 ": {\n width : number ;\n height : number ;\n }",
+                dimensions,
             ),
         ] {
             let repo = TestRepo::new();
             repo.init_git();
             let file = format!("area.{extension}");
             let source = |annotation| {
-                format!("export const AREA{annotation} = {{ width: 100 * 2, height: 50 * 2 }};\n")
+                format!(
+                    "type Dim = {{ width: number; height: number }};\nexport const AREA{annotation} = {initializer};\n"
+                )
             };
             repo.write(&file, source(before));
             repo.write(
@@ -156,26 +162,75 @@ fn type_annotations_formatting_is_unreported_and_nonblocking() {
 }
 
 #[test]
-fn type_annotation_literal_type_changes_survive_equal_normalized_signatures() {
+fn type_annotation_literal_whitespace_without_initializer_changes_follows_annotation_policy() {
     let repo = TestRepo::new();
     repo.init_git();
-    repo.write("api.ts", "export const VALUE: 'a b' = getText();\n");
+    let before = "declare function getText(): never;\nexport const VALUE: 'a b' = getText();\nexport const LABEL: `a b${string}` = getText();\n";
+    repo.write("api.ts", before);
     repo.write(
         "use.ts",
-        "import { VALUE } from './api';\nexport function read() { return VALUE; }\n",
+        "import { VALUE, LABEL } from './api';\nexport const first: 'a b' = VALUE;\nexport const second: `a b${string}` = LABEL;\n",
     );
     repo.commit_all("initial");
-    repo.write("api.ts", "export const VALUE: 'a  b' = getText();\n");
-    let api = repo.run_json("review", &["--git"]);
-    assert_eq!(
-        api["api_changes"]["type_annotation_changes"][0]["name"], "VALUE",
-        "{api}"
-    );
-    let (output, json) = hook(&repo, &[]);
-    assert!(output.status.success(), "{json}");
-    assert_eq!(json["api"]["type_annotation"][0]["n"], "VALUE", "{json}");
-    let (output, json) = hook(&repo, &["--strict-public-type-annotations"]);
-    assert_eq!(output.status.code(), Some(1), "{json}");
+    repo.write("api.ts", before.replace("a b", "a  b"));
+    let review = repo.run_json("review", &["--git"]);
+    let callers = review["impact"]["changes"][0]["impacted_callers"]
+        .as_array()
+        .unwrap();
+    let readings = [("VALUE", 1), ("LABEL", 2)];
+    for (name, line) in readings {
+        assert!(
+            callers.iter().any(|caller| caller["path"] == "use.ts"
+                && caller["line"] == line
+                && caller["symbols"] == serde_json::json!([name])),
+            "{review}"
+        );
+    }
+    for strict in [false, true] {
+        let flags: &[&str] = if strict {
+            &["--strict-public-type-annotations"]
+        } else {
+            &[]
+        };
+        let (output, json) = hook(&repo, flags);
+        assert_eq!(output.status.code(), Some(i32::from(strict)), "{json}");
+        assert_eq!(
+            json["api"]["type_annotation"].as_array().unwrap().len(),
+            2,
+            "{json}"
+        );
+        assert_eq!(
+            json["blocking_categories"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("policy.type_annotation")),
+            strict,
+            "{json}"
+        );
+        assert!(json["impacts"].is_null(), "{json}");
+        for (name, line) in readings {
+            assert!(
+                json["api"]["type_annotation"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["n"] == name),
+                "{json}"
+            );
+            assert!(
+                json["impact_info"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group["refs"].as_array().unwrap().iter().any(
+                        |reference| reference["s"] == serde_json::json!([name])
+                            && reference["ln"] == line
+                            && reference["p"] == "use.ts"
+                    )),
+                "{json}"
+            );
+        }
+    }
 }
 
 #[test]
