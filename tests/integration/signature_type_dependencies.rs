@@ -66,6 +66,208 @@ fn lists(items: &serde_json::Value, name: &str) -> bool {
         .any(|item| item["n"] == name)
 }
 
+fn assert_local_type_import(repo: &TestRepo, staged: bool, compatible: bool) {
+    let mut command = cargo_bin();
+    command
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root());
+    if staged {
+        command.arg("--staged");
+    }
+    let output = command.output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if compatible { 0 } else { 1 }),
+        "{json}"
+    );
+    if compatible {
+        assert!(
+            json["api"]["mod_compat"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["n"] == "send" && entry["reason"] == "trailing_optional_params"),
+            "{json}"
+        );
+        assert!(json["impacts"].is_null(), "{json}");
+    } else {
+        assert!(lists(&json["api"]["mod"], "send"), "{json}");
+    }
+}
+
+#[test]
+fn trailing_optional_parameters_keep_stable_local_type_imports() {
+    for (import, ty, provider_path) in [
+        (
+            "import type { Session } from './session';",
+            "Session",
+            "mail/session.ts",
+        ),
+        (
+            "import type { Session } from './session.js';",
+            "Session",
+            "mail/session.ts",
+        ),
+        (
+            "import { type Session as Input } from './session';",
+            "Input",
+            "mail/session.ts",
+        ),
+        (
+            "import type { Session } from '../session.js';",
+            "Session",
+            "session.ts",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("mail");
+        let old = format!(
+            "{import}\nexport function send(value: {ty}, retries = 0) {{ return `${{value.id}}:${{retries}}`; }}\n"
+        );
+        let new = old.replace("retries = 0)", "retries = 0, quiet = false)");
+        let provider = "export type Session = { id: string };\n";
+        repo.write(provider_path, provider);
+        repo.write("mail/mailer.ts", &old);
+        repo.write(
+            "mail/use.ts",
+            "import { send } from './mailer';\nexport const result = send({ id: 'a' });\n",
+        );
+        repo.commit_all("initial");
+        repo.write("mail/mailer.ts", &new);
+        repo.stage_all();
+        repo.write(provider_path, provider.replace("string", "number"));
+        assert_local_type_import(&repo, false, false);
+        assert_local_type_import(&repo, true, true);
+    }
+}
+
+#[test]
+fn trailing_optional_parameters_require_resolvable_node_esm_imports() {
+    for (package_type, specifier, attribute, compatible) in [
+        ("module", "./session", "", false),
+        ("module", "./session.js", "", true),
+        ("commonjs", "./session", "", true),
+        (
+            "commonjs",
+            "./session",
+            r#" with { "resolution-mode": "import" }"#,
+            false,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"module":"NodeNext","strict":true}}"#,
+        );
+        repo.write("package.json", format!(r#"{{"type":"{package_type}"}}"#));
+        repo.write("session.ts", "export type Session = { id: string };\n");
+        let old = format!(
+            "import type {{Session}} from '{specifier}'{attribute};\nexport function send(s: Session) {{ return s.id; }}\n"
+        );
+        repo.write("mailer.ts", &old);
+        repo.write(
+            "use.ts",
+            "import {send} from './mailer.js';\nsend({id:'a'});\n",
+        );
+        repo.commit_all("base");
+        repo.write(
+            "mailer.ts",
+            old.replace("s: Session)", "s: Session, quiet = false)"),
+        );
+        assert_local_type_import(&repo, false, compatible);
+    }
+}
+
+#[test]
+fn trailing_optional_parameters_require_complete_staged_type_resolution() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let old = "import type { Session } from './session.js';\nexport function send(s: Session, retry = 0) { return s.id; }\n";
+    repo.write("mailer.ts", old);
+    repo.write("session.tsx", "export type Session = { id: string };\n");
+    repo.write("feedback.ts", "export type Session = { id: Parameters<typeof import('./mailer.js').send>['length'] extends 1 | 2 ? string : number };\n");
+    repo.write("tsconfig.json", r#"{"compilerOptions":{"jsx":"preserve"}}"#);
+    repo.write(
+        "use.ts",
+        "import {send} from './mailer.js';\nsend({id:'a'});\n",
+    );
+    repo.commit_all("base");
+    repo.write("link-target.txt", "feedback.ts");
+    let oid = std::process::Command::new("git")
+        .args(["hash-object", "-w", "link-target.txt"])
+        .current_dir(repo.root())
+        .output()
+        .unwrap();
+    assert!(oid.status.success());
+    let oid = String::from_utf8(oid.stdout).unwrap();
+    repo.git([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "120000",
+        oid.trim(),
+        "session.ts",
+    ]);
+    repo.git(["commit", "-qm", "linked provider"]);
+    repo.write(
+        "mailer.ts",
+        old.replace("retry = 0)", "retry = 0, quiet = false)"),
+    );
+    repo.git(["add", "mailer.ts"]);
+    assert_local_type_import(&repo, true, false);
+}
+
+#[test]
+fn trailing_optional_parameters_keep_retargeted_and_dependent_imports_blocking() {
+    let old = "import type { Session } from './session';\nexport const key = 'a' as string;\nexport function send(value: Session) { return value.id; }\n";
+    let added = old.replace("value: Session)", "value: Session, quiet = false)");
+    for (provider, new, change_forwarded_type) in [
+        (
+            "export type Session = { id: string };",
+            added.replace("./session", "./other"),
+            false,
+        ),
+        (
+            "export type Session = { id: typeof import('./mailer').key };",
+            added.replace("'a' as string", "1 as number"),
+            false,
+        ),
+        (
+            "export type { Session } from './other';",
+            added.clone(),
+            true,
+        ),
+        ("export type Other = { id: string };", added, false),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("session.ts", provider);
+        let other = "export type Session = { id: number };\n";
+        repo.write(
+            "other.ts",
+            if change_forwarded_type {
+                other.replace("number", "string")
+            } else {
+                other.to_owned()
+            },
+        );
+        repo.write("mailer.ts", old);
+        repo.write(
+            "use.ts",
+            "import { send } from './mailer';\nsend({id:'a'});\n",
+        );
+        repo.commit_all("initial");
+        repo.write("mailer.ts", new);
+        if change_forwarded_type {
+            repo.write("other.ts", other);
+        }
+        assert_local_type_import(&repo, false, false);
+    }
+}
+
 #[test]
 fn public_signature_type_dependencies_report_changed_contracts() {
     for (before, after, call, changed, compatible) in [

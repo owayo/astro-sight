@@ -84,7 +84,21 @@ pub(super) fn relative_ts_source(
     path: &str,
     module: &str,
 ) -> Option<(SourceBuf, LangId)> {
-    let file = module.strip_prefix("./")?;
+    module.strip_prefix("./")?;
+    let (target, lang) = relative_ts_source_path(dir, path, module)?;
+    Some((load_new_source(dir, &target)?, lang))
+}
+
+pub(super) fn relative_ts_source_path(
+    dir: &str,
+    path: &str,
+    module: &str,
+) -> Option<(String, LangId)> {
+    let file = module.strip_prefix("./").or_else(|| {
+        module
+            .strip_prefix("../")
+            .map(|rest| rest.trim_start_matches("../"))
+    })?;
     if file.is_empty()
         || file
             .split('/')
@@ -102,7 +116,7 @@ pub(super) fn relative_ts_source(
     if !matches!(lang, LangId::Typescript | LangId::Tsx) {
         return None;
     }
-    Some((load_new_source(dir, &target)?, lang))
+    Some((target, lang))
 }
 
 /// 先読み済みの working tree ソースと base 側 blob を組にする。

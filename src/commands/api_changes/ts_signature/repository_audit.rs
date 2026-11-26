@@ -543,6 +543,7 @@ struct ConfigScan {
     bytes: usize,
     checked: BTreeSet<PathBuf>,
     standard: bool,
+    node_resolution: bool,
     path_keys: Vec<String>,
     base_dirs: Vec<PathBuf>,
     /// `paths` のキーと置き換え先。
@@ -638,6 +639,7 @@ impl ConfigScan {
             bytes: 0,
             checked: BTreeSet::new(),
             standard: true,
+            node_resolution: false,
             path_keys: Vec::new(),
             base_dirs: Vec::new(),
             path_mappings: Vec::new(),
@@ -699,6 +701,17 @@ impl ConfigScan {
         }
         if let Some(options) = config.get("compilerOptions") {
             let options = options.as_object()?;
+            // Node16 系では ESM の相対 import に拡張子が必要。extends をまたぐ組み合わせも保留する。
+            self.node_resolution |= ["moduleResolution", "module"].iter().any(|key| {
+                options
+                    .get(*key)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|mode| {
+                        ["node16", "node18", "node20", "nodenext"]
+                            .iter()
+                            .any(|node| mode.eq_ignore_ascii_case(node))
+                    })
+            });
             if options.contains_key("jsxFactory")
                 || options.contains_key("jsxFragmentFactory")
                 || options
@@ -1340,6 +1353,7 @@ fn override_names(key: &str) -> Option<Vec<String>> {
 
 /// package.json の、この証明に要る部分。
 struct Manifest {
+    esm: bool,
     external_consumers: bool,
     name: Option<String>,
     workspaces: bool,
@@ -1473,6 +1487,9 @@ impl Manifest {
             }
         }
         Some(Self {
+            esm: object
+                .get("type")
+                .is_some_and(|value| value.as_str() == Some("module")),
             external_consumers: [
                 "types",
                 "typings",
@@ -1501,6 +1518,8 @@ impl Manifest {
 pub(super) struct PackageBoundary {
     external_consumers: bool,
     root: PathBuf,
+    /// Node16 系のモードが使われる場合、最も近い package.json の形式を引く。
+    node_package_formats: Option<BTreeMap<PathBuf, bool>>,
     /// package.json の `name` (ワークスペースのパッケージと、`exports` による自己参照)。
     workspace_names: BTreeSet<String>,
     /// package.json の `name` → そのディレクトリ (`dir` 相対。外の祖先の package.json は None)。
@@ -1640,6 +1659,7 @@ impl PackageBoundary {
         let mut boundary = Self {
             external_consumers: false,
             root: files.root.clone(),
+            node_package_formats: configs.node_resolution.then(BTreeMap::new),
             workspace_names: BTreeSet::new(),
             package_dirs: BTreeMap::new(),
             path_keys: configs.path_keys.clone(),
@@ -1737,6 +1757,9 @@ impl PackageBoundary {
     }
 
     fn record(&mut self, directory: &Path, manifest: &Manifest, root: &Path) -> Option<()> {
+        if let Some(formats) = &mut self.node_package_formats {
+            formats.insert(directory.to_owned(), manifest.esm);
+        }
         self.record_dependencies(directory, &manifest.dependencies, root)?;
         self.non_registry.extend(manifest.patched.iter().cloned());
         if let Some(name) = &manifest.name {
@@ -1806,6 +1829,23 @@ impl PackageBoundary {
             }
         }
         Some(())
+    }
+
+    pub(super) fn needs_explicit_extension(&self, from: &str) -> bool {
+        let Some(formats) = &self.node_package_formats else {
+            return false;
+        };
+        match Path::new(from).extension().and_then(|ext| ext.to_str()) {
+            Some("mts" | "mjs") => true,
+            Some("cts" | "cjs") => false,
+            _ => self
+                .root
+                .join(from)
+                .ancestors()
+                .skip(1)
+                .find_map(|directory| formats.get(directory).copied())
+                .unwrap_or(false),
+        }
     }
 
     /// bare specifier が、registry から入れた依存を指すか。ワークスペースのパッケージ・パスの
