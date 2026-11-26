@@ -85,6 +85,7 @@ pub(super) fn module_imports<'s>(
 fn imports<'a, T: Copy>(
     root: Node<'_>,
     source: &'a [u8],
+    aliases_only: bool,
     mut resolve: impl FnMut(&str, &str) -> Option<T>,
 ) -> HashMap<Cow<'a, str>, Binding<T>> {
     let mut names = HashSet::new();
@@ -105,7 +106,7 @@ fn imports<'a, T: Copy>(
     }
     module_imports(root, source, |module, local, exported, type_only, named| {
         if let Some(imported) = exported
-            && local != imported
+            && (!aliases_only || local != imported)
             && named
             && let Some(target) = resolve(module, &imported)
         {
@@ -166,13 +167,14 @@ fn visible<'a>(
 pub(super) fn visit<'tree, T: Copy>(
     root: Node<'tree>,
     source: &[u8],
+    aliases_only: bool,
     resolve: impl FnMut(&str, &str) -> Option<T>,
     mut read: impl FnMut(Node<'tree>, T),
 ) {
     if root.has_error() {
         return;
     }
-    let bindings = imports(root, source, resolve);
+    let bindings = imports(root, source, aliases_only, resolve);
     visit_bindings(root, source, &bindings, |node, _, _, binding| {
         read(node, *binding)
     });

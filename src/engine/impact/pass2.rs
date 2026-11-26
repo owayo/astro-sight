@@ -13,6 +13,7 @@ use anyhow::Result;
 use lru::LruCache;
 
 use crate::engine::refs;
+use crate::language::LangId;
 
 use super::collector::{ImpactCollector, WorkerState};
 use super::ts_barrels::TsBarrelIndex;
@@ -411,7 +412,8 @@ pub(super) fn stream_caller_maps(
         .iter()
         .any(|c| !c.object_member_changes.is_empty());
     let index_writers = (objects && options.new_side == crate::models::impact::DiffNewSide::Index)
-        .then(|| TsBarrelIndex::for_index_writes(dir));
+        .then(|| TsBarrelIndex::for_index_objects(dir))
+        .transpose()?;
     let extra_writers = rust_diff_files
         .iter()
         .filter(|f| objects && f.new_path == "/dev/null")
@@ -424,7 +426,7 @@ pub(super) fn stream_caller_maps(
         );
     let Pass2Scan {
         ac,
-        files,
+        mut files,
         pool: rayon_pool,
         extra_writer_paths,
     } = prepare_scan(all_symbol_names, dir, options, extra_writers)?;
@@ -442,6 +444,21 @@ pub(super) fn stream_caller_maps(
         options.new_side,
         (rust_diff_input, rust_diff_files),
     );
+    if let Some(index) = &index_writers {
+        files.extend(
+            extra_writer_paths
+                .iter()
+                .filter(|p| !index.omits_index_path(p))
+                .map(|p| dir.join(p))
+                .filter(|p| {
+                    camino::Utf8Path::from_path(p).is_some_and(|p| {
+                        LangId::from_path(p).is_ok_and(super::import_facts::lang_is_ts_family)
+                    })
+                }),
+        );
+        files.sort_unstable();
+        files.dedup();
+    }
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
@@ -565,15 +582,31 @@ pub(super) fn stream_caller_maps(
                             ref_lang,
                             reexport_moves,
                             ts_barrels: &ts_barrels,
+                            object_modules: index_writers.as_ref().unwrap_or(&ts_barrels),
                         };
-                        if refs::visit_refs_and_defs_in_file_cb(
-                            all_symbol_names,
-                            &ac,
-                            utf8_path,
-                            &mut collector,
-                        )
-                        .is_ok()
-                        {
+                        let visited = if let Some(index) = index_writers.as_ref().filter(|_| {
+                            ref_lang.is_some_and(super::import_facts::lang_is_ts_family)
+                        }) {
+                            index.index_source(display_path_str).is_some_and(|source| {
+                                refs::visit_refs_and_defs_in_source_cb(
+                                    all_symbol_names,
+                                    &ac,
+                                    utf8_path,
+                                    &crate::engine::parser::SourceBuf::Vec(source),
+                                    &mut collector,
+                                )
+                                .is_ok()
+                            })
+                        } else {
+                            refs::visit_refs_and_defs_in_file_cb(
+                                all_symbol_names,
+                                &ac,
+                                utf8_path,
+                                &mut collector,
+                            )
+                            .is_ok()
+                        };
+                        if visited {
                             collector.finish_file();
                         } else {
                             // visit に失敗した場合でもバッファだけはクリアして再利用

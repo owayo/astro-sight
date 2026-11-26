@@ -441,7 +441,12 @@ where
     let mut unverified = UnverifiedObjectMembers::new();
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
         for (name, change) in &ctx.object_member_changes {
-            if change.queried_type || change.written {
+            if change.queried_type
+                || change.written
+                || change
+                    .unproved_read
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 unverified
                     .entry(ctx.new_path.clone())
                     .or_default()

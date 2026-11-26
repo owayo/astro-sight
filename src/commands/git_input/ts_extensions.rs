@@ -501,39 +501,47 @@ fn git_output(dir: &str, args: &[&str], max: usize) -> Option<Vec<u8>> {
     bytes.ok()
 }
 
-pub(crate) fn plain_index_module_paths(dir: &str) -> Option<HashSet<String>> {
+pub(crate) fn index_module_paths(dir: &str) -> Option<(HashSet<String>, bool)> {
     let prefix = git_output(dir, &["rev-parse", "--show-prefix"], 4096)?;
     let prefix = std::str::from_utf8(&prefix)
         .ok()?
         .trim_end_matches(['\r', '\n']);
-    if !plain_external_configs(dir, prefix, false).ok()? {
-        return None;
-    }
-    let paths = list_git_files(dir, None, prefix)?;
+    let (paths, plain) = list_tree_files(dir, None, prefix, 64 * 1024 * 1024)?;
     let reader = GitBlobBatch::index(dir);
-    for path in paths.iter().filter(|path| is_config(path)) {
-        if !plain_config(&read_source(dir, Some(&reader), path)?) {
-            return None;
-        }
-    }
-    Some(paths)
+    let resolves = plain
+        && plain_external_configs(dir, prefix, false).unwrap_or(false)
+        && paths.iter().filter(|path| is_config(path)).all(|path| {
+            read_source(dir, Some(&reader), path).is_some_and(|text| plain_config(&text))
+        });
+    Some((paths, resolves))
 }
 
 fn list_git_files(dir: &str, revision: Option<&str>, prefix: &str) -> Option<HashSet<String>> {
+    let (paths, plain) = list_tree_files(dir, revision, prefix, 4 * 1024 * 1024)?;
+    plain.then_some(paths)
+}
+
+fn list_tree_files(
+    dir: &str,
+    revision: Option<&str>,
+    prefix: &str,
+    bytes_limit: usize,
+) -> Option<(HashSet<String>, bool)> {
     let bytes = match revision {
         Some(revision) => git_output(
             dir,
             &["ls-tree", "-r", "-z", "--full-tree", revision],
-            4 * 1024 * 1024,
+            bytes_limit,
         )?,
         // --full-name は表示だけを変えるため、pathspec も root を指定する。
         None => git_output(
             dir,
             &["ls-files", "--stage", "--full-name", "-z", "--", ":/"],
-            4 * 1024 * 1024,
+            bytes_limit,
         )?,
     };
     let mut paths = HashSet::new();
+    let mut plain = true;
     for (ix, record) in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -541,13 +549,13 @@ fn list_git_files(dir: &str, revision: Option<&str>, prefix: &str) -> Option<Has
     {
         let (metadata, path) = std::str::from_utf8(record).ok()?.split_once('\t')?;
         let fields: Vec<_> = metadata.split(' ').collect();
-        if fields.len() != 3
-            || !matches!(fields[0], "100644" | "100755")
-            || (revision.is_none() && fields[2] != "0")
-            || path.contains(['\\', '\n', '\r'])
-            || ix == MAX_ENTRIES
-        {
+        if fields.len() != 3 {
             return None;
+        }
+        plain &= ix < MAX_ENTRIES && !path.contains(['\\', '\n', '\r']);
+        if !matches!(fields[0], "100644" | "100755") || (revision.is_none() && fields[2] != "0") {
+            plain = false;
+            continue;
         }
         let relative = if let Some(relative) = path.strip_prefix(prefix) {
             relative.to_owned()
@@ -574,7 +582,7 @@ fn list_git_files(dir: &str, revision: Option<&str>, prefix: &str) -> Option<Has
             return None;
         }
     }
-    Some(paths)
+    Some((paths, plain))
 }
 
 fn list_worktree(dir: &str) -> Option<HashSet<String>> {

@@ -1,6 +1,8 @@
 //! 静的オブジェクトの変更パスと、直接読む未変更メンバーの証明。
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 
 use tree_sitter::Node;
 
@@ -30,6 +32,8 @@ pub(super) struct ObjectMemberChange {
     pub(super) escaped: bool,
     pub(super) queried_type: bool,
     pub(super) written: bool,
+    pub(super) public_binding: bool,
+    pub(super) unproved_read: AtomicBool,
 }
 
 impl ObjectMemberChange {
@@ -228,7 +232,8 @@ fn object_declaration(
     source: &[u8],
     symbol: &Symbol,
     bindings: Option<&TemplateBindings<'_>>,
-) -> Option<(Vec<String>, StaticValue)> {
+    named_exports: &OnceCell<HashSet<String>>,
+) -> Option<(Vec<String>, StaticValue, bool)> {
     let declaration = super::descendant_for_range(root, &symbol.range)?;
     if declaration.kind() != "variable_declarator"
         || declaration.child_by_field_name("name")?.kind() != "identifier"
@@ -266,18 +271,29 @@ fn object_declaration(
         .parent()
         .filter(|parent| parent.kind() == "export_statement")
         .unwrap_or(lexical);
+    let at_module = header.parent() == Some(root);
+    let public = at_module
+        && (header != lexical
+            || named_exports
+                .get_or_init(|| {
+                    let mut names = HashSet::new();
+                    symbols::visit_js_ts_export_clause_specifiers(root, source, |s| {
+                        if s.statement.child_by_field_name("source").is_none()
+                            && s.local_name == s.exported_name
+                            && ![s.statement, s.specifier]
+                                .iter()
+                                .any(|n| n.children(&mut n.walk()).any(|c| c.kind() == "type"))
+                        {
+                            names.insert(s.local_name.to_owned());
+                        }
+                    });
+                    names
+                })
+                .contains(&symbol.name));
     Some((
         header_tokens(header, value.id(), source)?,
-        static_value(
-            value,
-            source,
-            0,
-            bindings.filter(|_| {
-                header
-                    .parent()
-                    .is_some_and(|parent| parent.id() == root.id())
-            }),
-        )?,
+        static_value(value, source, 0, bindings.filter(|_| at_module))?,
+        public,
     ))
 }
 
@@ -298,6 +314,7 @@ pub(super) fn collect_object_member_changes(
     let literal_ids = LiteralIds::default();
     let new_bindings = TemplateBindings::new(root, source, syms, &literal_ids);
     let typescript = matches!(lang, LangId::Typescript | LangId::Tsx);
+    let new_exports = OnceCell::new();
     let candidates: Vec<_> = affected
         .iter()
         .filter(|affected| affected.change_type == "modified")
@@ -307,9 +324,14 @@ pub(super) fn collect_object_member_changes(
             if matches.next().is_some() {
                 return None;
             }
-            let (header, value) =
-                object_declaration(root, source, symbol, typescript.then_some(&new_bindings))?;
-            Some((symbol, header, value))
+            let (header, value, public) = object_declaration(
+                root,
+                source,
+                symbol,
+                typescript.then_some(&new_bindings),
+                &new_exports,
+            )?;
+            Some((symbol, header, value, public))
         })
         .collect();
     if candidates.is_empty() {
@@ -337,7 +359,8 @@ pub(super) fn collect_object_member_changes(
         &old_symbols,
         &literal_ids,
     );
-    for (symbol, header, new) in candidates {
+    let old_exports = OnceCell::new();
+    for (symbol, header, new, public) in candidates {
         let mut matches = old_symbols.iter().filter(|old| old.name == symbol.name);
         let Some(old_symbol) = matches.next() else {
             continue;
@@ -348,11 +371,12 @@ pub(super) fn collect_object_member_changes(
         {
             continue;
         }
-        let Some((old_header, old)) = object_declaration(
+        let Some((old_header, old, old_public)) = object_declaration(
             old_tree.root_node(),
             &old_source.source,
             old_symbol,
             typescript.then_some(&old_bindings),
+            &old_exports,
         ) else {
             continue;
         };
@@ -394,6 +418,8 @@ pub(super) fn collect_object_member_changes(
                 escaped: false,
                 queried_type: false,
                 written: false,
+                public_binding: public && old_public,
+                unproved_read: AtomicBool::new(false),
             },
         );
     }

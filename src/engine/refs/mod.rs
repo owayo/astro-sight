@@ -1066,9 +1066,18 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     path: &camino::Utf8Path,
     visitor: &mut V,
 ) -> Result<()> {
-    let num = symbol_names.len();
     let source = parser::read_file(path)?;
+    visit_refs_and_defs_in_source_cb(symbol_names, ac, path, &source, visitor)
+}
 
+pub(crate) fn visit_refs_and_defs_in_source_cb<V: RefVisitor>(
+    symbol_names: &[String],
+    ac: &aho_corasick::AhoCorasick,
+    path: &camino::Utf8Path,
+    source: &parser::SourceBuf,
+    visitor: &mut V,
+) -> Result<()> {
+    let num = symbol_names.len();
     let mut present_indices = ac_present_indices(ac, source.as_bytes(), num);
     extend_rust_nfc_candidates(path, source.as_bytes(), symbol_names, &mut present_indices);
     let alias_scan =
@@ -1077,7 +1086,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
         return Ok(());
     }
 
-    let (tree, lang_id) = parser::parse_file(path, &source)?;
+    let (tree, lang_id) = parser::parse_file(path, source)?;
     let root = tree.root_node();
     if alias_scan {
         visitor.on_tree(root, source.as_bytes());
@@ -1094,14 +1103,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
         name_index: &name_index,
     };
     let mut sink = VisitorAdapter { visitor };
-    run_ref_walk(
-        root,
-        &source,
-        lang_id,
-        definition_kinds,
-        &matcher,
-        &mut sink,
-    );
+    run_ref_walk(root, source, lang_id, definition_kinds, &matcher, &mut sink);
     visitor.finish_tree(root, source.as_bytes(), lang_id);
     Ok(())
 }

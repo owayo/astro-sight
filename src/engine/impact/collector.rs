@@ -105,6 +105,7 @@ pub(super) struct RefEventMini {
     pub(super) fn_value_ref: bool,
     /// dot chain の直接読み出しパス。対象外は u32::MAX、文字列は既存 pool で共有する。
     pub(super) member_path_id: u32,
+    pub(super) member_owner: u32,
     pub(super) jsx_shape_id: u32,
     /// 別名のない named import/export 以外は、全体利用の範囲を証明しない。
     pub(super) unproven_module_ref: bool,
@@ -427,6 +428,7 @@ pub(super) struct ImpactCollector<'a> {
     /// 旧パス側に残る未変更参照を informational へ降格するために参照する。
     pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
     pub(super) ts_barrels: &'a super::ts_barrels::TsBarrelIndex,
+    pub(super) object_modules: &'a super::ts_barrels::TsBarrelIndex,
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
@@ -445,6 +447,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         super::ts_const_aliases::visit(
             root,
             source,
+            true,
             |module, imported| {
                 let (fc, name) = barrels.alias_owner(path, module, imported)?;
                 Some((fc, *names.get(name)? as u32))
@@ -488,6 +491,50 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
     fn finish_tree(&mut self, root: tree_sitter::Node<'_>, source: &[u8], lang: LangId) {
         if self.ref_events.is_empty() {
             return;
+        }
+        if self.ref_events.iter().any(|e| e.member_path_id != u32::MAX) {
+            let mut owners = HashMap::new();
+            super::ts_const_aliases::visit(
+                root,
+                source,
+                false,
+                |specifier, name| {
+                    let i = *self.changed_names.get(name)?;
+                    let contexts = &self.sym_to_fc[i];
+                    if !contexts.iter().any(|&fc| {
+                        self.file_contexts[fc as usize]
+                            .object_member_changes
+                            .contains_key(name)
+                    }) {
+                        return None;
+                    }
+                    let target = self
+                        .object_modules
+                        .object_read_source(self.path_str, specifier)?;
+                    contexts.iter().copied().find(|&fc| {
+                        let ctx = &self.file_contexts[fc as usize];
+                        ctx.object_member_changes
+                            .get(name)
+                            .is_some_and(|c| c.public_binding)
+                            && self
+                                .object_modules
+                                .exports_object(&target, name, &ctx.new_path)
+                    })
+                },
+                |node, owner| {
+                    owners.insert(node.start_position(), owner);
+                },
+            );
+            for event in self
+                .ref_events
+                .iter_mut()
+                .filter(|e| e.member_path_id != u32::MAX)
+            {
+                let point = tree_sitter::Point::new(event.line as usize, event.column as usize);
+                if let Some(&owner) = owners.get(&point) {
+                    event.member_owner = owner;
+                }
+            }
         }
         let callers = crate::engine::calls::EnclosingCallers::collect(root, source, lang);
         let mut ids = HashMap::new();
@@ -1172,6 +1219,7 @@ impl ImpactCollector<'_> {
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
+            member_owner: u32::MAX,
             jsx_shape_id,
             unproven_module_ref,
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
@@ -2001,14 +2049,16 @@ impl<'a> ImpactCollector<'a> {
         let all_symbol_names = self.all_symbol_names;
         let sym_key_canonical = &all_symbol_names[e.sym_ix as usize];
         // pool の lock 中には比較だけを行い、import 解析前に解放する。
-        let member_unchanged = (e.member_path_id != u32::MAX
-            && ctx
-                .object_member_changes
-                .get(sym_key_canonical)
-                .is_some_and(|change| {
+        let unchanged_object = ctx
+            .object_member_changes
+            .get(sym_key_canonical)
+            .filter(|change| {
+                e.member_path_id != u32::MAX && {
                     let pool = self.pool.lock().expect("string pool mutex poisoned");
                     change.read_is_unchanged(pool.get(e.member_path_id))
-                }))
+                }
+            });
+        let member_unchanged = (unchanged_object.is_some() && e.member_owner == fc_ix as u32)
             || self
                 .jsx_shapes
                 .get(e.jsx_shape_id as usize)
@@ -2023,7 +2073,7 @@ impl<'a> ImpactCollector<'a> {
             CallerRoute::Low
         } else {
             let bound_method = e.rust_private_call_target == fc_ix as u32;
-            let route = RouteDecisionContext {
+            let mut route = RouteDecisionContext {
                 filter_disabled,
                 js_signature_sites_trusted: self.new_side_is_worktree,
                 ref_lang: self.ref_lang,
@@ -2041,6 +2091,29 @@ impl<'a> ImpactCollector<'a> {
                 facts.base_route_low && !bound_method,
                 member_unchanged,
             );
+            if route == CallerRoute::Low
+                && e.member_path_id != u32::MAX
+                && ctx.object_member_changes.contains_key(sym_key_canonical)
+                && self.object_modules.may_import_object(
+                    self.path_str,
+                    sym_key_canonical,
+                    &ctx.new_path,
+                )
+            {
+                route = if member_unchanged {
+                    CallerRoute::Informational
+                } else {
+                    CallerRoute::Normal
+                };
+            }
+            if route == CallerRoute::Normal
+                && let Some(change) = unchanged_object
+                && e.member_owner != fc_ix as u32
+            {
+                change
+                    .unproved_read
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if route == CallerRoute::Normal
                 && !bound_method
                 && ctx
@@ -2142,6 +2215,7 @@ mod tests {
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
+            member_owner: u32::MAX,
             jsx_shape_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
