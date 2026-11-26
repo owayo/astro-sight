@@ -156,6 +156,10 @@ Parse errors, clues for `with` or `eval`, ambient declarations, and declaration 
 
 `context` and `impact` also route these proven sites in other files to `low_confidence_callers`. Both revisions must contain a unique direct function declaration, and the modified declaration itself must be a top-level function with a signature change. Mixed same-name affected methods or other declarations prevent this proof. Removed or added declarations, symbol-kind changes, and import sites do not qualify. Disabling the confidence filter disables this route. Direct `impact --staged` and review fallback without a staged snapshot remain conservative. When `review --staged` uses a complete index snapshot, only references inside that snapshot provide evidence.
 
+### Quoted property names in JavaScript and TypeScript
+
+A raw LF or CR inside a single- or double-quoted property name makes the module invalid. Reads of other properties can fail when the module is loaded, so review keeps the change blocking even if the edited property has no readers. A backslash followed by a line break is a valid line continuation. The two-character escape `\n` is also valid and adds a newline to the property name.
+
 ### TypeScript object members used in types
 
 When one property of an exported object literal changes, a direct read of an unchanged property can be informational. A type query can connect the two properties. For example, if `type Out = typeof SETTINGS.other` is the return type of a function that returns `SETTINGS.label`, changing `other` from a string to a number makes the return statement fail type checking. This also applies when `as const` makes the property's literal value part of its type. Since another file can import `Out`, `impact` and `review` keep reads of that object across files as possible impacts, even when an individual read still type-checks.

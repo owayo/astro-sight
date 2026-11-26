@@ -48,6 +48,120 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn invalid_quoted_object_keys_keep_the_object_and_unchanged_read_blocking() {
+    let cases = [
+        ("rawLf", "endpoint\n", "'ok'", false),
+        ("rawCr", "endpoint\r", "'new'", false),
+        ("rawCrlf", "endpoint\r\n", "`v`", false),
+        ("afterBackslash", "endpoint\\\\\n", "`v`", false),
+        ("afterQuestion", "endpoint\\?\n", "`v`", false),
+        ("invalidZero", r"endpoint\08", "`v`", false),
+        ("invalidCodepoint", r"endpoint\u{110000}", "`v`", false),
+        ("continued", "end\\\r\npoint", "`v`", true),
+        ("escapedNewline", r"end\npoint", "`v`", true),
+        ("unicodeSeparator", "end\u{2028}point", "`v`", true),
+    ];
+    for ext in ["js", "ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let declaration = |name: &str, key: &str, value: &str| {
+            format!("export const {name} = {{ key: 1, \"{key}\": {value} }};\n")
+        };
+        for (name, _, _, _) in cases {
+            repo.write(
+                format!("{name}.{ext}"),
+                declaration(name, "endpoint", "'ok'"),
+            );
+            repo.write(
+                format!("read_{name}.{ext}"),
+                format!("import {{ {name} }} from './{name}';\nexport const read = {name}.key;\n"),
+            );
+        }
+        repo.commit_all("initial");
+        for (name, key, value, _) in cases {
+            repo.write(format!("{name}.{ext}"), declaration(name, key, value));
+        }
+        for staged in [false, true] {
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"]);
+            if staged {
+                repo.stage_all();
+                for (name, _, _, _) in cases {
+                    repo.write(
+                        format!("{name}.{ext}"),
+                        declaration(name, "endpoint", "'ok'"),
+                    );
+                }
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{hook}");
+            for (name, _, _, valid) in cases {
+                let bucket = if valid { "mod_compat" } else { "mod" };
+                assert!(
+                    hook["api"][bucket]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item["n"] == name
+                            && (!valid || item["reason"] == "unused_object_members"))),
+                    "{ext} {name}: {hook}"
+                );
+                if !valid {
+                    let caller = format!("read_{name}.{ext}");
+                    assert!(
+                        hook["impacts"]
+                            .as_array()
+                            .is_some_and(|groups| groups.iter().any(|group| group["refs"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|r| r["p"] == caller && r["ln"] == 1))),
+                        "{ext} {name}: {hook}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unused_object_members_check_quoted_strings_inside_nested_values() {
+    let before = "export const recordLayout = { key: 1, endpoint: 'ok' };";
+    for (value, valid) in [
+        ("[{\"end\n\": 1}]", false),
+        ("() => ({[\"end\r\"]: 1})", false),
+        ("<span title={\"end\n\"} />", false),
+        ("<span title=\"end\npoint\" />", true),
+        ("`end\npoint`", true),
+    ] {
+        let repo = object_repo(
+            "tsx",
+            before,
+            &format!("export const recordLayout = {{ key: 1, deep: {value} }};"),
+            "export const read = recordLayout.key;",
+        );
+        let output = cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"])
+            .output()
+            .unwrap();
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.success(), valid, "{value:?}: {hook}");
+        if valid {
+            assert_eq!(
+                hook["api"]["mod_compat"][0]["reason"], "unused_object_members",
+                "{hook}"
+            );
+        } else {
+            assert_eq!(hook["api"]["mod"][0]["n"], "recordLayout", "{hook}");
+        }
+    }
+}
+
+#[test]
 fn impact_object_members_keep_reads_checked_against_type_queries_blocking() {
     let mut failures = Vec::new();
     for (query, old_value, new_value, suffix, blocking) in [

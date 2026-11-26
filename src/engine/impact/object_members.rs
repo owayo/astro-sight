@@ -93,7 +93,7 @@ fn static_key(node: Node<'_>, source: &[u8]) -> Option<String> {
     let text = node.utf8_text(source).ok()?;
     let key = match node.kind() {
         "property_identifier" => text,
-        "string" if text.starts_with(['\'', '"']) && text.len() >= 2 => &text[1..text.len() - 1],
+        "string" => crate::engine::js_string::quoted_contents(text)?,
         _ => return None,
     };
     if key.is_empty() || key.contains(['.', '\\']) || key == "__proto__" {
