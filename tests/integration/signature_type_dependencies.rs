@@ -77,6 +77,27 @@ fn public_signature_type_dependencies_report_changed_contracts() {
             false,
         ),
         (
+            "type Key = `data-${string}`;\nclass Bag { [read: Key]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "type Key = `attr-${string}`;\nclass Bag { [read: Key]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "format()['data-x']",
+            true,
+            false,
+        ),
+        (
+            "type E = { keep: `data-${string}`; other: number };\nclass Bag { [read: E['keep']]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "type E = { keep: `attr-${string}`; other: number };\nclass Bag { [read: E['keep']]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "format()['data-x']",
+            true,
+            false,
+        ),
+        (
+            "type E = { keep: `data-${string}`; other: number };\nclass Bag { [read: E['keep']]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "type E = { keep: `data-${string}`; other: string };\nclass Bag { [read: E['keep']]: number }\nexport function format(): Bag { return new Bag(); }\n",
+            "format()['data-x']",
+            false,
+            false,
+        ),
+        (
             "interface Options { size: string; }\nexport function format(options: Options): string { return String(options.size); }\n",
             "interface Options { size: number; }\nexport function format(options: Options): string { return String(options.size); }\n",
             "format({ size: 'open' })",

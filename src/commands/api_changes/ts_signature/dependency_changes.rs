@@ -1,13 +1,15 @@
 //! 同じファイルの型宣言の変更を、公開ヘッダの依存先へ伝える。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::models::change_evidence::{ChangeEvidence, ChangedPart};
 use tree_sitter::Node;
 
 use super::super::signature_tokens::{SigTokens, signature_tokens_in_range};
 use super::type_dependencies::{
-    DependencyEnvironment, Reference, collect_references_in_scope, references_unchanged,
+    DependencyEnvironment, Member, Reference, collect_references_in_scope, local_type_values,
+    references_unchanged,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,9 +77,23 @@ struct LocalType {
     references: References,
 }
 
+impl Reference {
+    fn whole(name: String) -> Self {
+        Self { name, member: None }
+    }
+
+    fn graph_key(&self) -> Cow<'_, Self> {
+        if matches!(self.member, Some(Member::Qualified(_))) {
+            Cow::Owned(Self::whole(self.name.clone()))
+        } else {
+            Cow::Borrowed(self)
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DependencySnapshot {
-    types: BTreeMap<String, Option<LocalType>>,
+    types: BTreeMap<Reference, Option<LocalType>>,
     declarations: BTreeMap<String, References>,
     exported: BTreeSet<String>,
     unknown: bool,
@@ -110,7 +126,13 @@ fn type_tokens(node: Node<'_>, source: &[u8], end: usize) -> Option<SigTokens> {
 fn header_references(node: Node<'_>, source: &[u8], outer: &[String]) -> References {
     let names = bindings(node, source, outer);
     let mut references = References::default();
-    for field in ["type_parameters", "parameters", "return_type", "type"] {
+    for field in [
+        "type_parameters",
+        "parameters",
+        "return_type",
+        "type",
+        "index_type",
+    ] {
         if let Some(root) = node.child_by_field_name(field) {
             let mut section = References::default();
             section.add(root, source, &names);
@@ -132,6 +154,27 @@ fn header_references(node: Node<'_>, source: &[u8], outer: &[String]) -> Referen
         }
     }
     references
+}
+
+fn indexed_properties<'tree>(
+    body: Node<'tree>,
+    source: &[u8],
+) -> Option<HashMap<String, Node<'tree>>> {
+    if !matches!(body.kind(), "object_type" | "interface_body") {
+        return None;
+    }
+    let mut properties = HashMap::new();
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor).filter(|n| !n.is_extra()) {
+        if member.kind() != "property_signature" {
+            return None;
+        }
+        let name = super::object_key_text(member.child_by_field_name("name")?, source)?;
+        if name.contains('\\') || properties.insert(name, member).is_some() {
+            return None;
+        }
+    }
+    Some(properties)
 }
 
 impl DependencySnapshot {
@@ -218,7 +261,7 @@ impl DependencySnapshot {
                                 references,
                             }
                         });
-                    match snapshot.types.entry(name) {
+                    match snapshot.types.entry(Reference::whole(name)) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(fact);
                         }
@@ -300,6 +343,7 @@ impl DependencySnapshot {
                 _ => {}
             }
         }
+        snapshot.collect_indexed_members(root, source);
         snapshot
     }
 
@@ -312,6 +356,69 @@ impl DependencySnapshot {
                 entry.get_mut().unknown = true;
                 entry.get_mut().extend(references);
             }
+        }
+    }
+
+    /// 同じファイルの単純な `T['key']` は、選んだプロパティの宣言とその依存だけをたどる。
+    fn collect_indexed_members(&mut self, root: Node<'_>, source: &[u8]) {
+        let indexed = |r: &&Reference| matches!(r.member, Some(Member::Indexed(_)));
+        let mut pending: BTreeSet<_> = self
+            .declarations
+            .values()
+            .flat_map(|refs| refs.names.iter().filter(indexed).cloned())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let locals = local_type_values(root, source, true).unwrap_or_default();
+        let mut owners = HashMap::new();
+        while let Some(reference) = pending.pop_first() {
+            if self.types.contains_key(&reference) {
+                continue;
+            }
+            let Some(Member::Indexed(key)) = &reference.member else {
+                continue;
+            };
+            let properties = owners
+                .entry(reference.name.clone())
+                .or_insert_with(|| indexed_properties(*locals.get(&reference.name)?, source));
+            let selected = properties
+                .as_ref()
+                .and_then(|properties| properties.get(key));
+            let mut references = References::default();
+            let mut tokens = Vec::new();
+            if let Some(&member) = selected {
+                references.add(member, source, &[]);
+                if let Some(header) = type_tokens(member, source, member.end_byte()) {
+                    tokens.push(header);
+                } else {
+                    references.unknown = true;
+                }
+            }
+            // this 型は選択元の他のメンバーも見る。解けない添字も元の型全体に依存させる。
+            if selected.is_none()
+                || references.unknown
+                || selected.is_some_and(|member| {
+                    crate::engine::tree_walk::any_node(
+                        *member,
+                        crate::engine::tree_walk::Children::Named,
+                        |node| node.kind() == "this_type",
+                    )
+                })
+            {
+                references
+                    .names
+                    .insert(Reference::whole(reference.name.clone()));
+            }
+            pending.extend(references.names.iter().filter(indexed).cloned());
+            self.types.insert(
+                reference,
+                Some(LocalType {
+                    kind: "lookup_type".to_owned(),
+                    tokens,
+                    references,
+                }),
+            );
         }
     }
 
@@ -336,10 +443,7 @@ impl DependencySnapshot {
                         .filter(|base| base.kind() == "identifier")
                         .and_then(|base| plain(base, source))
                     {
-                        references.names.insert(Reference {
-                            name: base,
-                            member: None,
-                        });
+                        references.names.insert(Reference::whole(base));
                     } else {
                         references.unknown = true;
                     }
@@ -390,11 +494,12 @@ impl DependencySnapshot {
                 {
                     references.unknown = true;
                 }
-                if let Some(member_name) = member
-                    .child_by_field_name("name")
-                    .and_then(|n| plain(n, source))
+                if member.kind() != "index_signature"
+                    && let Some(member_name) = member
+                        .child_by_field_name("name")
+                        .and_then(|n| plain(n, source))
                 {
-                    let mut independent = header_references(member, source, &names);
+                    let mut independent = member_refs.clone();
                     independent.unknown |= !matches!(
                         member.kind(),
                         "method_definition"
@@ -411,7 +516,7 @@ impl DependencySnapshot {
             tokens,
             references: references.clone(),
         });
-        match self.types.entry(name.to_owned()) {
+        match self.types.entry(Reference::whole(name.to_owned())) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(fact);
             }
@@ -425,13 +530,14 @@ impl DependencySnapshot {
     pub(crate) fn compare(self, new: Self) -> DependencyChanges {
         let mut changed = BTreeSet::new();
         let mut unknown = BTreeSet::new();
-        let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut reverse: BTreeMap<Reference, BTreeSet<Reference>> = BTreeMap::new();
         let keys: BTreeSet<_> = self.types.keys().chain(new.types.keys()).cloned().collect();
         for name in &keys {
             match (self.types.get(name), new.types.get(name)) {
                 (Some(Some(old)), Some(Some(next))) => {
                     if (old.kind != next.kind || old.tokens != next.tokens)
-                        && !(self.exported.contains(name) && new.exported.contains(name))
+                        && !(self.exported.contains(&name.name)
+                            && new.exported.contains(&name.name))
                     {
                         changed.insert(name.clone());
                     }
@@ -440,18 +546,22 @@ impl DependencySnapshot {
                             unknown.insert(name.clone());
                         }
                         for reference in &references.names {
-                            reverse
-                                .entry(reference.name.clone())
-                                .or_default()
-                                .insert(name.clone());
-                            if reference.member.is_some() || !keys.contains(&reference.name) {
+                            let key = reference.graph_key();
+                            if matches!(reference.member, Some(Member::Qualified(_)))
+                                || !keys.contains(key.as_ref())
+                            {
                                 unknown.insert(name.clone());
                             }
+                            reverse
+                                .entry(key.into_owned())
+                                .or_default()
+                                .insert(name.clone());
                         }
                     }
                 }
                 (Some(Some(_)), None) | (None, Some(Some(_)))
-                    if !(self.exported.contains(name) && new.exported.contains(name)) =>
+                    if !(self.exported.contains(&name.name)
+                        && new.exported.contains(&name.name)) =>
                 {
                     changed.insert(name.clone());
                 }
@@ -489,7 +599,8 @@ impl DependencySnapshot {
                     DependencyStatus::Unchanged
                 };
                 for reference in refs {
-                    if changed.contains(&reference.name) {
+                    let key = reference.graph_key();
+                    if changed.contains(key.as_ref()) {
                         status = DependencyStatus::Changed;
                         let mut parts = BTreeSet::from([ChangedPart::ReferencedType]);
                         if let Some(previous) = previous {
@@ -497,16 +608,18 @@ impl DependencySnapshot {
                                 previous
                                     .positions
                                     .intersection(&references.positions)
-                                    .filter(|(_, reference)| changed.contains(&reference.name))
+                                    .filter(|(_, reference)| {
+                                        changed.contains(reference.graph_key().as_ref())
+                                    })
                                     .map(|(part, _)| *part),
                             );
                         }
                         positions.insert(name.clone(), parts);
                         break;
                     }
-                    if reference.member.is_some()
-                        || unknown.contains(&reference.name)
-                        || !keys.contains(&reference.name)
+                    if matches!(reference.member, Some(Member::Qualified(_)))
+                        || unknown.contains(key.as_ref())
+                        || !keys.contains(key.as_ref())
                     {
                         status = DependencyStatus::Unknown;
                     }
@@ -751,6 +864,63 @@ mod tests {
     }
 
     #[test]
+    fn class_index_signature_bindings_do_not_name_class_members() {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            for (result, expected) in [
+                ("string", DependencyStatus::Unchanged),
+                ("Value", DependencyStatus::Changed),
+            ] {
+                let before = format!(
+                    "type Value = string; export class Bag {{ [read: string]: Value | (() => {result}); read(): {result} {{ return '' as any; }} }}"
+                );
+                let after = before.replace("Value = string", "Value = number");
+                let snapshot = |source: &str| {
+                    let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                    assert!(!tree.root_node().has_error());
+                    DependencySnapshot::collect(tree.root_node(), source.as_bytes())
+                };
+                let changes = snapshot(&before).compare(snapshot(&after));
+                assert_eq!(changes.get("Bag"), Some(&DependencyStatus::Changed));
+                assert_eq!(
+                    changes.get("Bag.read"),
+                    Some(&expected),
+                    "{lang:?}: {after}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn class_index_signature_selected_members_follow_their_own_dependencies() {
+        let source = concat!(
+            "type Key = `data-${string}`; type Other = number; ",
+            "interface Names { keep: Key; unused: Other } ",
+            "type Selected = Names['keep']; class Bag { [read: Selected | symbol]: number } ",
+            "export function pick(): Bag { return new Bag(); }"
+        );
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            let snapshot = |source: &str| {
+                let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                assert!(!tree.root_node().has_error());
+                DependencySnapshot::collect(tree.root_node(), source.as_bytes())
+            };
+            for (after, expected) in [
+                (source.replace("data-", "attr-"), DependencyStatus::Changed),
+                (
+                    source.replace("Other = number", "Other = string"),
+                    DependencyStatus::Unchanged,
+                ),
+            ] {
+                assert_eq!(
+                    snapshot(source).compare(snapshot(&after)).get("pick"),
+                    Some(&expected),
+                    "{lang:?}: {after}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn signature_dependency_node_contracts_exist() {
         for lang in [LangId::Typescript, LangId::Tsx] {
             for query in [
@@ -767,6 +937,7 @@ mod tests {
                 "(method_definition return_type: (type_annotation))",
                 "(abstract_method_signature)",
                 "(public_field_definition type: (type_annotation))",
+                "(index_signature name: (identifier) index_type: (lookup_type (type_identifier) (literal_type (string))) type: (type_annotation))",
                 "(lexical_declaration (variable_declarator name: (identifier)))",
                 "(variable_declaration)",
                 "(arrow_function)",

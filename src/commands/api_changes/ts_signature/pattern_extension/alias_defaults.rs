@@ -48,8 +48,8 @@ pub(super) fn indexed(
     {
         return None;
     }
-    let (inner, key) = lookup(ty)?;
-    let (group, index) = lookup(inner)?;
+    let (inner, key) = type_dependencies::lookup_type_parts(ty)?;
+    let (group, index) = type_dependencies::lookup_type_parts(inner)?;
     if group.kind() != "parenthesized_type"
         || index.kind() != "predefined_type"
         || index.utf8_text(source).ok()? != "number"
@@ -83,18 +83,6 @@ pub(super) fn indexed(
         });
     })?;
     matches
-}
-
-fn lookup(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    if node.kind() != "lookup_type" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let mut children = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra());
-    let pair = (children.next()?, children.next()?);
-    children.next().is_none().then_some(pair)
 }
 
 fn projected_literal<'tree>(object: Node<'tree>, key: &str, source: &[u8]) -> Option<Node<'tree>> {
