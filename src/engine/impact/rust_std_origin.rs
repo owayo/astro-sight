@@ -40,6 +40,13 @@ impl Scope {
     }
 }
 
+pub(super) fn builtin_derive(name: &str) -> bool {
+    matches!(
+        name,
+        "Clone" | "Copy" | "Debug" | "Default" | "Eq" | "PartialEq" | "Ord" | "PartialOrd" | "Hash"
+    )
+}
+
 /// Only compiler-defined attributes with no ability to introduce a sibling name
 /// can leave the module scope open. Unknown proc macros remain a barrier.
 pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
@@ -82,19 +89,7 @@ pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String
                 return None;
             }
             let name = derive.utf8_text(source).ok()?;
-            matches!(
-                name,
-                "Clone"
-                    | "Copy"
-                    | "Debug"
-                    | "Default"
-                    | "Eq"
-                    | "PartialEq"
-                    | "Ord"
-                    | "PartialOrd"
-                    | "Hash"
-            )
-            .then(|| name.to_owned())
+            builtin_derive(name).then(|| name.to_owned())
         })
         .collect();
     derives

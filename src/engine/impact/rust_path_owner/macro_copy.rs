@@ -586,6 +586,9 @@ fn uncertain_scopes(root: Node<'_>, text: &[u8], base: &Rc<Environment>) -> Hash
             || (node.kind() == "declaration_list" && parent_kind == "mod_item");
         let environment = if scope {
             let combined = outer.and_then(|outer| {
+                if node.kind() == "source_file" {
+                    return Some(outer);
+                }
                 let (inner, _) = environment_with_glob(node, text, None, true)?;
                 let mut combined = (*outer).clone();
                 combined.merge(inner);

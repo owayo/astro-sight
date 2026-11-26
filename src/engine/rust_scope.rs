@@ -36,6 +36,7 @@ const OPAQUE_SCOPES: &[&str] = &[
 struct BlockFacts {
     /// 宣言順の開始位置。参照ごとに前方の文を走査しない。
     lets: HashMap<String, Vec<LetBinding>>,
+    functions: HashSet<String>,
     barrier: bool,
     non_expression_macro_barrier: bool,
     // 呼び出し位置で新しい let を生成し得る文。既に終わった文は後の let を隠さない。
@@ -227,6 +228,14 @@ impl RustScopeIndex {
             } else {
                 None
             };
+            if !attributed
+                && statement.kind() == "function_item"
+                && let Some(name) = statement
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+            {
+                facts.functions.insert(binding_name(name).to_owned());
+            }
             if attributed || invocation.is_some() {
                 facts.dynamic_statements.push(statement.start_byte());
             }
@@ -426,6 +435,18 @@ impl RustScopeIndex {
                             bindings.partition_point(|binding| binding.start <= node.start_byte());
                         end.checked_sub(1).map(|i| &bindings[i])
                     });
+                    if scoped
+                        && !proven
+                        && !requires_macro_validation
+                        && latest.is_none()
+                        && facts.functions.contains(name)
+                        && facts
+                            .dynamic_statements
+                            .first()
+                            .is_none_or(|&pos| pos >= node.start_byte())
+                    {
+                        return LexicalBinding::RustValueBinding;
+                    }
                     // 束縛と利用の間の文マクロ・属性は、隠れた再束縛を生成できる。
                     let after_binding = latest.is_some_and(|binding| {
                         let end = facts

@@ -25,6 +25,7 @@ use crate::models::impact::DiffFile;
 mod enum_owner;
 mod format_owner;
 mod macro_copy;
+mod registry_macros;
 mod workspace_members;
 
 pub(super) use macro_copy::MacroCopy;
@@ -108,6 +109,12 @@ impl FileEvidence {
     }
 }
 
+#[derive(Clone)]
+pub(super) enum QualifiedCallOwner {
+    Type,
+    Function(PathBuf),
+}
+
 pub(super) struct RustPathOwnerIndex {
     current: Option<Arc<FileEvidence>>,
     root_associated_paths: HashSet<usize>,
@@ -118,6 +125,9 @@ pub(super) struct RustPathOwnerIndex {
     registry_qualifiers: RefCell<HashMap<String, bool>>,
     source_hash: blake3::Hash,
     direct_imports: HashMap<String, Vec<String>>,
+    qualified_call_owners: RefCell<HashMap<Vec<String>, Option<QualifiedCallOwner>>>,
+    field_types: std::cell::OnceCell<HashSet<String>>,
+    json_calls: RefCell<HashMap<usize, bool>>,
     local_type_names: HashSet<String>,
     local_value_names: HashSet<String>,
     closed_local_rule: OnceLock<Option<usize>>,
@@ -180,6 +190,14 @@ pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
     /// staged のときも、Cargo の外部設定は元の checkout の祖先にある。
     pub(super) layout_checkout: PathBuf,
+    pub(super) staged_binding_diff: Option<Box<str>>,
+    callable_cargo_known: bool,
+    registry_macros: Mutex<HashMap<String, bool>>,
+    lockfile_unchanged: bool,
+    callable_layout_stable: OnceLock<bool>,
+    macros_may_export_tokens: OnceLock<bool>,
+    macro_glob_names: Mutex<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>,
+    ordinary_files: Mutex<HashMap<RustModuleKey, Option<PathBuf>>>,
     staged_bindings: OnceLock<Option<Box<(crate::commands::git_snapshot::IndexSnapshot, Self)>>>,
     layout_cargo_settings: OnceLock<bool>,
     pub(super) canonical_root: Option<PathBuf>,
@@ -223,7 +241,7 @@ pub(super) struct RustPathOwnerProjectProof {
     pub(super) reexport_stable_chains: Mutex<HashMap<RustModuleKey, bool>>,
     files: Mutex<HashMap<PathBuf, Option<Arc<FileEvidence>>>>,
     pub(super) reexport_files:
-        Mutex<HashMap<PathBuf, Option<Arc<super::rust_reexport_owner::ModuleBindings>>>>,
+        Mutex<HashMap<PathBuf, Option<Arc<super::rust_reexport_owner::BindingVersions>>>>,
     leaf_sources: Mutex<HashMap<String, bool>>,
     visibility_modules: Mutex<HashMap<PathBuf, Option<VisibilityModule>>>,
     pub(super) cargo_configs: super::rust_cargo_config::CargoConfigProof,
@@ -259,6 +277,20 @@ impl RustPathOwnerProjectProof {
         Self {
             root: root.to_owned(),
             layout_checkout: root.to_owned(),
+            staged_binding_diff: None,
+            callable_cargo_known: reexport_cargo_enabled,
+            registry_macros: Mutex::default(),
+            lockfile_unchanged: !diff_files.iter().any(|file| {
+                [&file.old_path, &file.new_path].iter().any(|p| {
+                    Path::new(p)
+                        .file_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Cargo.lock"))
+                })
+            }),
+            callable_layout_stable: OnceLock::new(),
+            macros_may_export_tokens: OnceLock::new(),
+            macro_glob_names: Mutex::default(),
+            ordinary_files: Mutex::default(),
             staged_bindings: OnceLock::new(),
             layout_cargo_settings: OnceLock::new(),
             canonical_root: root.canonicalize().ok(),
@@ -461,6 +493,78 @@ impl RustPathOwnerProjectProof {
             .expect("relocation cache poisoned")
             .insert(file.to_owned(), result);
         result
+    }
+
+    fn callable_layout_stable(&self) -> bool {
+        self.callable_cargo_known
+            && *self.callable_layout_stable.get_or_init(|| {
+                self.reexport_old_sources.iter().all(|(path, old)| {
+                    if path == Path::new("/dev/null") {
+                        return true;
+                    }
+                    let Some(old) = old else {
+                        return false;
+                    };
+                    let Ok(tree) = parser::parse_source(old, LangId::Rust) else {
+                        return false;
+                    };
+                    !tree.root_node().has_error()
+                        && !crate::engine::rust_dynamic_source::tree_includes_external_source(
+                            tree.root_node(),
+                            old,
+                        )
+                        && !crate::engine::rust_dynamic_source::any_rust_text_include(
+                            tree.root_node(),
+                            old,
+                            |_| true,
+                        )
+                })
+            })
+    }
+
+    pub(super) fn declared_module_file(&self, src: &Path, module: &[String]) -> Option<PathBuf> {
+        let key = (src.to_owned(), module.to_vec());
+        if let Some(cached) = self
+            .ordinary_files
+            .lock()
+            .expect("module cache poisoned")
+            .get(&key)
+        {
+            return cached.clone();
+        }
+        let path = enum_owner::ordinary_module_file(&self.root, src, module);
+        self.ordinary_files
+            .lock()
+            .expect("module cache poisoned")
+            .insert(key, path.clone());
+        path
+    }
+
+    pub(super) fn macro_tokens_stay_in_module(&self) -> bool {
+        self.static_layout(true).is_some() && self.macros_may_export_tokens.get() == Some(&false)
+    }
+
+    pub(super) fn outside_parent(&self, file: &Path, reader: &Path) -> bool {
+        let Some(module) = self.ordinary_private_module(file) else {
+            return false;
+        };
+        let Some((_, parent)) = module.path.split_last() else {
+            return false;
+        };
+        let Some(package) = module.src.parent() else {
+            return false;
+        };
+        let directory = module.src.join(parent.iter().collect::<PathBuf>());
+        self.callable_layout_stable()
+            && self
+                .declared_module_file(&module.src, &module.path)
+                .as_deref()
+                == Some(file)
+            && reader.starts_with(package)
+            && !reader.starts_with(&directory)
+            && reader != directory.with_extension("rs")
+            && self.unrelocated(file)
+            && self.unrelocated(reader)
     }
 
     /// 差分の Rust ソース (変更元と、[`Self::owner_source`] が許した本体だけの変更) のどれも、
@@ -1534,7 +1638,14 @@ impl RustPathOwnerProjectProof {
                     self.root.to_str()?,
                 )?;
                 let root = Path::new(snapshot.dir().ok()?);
-                let mut project = Self::new(root, false, false, false, &[], "");
+                let input = self.staged_binding_diff.as_deref().unwrap_or("");
+                let files = crate::engine::diff::parse_unified_diff(input);
+                let mut project = Self::new(root, false, false, false, &files, input);
+                project.callable_cargo_known = super::rust_cargo_inputs_unchanged(
+                    &crate::engine::diff::scan_blocks(input),
+                    &files,
+                    true,
+                );
                 project.layout_checkout.clone_from(&self.layout_checkout);
                 project.cargo_configs =
                     super::rust_cargo_config::CargoConfigProof::capture(&self.layout_checkout);
@@ -2178,6 +2289,9 @@ impl RustPathOwnerIndex {
             registry_qualifiers: RefCell::new(HashMap::new()),
             source_hash: blake3::hash(source),
             direct_imports,
+            qualified_call_owners: RefCell::new(HashMap::new()),
+            field_types: std::cell::OnceCell::new(),
+            json_calls: RefCell::default(),
             local_type_names,
             local_value_names,
             closed_local_rule: OnceLock::new(),
@@ -2227,6 +2341,91 @@ impl RustPathOwnerIndex {
             return evidence.types.contains(name).then_some(owner);
         }
         current.types.contains(name).then(|| ref_file.to_owned())
+    }
+
+    fn field_types(&self, mut node: Node<'_>, source: &[u8]) -> &HashSet<String> {
+        self.field_types.get_or_init(|| {
+            while let Some(parent) = node.parent() {
+                node = parent;
+            }
+            let mut cursor = node.walk();
+            // 型パラメータのない無条件の構造体のフィールドで、型として使う単独名。
+            // 同じモジュールのこの名前は、モジュールへの別名にはなれない。
+            let mut field_types = HashSet::new();
+            for item in node.named_children(&mut cursor).filter(|item| {
+                item.kind() == "struct_item"
+                    && item.child_by_field_name("type_parameters").is_none()
+                    && !has_attribute_prefix(*item)
+            }) {
+                let Some(fields) = item.child_by_field_name("body") else {
+                    continue;
+                };
+                for field in fields.named_children(&mut fields.walk()) {
+                    if has_attribute_prefix(field) {
+                        continue;
+                    }
+                    let mut pending: Vec<_> =
+                        field.child_by_field_name("type").into_iter().collect();
+                    while let Some(ty) = pending.pop() {
+                        match ty.kind() {
+                            "type_identifier" => {
+                                if let Ok(name) = ty.utf8_text(source) {
+                                    field_types.insert(name.to_owned());
+                                }
+                            }
+                            "generic_type" => {
+                                if let Some(args) = ty.child_by_field_name("type_arguments") {
+                                    pending.extend(args.named_children(&mut args.walk()));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            field_types
+        })
+    }
+
+    pub(super) fn qualified_call_owner(
+        &self,
+        node: Node<'_>,
+        source: &[u8],
+        file: &Path,
+        project: &RustPathOwnerProjectProof,
+    ) -> Option<QualifiedCallOwner> {
+        let parent = node.parent()?;
+        if parent.kind() != "scoped_identifier"
+            || parent.child_by_field_name("name") != Some(node)
+            || has_uncertain_ancestor(node)
+        {
+            return None;
+        }
+        let path = path_segments(parent, source)?;
+        let first = path.first()?.as_str();
+        if first == "Self" {
+            return Some(QualifiedCallOwner::Type);
+        }
+        if !matches!(first, "crate" | "self" | "super")
+            && !self.root_associated_paths.contains(&parent.id())
+        {
+            return None;
+        }
+        if path.len() == 2 && self.field_types(node, source).contains(first) {
+            return Some(QualifiedCallOwner::Type);
+        }
+        if let Some(owner) = self.qualified_call_owners.borrow().get(&path) {
+            return owner.clone();
+        }
+        let owner = project
+            .callable_layout_stable()
+            .then(|| super::rust_reexport_owner::declared_call_owner(project, file, &path))
+            .flatten()
+            .filter(|_| project.unrelocated(file));
+        self.qualified_call_owners
+            .borrow_mut()
+            .insert(path, owner.clone());
+        owner
     }
 
     pub(super) fn free_function_owner(
@@ -5468,6 +5667,7 @@ mod tests {
                 true,
             ),
             ("pub fn bridge() { calls(); }\nfn calls() {}\n", false),
+            (r#"fn bridge() { println!("mod calls;"); }"#, false),
         ] {
             std::fs::write(root.path().join("shared/bridge.rs"), bridge).unwrap();
             let project = RustPathOwnerProjectProof::new(root.path(), false, false, false, &[], "");

@@ -86,6 +86,7 @@ pub(super) fn static_layout(
     // 走査で読み切れない入力 (先頭行の `#! [..]` の内側の属性・root の外を指す path の依存)。
     // `macro_rules!` の定義と同じく、配置は決めても、字句を組み立てる経路が無いとは言わない。
     let mut open = false;
+    let mut external_macros = false;
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(&directory).ok()? {
             let entry = entry.ok()?;
@@ -119,6 +120,7 @@ pub(super) fn static_layout(
                 // 木の中の proc-macro のクレートは、どのマクロの呼び出し・derive・属性からも
                 // (`#[path]` で読んだファイルの外の普通のモジュールでも) `mod calls;`・`include!(..)`・
                 // `#[path]` を返し得る (作るマクロの名前も取り込む先も分からない) ので、配置を決めない。
+                external_macros |= !super::dependency_tables(&manifest)?.is_empty();
                 if manifest_is_proc_macro(&manifest) {
                     return None;
                 }
@@ -500,6 +502,9 @@ pub(super) fn static_layout(
             }
         }
     }
+    project
+        .macros_may_export_tokens
+        .get_or_init(|| generates_macros || open || external_macros);
     let macros = !macro_definitions.is_empty() || generates_macros || open;
     Some((relocated, included, macros))
 }
@@ -1170,8 +1175,13 @@ fn may_declare_child_modules(target: &Path, module_macros: &HashSet<String>) -> 
                     || (node.kind() == "macro_invocation"
                         && last_macro_identifier(node, &source)
                             .is_none_or(|name| module_macros.contains(name)))
-                    || (node.kind() == "token_tree"
-                        && node.utf8_text(&source).is_ok_and(mentions_mod))
+                    || (token_list(node) && {
+                        let mut cursor = node.walk();
+                        node.children(&mut cursor).any(|token| {
+                            word_token(token, &source) == Some("mod")
+                                || hidden_words(token, &source).contains(&"mod")
+                        })
+                    })
                     // 引数の中の `children!()` は、外側のマクロ (`pass! { children!(); }`) が字句の
                     // まま展開して呼び出す。
                     || (token_list(node) && token_tree_names_any(node, &source, module_macros))
@@ -1407,7 +1417,16 @@ fn ordinary_file(dir: &Path, path: &Path) -> Option<bool> {
     }
 }
 
-fn ordinary_module_file(dir: &Path, src: &Path, modules: &[String]) -> Option<PathBuf> {
+pub(super) fn ordinary_module_file(dir: &Path, src: &Path, modules: &[String]) -> Option<PathBuf> {
+    module_file(dir, src, modules, false)
+}
+
+fn module_file(
+    dir: &Path,
+    src: &Path,
+    modules: &[String],
+    test_attribute: bool,
+) -> Option<PathBuf> {
     let mut found = None;
     for root in [src.join("lib.rs"), src.join("main.rs")] {
         if !ordinary_file(dir, &root)? {
@@ -1441,7 +1460,13 @@ fn ordinary_module_file(dir: &Path, src: &Path, modules: &[String]) -> Option<Pa
             let [declaration] = declarations.as_slice() else {
                 return None;
             };
-            if has_attribute_prefix(*declaration)
+            let enabled_test = test_attribute
+                && declaration.prev_named_sibling().is_some_and(|attr| {
+                    attr.kind() == "attribute_item"
+                        && attr.utf8_text(&source).ok() == Some("#[cfg(test)]")
+                        && !has_attribute_prefix(attr)
+                });
+            if (has_attribute_prefix(*declaration) && !enabled_test)
                 || declaration.child_by_field_name("body").is_some()
             {
                 return None;
@@ -1622,12 +1647,12 @@ impl RustPathOwnerIndex {
 /// crate root のときは `modules` は参照ファイルだけで、`roots` からは除く。
 pub(super) fn ancestor_chain(dir: &Path, ref_path: &str) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     let (_, src, modules) = source_module_path(dir, Path::new(ref_path))?;
-    if ordinary_module_file(dir, &src, &modules)? != Path::new(ref_path) {
+    if module_file(dir, &src, &modules, true)? != Path::new(ref_path) {
         return None;
     }
     let mut chain = vec![PathBuf::from(ref_path)];
     for count in (1..modules.len()).rev() {
-        chain.push(ordinary_module_file(dir, &src, &modules[..count])?);
+        chain.push(module_file(dir, &src, &modules[..count], true)?);
     }
     let mut roots = Vec::new();
     for root in [src.join("lib.rs"), src.join("main.rs")] {
