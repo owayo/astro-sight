@@ -542,6 +542,8 @@ TS / TSX では、型注釈のない `const` にタグなしのテンプレー�
 
 既定の hook は値変更を情報として報告する。`--strict-public-const-values` 指定時は blocking とし、影響を受ける利用側も `impacts` に出る場合がある。たとえば正規表現の `g`・`y` などのフラグの変更は、利用側での動作を変えうる。タグ付きテンプレート、型アサーション、`satisfies`、初期化子の種類が変わる場合には、宣言と初期化子に応じた判定を使う。静的な object / array の中のスカラー値は別に判定する。
 
+TS と TSX のテンプレートリテラル型では、固定文字列に含まれる空白の数も公開型の一部になる。たとえば `` `a b${string}` `` の空白を2個にして `` `a  b${string}` `` にし、公開 `const` の初期化子も変えた場合、hook は `api.mod` を出し、影響を受ける参照を `impacts` に載せる。型注釈だけを変えた場合は `api.type_annotation` に入り、`--strict-public-type-annotations` を指定すると blocking になる。
+
 ### JavaScript / TypeScript の削除と相対でない import
 
 消した export の名前の残った出現が、どれも別のものを指すと証明できれば (同じ名前を宣言する別のモジュールに解かれる import など)、`removed_dead`（hook では `api.rm_dead`）にする。相対でない指定子 (`@/net/transport` やパッケージの名前) は、リポジトリの `tsconfig*.json` / `jsconfig*.json` と、その `references` の先、解析するディレクトリに無ければ祖先のいちばん近い `tsconfig.json` / `jsconfig.json` で解く。設定は TypeScript と同じく読む。`extends` (相対パスと、package.json に `exports` の無い node_modules のパッケージ) を辿って `paths` と `baseUrl` を継承し、`${configDir}` も展開する。指定子には `paths` の完全一致のキーか、当たるパターンのうち接頭辞の最も長いものを使い、どのキーにも当たらないときだけ `baseUrl` を使う。既定の解決の方式は TypeScript 5 と 6 で違うので、候補は node10・bundler・classic (参照ファイルの祖先のディレクトリにある同名のファイルも探す) のどれで解いても入るように集める。宣言ファイル・拡張子の読み替え・ディレクトリの index・もう無いファイルも候補に入れる。どの設定でも候補に削除したファイルが無く、存在する候補がどれもその名前を export しているときだけ、import が別のものを指すと証明する。
