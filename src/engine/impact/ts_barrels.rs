@@ -10,21 +10,32 @@ use crate::engine::parser;
 use crate::language::LangId;
 
 use super::FileContext;
+mod object_reads;
 
-type OriginKey = (String, String, String, String, bool);
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum OriginUse {
+    Import,
+    ConstAlias,
+    ObjectRead,
+}
+
+type OriginKey = (String, String, String, String, OriginUse);
 
 #[derive(Default)]
 pub(super) struct TsBarrelIndex {
     pub(super) const_alias_reads: Mutex<HashSet<(String, String)>>,
     index_reader: Option<Mutex<crate::commands::GitBlobBatch>>,
+    unresolved_index: bool,
     const_candidates: Vec<(String, String, u32)>,
     root: PathBuf,
     files: HashSet<String>,
     modules: Mutex<Modules>,
     memo: Mutex<HashMap<OriginKey, Origin>>,
     alias_modules: Mutex<HashMap<(String, String), Option<String>>>,
+    object_sources: Mutex<HashMap<(String, String), Option<String>>>,
     proofs: Mutex<HashMap<(String, String, String), bool>>,
     reachability: Mutex<HashMap<(String, String), bool>>,
+    object_reachability: Mutex<HashMap<(String, String), bool>>,
     paths: Vec<(String, String, String, bool)>,
 }
 
@@ -33,6 +44,7 @@ type Modules = HashMap<String, Option<Arc<Module>>>;
 #[derive(Clone, Default)]
 struct Module {
     possible_commonjs: bool,
+    unproven_value_exports: bool,
     imports: HashMap<String, Vec<String>>,
     named: HashMap<String, Vec<(String, String)>>,
     stars: Vec<String>,
@@ -80,19 +92,20 @@ impl TsBarrelIndex {
         }
     }
 
-    pub(super) fn for_index_writes(dir: &Path) -> Self {
-        let Some((dir, files)) = dir
-            .to_str()
-            .and_then(|dir| Some((dir, crate::commands::plain_index_module_paths(dir)?)))
-        else {
-            return Self::default();
-        };
-        Self {
+    pub(super) fn for_index_objects(dir: &Path) -> anyhow::Result<Self> {
+        let dir = dir.to_str().ok_or_else(|| {
+            anyhow::anyhow!("Cannot read staged module paths from a non-UTF-8 directory")
+        })?;
+        let (files, resolves) = crate::commands::index_module_paths(dir).ok_or_else(|| {
+            anyhow::anyhow!("Cannot enumerate staged module paths within the 64 MiB metadata limit")
+        })?;
+        Ok(Self {
             root: dir.into(),
             files,
             index_reader: Some(Mutex::new(crate::commands::GitBlobBatch::index(dir))),
+            unresolved_index: !resolves,
             ..Self::default()
-        }
+        })
     }
 
     pub(super) fn snapshot_paths(&self) -> impl Iterator<Item = &str> {
@@ -100,6 +113,17 @@ impl TsBarrelIndex {
     }
     pub(super) fn omits_index_path(&self, path: &str) -> bool {
         self.index_reader.is_some() && !self.files.contains(path)
+    }
+
+    pub(super) fn index_source(&self, path: &str) -> Option<Vec<u8>> {
+        if !self.files.contains(path) {
+            return None;
+        }
+        self.index_reader
+            .as_ref()?
+            .lock()
+            .ok()?
+            .read_limited(path, crate::commands::MAX_INPUT_SIZE)
     }
 
     pub(super) fn has_changed_variables(&self) -> bool {
@@ -122,7 +146,14 @@ impl TsBarrelIndex {
                 return None;
             }
             let mut visiting = HashSet::new();
-            (self.origin::<true>(&target, imported, path, name, &mut visiting) == Origin::Changed
+            (self.origin(
+                OriginUse::ConstAlias,
+                &target,
+                imported,
+                path,
+                name,
+                &mut visiting,
+            ) == Origin::Changed
                 && self.module(path)?.const_exports.contains(name))
             .then_some((*fc, name.as_str()))
         })
@@ -243,7 +274,7 @@ impl TsBarrelIndex {
             return false;
         };
         let mut visiting = HashSet::new();
-        self.origin::<false>(&path, name, changed, name, &mut visiting) == Origin::Changed
+        self.origin(OriginUse::Import, &path, name, changed, name, &mut visiting) == Origin::Changed
     }
 
     fn module(&self, path: &str) -> Option<Arc<Module>> {
@@ -267,19 +298,17 @@ impl TsBarrelIndex {
         if !is_ts(lang) {
             return None;
         }
-        let source = if let Some(index) = &self.index_reader {
-            index
-                .lock()
-                .ok()?
-                .read_limited(path, crate::commands::MAX_INPUT_SIZE)?
+        let source = if self.index_reader.is_some() {
+            self.index_source(path)?
         } else {
             crate::engine::bounded_read::read_input_file(&self.root.join(path))?
         };
         module_from_source(&source, lang)
     }
 
-    fn origin<const CONST_ALIAS: bool>(
+    fn origin(
         &self,
+        usage: OriginUse,
         path: &str,
         name: &str,
         changed: &str,
@@ -291,7 +320,7 @@ impl TsBarrelIndex {
             name.to_owned(),
             changed.to_owned(),
             changed_name.to_owned(),
-            CONST_ALIAS,
+            usage,
         );
         if let Ok(memo) = self.memo.lock()
             && let Some(&result) = memo.get(&memo_key)
@@ -302,7 +331,7 @@ impl TsBarrelIndex {
         if !visiting.insert(visit_key.clone()) {
             return Origin::Unknown;
         }
-        let result = self.origin_inner::<CONST_ALIAS>(path, name, changed, changed_name, visiting);
+        let result = self.origin_inner(usage, path, name, changed, changed_name, visiting);
         visiting.remove(&visit_key);
         if result != Origin::Unknown
             && let Ok(mut memo) = self.memo.lock()
@@ -312,8 +341,9 @@ impl TsBarrelIndex {
         result
     }
 
-    fn origin_inner<const CONST_ALIAS: bool>(
+    fn origin_inner(
         &self,
+        usage: OriginUse,
         path: &str,
         name: &str,
         changed: &str,
@@ -326,6 +356,9 @@ impl TsBarrelIndex {
         if module.opaque {
             return Origin::Unknown;
         }
+        if usage == OriginUse::ObjectRead && module.unproven_value_exports {
+            return Origin::Unknown;
+        }
         if module.local_exports.contains(name) {
             return if path == changed && name == changed_name {
                 Origin::Changed
@@ -333,28 +366,27 @@ impl TsBarrelIndex {
                 Origin::Other
             };
         }
+        let resolve = |specifier: &str| match usage {
+            OriginUse::Import => self.resolve_for::<false>(path, specifier),
+            OriginUse::ConstAlias => self.resolve_for::<true>(path, specifier),
+            OriginUse::ObjectRead => self.object_read_source(path, specifier),
+        };
         if let Some(edges) = module.named.get(name) {
             if edges.len() != 1 {
                 return Origin::Unknown;
             }
             let (specifier, source_name) = &edges[0];
-            let Some(target) = self.resolve_for::<CONST_ALIAS>(path, specifier) else {
+            let Some(target) = resolve(specifier) else {
                 return Origin::Unknown;
             };
-            return self.origin::<CONST_ALIAS>(
-                &target,
-                source_name,
-                changed,
-                changed_name,
-                visiting,
-            );
+            return self.origin(usage, &target, source_name, changed, changed_name, visiting);
         }
         let mut found = Origin::Absent;
         for specifier in &module.stars {
-            let Some(target) = self.resolve_for::<CONST_ALIAS>(path, specifier) else {
+            let Some(target) = resolve(specifier) else {
                 return Origin::Unknown;
             };
-            match self.origin::<CONST_ALIAS>(&target, name, changed, changed_name, visiting) {
+            match self.origin(usage, &target, name, changed, changed_name, visiting) {
                 Origin::Unknown => return Origin::Unknown,
                 Origin::Absent => {}
                 result if found == Origin::Absent => found = result,
@@ -393,6 +425,9 @@ impl TsBarrelIndex {
     }
 
     fn resolve_for<const CONST_ALIAS: bool>(&self, from: &str, specifier: &str) -> Option<String> {
+        if self.unresolved_index {
+            return None;
+        }
         if self.index_reader.is_some() {
             if !specifier.starts_with('.') || specifier.contains(['?', '#', '\\']) {
                 return None;
@@ -401,6 +436,12 @@ impl TsBarrelIndex {
             let base = normalize(here.to_str()?)?;
             if self.files.contains(&format!("{base}/package.json")) {
                 return None;
+            }
+            if crate::commands::ts_const_rebinding::directory_specifier(specifier) {
+                if base.is_empty() {
+                    return None;
+                }
+                return self.resolve(from, &format!("{specifier}/index"));
             }
             return self.resolve(from, specifier);
         }
@@ -735,6 +776,7 @@ fn collect_import(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
 }
 
 fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Module) {
+    module.unproven_value_exports |= node.children(&mut node.walk()).any(|c| c.kind() == "type");
     let mut token_cursor = node.walk();
     if node
         .children(&mut token_cursor)
@@ -754,6 +796,9 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
             if binding.kind() != "export_specifier" {
                 continue;
             }
+            module.unproven_value_exports |= binding
+                .children(&mut binding.walk())
+                .any(|c| c.kind() == "type");
             let Some(name) = binding.child_by_field_name("name") else {
                 continue;
             };
@@ -765,6 +810,7 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
                 .and_then(|alias| alias.utf8_text(source).ok())
                 .unwrap_or(name);
             if !is_plain_name(name) || !is_plain_name(exported) {
+                module.unproven_value_exports = true;
                 continue;
             }
             if let Some(specifier) = &specifier {
@@ -1040,7 +1086,8 @@ mod tests {
             ..TsBarrelIndex::default()
         };
         assert_eq!(
-            index.origin::<false>(
+            index.origin(
+                OriginUse::Import,
                 "barrel.ts",
                 "LIMIT",
                 "barrel.ts",
@@ -1050,7 +1097,8 @@ mod tests {
             Origin::Other
         );
         assert_eq!(
-            index.origin::<false>(
+            index.origin(
+                OriginUse::Import,
                 "destructured.ts",
                 "LIMIT",
                 "real.ts",

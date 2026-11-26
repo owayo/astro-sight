@@ -48,6 +48,130 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn impact_object_members_verify_the_binding_of_each_read() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    for directory in ["slash", "main", "wrapper", "clean"] {
+        repo.create_dir_all(directory);
+    }
+    let object = |name: &str| {
+        format!(
+            "export const {name}={{label:'fixed',endpoint:'old'}};\nexport default {{label:{name}.endpoint}};\n"
+        )
+    };
+    let scopes = "import view, {Scope} from './scope';\nconst C=class Scope { static label=view.label; static read(){\nreturn Scope.label;\n}};\nexport function run(){for(let Scope={label:view.label};;){\nreturn Scope.label;\n}}\nexport const direct=Scope.label;\n";
+    repo.write("scope.ts", object("Scope"));
+    repo.write("readScope.ts", scopes);
+    let nested = "namespace N {export const Nested={label:'fixed',endpoint:'old'};}\nconst copy={label:N.Nested.endpoint}; export {copy as \"Nested\"};\n";
+    repo.write("nested.ts", nested);
+    let reader = |name: &str, spec: &str| {
+        format!("import {{ {name} }} from '{spec}';\nexport const read={name}.label;\n")
+    };
+    repo.write("readNested.ts", reader("Nested", "./nested"));
+    repo.write("safe.ts", "export {Scope} from './scope';\n");
+    repo.write("readForward.ts", reader("Scope", "./safe"));
+    repo.write("readFile.ts", reader("Slash", "./slash"));
+    for (name, owner, wrapper, spec) in [
+        ("Slash", "slash.ts", "slash/index.ts", "./slash/"),
+        ("Main", "main/index.ts", "main/entry.ts", "./main/"),
+        ("Wrapper", "wrapper/index.ts", "wrapper.ts", "./wrapper"),
+        ("Clean", "clean/index.ts", "", "./clean/"),
+    ] {
+        repo.write(owner, object(name));
+        if !wrapper.is_empty() {
+            let target = match name {
+                "Slash" => "../slash.js",
+                "Main" => "./index.js",
+                _ => "./wrapper/index.js",
+            };
+            repo.write(
+                wrapper,
+                format!("export {{default as \"{name}\"}} from '{target}';\n"),
+            );
+        }
+        repo.write(format!("read{name}.ts"), reader(name, spec));
+    }
+    repo.write("main/package.json", r#"{"main":"entry.js"}"#);
+    repo.write("clean/package.json", r#"{"main":"./index.js"}"#);
+    repo.commit_all("base");
+    for (name, path) in [
+        ("Scope", "scope.ts"),
+        ("Slash", "slash.ts"),
+        ("Main", "main/index.ts"),
+        ("Wrapper", "wrapper/index.ts"),
+        ("Clean", "clean/index.ts"),
+    ] {
+        repo.write(path, object(name).replace("old", "new"));
+    }
+    repo.write("nested.ts", nested.replace("old", "new"));
+    repo.stage_all();
+    for staged in [false, true] {
+        let mut flags = vec!["--git"];
+        if staged {
+            std::fs::remove_file(repo.root().join("wrapper.ts")).unwrap();
+            repo.remove_file("readScope.ts");
+            repo.write(
+                "clean.ts",
+                "export {default as Clean} from './clean/index.js';\n",
+            );
+            flags.push("--staged");
+        }
+        let context = repo.run_json("context", &flags);
+        for (name, path, line, blocking) in [
+            ("Scope", "scope.ts", 2, true),
+            ("Scope", "scope.ts", 5, true),
+            ("Scope", "scope.ts", 7, false),
+            ("Forward", "scope.ts", 1, false),
+            ("File", "slash.ts", 1, false),
+            ("Nested", "nested.ts", 1, true),
+            ("Slash", "slash.ts", 1, true),
+            ("Main", "main/index.ts", 1, true),
+            ("Wrapper", "wrapper/index.ts", 1, true),
+            ("Clean", "clean/index.ts", 1, false),
+        ] {
+            let change = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["path"] == path)
+                .unwrap();
+            let has = |key: &str| {
+                change[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r["path"] == format!("read{name}.ts") && r["line"] == line)
+            };
+            assert_eq!(
+                (has("impacted_callers"), has("informational_callers")),
+                (blocking, !blocking),
+                "{name} line {line} staged={staged}: {change}"
+            );
+        }
+    }
+    // 設定によって import 元の証明を見送っても、index にある読み取りは残る。
+    repo.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@types/*":["./types/*"]}}}"#,
+    );
+    repo.git(["add", "tsconfig.json"]);
+    let context = repo.run_json("context", &["--git", "--staged"]);
+    assert!(
+        context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "scope.ts"
+                && c["impacted_callers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r["path"] == "readScope.ts" && r["line"] == 2)),
+        "{context}"
+    );
+}
+
+#[test]
 fn impact_object_members_keep_reads_blocking_across_writers() {
     let cases = [
         (

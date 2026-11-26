@@ -17,10 +17,22 @@ use crate::models::impact::DiffFile;
 
 /// ディレクトリの package.json と設定を含め、別名が一意なファイルを指すか確かめる。
 pub(crate) fn resolved_const_import(dir: &str, from: &str, specifier: &str) -> Option<String> {
+    super::removed_attribution::normalize_relative_specifier(from, specifier)?;
     if super::removed_attribution::relative_directory_has_manifest(dir, from, specifier) {
         return None;
     }
+    if directory_specifier(specifier) {
+        return super::ref_index::resolved_relative_source(
+            dir,
+            from,
+            &format!("{specifier}/index"),
+        );
+    }
     super::ref_index::resolved_relative_source(dir, from, specifier)
+}
+
+pub(crate) fn directory_specifier(specifier: &str) -> bool {
+    matches!(specifier.rsplit('/').next(), Some("" | "." | ".."))
 }
 
 #[derive(Default)]

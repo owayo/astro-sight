@@ -215,6 +215,13 @@ pub(crate) fn find_binding_in_scope<'tree>(
         {
             return Some(ScopeBinding::Other);
         }
+        if scope.kind() == "for_statement"
+            && let Some(init) = scope.child_by_field_name("initializer")
+            && matches!(init.kind(), "lexical_declaration" | "variable_declaration")
+            && let Some(binding) = find_binding_in_subtree(init, source, name, false, namespace)
+        {
+            return Some(binding);
+        }
     }
 
     let body = scope.child_by_field_name("body").unwrap_or(scope);
@@ -358,8 +365,11 @@ fn find_binding_in_subtree<'tree>(
                 }
                 // statement_block / switch_body (および制御構造の中身) へ潜る際は
                 // nested block 扱いに切り替え、以降は var 由来の binding だけを拾う。
-                let nested =
-                    in_nested_block || matches!(child.kind(), "statement_block" | "switch_body");
+                let nested = in_nested_block
+                    || matches!(
+                        child.kind(),
+                        "statement_block" | "switch_body" | "for_statement" | "for_in_statement"
+                    );
                 push_named_children(&mut stack, child, nested);
             }
         }
