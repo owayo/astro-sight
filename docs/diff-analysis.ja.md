@@ -522,6 +522,10 @@ blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` �
 
 たとえば値の `as Item` も証明の対象外なので、型検査が通るコードでも同じ理由になり得る。位置のコードを確認し、必要に応じて TypeScript の型検査で判断する。互換・追随を確認できたエントリは引き続き情報提供のバケットへ入り、この項目を付けない。
 
+### TypeScript の公開名が指す値の変更
+
+`export { f }` を `export { other as f } from './provider.js'` に変えると、`f` を import した側には `provider.other` が渡る。元の関数を同じファイルに残して `export { f as legacy }` で公開しても、`review` は公開名 `f` の変更を報告する。たとえば `other` が `false` なら、利用側に残った `f()` は型検査でエラーになる。
+
 ### TypeScript のシグネチャが参照する型
 
 同じファイルのクラスを返す公開関数では、添字シグネチャ `[key: Key]: Value` の `Key` と `Value` の両方が戻り値の契約に含まれる。`Key` の変更で従来のキーが使えなくなると、その関数も `api.mod` に入る。`E['keep']` が単純なローカルのオブジェクト型のプロパティを指す場合は、`keep` の型とその依存先をたどる。`key` は添字の引数名なので、同名のクラスメソッドがあっても、そのメソッドには変更を結び付けない。

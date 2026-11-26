@@ -53,7 +53,7 @@ pub(crate) use exported::{
     PythonModuleExportPolicy, collect_js_ts_named_export_surface_names,
     collect_rust_reexported_names, is_python_symbol_exported_with_policy,
     is_rust_trait_declared_method, python_module_export_policy,
-    rust_node_has_unrestricted_pub_visibility,
+    rust_node_has_unrestricted_pub_visibility, visit_js_ts_export_clause_specifiers,
 };
 
 use containers::assign_enclosing_containers;
