@@ -113,6 +113,7 @@ pub(super) struct RefEventMini {
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
     pub(super) rust_value_binding: bool,
+    pub(super) rust_scoped_value: bool,
     /// Python の相対 import または同一ファイルの直下関数の所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
     pub(super) python_attribute_write: bool,
@@ -603,28 +604,62 @@ impl ImpactCollector<'_> {
         // 引数の中の参照は、呼び出しを普通の式に書き換えたファイルの写しの構文木で、マクロの外と
         // 同じ所有元の証明を回す (Issue #310)。囲むマクロのどれかを標準と証明できない・書き換えた
         // 形が読めないときは、元の構文木のまま扱う。
-        let rust_macro_site = rust_owner_index
-            .zip(node)
-            .filter(|&(_, node)| {
-                !rust_macro_callee && super::rust_path_owner::MacroCopy::candidate(node, source)
+        let macro_argument = self.ref_lang == Some(LangId::Rust)
+            && !rust_macro_callee
+            && node.is_some_and(|node| super::rust_path_owner::MacroCopy::candidate(node, source));
+        let copied_site = node
+            .filter(|_| {
+                (macro_argument || lexical_binding == LexicalBinding::RustMacroValueBinding)
+                    && (self.rust_path_owner_enabled
+                        || self.sym_to_fc[ix].iter().any(|&fc| {
+                            self.file_contexts[fc as usize]
+                                .rust_free_function_names
+                                .contains(&self.all_symbol_names[ix])
+                        }))
             })
-            .and_then(|(index, node)| {
+            .and_then(|node| {
                 let copy = self
                     .rust_macro_copy
                     .get_or_init(|| {
+                        let project = if self.rust_path_owner_enabled {
+                            self.rust_path_owner_project
+                        } else {
+                            let staged = self.rust_path_owner_project.staged_bindings()?;
+                            if crate::engine::bounded_read::read_input_file(
+                                &staged.root.join(self.path_str),
+                            )?
+                            .as_slice()
+                                != source
+                            {
+                                return None;
+                            }
+                            staged
+                        };
+                        let index = self.rust_path_owner.get_or_init(|| {
+                            super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                        });
                         super::rust_path_owner::MacroCopy::build(
                             node,
                             source,
                             index,
-                            Path::new(self.dir),
+                            &project.root,
                             self.path_str,
-                            self.rust_path_owner_project,
+                            project,
                         )
                     })
                     .as_ref()?;
                 let (site, in_use) = copy.site(node)?;
                 Some((copy, site, in_use))
             });
+        let rust_macro_site =
+            copied_site.filter(|_| self.rust_path_owner_enabled && macro_argument);
+        let copied_binding = copied_site.is_some_and(|(copy, site, _)| {
+            (!macro_argument
+                || site.parent().is_some_and(|p| {
+                    p.kind() == "field_expression" && p.child_by_field_name("value") == Some(site)
+                }))
+                && copy.local_binding(site)
+        });
         // 所有元の証明に使う識別子・ソース・索引。写しに対応できた参照は写しのものを使う。
         let (owner_node, owner_source, owner_index) = match rust_macro_site {
             Some((copy, site, _)) => (Some(site), copy.source(), Some(copy.index())),
@@ -1245,6 +1280,16 @@ impl ImpactCollector<'_> {
             member_owner: u32::MAX,
             jsx_shape_id,
             unproven_module_ref,
+            rust_scoped_value: copied_binding
+                || lexical_binding == LexicalBinding::RustScopedValue
+                    && node.is_some_and(|node| {
+                        !self
+                            .rust_opaque_attributes
+                            .get_or_init(|| {
+                                super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
+                            })
+                            .contains(node)
+                    }),
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
                 || (lexical_binding == LexicalBinding::RustMacroValueBinding
                     && self.rust_path_owner_enabled
@@ -1726,7 +1771,9 @@ impl<'a> ImpactCollector<'a> {
         {
             return true;
         }
-        if e.rust_value_binding && rust_function_only(ctx, name) {
+        if (e.rust_value_binding && rust_function_only(ctx, name))
+            || (e.rust_scoped_value && ctx.rust_free_function_names.contains(name))
+        {
             return true;
         }
         if e.rust_receiver_member && ctx.rust_free_function_names.contains(name) {
@@ -2244,6 +2291,7 @@ mod tests {
             jsx_shape_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
+            rust_scoped_value: false,
             python_import_owner_id: u32::MAX,
             python_attribute_write: false,
             python_non_method_site: false,

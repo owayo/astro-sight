@@ -536,7 +536,7 @@ impl OverBudget {
     }
 }
 
-pub(in crate::commands) struct IndexSnapshot {
+pub(crate) struct IndexSnapshot {
     _temporary: tempfile::TempDir,
     analysis_dir: PathBuf,
     /// 生成物の判定の属性を、スナップショットの `.gitattributes` (index の内容) と元のリポジトリの
@@ -646,6 +646,16 @@ impl OriginalRepository {
 }
 
 impl IndexSnapshot {
+    /// 呼び出し元で Git 差分の基点を持たない、index 内の名前解決用の写し。
+    pub(crate) fn for_bindings(dir: &str) -> Option<Self> {
+        let base = git_text(Path::new(dir), &["rev-parse", "--verify", "HEAD"]).ok()?;
+        let diff = super::git_input::run_git_diff(dir, &base, true).ok()?;
+        match Self::prepare(dir, &base, &diff, SnapshotBudget::DEFAULT).ok()? {
+            PreparedSnapshot::Ready(snapshot) => Some(snapshot),
+            PreparedSnapshot::OverBudget(_) => None,
+        }
+    }
+
     pub(super) fn prepare(
         dir: &str,
         base: &str,
@@ -776,7 +786,7 @@ impl IndexSnapshot {
         }))
     }
 
-    pub(in crate::commands) fn dir(&self) -> Result<&str> {
+    pub(crate) fn dir(&self) -> Result<&str> {
         self.analysis_dir
             .to_str()
             .ok_or_else(|| failure("Non-UTF-8 staged analysis path"))

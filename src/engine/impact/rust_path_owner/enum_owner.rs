@@ -81,6 +81,7 @@ pub(super) fn static_layout(
     // 渡す先のマクロの名前)。
     let mut include_fields: Vec<(bool, Option<String>)> = Vec::new();
     // マクロの本体か引数の token tree に現れる、信じる木の外のマクロの名前 ([`TRUSTED_MACROS`])。
+    let mut array_macros = HashSet::new();
     let mut tree_words: HashSet<String> = HashSet::new();
     // 走査で読み切れない入力 (先頭行の `#! [..]` の内側の属性・root の外を指す path の依存)。
     // `macro_rules!` の定義と同じく、配置は決めても、字句を組み立てる経路が無いとは言わない。
@@ -253,6 +254,26 @@ pub(super) fn static_layout(
                                 node, &source,
                             )
                         {
+                            if node.kind() == "token_tree"
+                                && node.child(0).is_some_and(|n| n.kind() == "[")
+                                && node.child(1).and_then(|n| name(n, &source)) == Some("path")
+                                && node
+                                    .child(2)
+                                    .is_some_and(|n| matches!(n.kind(), "]" | "." | "token_tree"))
+                            {
+                                let (in_definition, destination) =
+                                    include_destination(node, &source);
+                                if !macro_scopes.last().is_some_and(|scope| scope.simple) {
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                let Some(target) = destination.filter(|_| !in_definition) else {
+                                    return std::ops::ControlFlow::Break(());
+                                };
+                                array_macros.insert(target);
+                                return std::ops::ControlFlow::Continue(
+                                    crate::engine::tree_walk::Walk::Descend,
+                                );
+                            }
                             let target = if node.kind() == "attribute" {
                                 path_target(node, &source, &file)
                             } else {
@@ -402,6 +423,7 @@ pub(super) fn static_layout(
     };
     if !capable.is_empty()
         || !include_fields.is_empty()
+        || !array_macros.is_empty()
         || bare_hashes
             .iter()
             .any(|(in_definition, name)| !in_definition && quote_like(name))
@@ -410,7 +432,8 @@ pub(super) fn static_layout(
         // `pass! { pub(crate) use crate::children as mount; }`) は前置きの絞り込みが読まないので、
         // 木の中のどの `.rs` の別名と、マクロの token tree の `use` も集める。
         // 信じる木の外のマクロの名前が、どこかの token tree に現れるかも集める。
-        aliases_in_macros |= collect_use_aliases(&root, &mut macro_aliases, &mut tree_words)?;
+        aliases_in_macros |=
+            collect_use_aliases(&root, &mut macro_aliases, &mut tree_words, &array_macros)?;
         capable = module_macros(&macro_definitions, &macro_aliases);
     }
     if generates_macros || (aliases_in_macros && !capable.is_empty()) {
@@ -427,6 +450,15 @@ pub(super) fn static_layout(
     // マクロはその名前のマクロを作れず (`pass! { macro_rules! quote { .. } }`)、その名前を別名にも
     // できない (`pass! { use body as quote; }`)。
     let trusted = |name: &str| !in_tree(name) && !tree_words.contains(name);
+    // [path] は標準マクロの式引数に限る。別マクロの引数に同じ名前が出ていても、
+    // 木にマクロ定義や use を生成する字句がなければその名前を新しく束縛できない。
+    if array_macros.iter().any(|name| {
+        !STANDARD_EXPRESSION_MACROS.contains(&name.as_str())
+            || in_tree(name)
+            || tree_words.contains(name) && (generates_macros || aliases_in_macros)
+    }) {
+        return None;
+    }
     if bare_hashes.iter().any(|(in_definition, name)| {
         *in_definition || !quote_like(name) || !name.as_deref().is_some_and(trusted)
     }) {
@@ -539,6 +571,7 @@ fn collect_use_aliases(
     root: &Path,
     aliases: &mut Vec<(String, String)>,
     words: &mut HashSet<String>,
+    array_macros: &HashSet<String>,
 ) -> Option<bool> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -580,10 +613,17 @@ fn collect_use_aliases(
             return None;
         }
         let tree = parser::parse_source(&source, LangId::Rust).ok()?;
-        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        let result = crate::engine::tree_walk::walk_preorder(
             tree.root_node(),
             crate::engine::tree_walk::Children::Named,
             |node, _| {
+                if !array_macros.is_empty()
+                    && node.kind() == "use_declaration"
+                    && use_names(node, &source, true)
+                        .is_none_or(|names| names.iter().any(|n| array_macros.contains(n)))
+                {
+                    return std::ops::ControlFlow::Break(());
+                }
                 if let Some(alias) = use_alias(node, &source) {
                     aliases.push(alias);
                 }
@@ -594,6 +634,9 @@ fn collect_use_aliases(
                 std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
             },
         );
+        if result.is_break() {
+            return None;
+        }
     }
     Some(uses_in_macros)
 }
@@ -647,6 +690,7 @@ struct AttributeMacroScope {
     in_definition: bool,
     destination: Option<String>,
     recorded_hash: bool,
+    simple: bool,
 }
 
 impl AttributeInputs {
@@ -676,6 +720,9 @@ impl AttributeInputs {
                     || enclosing.is_some_and(|scope| scope.in_definition),
                 destination,
                 recorded_hash: false,
+                simple: node
+                    .child_by_field_name("macro")
+                    .is_some_and(|m| m.kind() == "identifier"),
             });
         }
         let Some(scope) = macro_scopes.last_mut() else {
@@ -915,7 +962,41 @@ fn collect_trusted_words(node: Node<'_>, source: &[u8], words: &mut HashSet<Stri
 /// ソースの文字が NFC か (ASCII だけなら真)。Rust は識別子を NFC で比べるので、NFC でない綴り
 /// (`cafe\u{301}` と `caf\u{e9}` は同じ名前) のあるファイルでは、名前を字面で照合できない。
 fn nfc_source(source: &[u8]) -> bool {
-    source.is_ascii() || std::str::from_utf8(source).is_ok_and(unicode_normalization::is_nfc)
+    let Ok(text) = std::str::from_utf8(source) else {
+        return false;
+    };
+    if source.is_ascii() || unicode_normalization::is_nfc(text) {
+        return true;
+    }
+    let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    // 識別子として解釈されない文字列と通常コメントの中身だけを読み飛ばす。
+    let mut end = 0;
+    let result = crate::engine::tree_walk::walk_preorder(
+        root,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if matches!(node.kind(), "string_literal" | "raw_string_literal")
+                || (matches!(node.kind(), "line_comment" | "block_comment")
+                    && !node
+                        .children(&mut node.walk())
+                        .any(|n| n.kind().contains("doc_comment")))
+            {
+                if !unicode_normalization::is_nfc(&text[end..node.start_byte()]) {
+                    return std::ops::ControlFlow::Break(());
+                }
+                end = node.end_byte();
+                return std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip);
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+    result.is_continue() && unicode_normalization::is_nfc(&text[end..])
 }
 
 /// 木の中の `macro_rules!` の定義 (同じ名前の定義はまとめる)。

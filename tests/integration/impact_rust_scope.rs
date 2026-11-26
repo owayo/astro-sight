@@ -482,6 +482,140 @@ fn rust_scope_repo(consumer: &str) -> TestRepo {
 }
 
 #[test]
+fn impact_rust_scope_tracks_tuple_closures_and_ordered_let_bindings() {
+    let consumer = r#"use crate::api::comments;
+fn rows(pairs: &[(usize, Vec<u8>)]) {
+    fn unrelated() {}
+    pairs.iter().for_each(|(_, comments)| {
+        let _ = comments.len();
+    });
+    assert_eq!(0, 0);
+    let comments = Vec::<u8>::new();
+    let _ = comments[0];
+}
+fn real() {
+    let comments = comments();
+    let _ = crate::api::comments;
+    { let comments = Vec::<u8>::new(); let _ = comments.len(); }
+}
+fn outside() {
+    { let comments = Vec::<u8>::new(); let _ = comments.len(); }
+    let _ = comments;
+}
+macro_rules! forward { ($f:ident) => { crate::api::$f() }; }
+fn macros() {
+    let comments = Vec::<u8>::new();
+    let _ = forward!(comments);
+}
+macro_rules! replace { ($f:ident) => { let $f = [crate::api::$f]; }; }
+fn function_values() {
+    let pairs = [(0, crate::api::comments)];
+    pairs.into_iter().for_each(|(_, comments)| {
+        let _: usize = comments();
+        let _: fn() -> usize = comments;
+    });
+    let arrays = [(0, [crate::api::comments])];
+    arrays.into_iter().for_each(|(_, comments)| {
+        let _: usize = comments[0]();
+    });
+    let comments = [1u8];
+    replace!(comments);
+    let _: usize = comments[0]();
+}
+"#;
+    let repo = rust_scope_repo(consumer);
+    // 別のモジュールにあるマクロ定義で、全局的な標準マクロの証明は成立しない。
+    repo.write("other.rs", "macro_rules! dbg { () => {}; }\n");
+    for staged in [false, true] {
+        if staged {
+            repo.git(["add", "api.rs", "other.rs"]);
+        }
+        let mut args = vec!["--git"];
+        if staged {
+            args.push("--staged");
+        }
+        let context = repo.run_json("context", &args);
+        let rows: Vec<_> = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|change| change["path"] == "api.rs")
+            .flat_map(|change| change["impacted_callers"].as_array().into_iter().flatten())
+            .filter(|caller| caller["path"] == "consumer.rs")
+            .map(|caller| caller["line"].as_u64().unwrap() + 1)
+            .collect();
+        assert_eq!(
+            rows,
+            [12, 13, 18, 23, 29, 30, 34, 37, 38],
+            "{staged}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_scope_checks_the_integration_targets_assertion_macro() {
+    for mode in ["plain", "shadow", "rehost"] {
+        let shadow = mode != "plain";
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.create_dir_all("tests/cases");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname='sample'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        repo.write("src/lib.rs", "pub fn comments(n: u8) -> u8 { n }\n");
+        let extra = if mode == "shadow" {
+            "macro_rules! assert_eq { ($f:ident.len(), $n:expr) => {{ let _ = sample::$f(1); }}; }"
+        } else {
+            ""
+        };
+        repo.write(
+            "tests/cases.rs",
+            format!("mod cases {{ {extra}\nmod data; mod check; }}\n"),
+        );
+        repo.write(
+            "tests/cases/data.rs",
+            "pub(super) fn rows()->Vec<u8> { vec![1] }\n",
+        );
+        repo.write("tests/cases/check.rs", "use super::data::*;\npub fn check() {\n let comments = rows();\n assert_eq!(comments.len(), 1);\n let _ = comments[0];\n}\n");
+        let other = if mode == "rehost" {
+            r#"mod data { pub(super) fn rows()->Vec<u8>{std::vec![1]} }
+macro_rules! assert_eq { ($f:ident.len(),$n:expr)=>{{let _=sample::$f(1);}}; }
+macro_rules! vec { ($a:ident)=>{#[$a = "cases/check.rs"] mod relocated;}; }
+vec![path];"#
+        } else {
+            "fn data() { let path=2; assert_eq!([2], [path]); let _=vec![path]; }"
+        };
+        repo.write(
+            "tests/other.rs",
+            format!("{other}\nconst _: &str = \"K\"; // K\n"),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/lib.rs",
+            "pub fn comments(n: u8, extra: u8) -> u8 { n + extra }\n",
+        );
+        for args in [vec!["--git"], vec!["--git", "--staged"]] {
+            if args.len() > 1 {
+                repo.stage_all();
+            }
+            let context = repo.run_json("context", &args);
+            let calls = context["changes"][0]["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["path"] == "tests/cases/check.rs")
+                .collect::<Vec<_>>();
+            assert_eq!(calls.iter().any(|c| c["line"] == 3), shadow, "{context}");
+            if !shadow {
+                assert!(calls.is_empty(), "{context}");
+            }
+        }
+    }
+}
+
+#[test]
 fn impact_rust_scope_inner_let_with_child_test_glob_preserves_real_calls() {
     for test_import in ["use super::*;", "use super::first_gap;"] {
         for actual_call in ["", "crate::jobs::start", "start"] {

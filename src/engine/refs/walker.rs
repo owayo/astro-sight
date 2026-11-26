@@ -462,7 +462,7 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 .rust_scope_index
                 .get_or_init(|| crate::engine::rust_scope::RustScopeIndex::build(node, env.source))
                 .as_ref()
-                .map(|index| index.resolve(node, env.source))
+                .map(|index| index.impact_binding(node, env.source))
                 .unwrap_or_default(),
             _ => crate::engine::lexical_binding::LexicalBinding::Unknown,
         };

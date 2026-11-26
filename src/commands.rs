@@ -12,7 +12,7 @@ use crate::service::{AppService, AstParams};
 
 mod common;
 pub(crate) use git_input::index_module_paths;
-mod git_snapshot;
+pub(crate) mod git_snapshot;
 mod host_entries;
 pub(crate) mod metrics;
 mod reference_evidence;

@@ -180,6 +180,7 @@ pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
     /// staged のときも、Cargo の外部設定は元の checkout の祖先にある。
     pub(super) layout_checkout: PathBuf,
+    staged_bindings: OnceLock<Option<Box<(crate::commands::git_snapshot::IndexSnapshot, Self)>>>,
     layout_cargo_settings: OnceLock<bool>,
     pub(super) canonical_root: Option<PathBuf>,
     ordinary_sources: OnceLock<bool>,
@@ -258,6 +259,7 @@ impl RustPathOwnerProjectProof {
         Self {
             root: root.to_owned(),
             layout_checkout: root.to_owned(),
+            staged_bindings: OnceLock::new(),
             layout_cargo_settings: OnceLock::new(),
             canonical_root: root.canonicalize().ok(),
             ordinary_sources: OnceLock::new(),
@@ -1523,6 +1525,23 @@ impl RustPathOwnerProjectProof {
             .get_or_init(|| scan_macro_definitions(&self.root))
             .as_ref()
             .is_none_or(|names| names.contains(name))
+    }
+
+    pub(super) fn staged_bindings(&self) -> Option<&Self> {
+        self.staged_bindings
+            .get_or_init(|| {
+                let snapshot = crate::commands::git_snapshot::IndexSnapshot::for_bindings(
+                    self.root.to_str()?,
+                )?;
+                let root = Path::new(snapshot.dir().ok()?);
+                let mut project = Self::new(root, false, false, false, &[], "");
+                project.layout_checkout.clone_from(&self.layout_checkout);
+                project.cargo_configs =
+                    super::rust_cargo_config::CargoConfigProof::capture(&self.layout_checkout);
+                Some(Box::new((snapshot, project)))
+            })
+            .as_deref()
+            .map(|(_, project)| project)
     }
 
     pub(super) fn allows_macro_value_bindings(&self) -> bool {

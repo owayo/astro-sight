@@ -131,7 +131,7 @@ threads-required = 2
 
 # Rust の同名の関連関数・引数・モジュールと、本当の呼び出し元を複数の構成で確認する。
 [[profile.default.overrides]]
-filter = 'test(=integration::impact_rust_scope::impact_rust_distinguishes_workspace_function_uses) | test(=integration::impact_rust_scope::impact_rust_external_associated_types_require_binding_proof)'
+filter = 'test(=integration::impact_rust_scope::impact_rust_distinguishes_workspace_function_uses) | test(=integration::impact_rust_scope::impact_rust_external_associated_types_require_binding_proof) | test(=integration::impact_rust_scope::impact_rust_scope_checks_the_integration_targets_assertion_macro)'
 priority = 50
 threads-required = 2
 
