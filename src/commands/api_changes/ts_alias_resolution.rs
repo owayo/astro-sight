@@ -125,7 +125,9 @@ impl TsAliasResolver {
             return resolver;
         };
         resolver.packages = read_packages(&root, &walked.manifests);
-        if let Some((projects, relative_unchanged)) = load_projects(&root, &walked.configs) {
+        if let Some((projects, relative_unchanged)) =
+            load_projects(&root, &walked.configs, ConfigFs::Current)
+        {
             resolver.projects = Some(projects);
             resolver.relative_unchanged = relative_unchanged;
         }
@@ -1058,8 +1060,15 @@ fn changes_relative_resolution(config: &Map<String, Value>) -> bool {
     suffixes_changed || roots_changed
 }
 
-fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<(Vec<Option<Effective>>, bool)> {
-    let mut loader = ConfigLoader::default();
+fn load_projects(
+    root: &Path,
+    configs: &[PathBuf],
+    fs: ConfigFs,
+) -> Option<(Vec<Option<Effective>>, bool)> {
+    let mut loader = ConfigLoader {
+        fs,
+        ..ConfigLoader::default()
+    };
     // (設定, extends と references で辿ってよい範囲)。
     let mut pending: Vec<(PathBuf, PathBuf)> = configs
         .iter()
@@ -1087,7 +1096,7 @@ fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<(Vec<Option<Effecti
             let mut found = false;
             for name in PROJECT_CONFIG_NAMES {
                 let path = ancestor.join(name);
-                if is_regular_file(&path)? {
+                if loader.fs.is_regular_file(&path)? {
                     pending.push((path, ancestor.to_path_buf()));
                     found = true;
                 }
@@ -1101,7 +1110,7 @@ fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<(Vec<Option<Effecti
     let mut projects = Vec::new();
     let mut relative_unchanged = true;
     while let Some((path, area)) = pending.pop() {
-        let Some(canonical) = regular_file(&path) else {
+        let Some(canonical) = loader.fs.regular_file(&path) else {
             projects.push(None);
             continue;
         };
@@ -1127,7 +1136,7 @@ fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<(Vec<Option<Effecti
                     .as_object()
                     .and_then(|reference| reference.get("path"))
                     .and_then(Value::as_str)
-                    .and_then(|path| referenced_path(&leaf, path, &area))
+                    .and_then(|path| referenced_path(&loader.fs, &leaf, path, &area))
                 {
                     Some(referenced) => pending.push((referenced, area.clone())),
                     None => projects.push(None),
@@ -1188,11 +1197,14 @@ impl ConfigLoader {
             return true;
         }
         let Some(raw) = self.read(canonical) else {
-            return read_utf8_file_limited(canonical, MAX_FILE_BYTES).is_some_and(|text| {
-                !text.contains("moduleSuffixes")
-                    && !text.contains("rootDirs")
-                    && !text.contains("extends")
-            });
+            return self
+                .fs
+                .read_utf8_limited(canonical, MAX_FILE_BYTES)
+                .is_some_and(|text| {
+                    !text.contains("moduleSuffixes")
+                        && !text.contains("rootDirs")
+                        && !text.contains("extends")
+                });
         };
         if changes_relative_resolution(&raw) {
             return false;
@@ -1414,7 +1426,7 @@ pub(crate) fn config_keeps_relative_resolution(dir: &str, config: &Path) -> bool
                 .as_object()
                 .and_then(|reference| reference.get("path"))
                 .and_then(Value::as_str)
-                .and_then(|referenced| referenced_path(leaf, referenced, &root))
+                .and_then(|referenced| referenced_path(&loader.fs, leaf, referenced, &root))
             else {
                 return false;
             };
@@ -1430,17 +1442,17 @@ fn regular_file(path: &Path) -> Option<PathBuf> {
 }
 
 /// `references` の `path` (設定ファイルか、tsconfig.json を持つディレクトリ)。`area` の外は None。
-fn referenced_path(directory: &Path, path: &str, area: &Path) -> Option<PathBuf> {
+fn referenced_path(fs: &ConfigFs, directory: &Path, path: &str, area: &Path) -> Option<PathBuf> {
     if path.contains('\\') {
         return None;
     }
     let target = normalize_lexically(&directory.join(path))?;
-    let file = if is_directory(&target)? {
+    let file = if fs.is_directory(&target)? {
         target.join("tsconfig.json")
     } else {
         target
     };
-    let canonical = regular_file(&file)?;
+    let canonical = fs.regular_file(&file)?;
     canonical.starts_with(area).then_some(canonical)
 }
 
