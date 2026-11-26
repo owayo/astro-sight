@@ -520,6 +520,8 @@ An unsupported value assertion such as `as Item` can produce the same reason eve
 
 ### TypeScript signature type dependencies
 
+When an exported function returns a class declared in the same file, both `Key` and `Value` in the index signature `[key: Key]: Value` contribute to its return type. A change to `Key` that invalidates an existing lookup puts the function in `api.mod`. When `E['keep']` selects a property on a simple local object type, review follows the type of `keep` and its dependencies. The name `key` belongs to the index parameter, so a method with that name keeps its own dependencies.
+
 `review` follows same-file non-exported type declarations used in explicit public contracts. Changing `type Label = string` to `number`, or changing a member of a private interface, reports the exported functions, classes, and annotated variables that depend on it in `api_changes.modified` (`api.mod` in the hook), even when their declaration headers have no changed lines. Their references enter the normal impact analysis, including its language, import ownership, alias, and exclusion rules. This also applies to staged review, using the index snapshot.
 
 The dependency graph follows alias chains, merged interfaces, class member annotations and inheritance, and literal enum contracts. It handles cycles and respects generic bindings; a local generic parameter named `Label` does not refer to a same-file alias of that name. Bodies, comments, and spacing outside literals do not change an explicit contract. Changes to types that are themselves exported retain the existing public-type classifications and closure proofs.

@@ -43,8 +43,22 @@ pub(crate) fn type_dependencies_unchanged(
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Reference {
     pub(super) name: String,
-    /// `NS.Member` の `Member`。
-    pub(super) member: Option<String>,
+    pub(super) member: Option<Member>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Member {
+    Qualified(String),
+    Indexed(String),
+}
+
+impl Reference {
+    fn qualified_member(&self) -> Option<&str> {
+        match &self.member {
+            Some(Member::Qualified(member)) => Some(member),
+            _ => None,
+        }
+    }
 }
 
 enum ImportKind {
@@ -426,6 +440,35 @@ fn collect_references(root: Node<'_>, source: &[u8], out: &mut Vec<Reference>) -
     collect_references_in_scope(root, source, out, &[])
 }
 
+pub(super) fn lookup_type_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if node.kind() != "lookup_type" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor).filter(|n| !n.is_extra());
+    let pair = (children.next()?, children.next()?);
+    children.next().is_none().then_some(pair)
+}
+
+fn indexed_member(node: Node<'_>, source: &[u8]) -> Option<Reference> {
+    let (owner, key) = lookup_type_parts(node)?;
+    if owner.kind() != "type_identifier" || key.kind() != "literal_type" {
+        return None;
+    }
+    let key = super::super::ts_required_members::only_named_child(key)?;
+    if key.kind() != "string" {
+        return None;
+    }
+    let key = static_js_string_text(key, source)?;
+    if key.contains('\\') {
+        return None;
+    }
+    Some(Reference {
+        name: plain(owner, source)?,
+        member: Some(Member::Indexed(key.to_owned())),
+    })
+}
+
 pub(super) fn collect_references_in_scope(
     root: Node<'_>,
     source: &[u8],
@@ -470,8 +513,13 @@ pub(super) fn collect_references_in_scope(
                 if !bound(&scopes, scope, &name) {
                     out.push(Reference {
                         name,
-                        member: Some(member),
+                        member: Some(Member::Qualified(member)),
                     });
+                }
+            }
+            "lookup_type" if let Some(reference) = indexed_member(node, source) => {
+                if !bound(&scopes, scope, &reference.name) {
+                    out.push(reference);
                 }
             }
             // 引数名・添字の名前・型述語の対象は束縛で、型の参照ではない。
@@ -579,7 +627,11 @@ fn check_references(
     let new = TopLevel::collect(new_root, new_source)?;
     let isolated = env.changed_paths.iter().all(|path| path == env.target_path);
     let mut seen = BTreeSet::new();
-    while let Some(reference) = pending.pop() {
+    while let Some(mut reference) = pending.pop() {
+        // 互換性の証明では従来どおり宣言全体を比較し、同じ型の添字ごとに読み直さない。
+        if matches!(reference.member, Some(Member::Indexed(_))) {
+            reference.member = None;
+        }
         if !seen.insert(reference.clone()) {
             continue;
         }
@@ -595,7 +647,9 @@ fn check_references(
                 }
             }
             (Some(Binding::Types(old_declarations)), Some(Binding::Types(new_declarations))) => {
-                if reference.member.is_some() || old_declarations.len() != new_declarations.len() {
+                if reference.qualified_member().is_some()
+                    || old_declarations.len() != new_declarations.len()
+                {
                     return None;
                 }
                 for ((old_statement, _), (new_statement, new_declaration)) in
@@ -634,7 +688,7 @@ fn check_references(
                 let exported = match kind {
                     ImportKind::Named(imported) => imported.as_str(),
                     ImportKind::Default => "default",
-                    ImportKind::Namespace => reference.member.as_deref()?,
+                    ImportKind::Namespace => reference.qualified_member()?,
                 };
                 if old.may_export(exported) || new.may_export(exported) {
                     return None;
