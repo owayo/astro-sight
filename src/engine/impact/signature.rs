@@ -267,22 +267,6 @@ fn line_has_identifier(line: &str, symbol: &str, lang: LangId) -> bool {
         .any(|tok| normalize_identifier(lang, tok).as_ref() == target.as_ref())
 }
 
-/// コンテキスト行（例: "    symbols::extract_symbols(...)"）から関数名の抽出を試みる。
-pub(crate) fn extract_function_from_context(context: &str) -> Option<String> {
-    // "fn name" パターンを検索
-    if let Some(pos) = context.find("fn ") {
-        let rest = &context[pos + 3..];
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-    None
-}
-
 /// old/new signature のトップレベル引数の個数が同じかを返す。
 /// どちらかの個数を数えられない (括弧が見つからない等) 場合は保守的に false
 /// (= arity が変わった扱いで blocking 維持)。
@@ -483,21 +467,6 @@ mod tests {
         assert!(!is_signature_line("    void* ptr = nullptr;"));
         assert!(!is_signature_line("    int count = 0;"));
         assert!(!is_signature_line("    bool flag = true;"));
-    }
-
-    // "fn name(...)" パターンから関数名を抽出できる
-    #[test]
-    fn extract_function_from_context_fn() {
-        assert_eq!(
-            extract_function_from_context("    fn process_data(x: i32) {"),
-            Some("process_data".to_string())
-        );
-    }
-
-    // fn キーワードが含まれない場合は None を返す
-    #[test]
-    fn extract_function_from_context_no_fn() {
-        assert_eq!(extract_function_from_context("let x = 42;"), None);
     }
 
     // 変更行にシンボル名が含まれる場合 true を返す

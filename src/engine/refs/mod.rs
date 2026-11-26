@@ -1081,6 +1081,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     if alias_scan {
         visitor.on_tree(root, source.as_bytes());
         if present_indices.is_empty() {
+            visitor.finish_tree(root, source.as_bytes(), lang_id);
             return Ok(());
         }
     }
@@ -1100,6 +1101,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
         &matcher,
         &mut sink,
     );
+    visitor.finish_tree(root, source.as_bytes(), lang_id);
     Ok(())
 }
 

@@ -90,6 +90,57 @@ struct CallerContexts<'tree> {
     by_callee: std::collections::HashMap<usize, (Option<usize>, Node<'tree>)>,
 }
 
+/// 参照位置から最も内側の名前付き関数を引く。隣接する宣言は列でも区別する。
+#[derive(Default)]
+pub(crate) struct EnclosingCallers {
+    boundaries: Vec<(tree_sitter::Point, Option<usize>)>,
+    names: Vec<String>,
+}
+
+impl EnclosingCallers {
+    pub(crate) fn collect(root: Node<'_>, source: &[u8], lang: LangId) -> Self {
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+        use std::ops::ControlFlow;
+
+        let mut index = Self::default();
+        let kinds = function_node_kinds(lang);
+        let mut ancestors = Vec::new();
+        let mut open = Vec::<(tree_sitter::Point, usize)>::new();
+        let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+            ancestors.truncate(depth);
+            if kinds.contains(&node.kind())
+                && let Some(name) =
+                    find_function_name(node, ancestors.last().copied(), source, lang)
+            {
+                let start = node.start_position();
+                while open.last().is_some_and(|&(end, _)| end <= start) {
+                    let (end, _) = open.pop().unwrap();
+                    index.boundaries.push((end, open.last().map(|&(_, i)| i)));
+                }
+                let i = index.names.len();
+                index.names.push(name);
+                index.boundaries.push((start, Some(i)));
+                open.push((node.end_position(), i));
+            }
+            ancestors.push(node);
+            ControlFlow::Continue(Walk::Descend)
+        });
+        while let Some((end, _)) = open.pop() {
+            index.boundaries.push((end, open.last().map(|&(_, i)| i)));
+        }
+        index
+    }
+
+    pub(crate) fn at(&self, line: usize, column: usize) -> Option<&str> {
+        let point = tree_sitter::Point::new(line, column);
+        let end = self
+            .boundaries
+            .partition_point(|&(start, _)| start <= point);
+        let (_, name) = self.boundaries[..end].last()?;
+        Some(&self.names[(*name)?])
+    }
+}
+
 impl<'tree> CallerContexts<'tree> {
     fn collect(root: Node<'tree>, callees: &[Node<'tree>], source: &[u8], lang_id: LangId) -> Self {
         use std::ops::ControlFlow;

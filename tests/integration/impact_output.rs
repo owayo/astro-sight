@@ -1,5 +1,63 @@
 use super::support::TestRepo;
 
+#[test]
+fn cross_file_caller_names_keep_the_first_caller_and_all_symbols_on_a_line() {
+    let repo = TestRepo::new();
+    let producer = "export function total(x: number) { return x; }\nexport function plus(x: number) { return x + 1; }\n";
+    repo.write("producer.ts", producer);
+    repo.write("runner.ts", "import { total, plus } from './producer';\nconst left = () => total(1); const right = () => plus(2);\nconst text = 'fn misleading'; total(3);\n");
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "producer.ts",
+        producer.replace("x: number)", "x: number, required: number)"),
+    );
+    let graph = repo.run_json("context", &["--git"]);
+    assert_eq!(
+        graph["changes"][0]["impacted_callers"],
+        serde_json::json!([
+            {"path": "runner.ts", "line": 1, "name": "left", "symbols": ["plus", "total"]},
+            {"path": "runner.ts", "line": 2, "name": "total", "symbols": ["total"]}
+        ]),
+        "{graph}"
+    );
+}
+
+#[test]
+fn cross_file_caller_names_use_the_enclosing_function_in_the_review_snapshot() {
+    let repo = TestRepo::new();
+    repo.write("producer.py", "def total(x):\n    return x\n");
+    let callers = "from producer import total\n\ndef plain():\n    return total(1)\n\nclass Runner:\n    def method(self):\n        def inner():\n            return total(2)\n        return total(3)\n\ntotal(4)\n";
+    repo.write("runner.py", callers);
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("producer.py", "def total(x, required):\n    return x\n");
+    repo.stage_all();
+    repo.write("runner.py", callers.replace("plain()", "worktree()"));
+    for (command, flags, first) in [
+        ("context", vec!["--git"], "worktree"),
+        ("review", vec!["--git", "--staged"], "plain"),
+    ] {
+        let result = repo.run_json(command, &flags);
+        let graph = result.get("impact").unwrap_or(&result);
+        let change = graph["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "producer.py")
+            .unwrap();
+        let impacted = change["impacted_callers"].as_array().unwrap();
+        for (line, caller) in [(3, first), (8, "inner"), (9, "method"), (11, "total")] {
+            let site = impacted
+                .iter()
+                .find(|c| c["path"] == "runner.py" && c["line"] == line)
+                .unwrap_or_else(|| panic!("{graph}"));
+            assert_eq!(site["name"], caller, "{graph}");
+            assert_eq!(site["symbols"], serde_json::json!(["total"]), "{graph}");
+        }
+    }
+}
+
 /// GitLab #35: メソッドの型注釈のみ変更 + クラス docblock のコメント修正
 /// (`* class SipUserSipUserId` → `* class SipUserId`) の diff で、コメント行の
 /// `class SipUserId` テキストがヘッダ変更と誤認され、`new SipUserId(...)` の生成箇所
