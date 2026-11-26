@@ -1,5 +1,5 @@
-//! 通常の Python パッケージだけを root / src の正確なモジュール名から解決する。
-//! namespace、別 root、相対 import、再 export はこの証明の対象外。
+//! root / src の正確なモジュール名から、通常の Python パッケージを解決する。
+//! 削除の帰属では、単一の root にある namespace package の子モジュールも調べる。
 
 use std::path::{Path, PathBuf};
 
@@ -78,6 +78,44 @@ pub(crate) fn resolve(dir: &str, module: &str) -> Option<String> {
 pub(super) fn resolve_with_package_check(
     dir: &str,
     module: &str,
+    package_check: impl FnMut(&Path) -> Option<()>,
+) -> Option<String> {
+    resolve_local(dir, module, false, package_check)
+}
+
+/// 属性の出所を調べる場合は、初期化子のない一意な親ディレクトリにも実在する子を探す。
+pub(super) fn is_inert_package_submodule(dir: &str, module: &str) -> bool {
+    if resolve_local(dir, module, true, inert_initializer).is_none() {
+        return false;
+    }
+    let view = crate::git_support::tree_view(Path::new(dir));
+    let Some(omitted) = view.omitted() else {
+        return false;
+    };
+    if omitted.is_empty() {
+        return true;
+    }
+    // 省略された初期化子や競合するモジュールを「存在しない」と判定しない。
+    for mut prefix in [PathBuf::new(), PathBuf::from("src")] {
+        for part in module.split('.') {
+            prefix.push(part);
+            if view.hides(&prefix)
+                || view.hides(&prefix.with_extension("py"))
+                || view.hides(&prefix.with_extension("so"))
+                || view.hides(&prefix.join("__init__.py"))
+                || view.hides(&prefix.join("__init__.so"))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn resolve_local(
+    dir: &str,
+    module: &str,
+    allow_namespace_parent: bool,
     mut package_check: impl FnMut(&Path) -> Option<()>,
 ) -> Option<String> {
     let parts: Vec<_> = module.split('.').collect();
@@ -127,7 +165,12 @@ pub(super) fn resolve_with_package_check(
         if !parent.is_dir() {
             return None;
         }
-        package_check(&package_initializer(&parent)?)?;
+        if !allow_namespace_parent
+            || parent.join("__init__.py").try_exists().ok()?
+            || competing_module(&parent, "__init__")?
+        {
+            package_check(&package_initializer(&parent)?)?;
+        }
     }
     let name = parts.last()?;
     if competing_module(&parent, name)? {
@@ -168,6 +211,20 @@ pub(super) fn resolve_with_package_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_initializer_cannot_prove_a_namespace_submodule() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git_support::fake_snapshot_record(
+            root.path(),
+            r#"{"path":"pkg/__init__.py","kind":"symlink","target":"regular_file"}"#,
+        );
+        std::fs::write(root.path().join("pkg/u.py"), "").unwrap();
+        assert!(!is_inert_package_submodule(
+            root.path().to_str().unwrap(),
+            "pkg.u"
+        ));
+    }
 
     #[test]
     fn exact_roots_do_not_resolve_suffix_matches_or_competing_packages() {
