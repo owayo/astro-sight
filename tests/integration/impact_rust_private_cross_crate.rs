@@ -142,6 +142,41 @@ impl<'a> Case<'a> {
 }
 
 #[test]
+fn rust_doctest_source_may_call_another_packages_private_function() {
+    let original = "mod guide;\nfn translate(_: u8) {}\npub mod api {\n    pub const CALL: fn(u8) = super::translate;\n    pub use CALL as translate;\n}\n";
+    let calls = "use super::*;\npub fn run() {\n    translate(1);\n}\n";
+    let read = "→ b/src/calls.rs:3 [translate]";
+    let other = "→ b/src/other.rs:3 [translate]";
+    for (argument, expected) in [
+        (r#""../../b/src/calls.rs""#, vec![read]),
+        (r##"r#"../../b/src/./calls.rs"#"##, vec![read]),
+        (r#"concat!("../../b/src/", "calls.rs")"#, vec![read, other]),
+        (r#""../README.md""#, vec![]),
+    ] {
+        let guide = format!(
+            "#[doc = concat!(\"```rust\\nuse a::api::*;\\nmod inner {{\\n\", include_str!({argument}), \"}}\\nfn main() {{}}\\n```\")]\npub struct Guide;\n"
+        );
+        let case = Case {
+            a_old: original.into(),
+            a_new: original
+                .replace("(_: u8)", "(_: u8, _: u8)")
+                .replace("fn(u8)", "fn(u8, u8)"),
+            b_lib: "mod calls;\nmod other;\nfn translate(_: u8) {}\n",
+            files: vec![
+                ("a/src/guide.rs", guide),
+                ("a/README.md", "// Guide\n".into()),
+                ("b/src/calls.rs", calls.into()),
+                ("b/src/other.rs", calls.into()),
+            ],
+            ..Case::new(A_OLD)
+        };
+        let (code, rows) = case.run();
+        assert_eq!(rows, expected, "{argument}");
+        assert_eq!(code, i32::from(!expected.is_empty()), "{argument}");
+    }
+}
+
+#[test]
 fn rust_extern_signature_change_reaches_the_dependent_crate() {
     let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
     case.a_old.push_str("\npub mod api {\n    unsafe extern \"C\" {\n        pub fn translate(x: u8);\n        fn local(x: u8);\n    }\n}\n");

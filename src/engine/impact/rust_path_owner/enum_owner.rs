@@ -193,7 +193,11 @@ pub(super) fn static_layout(
                 // 先頭のコメントの後の `#! [..]` も、同梱の文法は shebang にする。`.rs` のファイルを
                 // 文字列として読む `include_str!` は、`#[doc = ..]` で doctest の本体にできる。
                 open |= hidden_shebang(tree.root_node(), &source)
-                    || reads_rust_source_as_text(tree.root_node(), &source);
+                    || crate::engine::rust_dynamic_source::any_rust_text_include(
+                        tree.root_node(),
+                        &source,
+                        |_| true,
+                    );
                 let mut offsets = Vec::new();
                 let mut macro_scopes = Vec::new();
                 let result = crate::engine::tree_walk::walk_preorder(
@@ -329,7 +333,11 @@ pub(super) fn static_layout(
         }
         open |= hidden_inner_attribute(&source)
             || hidden_shebang(tree.root_node(), &source)
-            || reads_rust_source_as_text(tree.root_node(), &source);
+            || crate::engine::rust_dynamic_source::any_rust_text_include(
+                tree.root_node(),
+                &source,
+                |_| true,
+            );
         let mut macro_scopes = Vec::new();
         let result = crate::engine::tree_walk::walk_preorder(
             tree.root_node(),
@@ -480,160 +488,6 @@ fn hidden_shebang(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
                     .get(node.start_byte()..node.end_byte())
                     .is_some_and(hidden_inner_attribute))
     })
-}
-
-/// `include_str!` (マクロの呼び出しの節か、token tree の中の `include_str ! (..)`) が
-/// `.rs` のファイルを読み得るか ([`text_include_may_name_rust_source`])。読んだソースは
-/// `#[doc = concat!("```rust\n", include_str!("../../b/src/calls.rs"), "\n```")]` で doctest の本体に
-/// なり、別の package のファイルを変更元のクレートの doctest で型検査する (`include!`・`#[path]`・
-/// `mod` の宣言は要らない)。`include_str` の識別子が `!` の前でない位置 (別名の
-/// `use std::include_str as read_src;`・`cfg_if!` の引数の中の `use`) にあれば、別名の呼び出しを
-/// 追わずに読み得るとする (コメントの中の綴りは数えない)。
-fn reads_rust_source_as_text(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    // `include_bytes!` の結果は doctest の本体にならない (`concat!` はバイト列を受けず、`#[doc]` は
-    // 文字列だけを読む)。`include_str` を別の名前 (`include_bytes` も) に付け替える `use` は数える。
-    if memchr::memmem::find(source, b"include_str").is_none() {
-        return false;
-    }
-    crate::engine::tree_walk::any_node(root, crate::engine::tree_walk::Children::All, |node| {
-        if node.kind() == "identifier"
-            && node
-                .utf8_text(source)
-                .is_ok_and(|name| name.strip_prefix("r#").unwrap_or(name) == "include_str")
-            && !followed_by_bang(node)
-            && binds_macro_names(node)
-        {
-            return true;
-        }
-        text_include_arguments(node, source)
-            .is_some_and(|arguments| text_include_may_name_rust_source(arguments, source))
-    })
-}
-
-/// 識別子 `node` (パスの最後の要素なら、そのパス) の次の字句が `!` か。
-fn followed_by_bang(node: tree_sitter::Node<'_>) -> bool {
-    let mut current = node;
-    loop {
-        // 兄弟の API は名前が合ったときだけ呼ぶ (根から探し直すので重い)。
-        let mut next = current.next_sibling();
-        while let Some(sibling) = next.filter(|sibling| sibling.is_extra()) {
-            next = sibling.next_sibling();
-        }
-        match next {
-            Some(next) => return next.kind() == "!",
-            None => match current.parent() {
-                Some(parent) if parent.kind() == "scoped_identifier" => current = parent,
-                _ => return false,
-            },
-        }
-    }
-}
-
-/// 識別子 `node` が、マクロの名前を束縛し得る位置 (`use` の宣言・`extern crate`・マクロの引数の
-/// token tree の中) にあるか。普通の式や宣言の識別子 (`let include_str = false;`) はマクロの名前を
-/// 束縛しない。親の API は根から探し直すので、名前が合ったときだけ呼ぶ。
-fn binds_macro_names(node: tree_sitter::Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if matches!(
-            parent.kind(),
-            "use_declaration" | "extern_crate_declaration" | "token_tree"
-        ) {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
-/// `include_str!(..)` の呼び出しの引数の token tree。
-fn text_include_arguments<'t>(
-    node: tree_sitter::Node<'t>,
-    source: &[u8],
-) -> Option<tree_sitter::Node<'t>> {
-    let text_include = |name: &str| name == "include_str";
-    match node.kind() {
-        "macro_invocation" => {
-            if !text_include(last_macro_identifier(node, source)?) {
-                return None;
-            }
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| child.kind() == "token_tree")
-        }
-        "identifier" => {
-            let name = node.utf8_text(source).ok()?;
-            if !text_include(name.strip_prefix("r#").unwrap_or(name)) {
-                return None;
-            }
-            let mut next = node.next_sibling()?;
-            while next.is_extra() {
-                next = next.next_sibling()?;
-            }
-            if next.kind() != "!" {
-                return None;
-            }
-            let mut arguments = next.next_sibling()?;
-            while arguments.is_extra() {
-                arguments = arguments.next_sibling()?;
-            }
-            (arguments.kind() == "token_tree").then_some(arguments)
-        }
-        _ => None,
-    }
-}
-
-/// `include_str!` の引数 `arguments` が `.rs` のファイルを指し得るか。字面の文字列 1 つなら、`.rs` で
-/// 終わるか escape を含むとき。マクロや識別子を含む引数 (`concat!(env!("CARGO_MANIFEST_DIR"), ..)`
-/// も) は、どれも指し得る: `concat`・`env` は別名の `use` (`use std::env as concat;`) で付け替えられ、
-/// `env!` の値と 2 番目の引数 (エラーの文言) は読む先を決めない。
-fn text_include_may_name_rust_source(arguments: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    let mut cursor = arguments.walk();
-    let named: Vec<_> = arguments
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra())
-        .collect();
-    if let [only] = named.as_slice()
-        && matches!(only.kind(), "string_literal" | "raw_string_literal")
-    {
-        let text = only.utf8_text(source).unwrap_or("\\");
-        return text.contains('\\') || literal_may_open_rust_source(text);
-    }
-    true
-}
-
-/// `include_str!` の字面 1 つ (`"../README.md"`。escape は呼び出し側で除く) が `.rs` を開き得るか。
-/// Windows の開き方も見る: 要素の末尾の `.`・空白を落とし、`.` の要素を畳むので、`lib.rs.`・
-/// `lib.rs/.`・`lib.rs ` も `lib.rs` を読む。`:` (`lib.rs::$DATA` のストリームの名前) と、名前の
-/// 要素より後ろに親の要素 (`lib.rs/unused/../.`) があるものは決めない。
-fn literal_may_open_rust_source(literal: &str) -> bool {
-    let lower = literal.to_ascii_lowercase();
-    let path = lower
-        .trim_start_matches(['r', '#'])
-        .trim_start_matches('"')
-        .trim_end_matches('#')
-        .trim_end_matches('"');
-    if path.contains(':') {
-        return true;
-    }
-    let mut named = false;
-    let mut last = None;
-    for component in path.split('/') {
-        // `.`・空白だけの要素: `.` と空は飛ばし、ほか (`..`・`...`・`.. `) は親を指し得る。名前の
-        // 要素より後ろの親 (`lib.rs/unused/../.`) は、Windows が畳むので最後の要素を決めない。
-        if component.chars().all(|c| matches!(c, '.' | ' ')) {
-            if matches!(component, "" | ".") {
-                continue;
-            }
-            if named {
-                return true;
-            }
-            continue;
-        }
-        named = true;
-        last = Some(component.trim_end_matches(['.', ' ']));
-    }
-    last.is_none_or(|component| component.ends_with(".rs"))
 }
 
 /// ファイルの先頭の `#!` の行 (UTF-8 の BOM の後も) が、rustc では内側の属性になり得るか: `#!` の
@@ -1878,7 +1732,11 @@ mod tests {
         ] {
             let tree = parse(source);
             assert_eq!(
-                reads_rust_source_as_text(tree.root_node(), source.as_bytes()),
+                crate::engine::rust_dynamic_source::any_rust_text_include(
+                    tree.root_node(),
+                    source.as_bytes(),
+                    |_| true
+                ),
                 open,
                 "{source}"
             );

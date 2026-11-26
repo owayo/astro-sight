@@ -31,6 +31,7 @@ struct Package {
 pub(crate) struct CargoIndex {
     packages: Vec<Package>,
     rust_files: Vec<PathBuf>,
+    doctest_sources: HashSet<PathBuf>,
 }
 
 impl CargoIndex {
@@ -198,8 +199,17 @@ impl CargoIndex {
         // 標準の式マクロと組み込みの derive・属性は取り込みをしないが、別のファイルから
         // 上書きされうるので、全ソースを見てから決める。
         let mut expansions = ExpansionFacts::default();
+        let mut doctest_sources = HashSet::new();
         for path in &files.rust_files {
-            expansions.add(&tree.read(path)?)?;
+            let source = tree.read(path)?;
+            for literal in expansions.add(&source)? {
+                // 作業ツリーと Git の tree はそれぞれ自身の規則で解決する。
+                let target = tree.resolve(path.parent()?, literal)?;
+                if !sources.contains(target.as_path()) {
+                    return None;
+                }
+                doctest_sources.insert(target);
+            }
         }
         if !expansions.allows() {
             return None;
@@ -207,12 +217,15 @@ impl CargoIndex {
         Some(Self {
             packages,
             rust_files: files.rust_files,
+            doctest_sources,
         })
     }
 
     pub(crate) fn owner(&self, path: &str) -> Option<usize> {
         let path = Path::new(path);
-        if !path.extension()?.to_str()?.eq_ignore_ascii_case("rs") {
+        if !path.extension()?.to_str()?.eq_ignore_ascii_case("rs")
+            || self.doctest_sources.contains(path)
+        {
             return None;
         }
         self.packages
@@ -769,7 +782,7 @@ struct ExpansionFacts {
 impl ExpansionFacts {
     /// ソース 1 つを足す。ソースの取り込み・標準でないマクロや属性・依存の外の crate・解析失敗が
     /// あれば None。
-    fn add(&mut self, source: &[u8]) -> Option<()> {
+    fn add<'a>(&mut self, source: &'a [u8]) -> Option<Vec<&'a str>> {
         // LFS のポインタからは実際のソースの取り込みやマクロを確かめられない。
         if source.starts_with(b"version https://git-lfs.github.com/spec/v1") {
             return None;
@@ -777,6 +790,17 @@ impl ExpansionFacts {
         let tree = parser::parse_source(source, LangId::Rust).ok()?;
         let root = tree.root_node();
         if root.has_error() {
+            return None;
+        }
+        let mut doctest_sources = Vec::new();
+        if crate::engine::rust_dynamic_source::any_rust_text_include(root, source, |literal| {
+            if let Some(path) = literal {
+                doctest_sources.push(path);
+                false
+            } else {
+                true
+            }
+        }) {
             return None;
         }
         // macro_rules! の本体は呼び出されない限り展開されず、標準でないマクロの呼び出しは許さない
@@ -819,7 +843,7 @@ impl ExpansionFacts {
                     .map(|child| (child, children_in_definition)),
             );
         }
-        Some(())
+        Some(doctest_sources)
     }
 
     fn add_use(&mut self, node: Node<'_>, source: &[u8]) -> Option<()> {
@@ -1738,6 +1762,24 @@ mod tests {
             ])
             .is_some()
         );
+    }
+
+    #[test]
+    fn listed_tree_records_doctest_sources_in_that_tree() {
+        let index = scan_listed(&[
+            ("Cargo.toml", "[workspace]\nmembers=[\"a\",\"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname=\"a\"\nversion=\"0.1.0\"\n"),
+            ("b/Cargo.toml", "[package]\nname=\"b\"\nversion=\"0.1.0\"\n"),
+            (
+                "a/src/lib.rs",
+                "#[doc = include_str!(\"../../b/src/calls.rs\")]\npub struct Guide;",
+            ),
+            ("b/src/calls.rs", "pub fn run() {}"),
+            ("b/src/lib.rs", "mod calls;"),
+        ])
+        .unwrap();
+        assert!(index.owner("b/src/calls.rs").is_none());
+        assert!(index.owner("b/src/lib.rs").is_some());
     }
 
     #[test]
