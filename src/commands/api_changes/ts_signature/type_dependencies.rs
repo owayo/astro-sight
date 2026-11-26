@@ -62,7 +62,7 @@ impl Reference {
 }
 
 enum ImportKind {
-    Named(String),
+    Named { remote: String, type_only: bool },
     Default,
     Namespace,
 }
@@ -169,6 +169,7 @@ impl<'tree> TopLevel<'tree> {
     }
 
     fn collect_import(&mut self, statement: Node<'tree>, source: &[u8]) -> Option<()> {
+        let type_only = has_type_keyword(statement);
         let mut cursor = statement.walk();
         for child in statement.named_children(&mut cursor) {
             match child.kind() {
@@ -212,7 +213,10 @@ impl<'tree> TopLevel<'tree> {
                                         plain(local, source)?,
                                         Binding::Import(
                                             statement,
-                                            ImportKind::Named(plain(imported, source)?),
+                                            ImportKind::Named {
+                                                remote: plain(imported, source)?,
+                                                type_only: type_only || has_type_keyword(spec),
+                                            },
                                         ),
                                     );
                                 }
@@ -312,22 +316,23 @@ pub(super) fn named_type_import<'s>(
     if root.has_error() {
         return None;
     }
-    let Binding::Import(statement, ImportKind::Named(remote)) =
+    let Binding::Import(statement, ImportKind::Named { remote, .. }) =
         TopLevel::collect(root, source)?.bindings.remove(name)?
     else {
         return None;
     };
     // inline の `type` ではモジュールの評価が残り得る。
-    if !statement
-        .children(&mut statement.walk())
-        .any(|n| n.kind() == "type")
-    {
+    if !has_type_keyword(statement) {
         return None;
     }
     Some((
         static_specifier(statement.child_by_field_name("source")?, source)?,
         remote,
     ))
+}
+
+fn has_type_keyword(node: Node<'_>) -> bool {
+    node.children(&mut node.walk()).any(|n| n.kind() == "type")
 }
 
 /// 直接名前付きで公開された、型引数を持たない一意な型別名の右辺。
@@ -337,6 +342,10 @@ pub(super) fn exported_type_alias<'tree>(
     name: &str,
 ) -> Option<Node<'tree>> {
     let top = TopLevel::collect(root, source)?;
+    direct_alias(&top, name)
+}
+
+fn direct_alias<'tree>(top: &TopLevel<'tree>, name: &str) -> Option<Node<'tree>> {
     if top.exported.contains(name) {
         return None;
     }
@@ -353,6 +362,25 @@ pub(super) fn exported_type_alias<'tree>(
         && declaration.kind() == "type_alias_declaration"
         && declaration.child_by_field_name("type_parameters").is_none())
     .then(|| declaration.child_by_field_name("value"))?
+}
+
+/// RHS が外の型・値を参照しない直接の公開型別名。他の宣言を経由して変更元へ戻る型は含めない。
+pub(super) fn self_contained_exports(root: Node<'_>, source: &[u8]) -> Option<BTreeSet<String>> {
+    if root.has_error() || super::has_ts_signature_directive(root, source) {
+        return None;
+    }
+    let top = TopLevel::collect(root, source)?;
+    Some(
+        top.bindings
+            .keys()
+            .filter_map(|name| {
+                let ty = direct_alias(&top, name)?;
+                let mut references = Vec::new();
+                collect_references(ty, source, &mut references)?;
+                references.is_empty().then(|| name.clone())
+            })
+            .collect(),
+    )
 }
 
 fn plain(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -601,7 +629,9 @@ fn check(
     for root in roots {
         collect_references(*root, new_source, &mut pending)?;
     }
-    check_references(env, old_root, old_source, new_root, new_source, pending)
+    check_references(
+        env, old_root, old_source, new_root, new_source, pending, None,
+    )
 }
 
 pub(super) fn references_unchanged(
@@ -611,8 +641,18 @@ pub(super) fn references_unchanged(
     new_root: Node<'_>,
     new_source: &[u8],
     references: Vec<Reference>,
+    local_imports: Option<&mut BTreeSet<(String, String)>>,
 ) -> bool {
-    check_references(env, old_root, old_source, new_root, new_source, references).is_some()
+    check_references(
+        env,
+        old_root,
+        old_source,
+        new_root,
+        new_source,
+        references,
+        local_imports,
+    )
+    .is_some()
 }
 
 fn check_references(
@@ -622,6 +662,7 @@ fn check_references(
     new_root: Node<'_>,
     new_source: &[u8],
     mut pending: Vec<Reference>,
+    mut local_imports: Option<&mut BTreeSet<(String, String)>>,
 ) -> Option<()> {
     let old = TopLevel::collect(old_root, old_source)?;
     let new = TopLevel::collect(new_root, new_source)?;
@@ -675,10 +716,23 @@ fn check_references(
                 {
                     return None;
                 }
-                // 相対 import の型は、宣言のファイルの別の export を経由して戻ってくる依存を含め、
-                // 推移的にたどらないので証明しない。bare specifier は registry の依存だけを信頼する。
+                // 末尾引数の追加では type-only の相対 import を集め、呼び出し側で宣言元と右辺を確認する。
                 let specifier =
                     static_specifier(new_statement.child_by_field_name("source")?, new_source)?;
+                if (specifier.starts_with("./") || specifier.starts_with("../"))
+                    && let ImportKind::Named {
+                        remote,
+                        type_only: true,
+                    } = kind
+                    && reference.qualified_member().is_none()
+                    && let Some(imports) = local_imports.as_deref_mut()
+                    && !new_statement
+                        .named_children(&mut new_statement.walk())
+                        .any(|n| n.kind() == "import_attribute")
+                {
+                    imports.insert((specifier.to_owned(), remote.clone()));
+                    continue;
+                }
                 if specifier.starts_with(['.', '/'].as_slice())
                     || !(env.registry_dependency)(specifier)
                 {
@@ -686,7 +740,7 @@ fn check_references(
                 }
                 // 宣言のファイル自身が export し得る名前は、別名の解決で戻ってくることがある。
                 let exported = match kind {
-                    ImportKind::Named(imported) => imported.as_str(),
+                    ImportKind::Named { remote, .. } => remote.as_str(),
                     ImportKind::Default => "default",
                     ImportKind::Namespace => reference.qualified_member()?,
                 };
@@ -705,6 +759,23 @@ mod tests {
     use super::*;
     use crate::engine::parser;
     use crate::language::LangId;
+
+    #[test]
+    fn stable_imports_require_a_direct_self_contained_type_alias() {
+        let source = concat!(
+            "export type Session = { id: string; flags?: readonly ('a' | 'b')[] };\n",
+            "type Local = string; export type Indirect = { id: Local };\n",
+            "export type BackEdge = { id: typeof import('./mailer').key };\n",
+            "export type Generic<T> = { id: T };\n",
+            "export interface Mergeable { id: string }\n",
+            "export type { Other } from './other';\n",
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap();
+        assert_eq!(
+            self_contained_exports(tree.root_node(), source.as_bytes()).unwrap(),
+            BTreeSet::from(["Session".to_owned()])
+        );
+    }
 
     /// `Props` 型の右辺 (旧新でトークンが同じ) を起点に依存を確かめる。
     /// `registry` は registry の依存とみなす bare specifier。
@@ -928,6 +999,7 @@ mod tests {
                 "namespace_import",
                 "named_imports",
                 "import_specifier",
+                "import_attribute",
                 "import_require_clause",
                 "import_alias",
                 "export_statement",

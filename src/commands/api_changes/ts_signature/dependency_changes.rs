@@ -692,6 +692,7 @@ pub(crate) fn compatible_dependencies_unchanged(
         .filter(|path| *path != "/dev/null")
         .map(|path| crate::git_support::normalize_workspace_separators(path))
         .collect();
+    let mut local_imports = BTreeSet::new();
     references_unchanged(
         &DependencyEnvironment {
             target_path: site.new_path,
@@ -704,7 +705,11 @@ pub(crate) fn compatible_dependencies_unchanged(
         new.root_node(),
         &pair.new,
         references,
-    )
+        (reason == "trailing_optional_params" && site.old_path == site.new_path)
+            .then_some(&mut local_imports),
+    ) && local_imports
+        .into_iter()
+        .all(|(specifier, name)| evidence.stable_type_import(site, sources, specifier, &name))
 }
 
 #[cfg(test)]

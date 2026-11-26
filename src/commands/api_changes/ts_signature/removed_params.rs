@@ -109,6 +109,8 @@ fn load_base_inventory(root: &Path, paths: &[PathBuf]) -> Option<RemovalInventor
 /// 利用の在庫の基本の集合、その外のファイルを 1 回読んだ結果、設定と package.json、監査。
 pub(super) struct RemovalEvidence {
     pub(super) base: RemovalInventory,
+    /// 同じ宣言ファイル・指定子を使う関数の間で、解決と base 側ソースの照合を共用する。
+    local_type_exports: RefCell<HashMap<(String, String), BTreeSet<String>>>,
     /// 在庫の外のファイル。読めない・上限を超えたら None (どの証明もしない)。
     outside: Option<OutsideScan>,
     /// 設定と package.json。読めなければ None (外の bare import の解決先を決められない)。
@@ -171,6 +173,7 @@ impl RemovalEvidence {
         );
         Some(Self {
             base,
+            local_type_exports: RefCell::default(),
             outside,
             settings,
             repository,
@@ -229,6 +232,60 @@ impl RemovalEvidence {
     pub(super) fn relaxation(&self) -> Option<&PackageBoundary> {
         self.repository.as_ref()?;
         self.settings.as_ref().map(|settings| &settings.packages)
+    }
+
+    pub(super) fn stable_type_import(
+        &self,
+        site: &CompatibleModSite<'_>,
+        sources: &SignatureSourceCache<'_>,
+        specifier: String,
+        name: &str,
+    ) -> bool {
+        let mut exports = self.local_type_exports.borrow_mut();
+        let entry = exports.entry((site.new_path.to_owned(), specifier));
+        entry
+            .or_insert_with_key(|(_, specifier)| {
+                self.local_type_names(site, sources, specifier)
+                    .unwrap_or_default()
+            })
+            .contains(name)
+    }
+
+    fn local_type_names(
+        &self,
+        site: &CompatibleModSite<'_>,
+        sources: &SignatureSourceCache<'_>,
+        specifier: &str,
+    ) -> Option<BTreeSet<String>> {
+        // 省かれたリンクはモジュールの候補や設定を隠し得る。通常の checkout は空の一覧を返す。
+        if !crate::git_support::tree_view(Path::new(site.dir))
+            .omitted()?
+            .is_empty()
+        {
+            return None;
+        }
+        let normalized = super::super::removed_attribution::normalize_relative_specifier(
+            site.new_path,
+            specifier,
+        )?;
+        let requested = Path::new(&normalized);
+        let packages = self.relaxation()?;
+        let stem = match requested.extension().and_then(|ext| ext.to_str()) {
+            None if !packages.needs_explicit_extension(site.new_path) => requested.to_owned(),
+            Some("js" | "mjs" | "cjs") => requested.with_extension(""),
+            _ => return None,
+        };
+        let (path, _) =
+            super::super::source_pair::relative_ts_source_path(site.dir, site.new_path, specifier)?;
+        if Path::new(&path).with_extension("") != stem {
+            return None;
+        }
+        let file = self.base.files.get(&path)?;
+        let old = sources.read_base(site, &path)?;
+        if old.as_slice() != file.source.as_ref() {
+            return None;
+        }
+        type_dependencies::self_contained_exports(file.tree.root_node(), &file.source)
     }
 
     /// `name` を大域にリポジトリのどこかで宣言しているか。確かめられなければ true。

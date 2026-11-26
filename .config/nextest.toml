@@ -153,9 +153,9 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::optional_prop
 priority = 50
 threads-required = 2
 
-# 非公開型の変更を、通常と index の公開契約へ伝える回帰を先に始める。
+# 型の依存先を、作業ツリーと index の公開契約に照らす回帰を先に始める。
 [[profile.default.overrides]]
-filter = 'binary_id(astro-sight::integration) & test(=integration::signature_type_dependencies::public_signature_type_dependencies_report_changed_contracts)'
+filter = 'binary_id(astro-sight::integration) & (test(=integration::signature_type_dependencies::public_signature_type_dependencies_report_changed_contracts) | test(=integration::signature_type_dependencies::trailing_optional_parameters_keep_stable_local_type_imports))'
 priority = 50
 threads-required = 2
 
