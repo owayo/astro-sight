@@ -109,7 +109,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     let rust_crates = RustCrates::new(dir, diff_files, renames, base_blobs);
     // Phase 0: diff ファイルごとの事実と、ApiRefIndex で検索する名前を先に集める。
     let PreparedDiff {
-        retargeted_exports,
+        mut retargeted_exports,
         files: prepared,
         mut index_names,
         unverified_deleted_paths,
@@ -296,6 +296,11 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
     // `added` に乗らないケースでも `removed` を相殺できる。
     retargeted_exports.filter_candidates(state.buckets);
     let all_new_candidates = std::mem::take(&mut state.buckets.all_new_candidates);
+    retargeted_exports.restore_move_candidates(
+        &member_files,
+        &all_new_candidates,
+        &mut state.buckets.removed,
+    );
     let (verified_removed, unverified_removed): (Vec<_>, Vec<_>) =
         std::mem::take(&mut state.buckets.removed)
             .into_iter()
@@ -362,11 +367,13 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         &member_files,
     );
 
+    let source_exports =
+        retargeted_exports.verify_moves(&inputs, &member_files, &moved, state.closure_caches);
     let moved = ts_move_capture::verify(&inputs, &member_files, moved, &mut state.buckets.modified);
     // 別のファイルへ移した Rust の項目も、移動元と移動先の宣言 (同じ場所の `#[cfg]` の分岐を
     // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
     // ことの証明にはしない。
-    let moved = rust_impl_moves::verify(&inputs, moved, &mut state.buckets.modified);
+    let mut moved = rust_impl_moves::verify(&inputs, moved, &mut state.buckets.modified);
     compare_moved_availability(&inputs, &mut state, &moved);
     // 内容の同じ rename をした Rust のファイルの項目も、旧い置き場と新しい置き場の条件で比べる (Issue #316)。
     compare_renamed_availability(&inputs, &mut state, renames);
@@ -407,6 +414,7 @@ pub(crate) fn detect_api_changes_with_renames_and_blobs(
         &ambiguous_relation_keys,
         &mut state.buckets.parse_truncations,
     );
+    source_exports.settle(&mut moved, &mut removed_kept);
     removed_kept.extend(unverified_removed);
     // 有る設定の一部から消えた Rust の項目 (Issue #291) は、項目そのものは残るので移動の相殺に
     // かけず、名前の参照が repo に残れば removed、無ければ removed_dead にする。

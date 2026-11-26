@@ -528,6 +528,8 @@ An unsupported value assertion such as `as Item` can produce the same reason eve
 
 If `export { f }` becomes `export { other as f } from './provider.js'`, importers of `f` receive `provider.other`. Review reports the change under the public name `f`, even when the original function stays in the file as `export { f as legacy }`. If the original function was callable and `other` is `false`, an unchanged call to `f()` now fails type checking.
 
+When the original function moves to another file, existing callers may still import `f` from its old module. For example, `export { other as "f" } from './provider.js'` and `export * from './provider.js'` can both publish a different value under that name. Review keeps the change blocking if the old public name now resolves to that other value.
+
 ### Moving a TypeScript declaration into an existing module
 
 Moving `export const Date = 1` into a module where `read()` already returns `Date` changes what that expression reads. A caller that previously constructed a date with `new (read())()` now receives a number from `read()`. When review cannot establish that the destination's existing references keep their bindings, it reports the proposed move as an unverified `api.mod`. A property access such as `globalThis.Date` keeps its original meaning.

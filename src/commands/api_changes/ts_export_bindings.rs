@@ -10,6 +10,8 @@ use crate::engine::js_string::decoded;
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::models::review::ApiSymbolChange;
 
+mod moves;
+
 #[derive(Clone, PartialEq, Eq)]
 enum Target {
     Local(String),
@@ -63,6 +65,7 @@ fn display_name(name: &str) -> String {
 pub(super) struct Exports {
     names: BTreeMap<String, Binding>,
     locals: HashSet<String>,
+    stars: Vec<(String, bool)>,
     incomplete_names: bool,
 }
 
@@ -205,6 +208,12 @@ impl Exports {
             }
             if exported && has_token(stmt, "*") {
                 exports.incomplete_names = true;
+                if let Some(module) = stmt
+                    .child_by_field_name("source")
+                    .and_then(|n| node_name(n, source))
+                {
+                    exports.stars.push((module, has_token(stmt, "type")));
+                }
             }
             if exported
                 && has_token(stmt, "default")
@@ -302,6 +311,7 @@ impl Exports {
 #[derive(Default)]
 pub(crate) struct RetargetedExports {
     changes: Vec<ApiSymbolChange>,
+    moved_exports: BTreeMap<String, BTreeMap<String, Vec<(String, bool)>>>,
     replaced_locals: HashMap<String, HashSet<String>>,
     replacement_locals: HashMap<String, HashSet<String>>,
 }
@@ -311,6 +321,17 @@ impl RetargetedExports {
         let mut replaced_locals = HashSet::new();
         let mut replacement_locals = HashSet::new();
         for (public, before) in &old.names {
+            if let Target::Local(local) = &before.target
+                && !new.locals.contains(local)
+                && (new.names.contains_key(public) || !new.stars.is_empty())
+            {
+                self.moved_exports
+                    .entry(old_path.to_owned())
+                    .or_default()
+                    .entry(local.clone())
+                    .or_default()
+                    .push((public.clone(), before.type_only));
+            }
             let Some(after) = new.names.get(public) else {
                 continue;
             };
