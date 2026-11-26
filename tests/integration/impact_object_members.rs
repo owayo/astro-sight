@@ -48,6 +48,107 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn impact_object_members_keep_reads_checked_against_type_queries_blocking() {
+    let mut failures = Vec::new();
+    for (query, old_value, new_value, suffix, blocking) in [
+        ("typeof recordLayout.other", "'a'", "1", "", true),
+        ("typeof recordLayout.other", "'a'", "'b'", " as const", true),
+        ("(typeof recordLayout)['other']", "'a'", "1", "", true),
+        ("typeof recordLayout", "'a'", "1", "", true),
+        ("keyof typeof recordLayout", "'a'", "", " as const", true),
+        ("LocalKeys", "'a'", "", "", true),
+        ("typeof alias.other", "'a'", "1", "", true),
+        ("typeof lib.recordLayout.other", "'a'", "1", "", true),
+        (
+            "typeof import('./layout').recordLayout.other",
+            "'a'",
+            "1",
+            "",
+            true,
+        ),
+        ("typeof foreign.other", "'a'", "1", "", false),
+        ("typeof bucket.recordLayout.other", "'a'", "1", "", true),
+        ("typeof viaDefault.other", "'a'", "1", "", true),
+        ("typeof direct.other", "'a'", "1", "", true),
+        ("typeof extracted", "'a'", "1", "", true),
+        ("typeof recordLayout.other", "'a'", "'b'", "", false),
+        ("typeof recordLayout.label", "'a'", "1", "", false),
+        ("string", "'a'", "1", "", false),
+    ] {
+        let repo = TestRepo::new();
+        let declaration = |value: &str| {
+            let label = if query == "keyof typeof recordLayout" {
+                "other"
+            } else {
+                "a"
+            };
+            let prop = if value.is_empty() {
+                String::new()
+            } else {
+                format!(", other: {value}")
+            };
+            let local = if query == "LocalKeys" {
+                "export type Out = keyof typeof recordLayout extends 'label' ? number : string;\n"
+            } else {
+                ""
+            };
+            format!("export const recordLayout = {{ label: '{label}'{prop} }}{suffix};\n{local}")
+        };
+        repo.write("layout.ts", declaration(old_value));
+        repo.write("foreign.ts", "export const foreign = {other: 'a'};\n");
+        repo.write("barrel.ts", "export * as bucket from './layout';\nexport {recordLayout as default} from './layout';\n");
+        let result_type = if query == "typeof recordLayout" {
+            "Query['other']"
+        } else {
+            "Query"
+        };
+        let extra = match query {
+            "typeof bucket.recordLayout.other" | "typeof viaDefault.other" => {
+                "import viaDefault, {bucket} from './barrel';"
+            }
+            "LocalKeys" => "import type {Out as LocalKeys} from './layout';",
+            "typeof direct.other" => "const direct = recordLayout;",
+            "typeof extracted" => "const {other: extracted} = recordLayout;",
+            "string" => "export const category = typeof recordLayout.other;",
+            _ => "",
+        };
+        repo.write("types.ts", format!("import {{ recordLayout, recordLayout as alias }} from './layout';\nimport * as lib from './layout';\nimport {{ foreign }} from './foreign';\n{extra}\ntype Query = {query};\nexport type Out = {result_type};\n"));
+        repo.write("use.tsx", "import { recordLayout } from './layout';\nimport type { Out } from './types';\nexport function read(): Out {\n  return recordLayout.label;\n}\n");
+        repo.init_git();
+        repo.commit_all("base");
+        repo.write("layout.ts", declaration(new_value));
+        repo.stage_all();
+        for staged in [false, true] {
+            if staged {
+                repo.write("layout.ts", declaration(old_value));
+                repo.write("types.ts", "export type Out = string;\n");
+            }
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"]);
+            if staged {
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            let contains_read = |category: &str| {
+                hook[category]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|change| change["refs"].as_array().unwrap())
+                    .any(|entry| entry["p"] == "use.tsx" && entry["ln"] == 3)
+            };
+            if contains_read("impacts") != blocking || contains_read("impact_info") == blocking {
+                failures.push(format!("{query}, {suffix:?}, staged={staged}: {hook}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn impact_object_members_only_unchanged_direct_reads_are_informational() {
     for extension in ["js", "ts", "tsx"] {
         for (consumer, blocking) in [

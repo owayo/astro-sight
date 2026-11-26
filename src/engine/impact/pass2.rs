@@ -309,7 +309,7 @@ fn impact_worker_count() -> usize {
 /// rayon fold/reduce を動かし、chunk 終了時に global accumulator へ merge → chunk state を
 /// drop する。これにより次の chunk 開始時には前回の chunk local は解放済みとなる。
 pub(super) fn stream_caller_maps(
-    file_contexts: &[FileContext],
+    file_contexts: &mut [FileContext],
     all_symbol_names: &[String],
     sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
@@ -389,6 +389,13 @@ pub(super) fn stream_caller_maps(
     } else {
         TsBarrelIndex::default()
     };
+    super::object_members::type_queries::check(
+        dir,
+        &files,
+        file_contexts,
+        &ts_barrels,
+        options.new_side,
+    );
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());

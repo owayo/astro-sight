@@ -18,6 +18,7 @@ pub(super) struct TsBarrelIndex {
     modules: Mutex<HashMap<String, Option<Arc<Module>>>>,
     memo: Mutex<HashMap<(String, String, String, String), Origin>>,
     proofs: Mutex<HashMap<(String, String, String), bool>>,
+    reachability: Mutex<HashMap<(String, String), bool>>,
     paths: Vec<(String, String, String, bool)>,
 }
 
@@ -27,6 +28,8 @@ struct Module {
     named: HashMap<String, Vec<(String, String)>>,
     stars: Vec<String>,
     local_exports: HashSet<String>,
+    literal_exports: HashSet<String>,
+    dependencies: Vec<String>,
     opaque: bool,
 }
 
@@ -73,6 +76,72 @@ impl TsBarrelIndex {
         result
     }
 
+    /// 直接のオブジェクトなら問い合わせたパスを比較し、独立なリテラルなら影響しない。
+    /// 再輸出や変数経由の別名では、オブジェクトがパスの途中に現れる可能性も残す。
+    pub(super) fn query_observes_change(
+        &self,
+        caller: &str,
+        specifier: &str,
+        exported: Option<&str>,
+        changed: &str,
+        name: &str,
+        member_unchanged: bool,
+    ) -> bool {
+        let Some(target) = self.resolve(caller, specifier) else {
+            return true;
+        };
+        if target == changed && exported == Some(name) {
+            return !member_unchanged;
+        }
+        !exported
+            .zip(self.module(&target))
+            .is_some_and(|(export, module)| {
+                !module.opaque && module.literal_exports.contains(export)
+            })
+            && self.module_may_reach(&target, changed)
+    }
+
+    pub(super) fn module_may_reach(&self, from: &str, changed: &str) -> bool {
+        let key = (from.to_owned(), changed.to_owned());
+        if let Some(result) = self
+            .reachability
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).copied())
+        {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let mut pending = vec![from.to_owned()];
+        let result = 'search: loop {
+            let Some(path) = pending.pop() else {
+                break false;
+            };
+            if path == changed {
+                break true;
+            }
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Some(module) = self.module(&path) else {
+                break true;
+            };
+            if module.opaque {
+                break true;
+            }
+            for specifier in &module.dependencies {
+                let Some(target) = self.resolve(&path, specifier) else {
+                    break 'search true;
+                };
+                pending.push(target);
+            }
+        };
+        if let Ok(mut cache) = self.reachability.lock() {
+            cache.insert(key, result);
+        }
+        result
+    }
+
     fn proves_origin_uncached(&self, caller: &str, name: &str, changed: &str) -> bool {
         let Some(module) = self.module(caller) else {
             return false;
@@ -112,12 +181,17 @@ impl TsBarrelIndex {
         if !is_ts(lang) {
             return None;
         }
-        let source = std::fs::read(self.root.join(path)).ok()?;
+        let source = crate::engine::bounded_read::read_input_file(&self.root.join(path))?;
         let tree = parser::parse_source(&source, lang).ok()?;
         if tree.root_node().has_error() {
             return None;
         }
         let mut module = Module {
+            dependencies: crate::engine::imports::extract_imports(tree.root_node(), &source, lang)
+                .ok()?
+                .into_iter()
+                .map(|edge| edge.source)
+                .collect(),
             opaque: source
                 .windows(b"module.exports".len())
                 .any(|window| window == b"module.exports")
@@ -134,6 +208,8 @@ impl TsBarrelIndex {
                 _ => {}
             }
         }
+        module.dependencies.sort_unstable();
+        module.dependencies.dedup();
         Some(Arc::new(module))
     }
 
@@ -403,6 +479,7 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
         return;
     }
     let specifier = source_specifier(node, source);
+    module.dependencies.extend(specifier.iter().cloned());
     let mut cursor = node.walk();
     let clause = node
         .named_children(&mut cursor)
@@ -482,6 +559,15 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
                     continue;
                 }
                 if let Some(pattern) = declarator.child_by_field_name("name") {
+                    if pattern.kind() == "identifier"
+                        && declarator.child_by_field_name("type").is_none()
+                        && declarator
+                            .child_by_field_name("value")
+                            .is_some_and(super::object_members::type_queries::independent_literal)
+                        && let Ok(name) = pattern.utf8_text(source)
+                    {
+                        module.literal_exports.insert(name.to_owned());
+                    }
                     let _ = crate::engine::js_binding_pattern::visit_pattern_bindings(
                         pattern,
                         &mut |binding| {

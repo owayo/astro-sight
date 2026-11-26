@@ -10,6 +10,7 @@ use crate::models::impact::AffectedSymbol;
 use crate::models::symbol::Symbol;
 
 mod templates;
+pub(super) mod type_queries;
 use templates::{LiteralIds, TemplateBindings};
 
 #[derive(PartialEq)]
@@ -23,17 +24,40 @@ pub(super) struct ObjectMemberChange {
     old: StaticValue,
     new: StaticValue,
     changed: Vec<String>,
+    type_changes: Vec<usize>,
+    pub(super) escaped: bool,
+    pub(super) queried_type: bool,
 }
 
 impl ObjectMemberChange {
     pub(super) fn read_is_unchanged(&self, path: &str) -> bool {
-        !path.is_empty()
+        !self.queried_type
+            && !self.escaped
+            && !path.is_empty()
             && has_own_path(&self.old, path)
             && has_own_path(&self.new, path)
             && !self
                 .changed
                 .iter()
                 .any(|changed| paths_overlap(path, changed))
+    }
+
+    fn query_observes_path(&self, path: &str) -> bool {
+        self.type_changes
+            .iter()
+            .any(|&ix| paths_overlap(path, &self.changed[ix]))
+    }
+}
+
+fn widened_scalar(value: Option<&StaticValue>) -> Option<&str> {
+    match value? {
+        StaticValue::Literal(kind, text) => Some(match kind.as_str() {
+            "true" | "false" => "boolean",
+            "number" if text.ends_with('n') => "bigint",
+            k => k,
+        }),
+        StaticValue::Template(..) => Some("string"),
+        StaticValue::Object(_) => None,
     }
 }
 
@@ -344,11 +368,28 @@ pub(super) fn collect_object_member_changes(
         };
         let mut changed = Vec::new();
         changed_paths(&old, &new, "", &mut changed);
+        let literal_types = header.windows(2).any(|tokens| tokens == ["as", "const"]);
+        let type_changes = changed
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, path)| {
+                let before = widened_scalar(own_value(&old, path));
+                let after = widened_scalar(own_value(&new, path));
+                (literal_types || before.is_none() || before != after).then_some(ix)
+            })
+            .collect();
         new_declarations.insert(symbol.name.as_str(), new_name_id);
         old_declarations.insert(symbol.name.as_str(), old_name_id);
         changes.insert(
             symbol.name.clone(),
-            ObjectMemberChange { old, new, changed },
+            ObjectMemberChange {
+                old,
+                new,
+                changed,
+                type_changes,
+                escaped: false,
+                queried_type: false,
+            },
         );
     }
     let mut escaped = source_escapes(root, source, &changes, &new_declarations, false);
@@ -359,7 +400,11 @@ pub(super) fn collect_object_member_changes(
         &old_declarations,
         true,
     ));
-    changes.retain(|name, _| !escaped.contains(name));
+    changes.retain(|name, change| {
+        change.escaped = escaped.contains(name);
+        // 宣言元で値を持ち出しても、型問い合わせに依存する契約は別に調べる。
+        !change.escaped || !change.type_changes.is_empty()
+    });
     changes
 }
 

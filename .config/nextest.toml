@@ -20,6 +20,12 @@ filter = 'test(=integration::destructured_optional_defaults::unannotated_object_
 priority = 50
 threads-required = 2
 
+# TypeScript の型問い合わせと値の読み取りを、通常・index の複数の構成で検証する。
+[[profile.default.overrides]]
+filter = 'test(=integration::impact_object_members::impact_object_members_keep_reads_checked_against_type_queries_blocking)'
+priority = 50
+threads-required = 2
+
 # C++ の推論された受け手と明示型を、通常・index で対比する。
 [[profile.default.overrides]]
 filter = 'binary_id(astro-sight::integration) & test(integration::impact_cpp_inferred_receivers::)'

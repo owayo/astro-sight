@@ -248,7 +248,10 @@ impl RouteDecisionContext<'_> {
             || (event.is_import
                 && !event.rust_alias_import_used
                 && !(event.unproven_module_ref
-                    && file_context.object_member_changes.contains_key(symbol_name))
+                    && file_context
+                        .object_member_changes
+                        .get(symbol_name)
+                        .is_some_and(|change| !change.escaped))
                 && file_context.affected.iter().any(|symbol| {
                     symbol.change_type == "modified"
                         && ci_key(file_context.lang_id, &symbol.name) == symbol_name
@@ -546,7 +549,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 contexts.iter().any(|&fc_ix| {
                     self.file_contexts[fc_ix as usize]
                         .object_member_changes
-                        .contains_key(&self.all_symbol_names[ix])
+                        .get(&self.all_symbol_names[ix])
+                        .is_some_and(|change| !change.escaped && !change.queried_type)
                 })
             }) {
             node.and_then(|node| super::object_members::direct_member_read(node, source))
