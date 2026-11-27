@@ -37,6 +37,7 @@ struct BlockFacts {
     /// 宣言順の開始位置。参照ごとに前方の文を走査しない。
     lets: HashMap<String, Vec<LetBinding>>,
     functions: HashSet<String>,
+    named_imports: HashSet<String>,
     barrier: bool,
     non_expression_macro_barrier: bool,
     // 呼び出し位置で新しい let を生成し得る文。既に終わった文は後の let を隠さない。
@@ -61,7 +62,15 @@ pub(crate) struct RustScopeIndex {
 
 impl RustScopeIndex {
     /// walk の途中から呼ばれても、解析エラーと巻き上げ宣言を木全体で確認する。
-    pub(crate) fn build(mut root: Node<'_>, source: &[u8]) -> Option<Self> {
+    pub(crate) fn build(root: Node<'_>, source: &[u8]) -> Option<Self> {
+        Self::with_data_initializers(root, source, &HashSet::new())
+    }
+
+    pub(crate) fn with_data_initializers(
+        mut root: Node<'_>,
+        source: &[u8],
+        data: &HashSet<usize>,
+    ) -> Option<Self> {
         while let Some(parent) = root.parent() {
             root = parent;
         }
@@ -150,7 +159,7 @@ impl RustScopeIndex {
                     }
                 }
                 "block" => {
-                    let facts = index.block_facts(node, source);
+                    let facts = index.block_facts(node, source, data);
                     index.blocks.insert(node.id(), facts);
                 }
                 "for_expression" => {
@@ -206,7 +215,7 @@ impl RustScopeIndex {
         }
     }
 
-    fn block_facts(&mut self, block: Node<'_>, source: &[u8]) -> BlockFacts {
+    fn block_facts(&mut self, block: Node<'_>, source: &[u8], data: &HashSet<usize>) -> BlockFacts {
         let mut facts = BlockFacts::default();
         let mut cursor = block.walk();
         let mut attributed = false;
@@ -239,6 +248,23 @@ impl RustScopeIndex {
             if attributed || invocation.is_some() {
                 facts.dynamic_statements.push(statement.start_byte());
             }
+            if !attributed
+                && statement.kind() == "use_declaration"
+                && let Some(path) = statement.child_by_field_name("argument")
+                && let Some(name) = match path.kind() {
+                    "identifier" => Some(path),
+                    "scoped_identifier" => path.child_by_field_name("name"),
+                    "use_as_clause" => path.child_by_field_name("alias"),
+                    _ => None,
+                }
+                && let Ok(name) = name.utf8_text(source)
+            {
+                facts.named_imports.insert(
+                    crate::language::normalize_identifier(crate::language::LangId::Rust, name)
+                        .into_owned(),
+                );
+                continue;
+            }
             if statement.kind().ends_with("_item")
                 || matches!(
                     statement.kind(),
@@ -268,6 +294,7 @@ impl RustScopeIndex {
                 // 複数の束縛があっても初期化子は一度だけ走査する。
                 let rhs_names = statement
                     .child_by_field_name("value")
+                    .filter(|value| !data.contains(&value.id()))
                     .map(|value| subtree_names(value, source).0)
                     .unwrap_or_default();
                 for target in pattern_targets(pattern) {
@@ -454,9 +481,14 @@ impl RustScopeIndex {
                             .partition_point(|&start| start < node.start_byte());
                         end == 0 || facts.dynamic_statements[end - 1] < binding.start
                     });
-                    if facts.barrier && !typed_let_pattern && !(scoped && (proven || after_binding))
+                    // 名前を明示した use が巻き上げるのは、その import が束縛する名前だけ。
+                    let import_barrier = !facts.named_imports.is_empty()
+                        && (!scoped || !name.is_ascii() || facts.named_imports.contains(name));
+                    if (facts.barrier || import_barrier)
+                        && !typed_let_pattern
+                        && !(scoped && (proven || after_binding))
                     {
-                        if facts.non_expression_macro_barrier {
+                        if facts.non_expression_macro_barrier || import_barrier {
                             return LexicalBinding::Unknown;
                         }
                         requires_macro_validation = true;

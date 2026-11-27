@@ -463,7 +463,6 @@ pub(super) fn stream_caller_maps(
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
     let python_import_cache = super::python_imports::PythonImportCache::default();
-    let rust_std_project = super::rust_std_origin::RustStdProjectProof::new(dir);
     let mut rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
         dir,
         rust_module_wiring_unchanged,
@@ -475,7 +474,9 @@ pub(super) fn stream_caller_maps(
     rust_path_owner_project.layout_checkout = checkout.to_owned();
     if options.new_side == crate::models::impact::DiffNewSide::Index
         && file_contexts.iter().any(|ctx| {
-            !ctx.rust_super_functions.is_empty() || !ctx.rust_private_root_functions.is_empty()
+            !ctx.rust_super_functions.is_empty()
+                || !ctx.rust_private_root_functions.is_empty()
+                || ctx.rust_receiverless_associated_names.contains("new")
         })
     {
         rust_path_owner_project.staged_binding_diff = Some(rust_diff_input.into());
@@ -552,6 +553,7 @@ pub(super) fn stream_caller_maps(
                             import_spans: std::cell::OnceCell::new(),
                             python_imports: std::cell::OnceCell::new(),
                             rust_std_origin: std::cell::OnceCell::new(),
+                            rust_collections: std::cell::OnceCell::new(),
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_opaque_attributes: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
@@ -562,7 +564,7 @@ pub(super) fn stream_caller_maps(
                             rust_path_owner_enabled: options.new_side
                                 == crate::models::impact::DiffNewSide::WorkingTree,
                             rust_std_project_allowed: std::cell::OnceCell::new(),
-                            rust_std_project: &rust_std_project,
+                            rust_std_project: &rust_path_owner_project.std_project,
                             rust_cargo_reachability: &rust_cargo_reachability,
                             rust_owner_sources: &rust_owner_sources,
                             rust_ref_module: Default::default(),

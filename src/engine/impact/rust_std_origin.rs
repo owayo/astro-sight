@@ -1,7 +1,7 @@
 //! Rust impact evidence for names owned by the standard crates. Unproven names retain
 //! the existing impact route; this index does not change refs or dead-code output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -10,7 +10,7 @@ use tree_sitter::Node;
 
 use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
-use crate::language::LangId;
+use crate::language::{LangId, normalize_identifier};
 
 fn is_sysroot(name: &str) -> bool {
     matches!(name, "std" | "core" | "alloc")
@@ -19,6 +19,7 @@ fn is_sysroot(name: &str) -> bool {
 #[derive(Clone)]
 struct Binding {
     root: Option<String>,
+    collection: bool,
 }
 
 #[derive(Default)]
@@ -28,15 +29,16 @@ struct Scope {
     bindings: HashMap<String, Vec<Binding>>,
     has_glob: bool,
     has_macro_or_attribute: bool,
+    conditional_use: bool,
     shadowable_attributes: Vec<String>,
 }
 
 impl Scope {
-    fn bind(&mut self, name: &str, root: Option<String>) {
+    fn bind(&mut self, name: &str, root: Option<String>, collection: bool) {
         self.bindings
-            .entry(name.to_owned())
+            .entry(normalize_identifier(LangId::Rust, name).into_owned())
             .or_default()
-            .push(Binding { root });
+            .push(Binding { root, collection });
     }
 }
 
@@ -106,13 +108,17 @@ pub(super) struct RustStdOriginIndex {
 }
 
 impl RustStdOriginIndex {
-    pub(super) fn build(mut node: Node<'_>, source: &[u8]) -> Option<Self> {
+    pub(super) fn build(node: Node<'_>, source: &[u8]) -> Option<Self> {
         if !["std", "core", "alloc"]
             .iter()
             .any(|name| memchr::memmem::find(source, name.as_bytes()).is_some())
         {
             return None;
         }
+        Self::from_source(node, source)
+    }
+
+    fn from_source(mut node: Node<'_>, source: &[u8]) -> Option<Self> {
         while let Some(parent) = node.parent() {
             node = parent;
         }
@@ -139,7 +145,20 @@ impl RustStdOriginIndex {
         while let Some((node, scope_id)) = pending.pop() {
             let active = self.visit_node(node, source, scope_id);
             let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            let mut attributed = false;
+            let children: Vec<_> = node
+                .named_children(&mut cursor)
+                .inspect(|child| match child.kind() {
+                    "attribute_item" => attributed = true,
+                    "line_comment" | "block_comment" => {}
+                    kind => {
+                        if attributed && kind == "use_declaration" {
+                            self.scopes.get_mut(&active).unwrap().conditional_use = true;
+                        }
+                        attributed = false;
+                    }
+                })
+                .collect();
             for child in children.into_iter().rev() {
                 pending.push((child, active));
             }
@@ -177,7 +196,10 @@ impl RustStdOriginIndex {
                     .child_by_field_name("alias")
                     .or_else(|| node.child_by_field_name("name"));
                 if let Some(name) = name.and_then(|name| name.utf8_text(source).ok()) {
-                    self.scopes.get_mut(&active).unwrap().bind(name, None);
+                    self.scopes
+                        .get_mut(&active)
+                        .unwrap()
+                        .bind(name, None, false);
                 }
             }
             "macro_invocation" => {
@@ -207,7 +229,10 @@ impl RustStdOriginIndex {
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
                 {
-                    self.scopes.get_mut(&active).unwrap().bind(name, None);
+                    self.scopes
+                        .get_mut(&active)
+                        .unwrap()
+                        .bind(name, None, false);
                 }
             }
             _ => {}
@@ -299,7 +324,10 @@ impl RustStdOriginIndex {
 
     fn bind_use(&mut self, scope: usize, name: &str, path: &[String]) {
         let root = path.first().filter(|root| is_sysroot(root)).cloned();
-        self.scopes.get_mut(&scope).unwrap().bind(name, root);
+        self.scopes
+            .get_mut(&scope)
+            .unwrap()
+            .bind(name, root, collection_path(path));
     }
 
     fn record_use_path(&mut self, path: Node<'_>, segments: &[String]) {
@@ -356,7 +384,10 @@ impl RustStdOriginIndex {
             {
                 return false;
             }
-            if let Some(bindings) = scope.bindings.get(name) {
+            if let Some(bindings) = scope
+                .bindings
+                .get(normalize_identifier(LangId::Rust, name).as_ref())
+            {
                 return bindings.len() == 1
                     && bindings[0]
                         .root
@@ -413,6 +444,156 @@ impl RustStdOriginIndex {
     }
 }
 
+fn collection_path(path: &[String]) -> bool {
+    matches!(path, [root, module, ty] if matches!(root.as_str(), "std" | "alloc")
+        && matches!((module.as_str(), ty.as_str()), ("vec", "Vec") | ("string", "String")))
+}
+
+pub(super) struct CollectionBindings {
+    members: HashSet<usize>,
+    values: Option<crate::engine::rust_scope::RustScopeIndex>,
+}
+
+impl CollectionBindings {
+    pub(super) fn build(
+        mut root: Node<'_>,
+        source: &[u8],
+        known: Option<&RustStdOriginIndex>,
+    ) -> Option<Self> {
+        if ![b"Vec".as_slice(), b"String"]
+            .iter()
+            .any(|name| memchr::memmem::find(source, name).is_some())
+        {
+            return None;
+        }
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let owned;
+        let names = if let Some(known) = known {
+            known
+        } else {
+            owned = RustStdOriginIndex::from_source(root, source)?;
+            &owned
+        };
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+        use std::ops::ControlFlow;
+        let mut members = HashSet::new();
+        let mut candidates = HashSet::new();
+        let mut initializers = HashSet::new();
+        let mut scopes = Vec::new();
+        let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
+            scopes.truncate(depth);
+            let scope = if names.scopes.contains_key(&node.id()) {
+                node.id()
+            } else {
+                *scopes.last().unwrap()
+            };
+            scopes.push(scope);
+            if matches!(
+                node.kind(),
+                "token_tree" | "attribute_item" | "inner_attribute_item" | "macro_definition"
+            ) {
+                return ControlFlow::Continue(Walk::Skip);
+            }
+            if node.kind() == "let_declaration"
+                && node
+                    .child_by_field_name("pattern")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .is_some_and(|name| matches!(name, "new" | "r#new"))
+                && let Some(value) = node.child_by_field_name("value")
+            {
+                candidates.insert(value.id());
+            }
+            if node.kind() == "call_expression"
+                && let Some(callee) = node.child_by_field_name("function")
+                && callee.kind() == "scoped_identifier"
+                && let Some(member) = callee.child_by_field_name("name")
+                && matches!(member.utf8_text(source), Ok("new" | "r#new"))
+                && node
+                    .child_by_field_name("arguments")
+                    .is_some_and(|n| n.named_child_count() == 0)
+                && let Some(mut ty) = callee.child_by_field_name("path")
+            {
+                if ty.kind() == "generic_type"
+                    && let Some(inner) = ty.child_by_field_name("type")
+                {
+                    ty = inner;
+                }
+                if let Some(parts) = path_segments(ty, source)
+                    && !(parts.len() == 1 && ty.kind() == "scoped_identifier")
+                    && names.collection_type(scope, &parts)
+                {
+                    members.insert(member.id());
+                    if candidates.remove(&node.id()) {
+                        initializers.insert(node.id());
+                    }
+                }
+            }
+            ControlFlow::Continue(Walk::Descend)
+        });
+        if members.is_empty() {
+            return None;
+        }
+        Some(Self {
+            members,
+            values: (!initializers.is_empty())
+                .then(|| {
+                    crate::engine::rust_scope::RustScopeIndex::with_data_initializers(
+                        root,
+                        source,
+                        &initializers,
+                    )
+                })
+                .flatten(),
+        })
+    }
+
+    pub(super) fn proves(&self, node: Node<'_>, source: &[u8]) -> bool {
+        use crate::engine::lexical_binding::LexicalBinding;
+        self.members.contains(&node.id())
+            || self.values.as_ref().is_some_and(|values| {
+                matches!(
+                    values.impact_binding(node, source),
+                    LexicalBinding::RustValueBinding | LexicalBinding::RustScopedValue
+                )
+            })
+    }
+}
+
+impl RustStdOriginIndex {
+    fn collection_type(&self, scope: usize, path: &[String]) -> bool {
+        if collection_path(path) {
+            return self.root_unbound(scope, &path[0]);
+        }
+        let [name] = path else { return false };
+        for id in self.scope_chain(scope) {
+            let facts = &self.scopes[&id];
+            if facts.has_glob
+                || facts.has_macro_or_attribute
+                || facts.conditional_use
+                || self.has_shadowed_attribute(id)
+            {
+                return false;
+            }
+            if let Some(bindings) = facts.bindings.get(name) {
+                let [binding] = bindings.as_slice() else {
+                    return false;
+                };
+                return binding.collection
+                    && binding
+                        .root
+                        .as_ref()
+                        .is_some_and(|root| self.root_unbound(id, root));
+            }
+            if facts.module_boundary {
+                break;
+            }
+        }
+        matches!(name.as_str(), "Vec" | "String")
+    }
+}
+
 fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
     // `a::b::c` は `path` 側へ入れ子になる。段数だけ再帰しないよう、`path` を先頭まで
     // たどって末尾側から名前を集め、最後に並べ直す (`path` の無い `::name` はそこで終わる)。
@@ -421,7 +602,10 @@ fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
     loop {
         match current.kind() {
             "identifier" | "type_identifier" | "crate" | "self" | "super" => {
-                reversed.push(current.utf8_text(source).ok()?.to_owned());
+                reversed.push(
+                    normalize_identifier(LangId::Rust, current.utf8_text(source).ok()?)
+                        .into_owned(),
+                );
                 break;
             }
             "scoped_identifier" | "scoped_type_identifier" => {
@@ -429,7 +613,7 @@ fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
                     .child_by_field_name("name")?
                     .utf8_text(source)
                     .ok()?;
-                reversed.push(name.to_owned());
+                reversed.push(normalize_identifier(LangId::Rust, name).into_owned());
                 match current.child_by_field_name("path") {
                     Some(path) => current = path,
                     None => break,
@@ -599,8 +783,8 @@ fn has_foreign_std_alias(root: Node<'_>, source: &[u8]) -> bool {
                 node.child_by_field_name("alias"),
             )
             && let (Ok(name), Ok(alias)) = (name.utf8_text(source), alias.utf8_text(source))
-            && is_sysroot(alias)
-            && !is_sysroot(name)
+            && is_sysroot(&normalize_identifier(LangId::Rust, alias))
+            && !is_sysroot(&normalize_identifier(LangId::Rust, name))
         {
             return true;
         }

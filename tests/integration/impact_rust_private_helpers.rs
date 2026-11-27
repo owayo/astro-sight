@@ -3,6 +3,71 @@
 use super::support::*;
 
 #[test]
+fn rust_inherent_function_distinguishes_local_values_and_other_constructors() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='palette'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    let lib = "mod owner; mod viewer;\npub(crate) use owner::Palette;\npub fn paint() { let _ = Palette::new(); }\n";
+    let owner =
+        "pub(crate) struct Palette;\nimpl Palette {\n    pub(crate) fn new() -> Self { Self }\n}\n";
+    repo.write("src/lib.rs", lib);
+    repo.write("src/owner.rs", owner);
+    repo.write(
+        "src/viewer.rs",
+        r#"use crate::Palette;
+fn colors() -> Vec<u8> {
+    let _: Option<Palette> = None;
+    let mut new = Vec::new();
+    new.push(3);
+    new
+}
+fn direct() -> Palette { Palette::new() }
+fn pointer() { let _: fn() -> Palette = Palette::new; }
+fn alias() { use crate::Palette as Vec; let _ = Vec::new(); }
+fn bound() { let new = Palette::new; let _: fn() -> Palette = new; }
+fn raw_alias() { use crate::Palette as r#Vec; let _ = Vec::new(); }
+fn raw_type() { type r#Vec = Palette; let _ = Vec::new(); }
+fn parameter(new: &[u8]) -> usize {
+    use std::io::BufRead;
+    <[u8]>::len(new)
+}
+fn alias_constructor() { use std::vec::Vec as Buffer; let _: Vec<u8> = Buffer::new(); }
+fn qualified_constructor() { let _: Vec<u8> = ::std::vec::Vec::<u8>::new(); }
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        lib.replace("Palette::new()", "Palette::new(1)"),
+    );
+    repo.write("src/owner.rs", owner.replace("fn new()", "fn new(_: u8)"));
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            repo.write("src/owner.rs", owner);
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let context = repo.run_json("context", flags);
+        let rows: Vec<_> = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["path"] == "src/owner.rs")
+            .flat_map(|f| f["impacted_callers"].as_array().into_iter().flatten())
+            .filter(|c| c["path"] == "src/viewer.rs")
+            .map(|c| c["line"].as_u64().unwrap() + 1)
+            .collect();
+        assert_eq!(rows, [8, 9, 10, 11, 12, 13], "staged={staged}: {context}");
+    }
+}
+
+#[test]
 fn rust_associated_function_changes_distinguish_dot_calls_from_paths() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
