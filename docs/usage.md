@@ -92,6 +92,8 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 
 `--depth` (`depth` in session and MCP) is capped at 256 levels. A larger value expands 256 levels and adds a warning to `diagnostics` saying the expansion was cut off.
 
+For JavaScript and TypeScript, including JSX and TSX, `ast` and `symbols` report a syntax error in `diagnostics` when a single- or double-quoted string contains an unescaped line break (LF, CR, or CRLF). Backslash line continuations, template literal text and quoted JSX attribute values can span lines.
+
 ## symbols: Extract Symbols
 
 ```bash

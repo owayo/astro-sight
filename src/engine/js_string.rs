@@ -1,6 +1,11 @@
 //! JavaScript の文字列と識別子の escape を UTF-16 の値へ復元する。
 
 use std::borrow::Cow;
+use std::ops::ControlFlow;
+
+use tree_sitter::{Node, Point};
+
+use super::tree_walk::{Children, Walk, walk_preorder};
 
 pub(crate) fn decoded(raw: &str) -> Option<Cow<'_, str>> {
     if !raw.contains('\\') {
@@ -30,21 +35,35 @@ pub(crate) fn quoted_contents(literal: &str) -> Option<&str> {
 
 /// 不透明な値の中にも通常の文字列は現れる。JSX 属性の直接の引用符は別の字句規則を使う。
 pub(crate) fn quoted_strings_are_valid(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    use super::tree_walk::{Children, Walk, walk_preorder};
-    use std::ops::ControlFlow;
-
-    walk_preorder(root, Children::Named, |node, _| match node.kind() {
-        "string" => {
+    visit_quoted_strings(
+        root,
+        |_| false,
+        |node| {
             if node
                 .utf8_text(source)
                 .ok()
                 .and_then(quoted_contents)
                 .is_some()
             {
-                ControlFlow::Continue(Walk::Skip)
+                ControlFlow::Continue(())
             } else {
                 ControlFlow::Break(())
             }
+        },
+    )
+    .is_continue()
+}
+
+fn visit_quoted_strings<'a>(
+    root: Node<'a>,
+    mut skip: impl FnMut(Node<'a>) -> bool,
+    mut visit: impl FnMut(Node<'a>) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    walk_preorder(root, Children::Named, |node, _| match node.kind() {
+        _ if skip(node) => ControlFlow::Continue(Walk::Skip),
+        "string" => {
+            visit(node)?;
+            ControlFlow::Continue(Walk::Skip)
         }
         "jsx_attribute"
             if node
@@ -55,7 +74,55 @@ pub(crate) fn quoted_strings_are_valid(root: tree_sitter::Node<'_>, source: &[u8
         }
         _ => ControlFlow::Continue(Walk::Descend),
     })
-    .is_continue()
+}
+
+/// 文法が閉じ引用符の前で読み飛ばした改行を補う。既に ERROR のある文字列は重ねて報告しない。
+pub(crate) fn visit_unescaped_line_breaks(
+    root: Node<'_>,
+    source: &[u8],
+    mut report: impl FnMut(Point),
+) {
+    let mut breaks = memchr::memchr2_iter(b'\r', b'\n', source).peekable();
+    let skip = |node: Node<'_>| {
+        // 前順走査なので読み終えた改行は捨てられる。改行を含まない部分木には降りない。
+        while breaks.next_if(|&at| at < node.start_byte()).is_some() {}
+        node.is_error() || breaks.peek().is_none_or(|&at| at >= node.end_byte())
+    };
+    let _ = visit_quoted_strings(root, skip, |node| {
+        if !node.has_error()
+            && let Some(point) = unescaped_line_break(node, source)
+        {
+            report(point);
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+fn unescaped_line_break(node: Node<'_>, source: &[u8]) -> Option<Point> {
+    let literal = &source[node.byte_range()];
+    let mut point = node.start_position();
+    let mut line_start = 0;
+    for at in memchr::memchr2_iter(b'\r', b'\n', literal) {
+        // CRLF は一つの改行。tree-sitter の行番号は LF で進み、列はバイトで数える。
+        let lf = literal[at] == b'\n';
+        if !(lf && literal[..at].ends_with(b"\r")) {
+            let slashes = literal[..at]
+                .iter()
+                .rev()
+                .take_while(|&&c| c == b'\\')
+                .count();
+            if slashes.is_multiple_of(2) {
+                point.column += at - line_start;
+                return Some(point);
+            }
+        }
+        if lf {
+            point.row += 1;
+            point.column = 0;
+            line_start = at + 1;
+        }
+    }
+    None
 }
 
 fn visit_units(raw: &str, quote: Option<char>, mut emit: impl FnMut(&[u16])) -> Option<()> {

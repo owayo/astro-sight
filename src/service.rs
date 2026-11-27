@@ -1140,6 +1140,25 @@ fn collect_diagnostics(root: tree_sitter::Node<'_>, source: &[u8], response: &mu
                 });
         }
     }
+    if matches!(
+        response.language,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx
+    ) {
+        let native_count = response.diagnostics.len();
+        crate::engine::js_string::visit_unescaped_line_breaks(root, source, |point| {
+            response
+                .diagnostics
+                .push(crate::models::diagnostic::Diagnostic {
+                    severity: crate::models::diagnostic::Severity::Error,
+                    message: "Parse error: unescaped line break in string literal".to_owned(),
+                    line: Some(point.row),
+                    column: Some(point.column),
+                });
+        });
+        if native_count > 0 && native_count < response.diagnostics.len() {
+            response.diagnostics.sort_by_key(|d| (d.line, d.column));
+        }
+    }
 }
 
 /// エラーを含む部分木だけを前順に辿り、ERROR / MISSING ノードを診断として集める。

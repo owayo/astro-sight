@@ -28,6 +28,75 @@ fn ast_on_own_source() {
 }
 
 #[test]
+fn ast_reports_unescaped_line_breaks_only_in_ordinary_js_strings() {
+    let tmp = tempfile::tempdir().unwrap();
+    for ext in ["js", "jsx", "ts", "tsx"] {
+        let mut marked = String::new();
+        for quote in ['\'', '"'] {
+            for newline in ["\n", "\r", "\r\n"] {
+                for (before, marker) in [
+                    ("", "|"),
+                    ("\\", ""),
+                    ("\\\\", "|"),
+                    ("\\\\\\", ""),
+                    ("\\?", "|"),
+                ] {
+                    marked.push_str(&format!("void {quote}é{before}{marker}{newline}{quote};\n"));
+                }
+                marked.push_str(&format!("void {quote}é\\{newline}字|{newline}{quote};\n"));
+            }
+        }
+        marked.push_str("void \"a\\nb\\r\\u000a\u{2028}\u{2029}\";\n");
+        marked.push_str("void `a\n${'é|\n'}`;\n");
+        marked.push_str("/* \"a\n\" */ void /[\"']/;\n");
+        // この改行には文法自体が後続の識別子の位置で ERROR を返す。
+        marked.push_str("void 'abc\n|after';\n");
+        if matches!(ext, "jsx" | "tsx") {
+            marked.push_str("void <x a=\"é\n\" b='é\r\n字' c={\"é|\n\"} />;\n");
+        }
+        if matches!(ext, "ts" | "tsx") {
+            marked.push_str("type Bad = 'é|\r';\n");
+        }
+
+        let mut source = String::new();
+        let mut expected = Vec::new();
+        for (index, part) in marked.split('|').enumerate() {
+            if index > 0 {
+                let line = source.bytes().filter(|&b| b == b'\n').count();
+                let column = source.rsplit('\n').next().unwrap().len();
+                expected.push((line, column));
+            }
+            source.push_str(part);
+        }
+        let path = tmp.path().join(format!("sample.{ext}"));
+        std::fs::write(&path, source).unwrap();
+        for command in ["ast", "symbols"] {
+            let mut cmd = cargo_bin();
+            cmd.args([command, "--path"]).arg(&path).arg("--no-cache");
+            if command == "ast" {
+                cmd.args(["--line", "0", "--col", "6"]);
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{ext} {command}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let actual: Vec<_> = json["diagnostics"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|d| {
+                    assert_eq!(d["severity"], "error", "{d}");
+                    (
+                        d["line"].as_u64().unwrap() as usize,
+                        d["column"].as_u64().unwrap() as usize,
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "{ext} {command}");
+        }
+    }
+}
+
+#[test]
 fn ast_full_output() {
     // --full: legacy format with id, named, nested range, hash
     let output = cargo_bin()
