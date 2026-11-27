@@ -2,8 +2,8 @@
 
 mod package;
 mod scopes;
-pub(super) use package::PackageCache;
 use package::{Declaration, Package, ReceiverBound};
+pub(super) use package::{PackageCache, items_with_attributes};
 pub(super) use scopes::private_calls;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,14 +56,34 @@ fn identifier(name: &str) -> String {
 }
 
 #[derive(Default)]
-struct Names {
+pub(super) struct Names {
     items: HashSet<String>,
     imports: HashMap<String, Option<(UsePathOrigin, Vec<String>)>>,
     globs: Vec<(UsePathOrigin, Vec<String>)>,
 }
 
 impl Names {
-    fn collect(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Self> {
+    pub(super) fn extern_path(&self, mut path: Vec<String>) -> Option<Vec<String>> {
+        let first = path.first()?;
+        if !self.globs.is_empty() || self.items.contains(first) {
+            return None;
+        }
+        if let Some(alias) = self.imports.get(first) {
+            let (origin, target) = alias.as_ref()?;
+            let base = target.first()?;
+            if *origin != UsePathOrigin::Global
+                && (*origin != UsePathOrigin::Bare
+                    || self.items.contains(base)
+                    || self.imports.contains_key(base))
+            {
+                return None;
+            }
+            path.splice(..1, target.iter().cloned());
+        }
+        Some(path)
+    }
+
+    pub(super) fn collect(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Self> {
         if root.has_error() {
             return None;
         }
@@ -140,6 +160,63 @@ impl Names {
     }
 }
 
+/// 通常の path 依存（workspace からの継承・rename を含む）が指す既定の library。
+pub(super) fn direct_library(
+    directory: &Path,
+    manifest: &toml::Value,
+    workspace: &toml::Value,
+    name: &str,
+    project: &RustPathOwnerProjectProof,
+    accepts: impl Fn(&toml::Value) -> bool,
+) -> Option<PathBuf> {
+    let mut matches = manifest
+        .get("dependencies")?
+        .as_table()?
+        .iter()
+        .filter(|(key, _)| key.replace('-', "_") == name);
+    let (key, spec) = matches.next()?;
+    if matches.next().is_some() || !accepts(spec) {
+        return None;
+    }
+    let (base, spec) = if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+        (
+            Path::new(""),
+            workspace.get("workspace")?.get("dependencies")?.get(key)?,
+        )
+    } else {
+        (directory, spec)
+    };
+    if !accepts(spec) {
+        return None;
+    }
+    let root = &project.root;
+    let absolute = root
+        .join(base)
+        .join(spec.get("path")?.as_str()?)
+        .canonicalize()
+        .ok()?;
+    let dir = absolute
+        .strip_prefix(project.canonical_root.as_ref()?)
+        .ok()?;
+    let dependency = project.alias_cache.manifest(root, dir)?;
+    let package_name = dependency.get("package")?.get("name")?.as_str()?;
+    if package_name
+        != spec
+            .get("package")
+            .and_then(toml::Value::as_str)
+            .unwrap_or(key)
+        || dependency.get("lib").is_some_and(|lib| {
+            lib.get("path").is_some()
+                || lib
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|lib| lib != name)
+        })
+    {
+        return None;
+    }
+    Some(dir.join("src/lib.rs"))
+}
 pub(super) struct MethodBindings {
     owners: HashMap<usize, String>,
 }
@@ -289,49 +366,15 @@ impl Resolver<'_> {
         {
             return None;
         }
-        let deps = self.package.manifest.get("dependencies")?.as_table()?;
-        let (key, spec) = deps
-            .iter()
-            .find(|(name, _)| name.replace('-', "_") == ty[0])?;
-        let (base, spec) = if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-            (
-                Path::new(""),
-                self.package
-                    .workspace
-                    .get("workspace")?
-                    .get("dependencies")?
-                    .get(key)?,
-            )
-        } else {
-            (self.package.directory.as_path(), spec)
-        };
         let root = &self.project.root;
-        let absolute = root
-            .join(base)
-            .join(spec.get("path")?.as_str()?)
-            .canonicalize()
-            .ok()?;
-        let dir = absolute
-            .strip_prefix(self.project.canonical_root.as_ref()?)
-            .ok()?;
-        let dependency = self.project.alias_cache.manifest(root, dir)?;
-        let package_name = dependency.get("package")?.get("name")?.as_str()?;
-        if package_name
-            != spec
-                .get("package")
-                .and_then(toml::Value::as_str)
-                .unwrap_or(key)
-            || dependency.get("lib").is_some_and(|lib| {
-                lib.get("path").is_some()
-                    || lib
-                        .get("name")
-                        .and_then(toml::Value::as_str)
-                        .is_some_and(|name| name != ty[0])
-            })
-        {
-            return None;
-        }
-        let file = dir.join("src/lib.rs");
+        let file = direct_library(
+            &self.package.directory,
+            &self.package.manifest,
+            &self.package.workspace,
+            &ty[0],
+            self.project,
+            |_| true,
+        )?;
         if self.project.reexport_old_sources.contains_key(&file) {
             return None;
         }
