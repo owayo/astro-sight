@@ -128,7 +128,7 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     }
     let mode = if opts.full { "full" } else { "compact" };
     let cache_key = format!(
-        "v2_ast_{}_{}_{}_{}_{}_{}_{}",
+        "v3_ast_{}_{}_{}_{}_{}_{}_{}",
         opt_key(opts.line),
         opt_key(opts.col),
         opt_key(opts.end_line),
@@ -209,15 +209,13 @@ pub fn cmd_symbols(
     full: bool,
     query: Option<&str>,
 ) -> Result<()> {
-    // v3_: Symbol に enclosing container フィールド追加 (compact では `cn` キー)
-    // custom query は結果集合が変わるため query hash を key へ混ぜる
-    // (default query の cache key は従来のまま不変)。
+    // v4 は JS 文字列の改行診断を含む。custom query は結果集合が変わるため hash を混ぜる。
     let base_key = if full {
-        "v3_symbols_full"
+        "v4_symbols_full"
     } else if doc {
-        "v3_symbols_doc"
+        "v4_symbols_doc"
     } else {
-        "v3_symbols"
+        "v4_symbols"
     };
     let cache_key = match query {
         Some(q) => format!("{base_key}_q{}", &CacheStore::hash(q.as_bytes())[..16]),

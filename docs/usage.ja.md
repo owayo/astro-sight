@@ -89,6 +89,8 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 
 `--depth` (session・MCP の `depth`) は 256 段で打ち切る。それより大きい値を指定すると 256 段まで展開し、打ち切ったことを `diagnostics` に警告として出す。
 
+JavaScript・TypeScript（JSX・TSX を含む）の通常の引用符付き文字列に、エスケープされていない LF・CR・CRLF があると、`ast` と `symbols` は `diagnostics` に構文エラーを出す。バックスラッシュによる行継続、テンプレートリテラルの本文、引用符で囲んだ JSX の属性値は複数行に書ける。
+
 ## symbols - シンボル抽出
 
 ```bash
