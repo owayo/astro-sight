@@ -78,8 +78,7 @@ fn types_changed(files: &[(&str, &str)]) -> serde_json::Value {
     context(&all, &[("src/internal.rs", INTERNAL_NEW)])
 }
 
-/// Issue の再現: `matches!` の中の別の enum の variant は所有元の証明で外れ、ファイル自身が
-/// 宣言した同じ名前の型の経路は `match` で書いたときと同じく低確信度に回る。
+/// 標準マクロの中でも、同じファイルの型と修飾パスで指定した変更元の型を区別する。
 #[test]
 fn impact_rust_standard_macro_arguments_use_their_owners() {
     let context = types_changed(&[
@@ -91,17 +90,17 @@ fn impact_rust_standard_macro_arguments_use_their_owners() {
         ("src/user.rs", USER_MATCHES),
         (
             "src/paths.rs",
-            "enum ModulePath {\n    Crate,\n}\n\npub fn root() -> bool {\n    matches!(module(), ModulePath::Crate)\n}\n\nfn module() -> ModulePath {\n    ModulePath::Crate\n}\n",
+            "enum ModulePath {\n    Crate,\n}\n\npub fn root() -> bool {\n    matches!(module(), ModulePath::Crate)\n}\n\nfn module() -> ModulePath {\n    ModulePath::Crate\n}\n\nfn actual(path: crate::internal::ModulePath) -> bool {\n    matches!(path, crate::internal::ModulePath::Inline(_))\n}\n",
         ),
     ]);
-    assert!(
-        callers(&context, "impacted_callers").is_empty(),
+    assert_eq!(
+        callers(&context, "impacted_callers"),
+        ["src/paths.rs:13", "src/paths.rs:14"],
         "{context}"
     );
     assert!(has_no_caller(&context, "src/user.rs"), "{context}");
-    assert_eq!(
-        callers(&context, "low_confidence_callers"),
-        ["src/paths.rs:10", "src/paths.rs:6"],
+    assert!(
+        callers(&context, "low_confidence_callers").is_empty(),
         "{context}"
     );
 }
@@ -121,17 +120,17 @@ fn impact_rust_standard_macro_arguments_match_the_match_expression() {
         ),
         (
             "src/paths.rs",
-            "enum ModulePath {\n    Crate,\n}\n\npub fn root() -> bool {\n    match module() {\n        ModulePath::Crate => true,\n    }\n}\n\nfn module() -> ModulePath {\n    ModulePath::Crate\n}\n",
+            "enum ModulePath {\n    Crate,\n}\n\npub fn root() -> bool {\n    match module() {\n        ModulePath::Crate => true,\n    }\n}\n\nfn module() -> ModulePath {\n    ModulePath::Crate\n}\n\nfn actual(path: crate::internal::ModulePath) -> bool {\n    match path {\n        crate::internal::ModulePath::Inline(_) => true,\n    }\n}\n",
         ),
     ]);
-    assert!(
-        callers(&context, "impacted_callers").is_empty(),
+    assert_eq!(
+        callers(&context, "impacted_callers"),
+        ["src/paths.rs:15", "src/paths.rs:17"],
         "{context}"
     );
     assert!(has_no_caller(&context, "src/user.rs"), "{context}");
-    assert_eq!(
-        callers(&context, "low_confidence_callers"),
-        ["src/paths.rs:12", "src/paths.rs:7"],
+    assert!(
+        callers(&context, "low_confidence_callers").is_empty(),
         "{context}"
     );
 }

@@ -390,6 +390,7 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) rust_path_owner_project: &'a super::rust_path_owner::RustPathOwnerProjectProof,
     pub(super) rust_source_paths: &'a [Option<PathBuf>],
     pub(super) rust_path_owner_enabled: bool,
+    pub(super) rust_nominal_names: &'a std::collections::HashSet<&'a str>,
     pub(super) rust_std_project_allowed: std::cell::OnceCell<bool>,
     pub(super) rust_std_project: &'a super::rust_std_origin::RustStdProjectProof,
     pub(super) rust_cargo_reachability: &'a super::rust_cargo_reachability::RustCargoReachability,
@@ -1151,6 +1152,31 @@ impl ImpactCollector<'_> {
         } else {
             None
         };
+        let rust_owner = rust_owner.or_else(|| {
+            if self.ref_lang != Some(LangId::Rust)
+                || !self
+                    .rust_nominal_names
+                    .contains(self.all_symbol_names[ix].as_str())
+            {
+                return None;
+            }
+            let view = self.binding_view(source)?;
+            let node = owner_node?;
+            let index = owner_index.unwrap_or_else(|| {
+                self.rust_path_owner.get_or_init(|| {
+                    super::rust_path_owner::RustPathOwnerIndex::build(node, owner_source)
+                })
+            });
+            index
+                .nominal_owner(
+                    node,
+                    owner_source,
+                    Path::new(self.path_str),
+                    view,
+                    self.rust_nominal_names,
+                )
+                .map(|path| (path, false))
+        });
         let scoped_node = node.filter(|n| {
             scoped_function
                 && !self
