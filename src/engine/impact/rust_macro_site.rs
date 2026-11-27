@@ -149,7 +149,15 @@ pub(super) struct OpaqueAttributeScopes {
 }
 
 impl OpaqueAttributeScopes {
-    pub(super) fn build(mut root: Node<'_>, source: &[u8]) -> Self {
+    pub(super) fn build(root: Node<'_>, source: &[u8]) -> Self {
+        Self::with_test_attribute(root, source, false)
+    }
+
+    pub(super) fn with_test_attribute(
+        mut root: Node<'_>,
+        source: &[u8],
+        standard_test: bool,
+    ) -> Self {
         use crate::engine::tree_walk::{Children, Walk, walk_preorder};
         use std::ops::ControlFlow;
 
@@ -173,7 +181,9 @@ impl OpaqueAttributeScopes {
                             .named_child(0)
                             .and_then(|attr| attr.named_child(0))
                             .is_some_and(|name| name.utf8_text(source) == Ok("macro_export"));
-                        pending[depth] |= !exports_rule && !builtin_attribute(node, source);
+                        let test = standard_test && node.utf8_text(source) == Ok("#[test]");
+                        pending[depth] |=
+                            !exports_rule && !test && !builtin_attribute(node, source);
                         scopes.spans.push(node.byte_range());
                         Walk::Skip
                     }

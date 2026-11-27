@@ -410,6 +410,70 @@ struct OldSide {
 pub(super) struct LazyOldSide(std::cell::OnceCell<Option<OldSide>>);
 
 impl LazyOldSide {
+    pub(super) fn unchanged_receiver_calls<'p>(
+        &self,
+        input: &DeclarationChangeInput<'_>,
+        owners: &HashMap<String, PrivateMethodOwner>,
+        project: impl Fn() -> Option<&'p super::rust_receivers::Project<'p>>,
+    ) -> HashSet<tree_sitter::Point> {
+        if !owners.values().any(|owner| owner.unconditional) {
+            return HashSet::new();
+        }
+        let Some(old) = self.get(input) else {
+            return HashSet::new();
+        };
+        // 呼び出しの照合は raw identifier を正規化する。同じ綴りの別宣言があれば
+        // その呼び出しまで除かない (private owner の索引自体は宣言の綴りを保つ)。
+        let mut owners = owners.clone();
+        for symbol in input.syms.iter().chain(&old.symbols) {
+            if let Some(normalized) = symbol.name.strip_prefix("r#") {
+                owners.remove(normalized);
+            }
+        }
+        if !owners.values().any(|owner| owner.unconditional) {
+            return HashSet::new();
+        }
+        let new_calls = super::rust_receivers::independent_calls(
+            input.root,
+            input.source,
+            &owners,
+            input.file_path,
+            false,
+            &project,
+        );
+        if new_calls.is_empty() {
+            return new_calls;
+        }
+        let old_root = old.tree.root_node();
+        let old_calls = super::rust_receivers::independent_calls(
+            old_root,
+            &old.source,
+            &owners,
+            input.file_path,
+            true,
+            &project,
+        );
+        let old_rows =
+            (0..=old_root.end_position().row).filter(|line| !old.removed_lines.contains(line));
+        let new_rows = (0..=input.root.end_position().row)
+            .filter(|line| !input.facts.added_lines.contains(line));
+        let mut rows = new_rows.zip(old_rows).peekable();
+        let mut calls: Vec<_> = new_calls.into_iter().collect();
+        calls.sort_unstable();
+        calls
+            .into_iter()
+            .filter(|point| {
+                while rows.peek().is_some_and(|(new, _)| *new < point.row) {
+                    rows.next();
+                }
+                rows.peek().is_some_and(|&(new, old)| {
+                    new == point.row
+                        && old_calls.contains(&tree_sitter::Point::new(old, point.column))
+                })
+            })
+            .collect()
+    }
+
     fn get(&self, input: &DeclarationChangeInput<'_>) -> Option<&OldSide> {
         self.0.get_or_init(|| build_old_side(input)).as_ref()
     }
@@ -983,7 +1047,7 @@ fn rust_modified_alias_names(
 /// Rust と、明示戻り型を持つ TS/TSX の root 関数は、一意な旧新ヘッダと本体以外の
 /// ソースが一致するときに行比較へ混ざった本体の差を取り消す。
 pub(super) fn reconcile_declaration_changes(
-    mut old_side: LazyOldSide,
+    old_side: &mut LazyOldSide,
     input: &DeclarationChangeInput<'_>,
     affected: &mut [AffectedSymbol],
     sig_changes: &mut Vec<SignatureChange>,
@@ -1135,7 +1199,7 @@ pub(super) fn reconcile_declaration_changes(
         // 使う。他の言語では表示の補正だけに使うため、行ベースの検出が何も出していない
         // ときは従来どおり組を作らない (旧側の走査を増やさない)。
         let header_pair = if !is_added && (has_text_sig_change || input.lang_id == LangId::Python) {
-            unique_header_pair(input, &symbol_change.name, &mut old_side)
+            unique_header_pair(input, &symbol_change.name, old_side)
         } else {
             None
         };
@@ -1161,8 +1225,8 @@ pub(super) fn reconcile_declaration_changes(
             && has_text_sig_change
             && header_pair.is_none()
             && *rust_import_environment_unchanged
-                .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
-            && rust_same_name_parameter_patterns_changed(input, &symbol_change.name, &mut old_side)
+                .get_or_insert_with(|| same_rust_import_environment(input, old_side))
+            && rust_same_name_parameter_patterns_changed(input, &symbol_change.name, old_side)
         {
             sig_changes.retain(|sc| sc.name != symbol_change.name);
             continue;
@@ -1188,22 +1252,16 @@ pub(super) fn reconcile_declaration_changes(
             && has_text_sig_change
             && symbol_change.kind == "function"
             && matches!(input.lang_id, LangId::Typescript | LangId::Tsx)
-            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, &mut old_side)
+            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, old_side)
             && old.same_contract(&new)
-            && ts_only_typed_function_body_changed(
-                input,
-                &mut old_side,
-                &symbol_change.name,
-                &old,
-                &new,
-            )
+            && ts_only_typed_function_body_changed(input, old_side, &symbol_change.name, &old, &new)
         {
             sig_changes.retain(|sc| sc.name != symbol_change.name);
             continue;
         }
         if !is_added
             && input.lang_id == LangId::Rust
-            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, &mut old_side)
+            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, old_side)
         {
             // 名前変更と同時に本体を実装した場合も、通常引数のパターンは呼び出し契約に
             // 含めない。型・receiver・属性・外側の宣言・import が不変の場合だけ証明する。
@@ -1214,7 +1272,7 @@ pub(super) fn reconcile_declaration_changes(
                     .zip(new.rust_parameter_contract.as_ref())
                     .is_some_and(|(old, new)| old == new)
                 && *rust_import_environment_unchanged
-                    .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
+                    .get_or_insert_with(|| same_rust_import_environment(input, old_side))
             {
                 sig_changes.retain(|sc| sc.name != symbol_change.name);
                 continue;
@@ -1227,9 +1285,9 @@ pub(super) fn reconcile_declaration_changes(
                 old.rust_const_qualifier.as_ref(),
             ) && new_qualifier.header_only_adds_const_to(old_qualifier)
                 && *rust_import_environment_unchanged
-                    .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
+                    .get_or_insert_with(|| same_rust_import_environment(input, old_side))
                 && rust_file_items
-                    .get_or_insert_with(|| rust_file_items_pair(input, &mut old_side))
+                    .get_or_insert_with(|| rust_file_items_pair(input, old_side))
                     .as_ref()
                     .is_some_and(|(old_items, new_items)| {
                         new_qualifier.only_adds_const_to(new_items, old_qualifier, old_items)
@@ -1240,8 +1298,8 @@ pub(super) fn reconcile_declaration_changes(
             // 従来の本体変更の証明は byte 比較も求め、適用範囲を広げない。
             if has_text_sig_change
                 && old.same_contract(&new)
-                && (rust_only_body_changed(input, &mut old_side, &old, &new)
-                    || rust_only_header_formatting_changed(input, &mut old_side, &old, &new))
+                && (rust_only_body_changed(input, old_side, &old, &new)
+                    || rust_only_header_formatting_changed(input, old_side, &old, &new))
             {
                 sig_changes.retain(|sc| sc.name != symbol_change.name);
                 continue;
@@ -1324,22 +1382,20 @@ pub(super) fn reconcile_declaration_changes(
     }
     let mut proof = DeclarationProof {
         python_modified_direct_function_names: python_modified_direct_function_names(
-            input,
-            affected,
-            &mut old_side,
+            input, affected, old_side,
         ),
         js_modified_direct_function_names: js_modified_direct_function_names(
             input,
             affected,
             sig_changes,
-            &mut old_side,
+            old_side,
         ),
         rust_const_additions,
         ..Default::default()
     };
     if input.lang_id == LangId::Rust {
-        proof.rust_alias_changes = rust_modified_alias_names(input, affected, &mut old_side);
-        proof.rust_value_only_constants = rust_value_only_constants(input, affected, &mut old_side);
+        proof.rust_alias_changes = rust_modified_alias_names(input, affected, old_side);
+        proof.rust_value_only_constants = rust_value_only_constants(input, affected, old_side);
     }
     if input.lang_id != LangId::Rust || affected.is_empty() || input.root.has_error() {
         return proof;
@@ -2041,7 +2097,7 @@ mod tests {
                 LangId::Rust,
             );
             reconcile_declaration_changes(
-                LazyOldSide::default(),
+                &mut LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &section,
                     complete_single_file_diff: path == old_path,
@@ -2089,7 +2145,7 @@ mod tests {
             let mut signatures =
                 super::super::signature::detect_signature_changes(&text, path, &affected, lang);
             reconcile_declaration_changes(
-                LazyOldSide::default(),
+                &mut LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &text,
                     complete_single_file_diff: true,
@@ -2424,7 +2480,7 @@ mod tests {
             super::super::signature::detect_signature_changes(&text, path, &affected, LangId::Rust);
         assert!(diff::reconstruct_old_source(&text, path, source).is_none());
         reconcile_declaration_changes(
-            LazyOldSide::default(),
+            &mut LazyOldSide::default(),
             &DeclarationChangeInput {
                 file_diff: &text,
                 complete_single_file_diff: true,
@@ -2566,7 +2622,7 @@ mod tests {
             let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
             let mut sig_changes = Vec::new();
             reconcile_declaration_changes(
-                LazyOldSide::default(),
+                &mut LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     complete_single_file_diff: true,
@@ -2824,7 +2880,7 @@ mod tests {
             super::super::signature::detect_signature_changes(&diff_text, path, &affected, lang_id);
         if reconcile {
             reconcile_declaration_changes(
-                LazyOldSide::default(),
+                &mut LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     complete_single_file_diff: extra_diff.is_empty(),
@@ -3278,7 +3334,7 @@ mod tests {
                 LangId::Rust,
             );
             let proof = reconcile_declaration_changes(
-                LazyOldSide::default(),
+                &mut LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     complete_single_file_diff: path == old_path,

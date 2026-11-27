@@ -11,6 +11,14 @@ pub(crate) fn any_rust_text_include<'a>(
     source: &'a [u8],
     mut matches: impl FnMut(Option<&'a str>) -> bool,
 ) -> bool {
+    any_rust_text_include_at(root, source, |_, literal| matches(literal))
+}
+
+pub(crate) fn any_rust_text_include_at<'a>(
+    root: Node<'_>,
+    source: &'a [u8],
+    mut matches: impl FnMut(Node<'_>, Option<&'a str>) -> bool,
+) -> bool {
     if memchr::memmem::find(source, b"include_str").is_none() {
         return false;
     }
@@ -22,7 +30,7 @@ pub(crate) fn any_rust_text_include<'a>(
             && !followed_by_bang(node)
             && binds_macro_names(node)
         {
-            return matches(None);
+            return matches(node, None);
         }
         let Some(arguments) = text_include_arguments(node, source) else {
             return false;
@@ -35,7 +43,7 @@ pub(crate) fn any_rust_text_include<'a>(
             .next()
             .filter(|node| matches!(node.kind(), "string_literal" | "raw_string_literal"))
         else {
-            return matches(None);
+            return matches(node, None);
         };
         let Some(path) = literal
             .named_child(0)
@@ -47,9 +55,9 @@ pub(crate) fn any_rust_text_include<'a>(
             .and_then(|n| n.utf8_text(source).ok())
             .filter(|text| !text.contains('\\'))
         else {
-            return matches(None);
+            return matches(node, None);
         };
-        literal_may_open_rust_source(path) && matches(Some(path))
+        literal_may_open_rust_source(path) && matches(node, Some(path))
     })
 }
 

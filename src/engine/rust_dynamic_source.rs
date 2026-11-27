@@ -1,7 +1,7 @@
 //! Rust の取り込み構文を、空白とコメントに依存せず検出する。
 
 mod text_include;
-pub(crate) use text_include::any_rust_text_include;
+pub(crate) use text_include::{any_rust_text_include, any_rust_text_include_at};
 
 use tree_sitter::Node;
 

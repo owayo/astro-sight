@@ -15,6 +15,170 @@ const ADMIN_NEW: &str = "use super::*;\npub(super) struct Administration {\n    
 /// 真の呼び出し元の行。
 const ADMIN_CALL: &str =
     "let admin = Arc::new(admin::Administration::new(config::Config::default()));";
+
+#[test]
+fn rust_same_file_method_calls_respect_receiver_types() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='receivers'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    let old = r#"use std::collections::HashMap;
+struct Cache;
+struct Data { bytes: Vec<u8> }
+struct Wrapper(Cache);
+impl std::ops::Deref for Wrapper {
+    type Target = Cache;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl Cache {
+    fn get(&self, _: usize) -> usize { 0 }
+}
+fn callers(cache: &Cache, data: &Data, bytes: &[u8], map: &HashMap<usize, u8>) {
+    let _ = cache.get(0);
+    let _ = bytes.get(0);
+    let _ = data.bytes.get(0);
+    let _ = map.get(&0);
+    let _ = (bytes.get(0), cache.get(0));
+    { let bytes = cache; let _ = bytes.get(0); }
+}
+fn indirect(wrapper: &Wrapper) { let _ = wrapper.get(0); }
+fn aliased(cache: &Cache) { type Vec<T> = (Cache, T); let bytes: Vec<u8> = (Cache, 0); let _ = bytes.0.get(0); }
+"#;
+    repo.write("src/lib.rs", old);
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        old.replace("fn get(&self", "fn get(&mut self"),
+    );
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            repo.write("src/lib.rs", old);
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let context = repo.run_json("context", flags);
+        let actual: BTreeSet<_> = context["changes"][0]["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|caller| {
+                caller["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "get")
+            })
+            .map(|caller| {
+                old.lines()
+                    .nth(caller["line"].as_u64().unwrap() as usize)
+                    .unwrap()
+                    .trim()
+            })
+            .collect();
+        let expected: BTreeSet<_> = old
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.contains("cache.get(0)")
+                    || line.contains("let bytes = cache;")
+                    || line.contains("wrapper.get(0)")
+                    || line.contains("bytes.0.get(0)")
+            })
+            .collect();
+        assert_eq!(actual, expected, "staged={staged}");
+    }
+}
+#[test]
+fn rust_same_file_method_results_check_inherent_dispatch_and_factory_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='methods'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod reader; mod catalog; mod extension;\nfn flag(include: bool) { assert!(include); }\n",
+    );
+    let provider = "pub struct Records;\nimpl Records {\n    pub fn open() -> Self { Records }\n    pub fn get(&self, _: &str) -> bool { true }\n}\n";
+    repo.write("src/catalog.rs", provider);
+    let plain = r#"use crate::catalog as cards;
+pub(crate) struct Store;
+pub(crate) struct Data { bytes: Vec<u8> }
+pub(crate) struct Other { bytes: Store }
+impl Store {
+    fn get(&mut self, _: usize) -> Option<&Data> { None }
+}
+fn view(store: &mut Store) {
+    let Some(data) = store.get(0) else { return };
+    let _ = data.bytes.get(0);
+    let records = cards::Records::open();
+    let _ = records.get("name");
+}
+fn check_name(include: bool) { assert!(include); let _text = include_str!("catalog.rs"); }
+"#;
+    repo.write("src/reader.rs", plain);
+    repo.write("src/extension.rs", "use crate::reader::{Store, Other};\npub trait Read {fn get(&mut self, key: usize) -> Option<&Other>;}\nimpl Read for Store {fn get(&mut self, _:usize) -> Option<&Other>{None}}\n");
+    repo.init_git();
+    repo.commit_all("base");
+    let changed = plain.replace("fn get(&mut self", "fn get(&self");
+    let rows = |cx: &serde_json::Value| -> BTreeSet<u64> {
+        cx["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["path"] == "src/reader.rs")
+            .flat_map(|c| c["impacted_callers"].as_array().into_iter().flatten())
+            .filter(|c| c["symbols"].as_array().unwrap().iter().any(|n| n == "get"))
+            .map(|c| c["line"].as_u64().unwrap())
+            .collect()
+    };
+    let lines = |repo: &TestRepo, args: &[&str]| rows(&repo.run_json("context", args));
+    repo.write("src/reader.rs", &changed);
+    assert_eq!(lines(&repo, &["--git"]), BTreeSet::from([8]));
+    repo.stage_all();
+    repo.write(
+        "src/catalog.rs",
+        provider.replace(
+            "-> Self { Records }",
+            "-> crate::reader::Store { crate::reader::Store }",
+        ),
+    );
+    assert_eq!(lines(&repo, &["--git", "--staged"]), BTreeSet::from([8]));
+    assert_eq!(
+        rows(&repo.run_json("review", &["--git", "--staged"])["impact"]),
+        BTreeSet::from([8])
+    );
+    assert!(lines(&repo, &["--git"]).contains(&11));
+    repo.write("src/catalog.rs", provider);
+    let bound = plain.replace(
+        "use crate::catalog as cards;",
+        "use crate::catalog as cards; use crate::extension::Read;",
+    );
+    repo.write("src/reader.rs", &bound);
+    repo.commit_all("bring the competing trait into scope");
+    repo.write(
+        "src/reader.rs",
+        bound.replace("fn get(&mut self", "fn get(&self"),
+    );
+    assert_eq!(lines(&repo, &["--git"]), BTreeSet::from([8, 9]));
+    for input in [
+        "#[doc = include_str!(\"catalog.rs\")] struct Guide;",
+        "fn read_docs() { let _text = include_str!(concat!(\"catalog\", \".rs\")); }",
+        "macro_rules! include_str { ($p:literal) => { () }; } fn read_docs() { let _text = include_str!(\"catalog.rs\"); }",
+    ] {
+        repo.write("src/reader.rs", format!("{plain}{input}\n"));
+        repo.commit_all("unverified Rust text source");
+        repo.write("src/reader.rs", &changed);
+        assert!(lines(&repo, &["--git"]).contains(&9), "{input}");
+    }
+}
+
 /// 別の型の `new` を呼ぶ行 (crate の型、`use` した std の型、prelude の型とモジュールの自由関数、
 /// std のフルパス)。
 const OTHER_CALLS: [&str; 4] = [

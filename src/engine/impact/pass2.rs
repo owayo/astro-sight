@@ -99,13 +99,10 @@ struct Pass2Scan {
 }
 
 pub(super) struct Pass2Evidence<'a> {
-    pub(super) checkout: &'a Path,
     pub(super) options: &'a crate::models::impact::ContextAnalysisOptions,
     pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
     pub(super) cargo_graph_enabled: bool,
-    pub(super) rust_module_wiring_unchanged: bool,
-    pub(super) rust_private_scope_wiring_unchanged: bool,
-    pub(super) rust_reexport_cargo_enabled: bool,
+    pub(super) rust_project: super::rust_path_owner::RustPathOwnerProjectProof,
     pub(super) rust_diff_files: &'a [crate::models::impact::DiffFile],
     pub(super) rust_diff_input: &'a str,
 }
@@ -346,12 +343,9 @@ pub(super) fn stream_caller_maps(
 ) -> Result<StreamCallerMaps> {
     let Pass2Evidence {
         options,
-        checkout,
         reexport_moves,
         cargo_graph_enabled,
-        rust_module_wiring_unchanged,
-        rust_private_scope_wiring_unchanged,
-        rust_reexport_cargo_enabled,
+        rust_project: mut rust_path_owner_project,
         rust_diff_files,
         rust_diff_input,
     } = evidence;
@@ -497,15 +491,6 @@ pub(super) fn stream_caller_maps(
         .into_iter()
         .filter_map(|(name, constant)| constant.then_some(name))
         .collect();
-    let mut rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
-        dir,
-        rust_module_wiring_unchanged,
-        rust_private_scope_wiring_unchanged,
-        rust_reexport_cargo_enabled,
-        rust_diff_files,
-        rust_diff_input,
-    );
-    rust_path_owner_project.layout_checkout = checkout.to_owned();
     if options.new_side == crate::models::impact::DiffNewSide::Index
         && (!rust_nominal_names.is_empty()
             || file_contexts.iter().any(|ctx| {

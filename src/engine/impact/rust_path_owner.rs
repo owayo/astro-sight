@@ -549,6 +549,58 @@ impl RustPathOwnerProjectProof {
             })
     }
 
+    /// 旧側にも別のモジュールへ現在のファイルを取り込む構文がないこと。
+    /// 標準マクロへ式として渡すローカル名 `include` はソースの取り込みを生じない。
+    pub(super) fn previous_receiver_layout_known(&self) -> bool {
+        let Some(relocated) = self.static_layout(true) else {
+            return false;
+        };
+        self.callable_cargo_known
+            && self.reexport_old_sources.iter().all(|(file, old)| {
+                if file == Path::new("/dev/null") {
+                    return true;
+                }
+                let Some((source, path)) = old.as_deref().zip(file.to_str()) else {
+                    return false;
+                };
+                let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+                    return false;
+                };
+                let root = tree.root_node();
+                let mut expressions = format_owner::StockExpressions::new(true);
+                !root.has_error()
+                    && !crate::engine::rust_dynamic_source::any_rust_text_include_at(
+                        root,
+                        source,
+                        |node, literal| {
+                            let call = match node.kind() {
+                                "macro_invocation" => Some(node),
+                                "identifier" => {
+                                    node.parent().filter(|p| p.kind() == "macro_invocation")
+                                }
+                                _ => None,
+                            };
+                            literal.is_none()
+                                || !call.is_some_and(|call| {
+                                    expressions
+                                        .proves(call, source, &self.root, path, self, relocated)
+                                })
+                        },
+                    )
+                    && !crate::engine::tree_walk::any_node(
+                        root,
+                        crate::engine::tree_walk::Children::Named,
+                        |node| {
+                            crate::engine::rust_dynamic_source::node_includes_external_source(
+                                node, source,
+                            ) && !(node.kind() == "identifier"
+                                && expressions
+                                    .proves(node, source, &self.root, path, self, relocated))
+                        },
+                    )
+            })
+    }
+
     pub(super) fn declared_module_file(&self, src: &Path, module: &[String]) -> Option<PathBuf> {
         let key = (src.to_owned(), module.to_vec());
         if let Some(cached) = self
@@ -1659,13 +1711,16 @@ impl RustPathOwnerProjectProof {
     }
 
     pub(super) fn staged_bindings(&self) -> Option<&Self> {
+        self.staged_bindings_for(self.staged_binding_diff.as_deref().unwrap_or(""))
+    }
+
+    pub(super) fn staged_bindings_for(&self, input: &str) -> Option<&Self> {
         self.staged_bindings
             .get_or_init(|| {
                 let snapshot = crate::commands::git_snapshot::IndexSnapshot::for_bindings(
                     self.root.to_str()?,
                 )?;
                 let root = Path::new(snapshot.dir().ok()?);
-                let input = self.staged_binding_diff.as_deref().unwrap_or("");
                 let files = crate::engine::diff::parse_unified_diff(input);
                 let mut project = Self::new(root, false, false, false, &files, input);
                 project.callable_cargo_known = super::rust_cargo_inputs_unchanged(

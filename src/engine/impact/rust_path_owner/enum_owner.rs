@@ -491,13 +491,12 @@ pub(super) fn static_layout(
     for (file, source, offsets) in candidates {
         let tree = parser::parse_source(&source, LangId::Rust).ok()?;
         let relative = file.strip_prefix(&root).ok()?.to_str()?;
+        let mut expressions = super::format_owner::StockExpressions::new(false);
         for offset in offsets {
             let node = tree
                 .root_node()
                 .descendant_for_byte_range(offset, offset + "include".len())?;
-            if !super::format_owner::stock_expression(
-                node, &source, &root, relative, project, &relocated,
-            ) {
+            if !expressions.proves(node, &source, &root, relative, project, &relocated) {
                 return None;
             }
         }

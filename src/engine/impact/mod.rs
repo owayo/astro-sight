@@ -19,6 +19,7 @@ mod rust_macro_site;
 pub(crate) use rust_macro_site::changes_name_resolution;
 mod rust_owner_alias;
 mod rust_path_owner;
+mod rust_receivers;
 mod rust_reexport_owner;
 pub(crate) mod rust_std_origin;
 mod rust_visibility_scope;
@@ -343,6 +344,40 @@ where
     let mut reexport_moves = ReexportMoveIndex::build(diff_input);
     // 「純粋な移動」の証拠として、移動元の旧宣言と移動先の新宣言の全体を AST で照合する。
     reexport_moves.verify_declarations(diff_input, |path| new_side_source.read_checked(dir, path));
+    let diff_blocks = std::cell::LazyCell::new(|| diff::scan_blocks(diff_input));
+    let cargo_graph_enabled = std::cell::LazyCell::new(|| {
+        options.new_side == crate::models::impact::DiffNewSide::WorkingTree
+            && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, false)
+    });
+    let cargo_inputs_known =
+        std::cell::LazyCell::new(|| rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, true));
+    let rust_project = std::cell::OnceCell::new();
+    let build_project = || {
+        let mut project = rust_path_owner::RustPathOwnerProjectProof::new(
+            dir,
+            *cargo_graph_enabled
+                && rust_path_owner::module_wiring_unchanged(dir, &diff_files, diff_input),
+            *cargo_graph_enabled
+                && rust_path_owner::private_scope_wiring_unchanged(dir, &diff_files, diff_input),
+            options.new_side == crate::models::impact::DiffNewSide::WorkingTree
+                && *cargo_inputs_known,
+            &diff_files,
+            diff_input,
+        );
+        project.layout_checkout = checkout.to_owned();
+        project
+    };
+    // Pass 1 と Pass 2 が同じモジュール配置・旧ソース・index のスナップショットを使う。
+    let receiver_layout = || {
+        if !*cargo_inputs_known {
+            return None;
+        }
+        let p = rust_project.get_or_init(build_project);
+        match &new_side_source {
+            NewSideSource::WorkingTree => Some(p),
+            NewSideSource::Index(_) => p.staged_bindings_for(diff_input),
+        }
+    };
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
     let pass1::AffectedSymbolCollection {
@@ -357,6 +392,7 @@ where
         &new_side_source,
         &reexport_moves,
         &options.derived_contract_changes,
+        &receiver_layout,
     );
     log_phase("context.pass1", "end", t.elapsed().as_millis());
     log_phase(
@@ -396,12 +432,6 @@ where
     // (`typed_low_caller_maps`) へ振り分けて強い impact 信号を汚染しない。
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
-    // Index 側の manifest、依存関係の変更、別 package への移動は
-    // 作業ツリーだけから旧側の到達性を証明できない。hunk の無い rename・binary・gitlink の
-    // ブロックも見落とさないよう、diff の全てのブロックで確かめる (Issue #374・#377)。
-    let diff_blocks = diff::scan_blocks(diff_input);
-    let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
-        && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, false);
     let pass2_maps = stream_caller_maps(
         &mut file_contexts,
         &all_symbol_names,
@@ -410,16 +440,9 @@ where
         dir,
         Pass2Evidence {
             options,
-            checkout,
             reexport_moves: &reexport_moves,
-            cargo_graph_enabled,
-            rust_module_wiring_unchanged: cargo_graph_enabled
-                && rust_path_owner::module_wiring_unchanged(dir, &diff_files, diff_input),
-            rust_private_scope_wiring_unchanged: cargo_graph_enabled
-                && rust_path_owner::private_scope_wiring_unchanged(dir, &diff_files, diff_input),
-            rust_reexport_cargo_enabled: options.new_side
-                == crate::models::impact::DiffNewSide::WorkingTree
-                && rust_cargo_inputs_unchanged(&diff_blocks, &diff_files, true),
+            cargo_graph_enabled: *cargo_graph_enabled,
+            rust_project: rust_project.into_inner().unwrap_or_else(build_project),
             rust_diff_files: &diff_files,
             rust_diff_input: diff_input,
         },

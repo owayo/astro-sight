@@ -52,6 +52,8 @@ struct Pass1Inputs<'a> {
     single_in_place_file: bool,
     /// JS 系の旧側監査は、追加候補を見つけたときに一度だけ実行する。
     old_js_declarations: OnceCell<Option<OldJsDeclarations>>,
+    receiver_layout: &'a dyn Fn() -> Option<&'a super::rust_path_owner::RustPathOwnerProjectProof>,
+    receiver_project: OnceCell<Option<super::rust_receivers::Project<'a>>>,
 }
 
 #[derive(Default)]
@@ -110,13 +112,14 @@ impl CrossFileSymbolRegistry {
 }
 
 /// Pass 1: 変更ファイルをパースし、シンボルを抽出し、cross-file 参照検索が必要なシンボル名を決定する。
-pub(super) fn collect(
-    diff_input: &str,
-    diff_files: &[DiffFile],
-    dir: &Path,
-    new_side_source: &NewSideSource,
-    reexport_moves: &ReexportMoveIndex,
-    derived_contract_changes: &BTreeMap<String, BTreeSet<String>>,
+pub(super) fn collect<'a>(
+    diff_input: &'a str,
+    diff_files: &'a [DiffFile],
+    dir: &'a Path,
+    new_side_source: &'a NewSideSource,
+    reexport_moves: &'a ReexportMoveIndex,
+    derived_contract_changes: &'a BTreeMap<String, BTreeSet<String>>,
+    receiver_layout: &'a dyn Fn() -> Option<&'a super::rust_path_owner::RustPathOwnerProjectProof>,
 ) -> AffectedSymbolCollection {
     let inputs = Pass1Inputs {
         dir,
@@ -128,6 +131,8 @@ pub(super) fn collect(
         file_sections: diff::FileSections::split(diff_input),
         single_in_place_file: matches!(diff_files, [only] if only.old_path == only.new_path),
         old_js_declarations: OnceCell::new(),
+        receiver_layout,
+        receiver_project: OnceCell::new(),
     };
     let mut file_contexts = Vec::new();
     let mut registry = CrossFileSymbolRegistry::default();
@@ -369,7 +374,7 @@ fn analyze_changed_file(
         facts: &changed_line_facts,
         reexport_moves,
     };
-    let old_side = declaration::LazyOldSide::default();
+    let mut old_side = declaration::LazyOldSide::default();
     let foreign = declaration::ForeignChanges::collect(&declaration_input, &old_side);
     let start =
         |sym: &Symbol| tree_sitter::Point::new(sym.range.start.line, sym.range.start.column);
@@ -521,7 +526,7 @@ fn analyze_changed_file(
     };
     // 複数行ヘッダや宣言移動の差分は、旧側 AST と突き合わせて補う。
     let declaration_proof = declaration::reconcile_declaration_changes(
-        old_side,
+        &mut old_side,
         &declaration_input,
         &mut affected,
         &mut sig_changes,
@@ -644,7 +649,7 @@ fn analyze_changed_file(
     );
 
     let t = std::time::Instant::now();
-    let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
+    let mut call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
     log_phase(
         &format!("context.pass1.extract_calls n={}", call_edges.len()),
         "end",
@@ -684,6 +689,29 @@ fn analyze_changed_file(
         .filter(|_| in_place)
         .map(|old| private_root_functions(old, &rust_private_root_names, root, &source, &syms))
         .unwrap_or_default();
+    if sig_changes
+        .iter()
+        .any(|sig| rust_private_method_owners.contains_key(&sig.name))
+    {
+        let independent = old_side.unchanged_receiver_calls(
+            &declaration_input,
+            &rust_private_method_owners,
+            || {
+                inputs
+                    .receiver_project
+                    .get_or_init(|| {
+                        (inputs.receiver_layout)().map(super::rust_receivers::Project::new)
+                    })
+                    .as_ref()
+            },
+        );
+        call_edges.retain(|edge| {
+            !independent.contains(&tree_sitter::Point::new(
+                edge.call_site.line,
+                edge.call_site.column,
+            ))
+        });
+    }
 
     // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
     // ループの外で 1 度だけ組み立てる。

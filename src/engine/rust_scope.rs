@@ -46,6 +46,7 @@ struct BlockFacts {
 
 struct LetBinding {
     start: usize,
+    declaration: usize,
     proven: bool,
 }
 
@@ -61,6 +62,11 @@ pub(crate) struct RustScopeIndex {
 }
 
 impl RustScopeIndex {
+    pub(crate) fn blocks_without_imports(&self, path: &[Node<'_>]) -> bool {
+        path.iter()
+            .filter_map(|node| self.blocks.get(&node.id()))
+            .all(|block| !block.barrier && block.named_imports.is_empty())
+    }
     /// walk の途中から呼ばれても、解析エラーと巻き上げ宣言を木全体で確認する。
     pub(crate) fn build(root: Node<'_>, source: &[u8]) -> Option<Self> {
         Self::with_data_initializers(root, source, &HashSet::new())
@@ -307,6 +313,7 @@ impl RustScopeIndex {
                             .or_default()
                             .push(LetBinding {
                                 start: statement.end_byte(),
+                                declaration: statement.id(),
                                 proven,
                             });
                         if proven {
@@ -320,6 +327,76 @@ impl RustScopeIndex {
             attributed = false;
         }
         facts
+    }
+
+    /// レシーバーの値を導入した let または関数引数の宣言を、走査中の祖先列から引く。
+    pub(crate) fn receiver_binding(
+        &self,
+        name: &str,
+        site: Node<'_>,
+        ancestors: &[Node<'_>],
+    ) -> Option<usize> {
+        let name = binding_name(name);
+        for &scope in ancestors.iter().rev() {
+            match scope.kind() {
+                "block" => {
+                    let facts = self.blocks.get(&scope.id())?;
+                    if facts.named_imports.contains(name) || facts.functions.contains(name) {
+                        return None;
+                    }
+                    let binding = facts.lets.get(name).and_then(|lets| {
+                        let end =
+                            lets.partition_point(|binding| binding.start <= site.start_byte());
+                        lets[..end].last()
+                    });
+                    let n = facts
+                        .dynamic_statements
+                        .partition_point(|&start| start < site.start_byte());
+                    if n > 0 && binding.is_none_or(|b| facts.dynamic_statements[n - 1] >= b.start) {
+                        return None;
+                    }
+                    if let Some(binding) = binding {
+                        return Some(binding.declaration);
+                    }
+                    if facts.non_expression_macro_barrier {
+                        return None;
+                    }
+                }
+                "function_item" => {
+                    return self
+                        .parameters
+                        .get(&scope.id())?
+                        .contains(name)
+                        .then_some(scope.id());
+                }
+                "for_expression" if !self.for_pattern_names.get(&scope.id())?.contains(name) => {}
+                "closure_expression" | "match_arm" | "let_condition"
+                    if !self.scoped_patterns.get(&scope.id())?.contains(name) => {}
+                "if_expression" | "while_expression"
+                    if scope.child_by_field_name("condition").is_some_and(|cond| {
+                        matches!(cond.kind(), "let_condition" | "let_chain")
+                    }) =>
+                {
+                    return None;
+                }
+                "let_declaration" if field_contains(scope, "alternative", site) => return None,
+                kind if ITEM_BOUNDARIES.contains(&kind)
+                    || matches!(
+                        kind,
+                        "for_expression"
+                            | "closure_expression"
+                            | "match_arm"
+                            | "let_condition"
+                            | "match_guard"
+                            | "let_chain"
+                    ) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     pub(crate) fn resolve(&self, node: Node<'_>, source: &[u8]) -> LexicalBinding {
