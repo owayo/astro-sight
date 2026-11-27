@@ -138,6 +138,8 @@ A two-part associated path such as `AppPaths::resolve()` can be distinguished fr
 
 For a private free function declared at file scope in both versions, a call such as `Sha256::digest(bytes)` in another module is also excluded when a unique named import supplies its qualifier from a regular registry dependency. The proof checks the module chain, local shadowing, and Cargo's dependency sources. It applies to a standalone Cargo package inside another Git repository when these checks pass.
 
+When a Rust free function named `imports` changes, `debug!(imports = result.imports.len())` can be excluded from its callers if the macro resolves to the registry dependency `tracing` 0.1. The first occurrence names a log field and the second reads a struct field. A call such as `debug!(count = crate::producer::imports(1))` still refers to the changed function.
+
 Callers fall into 3 groups by confidence and by how breaking they are. "Blocking" here means a finding that makes `impact` or `review --hook` return exit 1.
 
 - `impacted_callers`: actual call sites. Those left outside the diff are blocking for `impact`. References to symbols whose number of arguments changed, and references that cannot be decided, also stay here

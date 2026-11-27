@@ -1,7 +1,7 @@
-//! モジュール内で式を評価する serde_json の json! と、serde の derive の出所。
+//! serde_json・serde・tracing のマクロを提供する crates.io 依存の出所。
 use super::*;
 
-/// crates.io の 1.x を直接使う単一 package に限定する。Cargo の設定や rename、
+/// 対応する版を crates.io から直接使う単一 package に限定する。Cargo の設定や rename、
 /// path・git・patch による同名の差し替え、別ターゲットだけの依存は使わない。
 pub(super) fn stock_dependency(
     project: &RustPathOwnerProjectProof,
@@ -20,16 +20,21 @@ pub(super) fn stock_dependency(
                 .as_deref()
                 != Some(file)
             || !project.edition_2018_or_later(Path::new(""))?
-            || !project
-                .cargo_configs
-                .keeps_dependency_sources(&project.layout_checkout)
-            || !project
-                .cargo_configs
-                .keeps_dependency_sources(&project.root)
         {
             return None;
         }
-        Some(())
+        let known_settings = if name == "tracing" {
+            // staged review の中の設定は index、その外側は呼び出し元の checkout で検証する。
+            project.layout_cargo_settings_known()
+        } else {
+            project
+                .cargo_configs
+                .keeps_dependency_sources(&project.layout_checkout)
+                && project
+                    .cargo_configs
+                    .keeps_dependency_sources(&project.root)
+        };
+        known_settings.then_some(())
     };
     if location().is_none() {
         return false;
@@ -132,10 +137,15 @@ pub(super) fn stock_dependency(
             spec.as_str()?
         };
         let version = version.trim_start_matches(['=', '~', '^']);
-        if version.split('.').next() != Some("1")
+        let series = registry_series(name);
+        if !(version == series.trim_end_matches('.') || version.starts_with(series))
             || !version.bytes().all(|b| b == b'.' || b.is_ascii_digit())
         {
             return None;
+        }
+        // tracing の名前解決は呼び出し位置の module と block で別途確かめる。
+        if name == "tracing" {
+            return Some(());
         }
         let root_file = Path::new("src/lib.rs");
         let root = read_input_file(&project.root.join(root_file))?;
@@ -160,6 +170,10 @@ pub(super) fn stock_dependency(
     known
 }
 
+fn registry_series(name: &str) -> &'static str {
+    if name == "tracing" { "0.1." } else { "1." }
+}
+
 /// 同名の複数バージョンも含め、derive が実際に使う実装（serde_derive・quote など）まで調べる。
 fn registry_closure<'a>(lock: &'a toml::Value, name: &'a str) -> Option<HashSet<&'a str>> {
     let mut packages = HashMap::<&str, Vec<&toml::Value>>::new();
@@ -179,7 +193,11 @@ fn registry_closure<'a>(lock: &'a toml::Value, name: &'a str) -> Option<HashSet<
             if pkg.get("source")?.as_str()?
                 != "registry+https://github.com/rust-lang/crates.io-index"
                 || pkg.get("checksum")?.as_str()?.len() != 64
-                || next == name && !pkg.get("version")?.as_str()?.starts_with("1.")
+                || next == name
+                    && !pkg
+                        .get("version")?
+                        .as_str()?
+                        .starts_with(registry_series(name))
             {
                 return None;
             }
