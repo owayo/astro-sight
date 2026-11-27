@@ -356,6 +356,9 @@ fn analyze_changed_file(
     let changed_new_lines = &changed_line_facts.added_lines;
     let declaration_input = declaration::DeclarationChangeInput {
         file_diff,
+        complete_single_file_diff: single_in_place_file
+            && matches!(lang_id, LangId::Rust | LangId::Typescript | LangId::Tsx)
+            && complete_text_diff(inputs.diff_input, 1),
         file_path: &df.new_path,
         old_file_path: &df.old_path,
         syms: &syms,
@@ -504,9 +507,8 @@ fn analyze_changed_file(
     let t = std::time::Instant::now();
     let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
     // 同時に別ファイルから import した型が変わると、同じ宣言でも呼び出し側の型が変わる。
-    let equivalent_exports = if single_in_place_file
+    let equivalent_exports = if declaration_input.complete_single_file_diff
         && matches!(lang_id, LangId::Typescript | LangId::Tsx)
-        && complete_text_diff(inputs.diff_input, 1)
     {
         declaration::equivalent_function_exports(
             &declaration_input,
