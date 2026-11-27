@@ -497,6 +497,7 @@ pub(super) fn stream_caller_maps(
                 !ctx.rust_function_names.is_empty() && !ctx.sig_changes.is_empty()
                     || !ctx.rust_free_function_names.is_empty()
                     || !ctx.rust_super_functions.is_empty()
+                    || !ctx.rust_private_method_owners.is_empty()
                     || !ctx.rust_private_root_functions.is_empty()
                     || ctx.rust_receiverless_associated_names.contains("new")
             }))
@@ -578,7 +579,7 @@ pub(super) fn stream_caller_maps(
                             rust_collections: std::cell::OnceCell::new(),
                             rust_nominal_names: &rust_nominal_names,
                             rust_constant_names: &rust_constant_names,
-                            staged_constant_source_matches: Default::default(),
+                            staged_rust_source_matches: Default::default(),
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_opaque_attributes: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),

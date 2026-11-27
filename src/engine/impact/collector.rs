@@ -394,7 +394,7 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) rust_path_owner_enabled: bool,
     pub(super) rust_nominal_names: &'a std::collections::HashSet<&'a str>,
     pub(super) rust_constant_names: &'a std::collections::HashSet<String>,
-    pub(super) staged_constant_source_matches: std::cell::OnceCell<bool>,
+    pub(super) staged_rust_source_matches: std::cell::OnceCell<bool>,
     pub(super) rust_std_project_allowed: std::cell::OnceCell<bool>,
     pub(super) rust_std_project: &'a super::rust_std_origin::RustStdProjectProof,
     pub(super) rust_cargo_reachability: &'a super::rust_cargo_reachability::RustCargoReachability,
@@ -895,20 +895,23 @@ impl ImpactCollector<'_> {
         };
         let rust_private_call_target = node
             .filter(|_| {
-                rust_explicit_method_owner_id != u32::MAX
-                    && self.rust_path_owner_enabled
-                    && !is_import
-                    && rust_macro_site.is_none()
+                rust_explicit_method_owner_id != u32::MAX && !is_import && rust_macro_site.is_none()
             })
             .and_then(|node| {
                 self.rust_private_calls
                     .get_or_init(|| {
+                        let project = self.rust_path_owner_project.private_call_project()?;
+                        if !self.rust_path_owner_enabled
+                            && !self.indexed_rust_source_matches(project, source)
+                        {
+                            return None;
+                        }
                         super::rust_owner_alias::private_calls(
                             node,
                             source,
                             Path::new(self.path_str),
                             self.file_contexts,
-                            self.rust_path_owner_project,
+                            project,
                         )
                     })
                     .as_ref()?
@@ -1382,11 +1385,7 @@ impl ImpactCollector<'_> {
                     .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(n, source))
                     .plain_local_value_owner(n, source, &self.all_symbol_names[ix])
                     // 字句束縛は同じファイルの木で確定する。行末だけの差では束縛は変わらない。
-                    && *self.staged_constant_source_matches.get_or_init(|| {
-                        self.rust_path_owner_project.staged_bindings()
-                            .and_then(|view| crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str)))
-                            .is_some_and(|indexed| super::rust_line_endings::same_text(source, &indexed))
-                    })
+                    && self.rust_path_owner_project.staged_bindings().is_some_and(|view| self.indexed_rust_source_matches(view, source))
             });
         let rust_local_owner = staged_local_value
             || (rust_plain_name
@@ -1772,6 +1771,18 @@ struct ScopeEvidence {
 }
 
 impl<'a> ImpactCollector<'a> {
+    /// 行単位の Rust 構文には CRLF / LF 差を許す。バイト位置を写す証明は binding_view に限る。
+    fn indexed_rust_source_matches(
+        &self,
+        view: &super::rust_path_owner::RustPathOwnerProjectProof,
+        source: &[u8],
+    ) -> bool {
+        *self.staged_rust_source_matches.get_or_init(|| {
+            crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str))
+                .is_some_and(|indexed| super::rust_line_endings::same_text(source, &indexed))
+        })
+    }
+
     fn binding_view(
         &self,
         source: &[u8],
