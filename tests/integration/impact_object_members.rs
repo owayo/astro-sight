@@ -240,6 +240,76 @@ fn object_key_spelling_preserves_order_values_and_unrelated_dynamic_reads() {
 }
 
 #[test]
+fn retained_object_member_values_preserve_literal_whitespace() {
+    let old = "\"a b\"";
+    for (extension, wrapper, new, add_member, changed) in [
+        ("ts", " as const", "\"a  b\"", true, true),
+        ("js", "", "\"a  b\"", true, true),
+        ("ts", " as const", "\"a  b\"", false, true),
+        ("ts", " as const", "\"a c\"", false, true),
+        ("ts", " as const", "   \"a b\"", true, false),
+    ] {
+        let declaration = |value: &str, add_member: bool| {
+            let extra = if add_member { ", fresh: true" } else { "" };
+            format!("export const recordLayout = {{ endpoint: {value}{extra} }}{wrapper};\n")
+        };
+        let before = declaration(old, false);
+        let repo = object_repo(
+            extension,
+            &before,
+            &declaration(new, add_member),
+            "export const result = recordLayout.endpoint;",
+        );
+        repo.stage_all();
+        for staged in [false, true] {
+            if staged {
+                repo.write(format!("layout.{extension}"), &before);
+            }
+            let run = |command: &str, options: &[&str]| {
+                let mut cmd = cargo_bin();
+                cmd.args([command, "--dir"])
+                    .arg(repo.root())
+                    .arg("--git")
+                    .args(options);
+                if staged {
+                    cmd.arg("--staged");
+                }
+                cmd.output().unwrap()
+            };
+            let review = run("review", &["--hook"]);
+            let json: serde_json::Value = serde_json::from_slice(&review.stderr).unwrap();
+            assert_eq!(
+                review.status.code(),
+                Some(i32::from(changed && add_member)),
+                "{old} -> {new}, staged={staged}: {json}"
+            );
+            if add_member {
+                let bucket = if changed { "mod" } else { "mod_compat" };
+                assert!(
+                    json["api"][bucket]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item["n"] == "recordLayout")),
+                    "{json}"
+                );
+            }
+            let impact = run("impact", &[]);
+            let report = String::from_utf8(impact.stderr).unwrap();
+            assert_eq!(
+                impact.status.code(),
+                Some(i32::from(changed)),
+                "{old} -> {new}, staged={staged}: {report}"
+            );
+            if changed {
+                assert!(
+                    report.contains(&format!("consumer.{extension}:2")),
+                    "{report}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn impact_object_members_scan_insertions_inside_existing_values() {
     let repo = TestRepo::new();
     repo.init_git();
