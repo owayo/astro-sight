@@ -633,16 +633,7 @@ impl ImpactCollector<'_> {
                     .contains(&self.all_symbol_names[ix])
             });
         if scoped_function {
-            self.rust_binding_view.get_or_init(|| {
-                if self.rust_path_owner_enabled {
-                    return Some(self.rust_path_owner_project);
-                }
-                let view = self.rust_path_owner_project.staged_bindings()?;
-                (crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str))?
-                    .as_slice()
-                    == source)
-                    .then_some(view)
-            });
+            self.binding_view(source);
         }
         let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
             && self.rust_path_owner_enabled)
@@ -675,20 +666,7 @@ impl ImpactCollector<'_> {
                 let copy = self
                     .rust_macro_copy
                     .get_or_init(|| {
-                        let project = if self.rust_path_owner_enabled {
-                            self.rust_path_owner_project
-                        } else {
-                            let staged = self.rust_path_owner_project.staged_bindings()?;
-                            if crate::engine::bounded_read::read_input_file(
-                                &staged.root.join(self.path_str),
-                            )?
-                            .as_slice()
-                                != source
-                            {
-                                return None;
-                            }
-                            staged
-                        };
+                        let project = self.binding_view(source)?;
                         let index = self.rust_path_owner.get_or_init(|| {
                             super::rust_path_owner::RustPathOwnerIndex::build(node, source)
                         });
@@ -1185,6 +1163,20 @@ impl ImpactCollector<'_> {
             Some(QualifiedCallOwner::Function(path)) => Some((path, true)),
             _ => None,
         });
+        let rust_owner = rust_owner.or_else(|| {
+            let node = node.filter(|node| {
+                rust_private_function_candidate
+                    && rust_name_site == super::rust_macro_site::MacroSite::Unknown
+                    && node.kind() == "identifier"
+            })?;
+            let index = self
+                .rust_path_owner
+                .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source));
+            let path = index.definition_crate_path(node, source)?;
+            self.binding_view(source)?
+                .macro_function(Path::new(self.path_str), path)
+                .map(|file| (file, true))
+        });
         let rust_owner_path_id = rust_owner
             .as_ref()
             .and_then(|(owner, _)| owner.to_str())
@@ -1563,6 +1555,22 @@ struct ScopeEvidence {
 }
 
 impl<'a> ImpactCollector<'a> {
+    fn binding_view(
+        &self,
+        source: &[u8],
+    ) -> Option<&'a super::rust_path_owner::RustPathOwnerProjectProof> {
+        *self.rust_binding_view.get_or_init(|| {
+            if self.rust_path_owner_enabled {
+                return Some(self.rust_path_owner_project);
+            }
+            let view = self.rust_path_owner_project.staged_bindings()?;
+            (crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str))?
+                .as_slice()
+                == source)
+                .then_some(view)
+        })
+    }
+
     fn owner_source(&self, fc: usize) -> Option<&super::rust_path_owner::PrivateModule> {
         self.rust_owner_sources[fc]
             .get_or_init(|| {

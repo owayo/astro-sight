@@ -1301,7 +1301,7 @@ fn name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     Some(name.strip_prefix("r#").unwrap_or(name))
 }
 
-fn attribute_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+pub(super) fn attribute_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     let attribute = if node.kind() == "attribute" {
         node
     } else {
