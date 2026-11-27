@@ -5446,6 +5446,10 @@
     "named": false
   },
   {
+    "type": "safe",
+    "named": false
+  },
+  {
     "type": "self",
     "named": true
   },

@@ -40,6 +40,125 @@ fn texts<'a>(tree: &Tree, source: &'a str, kind: &str) -> Vec<&'a str> {
 }
 
 #[test]
+fn rust_foreign_safety_qualifiers_keep_item_kinds_and_names() {
+    let source = r##"macro_rules! safe { () => {} }
+unsafe extern r#"C"# {
+    safe!();
+    #[allow(dead_code)]
+    pub(crate) safe /* guaranteed */ fn safe(safe: i32) -> i32;
+    unsafe fn explicit();
+    fn implicit();
+    pub safe static KNOWN: i32;
+    unsafe static mut RAW: i32;
+    static PLAIN: i32;
+}
+struct Record { safe: i32 }
+fn ordinary(safe: Record) -> i32 { safe.safe }
+"##;
+    let tree = clean(source);
+    let root = tree.root_node();
+    let block = nodes(root)
+        .into_iter()
+        .find(|n| n.kind() == "foreign_mod_item")
+        .unwrap();
+    let body = block.child_by_field_name("body").unwrap();
+    assert_eq!(body.kind(), "declaration_list");
+    assert_eq!(
+        texts(&tree, source, "function_modifiers"),
+        ["safe", "unsafe"]
+    );
+    let mut cursor = body.walk();
+    let items: Vec<_> = body
+        .named_children(&mut cursor)
+        .filter_map(|node| {
+            let name = node
+                .child_by_field_name("name")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            Some((node.kind(), name))
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            ("function_signature_item", "safe"),
+            ("function_signature_item", "explicit"),
+            ("function_signature_item", "implicit"),
+            ("static_item", "KNOWN"),
+            ("static_item", "RAW"),
+            ("static_item", "PLAIN"),
+        ]
+    );
+    let functions = crate::engine::symbols::extract_symbols_without_complexity(
+        root,
+        source.as_bytes(),
+        LangId::Rust,
+    )
+    .unwrap();
+    for (name, line) in [
+        ("safe", 4),
+        ("explicit", 5),
+        ("implicit", 6),
+        ("ordinary", 12),
+    ] {
+        assert!(
+            functions.iter().any(|s| s.name == name
+                && s.kind == crate::models::symbol::SymbolKind::Function
+                && s.range.start.line == line),
+            "{functions:?}"
+        );
+    }
+    assert_eq!(texts(&tree, source, "macro_invocation"), ["safe!()"]);
+}
+
+#[test]
+fn rust_foreign_safety_qualifiers_are_specific_to_external_declarations() {
+    for source in [
+        "pub safe fn ordinary() {}",
+        "trait Api { safe fn method(); }",
+        "impl Api { safe fn method() {} }",
+        "pub safe static VALUE: u8 = 0;",
+        "extern \"C\" { pub safe fn ordinary(); }",
+        "unsafe extern \"C\" { pub safe unsafe fn bad(); }",
+        "unsafe extern \"C\" { pub unsafe safe fn bad(); }",
+        "unsafe extern \"C\" { safe pub fn bad(); }",
+        "unsafe extern \"C\" { pub safe fn with_body() {} }",
+        "unsafe extern \"C\" { pub safe static VALUE: u8 = 0; }",
+    ] {
+        let tree = parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "{source}: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+}
+
+#[test]
+fn rust_safe_remains_an_identifier_in_types_patterns_and_macro_paths() {
+    for source in [
+        "pub fn wrap<'safe, safe>(x: &'safe safe) -> &'safe safe { x }",
+        "pub fn view(safe: i32) -> i32 { match safe { safe @ 0 => safe, _ => 1 } }",
+        "pub struct safe; pub fn build() -> safe { safe }",
+        "pub type safe = usize; pub const VALUE: safe = 0;",
+        "mod a { pub struct Item; } use a::Item as safe; pub const VALUE: safe = safe;",
+    ] {
+        let tree = clean(source);
+        assert!(texts(&tree, source, "function_modifiers").is_empty());
+    }
+    let source = r#"#[macro_export] macro_rules! emit { () => {} }
+mod safe { pub mod nested { pub use crate::emit; } }
+unsafe extern "C" { safe::nested::emit!(); }
+"#;
+    let tree = clean(source);
+    assert_eq!(
+        texts(&tree, source, "macro_invocation"),
+        ["safe::nested::emit!()"]
+    );
+    assert!(texts(&tree, source, "scoped_identifier").contains(&"safe::nested::emit"));
+}
+
+#[test]
 fn rust_unicode_separators_preserve_following_declarations_and_byte_positions() {
     for source in [SOURCE.to_string(), SOURCE.replace('\n', "\r\n")] {
         let tree = clean(&source);

@@ -280,13 +280,57 @@ module.exports = grammar({
       ),
     ),
 
-    foreign_mod_item: $ => seq(
-      optional('unsafe'),
-      $.extern_modifier,
-      choice(
-        ';',
-        field('body', $.declaration_list),
-      ),
+    foreign_mod_item: $ => choice(
+      seq($.extern_modifier, choice(';', field('body', $.declaration_list))),
+      seq('unsafe', $.extern_modifier, choice(
+        ';', field('body', alias($._unsafe_foreign_declaration_list, $.declaration_list)),
+      )),
+    ),
+
+    _unsafe_foreign_declaration_list: $ => seq(
+      '{',
+      repeat(choice(
+        $._declaration_statement,
+        alias($._safe_foreign_function, $.function_signature_item),
+        alias($._qualified_foreign_static, $.static_item),
+        alias($._foreign_safe_macro, $.macro_invocation),
+      )),
+      '}',
+    ),
+
+    _safe_foreign_function: $ => seq(
+      optional($.visibility_modifier),
+      alias($._safe_modifier, $.function_modifiers),
+      $._function_declarator,
+      ';',
+    ),
+
+    _safe_modifier: _ => 'safe',
+
+    _foreign_safe_macro: $ => seq(
+      field('macro', choice(
+        alias('safe', $.identifier),
+        alias($._foreign_safe_macro_path, $.scoped_identifier),
+      )),
+      '!',
+      alias($.delim_token_tree, $.token_tree),
+    ),
+
+    _foreign_safe_macro_path: $ => seq(
+      field('path', choice(
+        alias('safe', $.identifier),
+        alias($._foreign_safe_macro_path, $.scoped_identifier),
+      )),
+      '::',
+      field('name', $.identifier),
+    ),
+
+    _qualified_foreign_static: $ => seq(
+      optional($.visibility_modifier),
+      choice('safe', 'unsafe'),
+      'static',
+      $._static_declarator,
+      ';',
     ),
 
     declaration_list: $ => seq(
@@ -411,15 +455,19 @@ module.exports = grammar({
       // Not actual rust syntax, but made popular by the lazy_static crate.
       optional('ref'),
 
-      optional($.mutable_specifier),
-      field('name', $.identifier),
-      ':',
-      field('type', $._type),
+      $._static_declarator,
       optional(seq(
         '=',
         field('value', $._expression),
       )),
       ';',
+    ),
+
+    _static_declarator: $ => seq(
+      optional($.mutable_specifier),
+      field('name', $.identifier),
+      ':',
+      field('type', $._type),
     ),
 
     type_item: $ => seq(
@@ -437,25 +485,24 @@ module.exports = grammar({
     function_item: $ => seq(
       optional($.visibility_modifier),
       optional($.function_modifiers),
-      'fn',
-      field('name', choice($.identifier, $.metavariable)),
-      field('type_parameters', optional($.type_parameters)),
-      field('parameters', $.parameters),
-      optional(seq('->', field('return_type', $._type))),
-      optional($.where_clause),
+      $._function_declarator,
       field('body', $.block),
     ),
 
     function_signature_item: $ => seq(
       optional($.visibility_modifier),
       optional($.function_modifiers),
+      $._function_declarator,
+      ';',
+    ),
+
+    _function_declarator: $ => seq(
       'fn',
       field('name', choice($.identifier, $.metavariable)),
       field('type_parameters', optional($.type_parameters)),
       field('parameters', $.parameters),
       optional(seq('->', field('return_type', $._type))),
       optional($.where_clause),
-      ';',
     ),
 
     function_modifiers: $ => repeat1(choice(
