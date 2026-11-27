@@ -46,6 +46,73 @@ fn typescript_node_with_text<'a>(
 }
 
 #[test]
+fn typescript_type_only_star_exports_keep_the_source_and_namespace() {
+    let source = b"export type * from './m.js';\nexport type * as Rows from './m.js';\nexport * from './m.js';\nexport * as Rows from './m.js';\nexport type {Row} from './m.js';";
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let tree = assert_typescript_parse_clean(source, lang);
+        let root = tree.root_node();
+        assert_eq!(root.named_child_count(), 5);
+        for (index, children) in [
+            &["export", "type", "*", "from", "string", ";"][..],
+            &["export", "type", "namespace_export", "from", "string", ";"],
+            &["export", "*", "from", "string", ";"],
+            &["export", "namespace_export", "from", "string", ";"],
+            &["export", "type", "export_clause", "from", "string", ";"],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let stmt = root.named_child(index as u32).unwrap();
+            assert_eq!(stmt.kind(), "export_statement");
+            let kinds: Vec<_> = stmt.children(&mut stmt.walk()).map(|n| n.kind()).collect();
+            assert_eq!(&kinds, children, "{lang:?}");
+            assert_eq!(
+                stmt.child_by_field_name("source")
+                    .unwrap()
+                    .utf8_text(source)
+                    .unwrap(),
+                "'./m.js'"
+            );
+            if let Some(ns) = stmt
+                .named_child(0)
+                .filter(|n| n.kind() == "namespace_export")
+            {
+                let parts: Vec<_> = ns
+                    .children(&mut ns.walk())
+                    .map(|n| n.utf8_text(source).unwrap())
+                    .collect();
+                assert_eq!(parts, ["*", "as", "Rows"]);
+            }
+        }
+        for malformed in [
+            "export type *;",
+            "export type * as Rows;",
+            "export type * as from './m.js';",
+        ] {
+            assert!(
+                parse_source(malformed.as_bytes(), lang)
+                    .unwrap()
+                    .root_node()
+                    .has_error(),
+                "{lang:?} {malformed}"
+            );
+        }
+    }
+    for typed in [
+        "export type * from './m.js';",
+        "export type * as Rows from './m.js';",
+    ] {
+        assert!(
+            parse_source(typed.as_bytes(), LangId::Javascript)
+                .unwrap()
+                .root_node()
+                .has_error(),
+            "{typed}"
+        );
+    }
+}
+
+#[test]
 fn typescript_template_literal_type_escapes_preserve_text_and_interpolation() {
     let source = br#"type Label = `a\u0061\${x}\`\t b${string}z`;
 const value = `a\u0061\${x}\`\t b${input}z`;

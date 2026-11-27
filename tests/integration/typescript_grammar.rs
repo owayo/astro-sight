@@ -68,6 +68,35 @@ fn assert_typescript_cli_clean(ast: &Value, source: &str) {
 }
 
 #[test]
+fn typescript_cli_parses_type_only_star_exports_at_the_type_keyword() {
+    let repo = TestRepo::new();
+    for extension in ["ts", "tsx"] {
+        let path = repo.path(format!("api.{extension}"));
+        for (declaration, namespace) in [
+            ("export type * from './types.js';", false),
+            ("export type * as Rows from './types.js';", true),
+        ] {
+            repo.write(format!("api.{extension}"), declaration);
+            let ast = typescript_cli_json(
+                "ast",
+                &path,
+                &["--line", "0", "--col", "7", "--depth", "4", "--full"],
+            );
+            assert_typescript_cli_clean(&ast, declaration);
+            let stmt = &ast["ast"][0];
+            assert_eq!(stmt["kind"], "export_statement");
+            assert_eq!(typescript_ast_field(stmt, "source")["kind"], "string");
+            assert_eq!(
+                typescript_ast_nodes(stmt)
+                    .iter()
+                    .any(|node| node["kind"] == "namespace_export"),
+                namespace
+            );
+        }
+    }
+}
+
+#[test]
 fn typescript_template_literal_type_escape_keeps_the_breaking_api_and_consumer() {
     let source = r#"export const LABEL: `a\${x} b${string}` = `a\${x} b/old`;
 "#;
