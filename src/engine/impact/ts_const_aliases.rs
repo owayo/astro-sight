@@ -1,4 +1,4 @@
-//! named import の別名が指す値を読む位置だけ、元の const の caller に加える。
+//! named import の別名が指す値を読む位置を、元の公開シンボルの caller に加える。
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -257,6 +257,11 @@ pub(super) fn visit_bindings<'tree, T>(
             && let Some(text) = decoded(text)
             && let Some((name, binding)) = bindings.get_key_value(text.as_ref())
             && (!binding.type_only || type_query_depth.is_some())
+            && !crate::engine::js_occurrence::is_intrinsic_jsx_name(
+                node,
+                ancestors.last().copied(),
+                source,
+            )
             && visible(&mut scopes, source, name, escaped.get(name.as_ref()))
         {
             read(

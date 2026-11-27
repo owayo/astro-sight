@@ -23,10 +23,11 @@ type OriginKey = (String, String, String, String, OriginUse);
 
 #[derive(Default)]
 pub(super) struct TsBarrelIndex {
-    pub(super) const_alias_reads: Mutex<HashSet<(String, String)>>,
+    pub(super) ts_alias_references: Mutex<HashSet<(String, String)>>,
     index_reader: Option<Mutex<crate::commands::GitBlobBatch>>,
     unresolved_index: bool,
     const_candidates: Vec<(String, String, u32)>,
+    changed_functions: HashMap<String, HashMap<String, u32>>,
     root: PathBuf,
     files: HashSet<String>,
     modules: Mutex<Modules>,
@@ -49,6 +50,7 @@ struct Module {
     named: HashMap<String, Vec<(String, String)>>,
     stars: Vec<String>,
     local_exports: HashSet<String>,
+    local_export_bindings: HashMap<String, String>,
     literal_exports: HashSet<String>,
     declared_functions: HashSet<String>,
     const_exports: HashSet<String>,
@@ -92,7 +94,7 @@ impl TsBarrelIndex {
         }
     }
 
-    pub(super) fn for_index_objects(dir: &Path) -> anyhow::Result<Self> {
+    pub(super) fn from_index(dir: &Path) -> anyhow::Result<Self> {
         let dir = dir.to_str().ok_or_else(|| {
             anyhow::anyhow!("Cannot read staged module paths from a non-UTF-8 directory")
         })?;
@@ -126,6 +128,61 @@ impl TsBarrelIndex {
             .read_limited(path, crate::commands::MAX_INPUT_SIZE)
     }
 
+    pub(super) fn index_changed_functions(&mut self, changes: &[FileContext]) {
+        for (fc, ctx) in changes.iter().enumerate() {
+            for name in &ctx.js_modified_direct_function_names {
+                self.changed_functions
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(ctx.new_path.clone(), fc as u32);
+            }
+        }
+    }
+
+    pub(super) fn has_changed_functions(&self) -> bool {
+        !self.changed_functions.is_empty()
+    }
+
+    pub(super) fn function_alias_owner(
+        &self,
+        caller: &str,
+        module: &str,
+        name: &str,
+    ) -> Option<(u32, &str)> {
+        if self.changed_functions.is_empty() {
+            return None;
+        }
+        let mut path = self.object_read_source(caller, module)?;
+        let mut name = name.to_owned();
+        let mut visited = HashSet::new();
+        loop {
+            let module = self.module(&path)?;
+            if module.opaque {
+                return None;
+            }
+            if module.local_exports.contains(&name) {
+                let local = if module.declared_functions.contains(&name) {
+                    &name
+                } else {
+                    if module.unproven_value_exports {
+                        return None;
+                    }
+                    module.local_export_bindings.get(&name)?
+                };
+                let (changed, candidates) = self.changed_functions.get_key_value(local)?;
+                return Some((*candidates.get(&path)?, changed));
+            }
+            if module.unproven_value_exports || !visited.insert((path.clone(), name.clone())) {
+                return None;
+            }
+            let [(specifier, imported)] = module.named.get(&name)?.as_slice() else {
+                return None;
+            };
+            path = self.object_read_source(&path, specifier)?;
+            name.clone_from(imported);
+        }
+    }
+
     pub(super) fn has_changed_variables(&self) -> bool {
         !self.const_candidates.is_empty()
     }
@@ -136,6 +193,9 @@ impl TsBarrelIndex {
         specifier: &str,
         imported: &str,
     ) -> Option<(u32, &str)> {
+        if self.const_candidates.is_empty() {
+            return None;
+        }
         let target = self.resolve_for::<true>(caller, specifier)?;
         let module = self.module(&target)?;
         if module.opaque {
@@ -820,6 +880,9 @@ fn collect_export(node: tree_sitter::Node<'_>, source: &[u8], module: &mut Modul
                     .or_default()
                     .push((specifier.clone(), name.to_owned()));
             } else {
+                module
+                    .local_export_bindings
+                    .insert(exported.to_owned(), name.to_owned());
                 module.local_exports.insert(exported.to_owned());
             }
         }

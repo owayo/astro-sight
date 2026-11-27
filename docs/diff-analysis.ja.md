@@ -181,6 +181,8 @@ JS / TS / TSX のトップレベル関数について、別ファイルの同名
 
 ### TypeScript の named import の別名
 
+`import { format as other } from "./layout"` で取り込んだ関数に必須引数を足すと、`context` と `impact` は未修正の `other("a")` の行を `format` の影響先として報告する。`import { "format" as other }` のように公開名を引用符で囲んだ場合も同じ扱いになる。別のモジュールが `export { format as pretty } from "./layout"` として再公開しており、相対パスの解決先が一意なら、`import { pretty as other }` を経由して呼んだ行も `format` の影響先になる。
+
 `import { palette as palette }` や `import { "palette" as palette }` は、公開名と手元で使う名前が同じなので、`import { palette }` と同じく宣言行を情報提供に分ける。変更したプロパティの読み取りや、引数を変えた関数の呼び出しは引き続き影響先になる。利用側の識別子が Unicode エスケープで書かれ、参照検索でその行を特定できない場合は、import 行を影響候補に残すことがある。
 
 `export const VALUE` の型や値を変更すると、`import { VALUE as TMP } from './values'` を通して `TMP` を読む行も `VALUE` の影響先に含まれる。相対パスの再エクスポートで名前が変わっても、元の定数を特定できれば追跡する。`import type` の別名を使う `typeof TMP` も対象になる。同名の引数を読む行や `obj.TMP` のプロパティ名は、この定数の利用には数えない。

@@ -74,7 +74,7 @@ const IMPACT_DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 ];
 
 pub(super) struct StreamCallerMaps {
-    pub(super) const_alias_reads: std::collections::HashSet<(String, String)>,
+    pub(super) ts_alias_references: std::collections::HashSet<(String, String)>,
     pub(super) caller_maps: Vec<TypedCallerMap>,
     pub(super) low_caller_maps: Vec<TypedCallerMap>,
     pub(super) informational_caller_maps: Vec<TypedCallerMap>,
@@ -360,7 +360,7 @@ pub(super) fn stream_caller_maps(
 
     // CI 言語 skip で解析を打ち切るときに返す空結果。
     let empty_result = || StreamCallerMaps {
-        const_alias_reads: Default::default(),
+        ts_alias_references: Default::default(),
         caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
@@ -411,15 +411,19 @@ pub(super) fn stream_caller_maps(
     let objects = file_contexts
         .iter()
         .any(|c| !c.object_member_changes.is_empty());
-    let index_writers = (objects && options.new_side == crate::models::impact::DiffNewSide::Index)
-        .then(|| TsBarrelIndex::for_index_objects(dir))
+    let functions = file_contexts
+        .iter()
+        .any(|ctx| !ctx.js_modified_direct_function_names.is_empty());
+    let mut index_modules = ((objects || functions)
+        && options.new_side == crate::models::impact::DiffNewSide::Index)
+        .then(|| TsBarrelIndex::from_index(dir))
         .transpose()?;
     let extra_writers = rust_diff_files
         .iter()
         .filter(|f| objects && f.new_path == "/dev/null")
         .map(|f| f.old_path.as_str())
         .chain(
-            index_writers
+            index_modules
                 .iter()
                 .flat_map(|index| index.snapshot_paths())
                 .filter(|p| !dir.join(p).is_file()),
@@ -430,21 +434,25 @@ pub(super) fn stream_caller_maps(
         pool: rayon_pool,
         extra_writer_paths,
     } = prepare_scan(all_symbol_names, dir, options, extra_writers)?;
-    let ts_barrels = if options.new_side == crate::models::impact::DiffNewSide::WorkingTree {
+    let mut ts_barrels = if options.new_side == crate::models::impact::DiffNewSide::WorkingTree {
         TsBarrelIndex::build(dir, &files, file_contexts)
     } else {
         TsBarrelIndex::default()
     };
+    index_modules
+        .as_mut()
+        .unwrap_or(&mut ts_barrels)
+        .index_changed_functions(file_contexts);
     super::object_members::project::check(
         dir,
         (&files, &extra_writer_paths),
         file_contexts,
         &ts_barrels,
-        index_writers.as_ref(),
+        index_modules.as_ref(),
         options.new_side,
         (rust_diff_input, rust_diff_files),
     );
-    if let Some(index) = &index_writers {
+    if let Some(index) = &index_modules {
         files.extend(
             extra_writer_paths
                 .iter()
@@ -610,9 +618,9 @@ pub(super) fn stream_caller_maps(
                             ref_lang,
                             reexport_moves,
                             ts_barrels: &ts_barrels,
-                            object_modules: index_writers.as_ref().unwrap_or(&ts_barrels),
+                            import_modules: index_modules.as_ref().unwrap_or(&ts_barrels),
                         };
-                        let visited = if let Some(index) = index_writers.as_ref().filter(|_| {
+                        let visited = if let Some(index) = index_modules.as_ref().filter(|_| {
                             ref_lang.is_some_and(super::import_facts::lang_is_ts_family)
                         }) {
                             index.index_source(display_path_str).is_some_and(|source| {
@@ -667,8 +675,8 @@ pub(super) fn stream_caller_maps(
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
     Ok(StreamCallerMaps {
-        const_alias_reads: ts_barrels
-            .const_alias_reads
+        ts_alias_references: ts_barrels
+            .ts_alias_references
             .into_inner()
             .expect("TS aliases"),
         caller_maps: global_maps,

@@ -182,6 +182,8 @@ An insertion inside an existing property value triggers a search for readers, ev
 
 ### TypeScript Named Import Aliases
 
+When a function imported with `import { format as other } from "./layout"` gains a required parameter, `context` and `impact` report the unchanged `other("a")` call under `format`. Quoting the exported name, as in `import { "format" as other }`, gives the same result. If an intermediate module re-exports the function as `export { format as pretty } from "./layout"`, calls through `import { pretty as other }` also point back to `format` when the relative paths resolve uniquely.
+
 An import such as `import { palette as palette }` or `import { "palette" as palette }` keeps the exported name. Its declaration is informational just like `import { palette }`. Reading a changed property or calling a function with a changed signature can still be blocking. If a use spells the local name with a Unicode escape that the reference search cannot match, the import line can remain a possible impact.
 
 Changing the type or value of `export const VALUE` can affect a line that reads `TMP` through `import { VALUE as TMP } from './values'`. The impact appears under `VALUE`, including when a relative re-export renames the constant and its origin can be resolved. A `typeof TMP` query also counts when the alias comes from `import type`. A same-name function parameter or the property name in `obj.TMP` refers to a separate binding.

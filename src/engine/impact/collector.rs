@@ -439,12 +439,12 @@ pub(super) struct ImpactCollector<'a> {
     /// 旧パス側に残る未変更参照を informational へ降格するために参照する。
     pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
     pub(super) ts_barrels: &'a super::ts_barrels::TsBarrelIndex,
-    pub(super) object_modules: &'a super::ts_barrels::TsBarrelIndex,
+    pub(super) import_modules: &'a super::ts_barrels::TsBarrelIndex,
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
     fn needs_alias_scan(&self, lang: LangId, source: &[u8]) -> bool {
-        self.ts_barrels.has_changed_variables()
+        (self.ts_barrels.has_changed_variables() || self.import_modules.has_changed_functions())
             && matches!(lang, LangId::Typescript | LangId::Tsx | LangId::Javascript)
             && memchr::memmem::find(source, b"import").is_some()
             && memchr::memmem::find(source, b"as").is_some()
@@ -452,6 +452,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
 
     fn on_tree(&mut self, root: tree_sitter::Node<'_>, source: &[u8]) {
         let barrels = self.ts_barrels;
+        let modules = self.import_modules;
         let path = self.path_str;
         let names = self.changed_names;
         let mut lines = None;
@@ -460,7 +461,9 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             source,
             true,
             |module, imported| {
-                let (fc, name) = barrels.alias_owner(path, module, imported)?;
+                let (fc, name) = modules
+                    .function_alias_owner(path, module, imported)
+                    .or_else(|| barrels.alias_owner(path, module, imported))?;
                 Some((fc, *names.get(name)? as u32))
             },
             |node, (fc, sym)| self.collect_alias_ref(node, source, &mut lines, fc, sym),
@@ -520,7 +523,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                         return None;
                     }
                     let target = self
-                        .object_modules
+                        .import_modules
                         .object_read_source(self.path_str, specifier)?;
                     contexts.iter().copied().find(|&fc| {
                         let ctx = &self.file_contexts[fc as usize];
@@ -528,7 +531,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                             .get(name)
                             .is_some_and(|c| c.public_binding)
                             && self
-                                .object_modules
+                                .import_modules
                                 .exports_object(&target, name, &ctx.new_path)
                     })
                 },
@@ -1789,7 +1792,7 @@ impl<'a> ImpactCollector<'a> {
         if !aliases.is_empty() {
             let mut reads = collector
                 .ts_barrels
-                .const_alias_reads
+                .ts_alias_references
                 .lock()
                 .expect("TS aliases");
             reads.extend(aliases.into_iter().map(|(fc, sym)| {
@@ -2374,7 +2377,7 @@ impl<'a> ImpactCollector<'a> {
             if route == CallerRoute::Low
                 && e.member_path_id != u32::MAX
                 && ctx.object_member_changes.contains_key(sym_key_canonical)
-                && self.object_modules.may_import_object(
+                && self.import_modules.may_import_object(
                     self.path_str,
                     sym_key_canonical,
                     &ctx.new_path,
