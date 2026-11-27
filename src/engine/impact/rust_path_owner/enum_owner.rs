@@ -1311,6 +1311,10 @@ pub(super) fn attribute_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a
 }
 
 fn stable_item(item: Node<'_>, source: &[u8]) -> bool {
+    stable_attributes(item, source, false)
+}
+
+fn stable_attributes(item: Node<'_>, source: &[u8], shadowable: bool) -> bool {
     let mut previous = item.prev_named_sibling();
     while let Some(node) = previous {
         match node.kind() {
@@ -1318,6 +1322,7 @@ fn stable_item(item: Node<'_>, source: &[u8]) -> bool {
             "attribute_item" => {
                 let attribute = attribute_name(node, source);
                 if matches!(attribute, Some("cfg" | "cfg_attr"))
+                    || shadowable && matches!(attribute, Some("derive" | "test"))
                     || (attribute != Some("derive")
                         && super::super::rust_std_origin::safe_attribute(node, source).is_none())
                 {
@@ -1344,7 +1349,13 @@ fn root_is_plain(root: Node<'_>, source: &[u8]) -> bool {
 }
 
 impl EnumFile {
-    fn read(source: &[u8]) -> Option<Self> {
+    pub(super) fn contains(&self, ty: &str, variant: &str) -> bool {
+        self.variants
+            .get(ty)
+            .is_some_and(|variants| variants.contains(variant))
+    }
+
+    pub(super) fn read(source: &[u8]) -> Option<Self> {
         let tree = parser::parse_source(source, LangId::Rust).ok()?;
         let root = tree.root_node();
         if !root_is_plain(root, source) {
@@ -1353,6 +1364,18 @@ impl EnumFile {
         let mut variants = HashMap::new();
         let mut ambiguous = HashSet::new();
         let mut cursor = root.walk();
+        let shadowable = root.named_children(&mut cursor).any(|item| {
+            item.kind() == "extern_crate_declaration"
+                || item.kind() == "use_declaration"
+                    && root_use_names(item, source).is_none_or(|names| {
+                        names.iter().any(|name| {
+                            matches!(
+                                crate::language::normalize_identifier(LangId::Rust, name).as_ref(),
+                                "derive" | "test"
+                            )
+                        })
+                    })
+        });
         for item in root.named_children(&mut cursor) {
             let Some(identifier) = item
                 .child_by_field_name("name")
@@ -1360,7 +1383,7 @@ impl EnumFile {
             else {
                 continue;
             };
-            if item.kind() != "enum_item" || !stable_item(item, source) {
+            if item.kind() != "enum_item" || !stable_attributes(item, source, shadowable) {
                 ambiguous.insert(identifier.to_owned());
                 continue;
             }

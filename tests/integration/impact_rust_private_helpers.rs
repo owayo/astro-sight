@@ -3,6 +3,190 @@
 use super::support::*;
 
 #[test]
+fn rust_enum_type_changes_keep_only_references_to_the_selected_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='types'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod types; mod tags; mod uses; mod fields; mod copies;\n",
+    );
+    repo.write("src/main.rs", "fn main() {}\n");
+    repo.write("src/types.rs", "pub(super) enum Member { First, Second }\n");
+    repo.write("src/tags.rs", "pub(super) enum Site { Member, Other }\n");
+    repo.write(
+        "src/uses.rs",
+        r#"use super::tags::Site;
+fn tag(v: Site) -> bool {
+    match v { Site::Member => true, _ => false }
+}
+fn qualified(v: Site) -> bool {
+    match v { crate::tags::Site::Member => true, _ => false }
+}
+fn nested_import() {
+    use super::tags::Site as Label;
+    let _ = Label::Member;
+}
+fn genuine() -> super::types::Member {
+    super::types::Member::First
+}
+"#,
+    );
+    repo.write(
+        "src/fields.rs",
+        r#"use super::*;
+struct Member<'a> { data: &'a str }
+fn field(s: &str) -> Option<Member<'_>> {
+    Some(Member { data: s })
+}
+mod actual {
+    use crate::types::Member;
+    pub(super) fn make() -> Member { Member::First }
+}
+"#,
+    );
+    repo.write(
+        "src/copies.rs",
+        r#"#[derive(Clone)]
+enum Member { Other }
+fn local() -> Option<Member> { Some(Member::Other) }
+fn actual() {
+    use crate::types::Member;
+    let _ = Member::First;
+}
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/types.rs", "pub(super) enum Member { Third, Second }\n");
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            repo.write(
+                "src/tags.rs",
+                "pub(super) use crate::types::Member as Site;\n",
+            );
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let result = repo.run_json("context", flags);
+        let rows = result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "src/types.rs")
+            .unwrap()["impacted_callers"]
+            .as_array()
+            .unwrap();
+        let lines = |file: &str| {
+            rows.iter()
+                .filter(|r| r["path"] == file)
+                .map(|r| r["line"].as_u64().unwrap() + 1)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines("src/uses.rs"), [12, 13], "staged={staged}: {result}");
+        assert_eq!(lines("src/fields.rs"), [8], "staged={staged}: {result}");
+        assert_eq!(lines("src/copies.rs"), [6], "staged={staged}: {result}");
+    }
+}
+
+#[test]
+fn rust_enum_variant_in_a_shared_lib_and_bin_source_keeps_both_origins() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='shared'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/lib.rs", "pub mod types; mod tags; mod uses;\n");
+    repo.write(
+        "src/main.rs",
+        "mod tags { pub(super) use shared::types::Member as Site; }\nmod uses; fn main() {}\n",
+    );
+    repo.write("src/types.rs", "pub enum Member { Member, Other }\n");
+    repo.write("src/tags.rs", "pub(super) enum Site { Member, Other }\n");
+    repo.write(
+        "src/uses.rs",
+        "fn is_member(value: crate::tags::Site) -> bool {\n    match value { crate::tags::Site::Member => true, _ => false }\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/types.rs", "pub enum Member { Third, Other }\n");
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let result = repo.run_json("context", flags);
+        assert!(
+            result["changes"].as_array().unwrap()[0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["path"] == "src/uses.rs" && row["line"] == 1),
+            "staged={staged}: {result}"
+        );
+    }
+}
+
+#[test]
+fn rust_enum_changed_type_keeps_uses_when_derive_rewrites_a_local_declaration() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("rewrite/src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='host'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nrewrite={path='rewrite'}\n",
+    );
+    repo.write(
+        "rewrite/Cargo.toml",
+        "[package]\nname='rewrite'\nversion='0.1.0'\nedition='2024'\n[lib]\nproc-macro=true\n",
+    );
+    repo.write(
+        "rewrite/src/lib.rs",
+        r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+#[proc_macro_attribute]
+pub fn alias(_: TokenStream, _: TokenStream) -> TokenStream {
+    "type Member = crate::types::Member;".parse().unwrap()
+}
+"#,
+    );
+    repo.write("src/lib.rs", "mod types; mod uses;\n");
+    repo.write("src/types.rs", "pub(super) enum Member { First, Second }\n");
+    repo.write(
+        "src/uses.rs",
+        "use rewrite::alias as r#derive;\n#[derive(Clone)]\nenum Member { Other }\nfn actual() { let _ = Member::First; }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/types.rs", "pub(super) enum Member { Third, Second }\n");
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let result = repo.run_json("context", flags);
+        assert!(
+            result["changes"].as_array().unwrap()[0]["low_confidence_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["path"] == "src/uses.rs" && row["line"] == 3),
+            "staged={staged}: {result}"
+        );
+    }
+}
+
+#[test]
 fn rust_inherent_function_distinguishes_local_values_and_other_constructors() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

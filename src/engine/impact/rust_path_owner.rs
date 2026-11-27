@@ -26,6 +26,7 @@ mod enum_owner;
 mod format_owner;
 mod macro_copy;
 mod macro_crate;
+mod nominal;
 mod registry_macros;
 mod workspace_members;
 
@@ -138,6 +139,7 @@ pub(super) struct RustPathOwnerIndex {
     resolved_paths: RefCell<HashMap<Vec<String>, Option<PathBuf>>>,
     enum_files: RefCell<HashMap<PathBuf, Option<enum_owner::EnumFile>>>,
     enum_owners: RefCell<HashMap<(String, String), Option<PathBuf>>>,
+    nominal_sites: std::cell::OnceCell<Option<nominal::NominalSites>>,
     format_environment: OnceLock<Option<format_owner::Environment>>,
     /// スコープが名前を再束縛し得るかの判定の結果。同じスコープの中の参照ごとに部分木を
     /// 走査し直さない (大きな関数の本体で参照の数に比例して遅くならないように)。
@@ -2319,6 +2321,7 @@ impl RustPathOwnerIndex {
             resolved_paths: RefCell::new(HashMap::new()),
             enum_files: RefCell::new(HashMap::new()),
             enum_owners: RefCell::new(HashMap::new()),
+            nominal_sites: Default::default(),
             format_environment: OnceLock::new(),
             rebinds: RefCell::new(HashMap::new()),
             verified_source: std::cell::Cell::new(None),

@@ -463,6 +463,21 @@ pub(super) fn stream_caller_maps(
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
     let python_import_cache = super::python_imports::PythonImportCache::default();
+    let mut nominal = HashMap::new();
+    for ctx in file_contexts
+        .iter()
+        .filter(|ctx| ctx.lang_id == LangId::Rust)
+    {
+        for symbol in &ctx.affected {
+            let matches = matches!(symbol.kind.as_str(), "enum" | "struct" | "union")
+                && !ctx.rust_kind_changes.contains(&symbol.name);
+            *nominal.entry(symbol.name.as_str()).or_insert(true) &= matches;
+        }
+    }
+    let rust_nominal_names: std::collections::HashSet<_> = nominal
+        .into_iter()
+        .filter_map(|(name, matches)| matches.then_some(name))
+        .collect();
     let mut rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
         dir,
         rust_module_wiring_unchanged,
@@ -473,11 +488,12 @@ pub(super) fn stream_caller_maps(
     );
     rust_path_owner_project.layout_checkout = checkout.to_owned();
     if options.new_side == crate::models::impact::DiffNewSide::Index
-        && file_contexts.iter().any(|ctx| {
-            !ctx.rust_super_functions.is_empty()
-                || !ctx.rust_private_root_functions.is_empty()
-                || ctx.rust_receiverless_associated_names.contains("new")
-        })
+        && (!rust_nominal_names.is_empty()
+            || file_contexts.iter().any(|ctx| {
+                !ctx.rust_super_functions.is_empty()
+                    || !ctx.rust_private_root_functions.is_empty()
+                    || ctx.rust_receiverless_associated_names.contains("new")
+            }))
     {
         rust_path_owner_project.staged_binding_diff = Some(rust_diff_input.into());
     }
@@ -554,6 +570,7 @@ pub(super) fn stream_caller_maps(
                             python_imports: std::cell::OnceCell::new(),
                             rust_std_origin: std::cell::OnceCell::new(),
                             rust_collections: std::cell::OnceCell::new(),
+                            rust_nominal_names: &rust_nominal_names,
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_opaque_attributes: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
