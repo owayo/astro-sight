@@ -224,3 +224,64 @@ fn rust_import_path_review_keeps_included_source_rebindings_blocking() {
         );
     }
 }
+
+#[test]
+fn rust_import_path_parameter_keeps_only_unproven_callers() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("nodes/src");
+    repo.write("Cargo.toml", "[package]\nname='bindings'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nnodes={path='nodes'}\n");
+    let provider = "[package]\nname='nodes'\nversion='0.1.0'\nedition='2024'\n";
+    repo.write("nodes/src/main.rs", "fn main() {}\n");
+    repo.write("nodes/src/lib.rs", "pub struct Node<'a>(pub &'a str);\n");
+    repo.write("src/lib.rs", "pub mod api;\npub mod caller;\n");
+    repo.write("src/caller.rs", "use crate::api::text;\nuse nodes::Node;\npub fn name(n: Node<'_>) -> &str {\n    text(n)\n}\n");
+    repo.init_git();
+    let signature = "pub(crate) fn text(\r\n    n: nodes::Node<'_>,\r\n) -> &str { n.0 }\r\n";
+    let import = "use nodes::Node;\n";
+    let local = "struct Node<'a>(&'a str);\n";
+    for (before, after, short, autolib, compatible) in [
+        (import, import, "Node<'_>", true, true),
+        ("", import, "Node<'_>", true, true),
+        (local, local, "Node<'_>", true, false),
+        (import, import, "Node<'static>", true, false),
+        (import, import, "Node<'_>", false, false),
+    ] {
+        repo.write("nodes/Cargo.toml", format!("{provider}autolib={autolib}\n"));
+        repo.write("src/api.rs", format!("{before}{signature}"));
+        repo.commit_all("qualified parameter");
+        repo.write(
+            "src/api.rs",
+            format!("{after}{}", signature.replace("nodes::Node<'_>", short)),
+        );
+        for staged in [false, true] {
+            let args = if staged {
+                repo.stage_all();
+                vec!["--git", "--staged"]
+            } else {
+                vec!["--git"]
+            };
+            let context = repo.run_json("context", &args);
+            let file = &context["changes"][0];
+            let has_call = |key: &str| {
+                file[key].as_array().is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row["path"] == "src/caller.rs"
+                            && row["line"] == 3
+                            && row["symbols"][0] == "text"
+                    })
+                })
+            };
+            assert_eq!(
+                has_call("impacted_callers"),
+                !compatible,
+                "staged={staged}: {file}"
+            );
+            if compatible {
+                assert!(has_call("informational_callers"), "{file}");
+            }
+            let (output, value) = hook(&repo, staged);
+            assert_eq!(output.status.success(), compatible, "{value}");
+        }
+    }
+}
