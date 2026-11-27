@@ -17,6 +17,81 @@ const ADMIN_CALL: &str =
     "let admin = Arc::new(admin::Administration::new(config::Config::default()));";
 
 #[test]
+fn rust_associated_function_distinguishes_same_spelled_local_types() {
+    let producer =
+        "struct Names;\nimpl Names {\n    fn collect() -> Self { Self }\n}\nmod child;\n";
+    let local = r#"struct Names;
+impl Names {
+    fn collect() -> Self { Self }
+}
+pub fn run() { let _: Names = Names::collect(); }
+fn pointer() { let _: fn() -> Names = Names::collect; }
+fn anchored() { let _ = self::Names::collect(); }
+"#;
+    for true_calls in [false, true] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/producer");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname='owners'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        let producer = if true_calls {
+            repo.write(
+                "src/lib.rs",
+                "mod producer;\nmod consumer;\nmod switched;\n",
+            );
+            repo.write("src/switched.rs", "use crate::producer::Names as Imported;\ntype Names = Imported;\ntrait Factory { fn collect() -> u8 { 1 } }\nimpl Factory for Names {}\nfn value() -> u8 { Names::collect() }\n");
+            producer.replacen("struct Names", "pub(super) struct Names", 1)
+        } else {
+            repo.write("src/lib.rs", "mod producer;\nmod consumer;\n");
+            producer.to_owned()
+        };
+        repo.write("src/producer.rs", &producer);
+        repo.write("src/consumer.rs", local);
+        let child = if true_calls {
+            format!(
+                "{local}fn both() {{ let _ = (Names::collect(), super::Names::collect()); }}\nuse super::Names as Actual;\nfn imported() {{ let _ = Actual::collect(); }}\nfn rebound() {{ type Names = super::Names; let _ = Names::collect(); }}\n"
+            )
+        } else {
+            String::new()
+        };
+        repo.write("src/producer/child.rs", child);
+        repo.init_git();
+        repo.commit_all("base");
+        repo.write(
+            "src/producer.rs",
+            producer.replace("fn collect", "pub(super) fn collect"),
+        );
+        for staged in [false, true] {
+            let args = if staged {
+                repo.stage_all();
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let context = repo.run_json("context", args);
+            let changes = context["changes"][0]["impacted_callers"].as_array();
+            let actual: BTreeSet<_> = changes
+                .into_iter()
+                .flatten()
+                .map(|r| (r["path"].as_str().unwrap(), r["line"].as_u64().unwrap()))
+                .collect();
+            let expected = if true_calls {
+                BTreeSet::from([
+                    ("src/producer/child.rs", 7),
+                    ("src/producer/child.rs", 9),
+                    ("src/producer/child.rs", 10),
+                    ("src/switched.rs", 4),
+                ])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(actual, expected, "staged={staged}: {context}");
+        }
+    }
+}
+
+#[test]
 fn rust_same_file_method_calls_respect_receiver_types() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

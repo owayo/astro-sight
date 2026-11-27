@@ -1442,7 +1442,33 @@ impl ImpactCollector<'_> {
                         view,
                     )
         });
+        let separate_inherent = self.ref_lang == Some(LangId::Rust)
+            && !is_import
+            && node.is_some_and(|node| {
+                let [fc] = self.sym_to_fc[ix].as_slice() else {
+                    return false;
+                };
+                let ctx = &self.file_contexts[*fc as usize];
+                let name = &self.all_symbol_names[ix];
+                node.kind() == "identifier"
+                    && ctx.rust_receiverless_associated_names.contains(name)
+                    && ctx.rust_inherent_method_owners.contains_key(name)
+                    && self.binding_view(source).is_some_and(|view| {
+                        self.rust_path_owner
+                            .get_or_init(|| {
+                                super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                            })
+                            .separate_inherent_call(
+                                node,
+                                source,
+                                Path::new(self.path_str),
+                                ctx,
+                                view,
+                            )
+                    })
+            });
         let rust_local_owner = rust_local_owner
+            || separate_inherent
             || visibility_independent
             || (rust_name_site == super::rust_macro_site::MacroSite::RuleBody
                 && rust_owner_index

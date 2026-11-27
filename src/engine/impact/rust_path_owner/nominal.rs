@@ -277,9 +277,135 @@ fn type_path(
     Some(result)
 }
 
+fn local_inherent_calls(
+    root: Node<'_>,
+    source: &[u8],
+    module: &[String],
+    wanted: &HashSet<&str>,
+) -> HashSet<usize> {
+    use super::super::rust_owner_alias::items_with_attributes;
+    let mut methods = HashSet::new();
+    for (item, attributed) in items_with_attributes(root.named_children(&mut root.walk())) {
+        if attributed
+            || item.kind() != "impl_item"
+            || item.child_by_field_name("trait").is_some()
+            || item.child_by_field_name("type_parameters").is_some()
+            || item
+                .named_children(&mut item.walk())
+                .any(|n| n.kind() == "where_clause")
+        {
+            continue;
+        }
+        let Some(owner) = item
+            .child_by_field_name("type")
+            .filter(|ty| ty.kind() == "type_identifier")
+            .and_then(|ty| ty.utf8_text(source).ok())
+        else {
+            continue;
+        };
+        let Some(body) = item.child_by_field_name("body") else {
+            continue;
+        };
+        for (method, attributed) in items_with_attributes(body.named_children(&mut body.walk())) {
+            if !attributed
+                && method.kind() == "function_item"
+                && let Some(name) = method
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                && wanted.contains(name.trim_start_matches("r#"))
+            {
+                methods.insert((
+                    owner.trim_start_matches("r#"),
+                    name.trim_start_matches("r#"),
+                ));
+            }
+        }
+    }
+    if methods.is_empty() {
+        return HashSet::new();
+    }
+    let LexicalSites { scopes, candidates } = LexicalSites::collect(root, source, module, wanted);
+    candidates
+        .into_iter()
+        .filter_map(|(node, parent, scope)| {
+            if parent.kind() != "scoped_identifier"
+                || parent.child_by_field_name("name") != Some(node)
+            {
+                return None;
+            }
+            if scopes[scope].opaque {
+                return None;
+            }
+            let path = parent.child_by_field_name("path")?;
+            let (owner_node, binding_scope) = match path.kind() {
+                "identifier" => (path, scope),
+                "scoped_identifier" if path.child_by_field_name("path")?.kind() == "self" => {
+                    (path.child_by_field_name("name")?, 0)
+                }
+                _ => return None,
+            };
+            let owner = owner_node.utf8_text(source).ok()?.trim_start_matches("r#");
+            let name = node.utf8_text(source).ok()?.trim_start_matches("r#");
+            (matches!(lookup(&scopes, binding_scope, owner), Some(Binding::Local))
+                && methods.contains(&(owner, name)))
+            .then_some(node.id())
+        })
+        .collect()
+}
+
 pub(super) struct NominalSites(HashMap<usize, PathBuf>);
 
 impl RustPathOwnerIndex {
+    /// 参照ファイルが独自に宣言した型の inherent 関数を、同じ綴りの別の型から区別する。
+    pub(in crate::engine::impact) fn separate_inherent_call(
+        &self,
+        node: Node<'_>,
+        source: &[u8],
+        file: &Path,
+        ctx: &super::super::FileContext,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        let changed = Path::new(&ctx.new_path);
+        if changed == file
+            || project.reexport_old_sources.len() != 1
+            || !project.reexport_old_sources.contains_key(changed)
+            || !self.same_source(source)
+        {
+            return false;
+        }
+        self.local_inherent_sites
+            .get_or_init(|| {
+                let prove = || {
+                    let origin = project.ordinary_private_module(changed)?;
+                    let reader = project.ordinary_private_module(file)?;
+                    if origin.src != reader.src
+                        || !project.callable_layout_stable()
+                        || !project.unrelocated(changed)
+                        || !project.unrelocated(file)
+                        || stable_file(project, &origin, &origin.path)?.as_path() != changed
+                        || stable_file(project, &reader, &reader.path)?.as_path() != file
+                    {
+                        return None;
+                    }
+                    let mut root = node;
+                    while let Some(parent) = root.parent() {
+                        root = parent;
+                    }
+                    if root.has_error() {
+                        return None;
+                    }
+                    let wanted = ctx
+                        .rust_inherent_method_owners
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    Some(local_inherent_calls(root, source, &reader.path, &wanted))
+                };
+                prove().unwrap_or_default()
+            })
+            .contains(&node.id())
+    }
+
     pub(in crate::engine::impact) fn nominal_owner(
         &self,
         node: Node<'_>,
