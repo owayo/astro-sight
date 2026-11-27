@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use tree_sitter::Node;
 
 mod return_contract;
-pub(super) use return_contract::preserves_return;
+pub(super) use return_contract::{preserves_return, returns_jsx};
 
 #[derive(Default)]
 pub(super) struct PropertyTypes<'tree> {

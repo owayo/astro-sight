@@ -205,7 +205,7 @@ pub(super) fn python_contract_decision(
 }
 
 /// private alias の引数では渡すキーを、戻り値では生成箇所と全利用で扱うキーを確かめる。
-pub(super) fn local_props_alias_removal_decision(
+pub(super) fn local_props_alias_decision(
     inputs: &DetectionInputs<'_>,
     caches: &mut ApiClosureCaches,
     site: &CompatibleModSite<'_>,
@@ -223,6 +223,15 @@ pub(super) fn local_props_alias_removal_decision(
         .is_some_and(|names| names.may_differ(site.name))
     {
         return None;
+    }
+    if let Some(compatible) = super::ts_signature::prove_local_named_property_addition(
+        inputs.ref_index,
+        site,
+        sources,
+        &mut caches.optional_removal,
+        inputs.diff_files,
+    ) {
+        return Some(SignatureDecision::Compatible(compatible));
     }
     prove_local_alias_property_removal(
         inputs.ref_index,

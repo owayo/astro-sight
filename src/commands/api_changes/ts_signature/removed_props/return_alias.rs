@@ -84,7 +84,7 @@ fn return_object<'tree>(
     {
         return None;
     }
-    exclusive_local_object(root, source, alias)
+    exclusive_local_object(root, source, alias, false)
 }
 
 /// 戻り値を組み立てる側も、新しい型に残るキーだけを持つリテラルか undefined を返す。

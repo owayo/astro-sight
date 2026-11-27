@@ -4,14 +4,14 @@
 //! TypeScript の余剰プロパティの検査は、書いたキーにしか掛からない。消したキーを書かない
 //! JSX 要素と object リテラルは、旧新の props の型で同じ型検査の結果になる。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use tree_sitter::Node;
 
 use super::removed_params::{
     OptionalRemovalCache, UseRule, prove_repository_uses, unique_function_declaration,
 };
-use super::type_dependencies::{DependencyEnvironment, type_dependencies_unchanged};
+use super::type_dependencies::property_dependencies_unchanged;
 use super::*;
 use crate::models::impact::DiffFile;
 
@@ -211,27 +211,13 @@ fn detect_props_removed(
         } else if !evidence.repository.as_ref()?.jsx_standard() {
             return None;
         }
-        let packages = evidence.relaxation()?;
-        let changed_paths: BTreeSet<String> = diff_files
-            .iter()
-            .flat_map(|file| [file.old_path.as_str(), file.new_path.as_str()])
-            .filter(|path| *path != "/dev/null")
-            .map(crate::git_support::normalize_workspace_separators)
-            .collect();
-        let registry_dependency = |specifier: &str| packages.is_registry_dependency(specifier);
-        let declared_globally = |name: &str| evidence.declares_global(name);
-        let environment = DependencyEnvironment {
-            target_path: site.new_path,
-            changed_paths: &changed_paths,
-            registry_dependency: &registry_dependency,
-            declared_globally: &declared_globally,
-        };
-        if !type_dependencies_unchanged(
-            &environment,
+        if !property_dependencies_unchanged(
+            site,
+            src,
             old_root,
-            &src.old,
             new_root,
-            &src.new,
+            evidence,
+            diff_files,
             &removal.type_roots,
         ) {
             return None;
@@ -411,7 +397,7 @@ fn props_removal<'tree>(
     })
 }
 
-fn only_parameter(function: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn only_parameter(function: Node<'_>) -> Option<Node<'_>> {
     let parameters = function.child_by_field_name("parameters")?;
     let mut cursor = parameters.walk();
     let parameters: Vec<_> = parameters
@@ -479,21 +465,24 @@ fn parameter_props_type<'tree>(
     }
     Some(ParameterPropsType {
         annotation: *ty,
-        object: exclusive_local_object(root, source, *ty)?,
+        object: exclusive_local_object(root, source, *ty, false)?,
     })
 }
 
-fn exclusive_local_object<'tree>(
+pub(super) fn exclusive_local_object<'tree>(
     root: Node<'tree>,
     source: &[u8],
     ty: Node<'tree>,
+    include_interfaces: bool,
 ) -> Option<Node<'tree>> {
     let name = ty.utf8_text(source).ok()?;
-    let object = *type_dependencies::local_type_aliases(root, source)?.get(name)?;
+    let object =
+        *type_dependencies::local_type_values(root, source, include_interfaces)?.get(name)?;
     let declaration = object.parent()?;
-    if object.kind() != "object_type"
-        || declaration.kind() != "type_alias_declaration"
-        || declaration.parent()?.id() != root.id()
+    if !matches!(
+        (declaration.kind(), object.kind()),
+        ("type_alias_declaration", "object_type") | ("interface_declaration", "interface_body")
+    ) || declaration.parent()?.id() != root.id()
     {
         return None;
     }
@@ -619,6 +608,8 @@ fn pattern_drops_only(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::engine::parser;
     use crate::language::LangId;

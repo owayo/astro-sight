@@ -520,13 +520,8 @@ pub(super) fn collect_modified_symbols(
             let decision = if facts.type_dependencies.get(name)
                 == Some(&super::ts_signature::DependencyStatus::Changed)
             {
-                local_props_alias_removal_decision(
-                    inputs,
-                    state.closure_caches,
-                    &site,
-                    &mut sources,
-                )
-                .unwrap_or(SignatureDecision::Blocking(None))
+                local_props_alias_decision(inputs, state.closure_caches, &site, &mut sources)
+                    .unwrap_or(SignatureDecision::Blocking(None))
             } else {
                 match type_annotation_decision(&site, &mut sources) {
                     Some(decision) => decision,

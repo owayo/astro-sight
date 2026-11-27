@@ -34,6 +34,33 @@ fn jsx(node: Node<'_>) -> bool {
     matches!(node.kind(), "jsx_element" | "jsx_self_closing_element")
 }
 
+/// 条件式の各分岐を反復でたどり、値を返すすべての枝が JSX 要素か確かめる。
+pub(in super::super) fn returns_jsx(body: Node<'_>, source: &[u8]) -> bool {
+    let Some(value) = single_return(body, source) else {
+        return false;
+    };
+    let mut pending = vec![value];
+    while let Some(node) = pending.pop() {
+        let Some(node) = unwrap_parentheses(node) else {
+            return false;
+        };
+        if jsx(node) {
+            continue;
+        }
+        if node.kind() != "ternary_expression" {
+            return false;
+        }
+        let (Some(yes), Some(no)) = (
+            node.child_by_field_name("consequence"),
+            node.child_by_field_name("alternative"),
+        ) else {
+            return false;
+        };
+        pending.extend([yes, no]);
+    }
+    true
+}
+
 fn value_name(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -301,7 +328,7 @@ pub(in super::super) fn preserves_return(
         return false;
     }
     identical
-        || (single_return(old_body, a).is_some_and(jsx)
-            && single_return(new_body, b).is_some_and(jsx)
+        || (returns_jsx(old_body, a)
+            && returns_jsx(new_body, b)
             && !new.children(&mut new.walk()).any(|node| node.kind() == "*"))
 }

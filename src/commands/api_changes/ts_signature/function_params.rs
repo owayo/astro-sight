@@ -26,31 +26,34 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     diff_files: &[crate::models::impact::DiffFile],
     public_name_differs: bool,
 ) -> Option<Result<CompatibleApiModification, ()>> {
-    let mut check = |old_fn: Node<'_>,
-                     old_source: &[u8],
-                     new_fn: Node<'_>,
-                     new_source: &[u8],
-                     memo| {
-        let extension =
-            optional_object_props_extension(old_fn, old_source, new_fn, new_source, Some(site))?;
-        let safe =
-            added_props::preserves_return(old_fn, old_source, new_fn, new_source, &extension)
-                && (extension.parameters.is_empty()
-                    || (!public_name_differs
-                        && added_props::repository_accepts(
-                            index,
-                            site,
-                            &mut caches.optional_removal,
-                            new_fn,
-                            new_source,
-                            extension.parameters,
-                            memo,
-                        )));
-        Some(
-            safe.then(|| site.compatible("optional_object_props"))
-                .ok_or(()),
-        )
-    };
+    let mut check =
+        |old_fn: Node<'_>, old_source: &[u8], new_fn: Node<'_>, new_source: &[u8], memo| {
+            let extension = optional_object_props_extension(
+                old_fn,
+                old_source,
+                new_fn,
+                new_source,
+                Some(site),
+                None,
+            )?;
+            let safe =
+                added_props::preserves_return(old_fn, old_source, new_fn, new_source, &extension)
+                    && (extension.parameters.is_empty()
+                        || (!public_name_differs
+                            && added_props::repository_accepts(
+                                index,
+                                site,
+                                &mut caches.optional_removal,
+                                new_fn,
+                                new_source,
+                                extension.parameters,
+                                memo,
+                            )));
+            Some(
+                safe.then(|| site.compatible("optional_object_props"))
+                    .ok_or(()),
+            )
+        };
     with_resolved_ts_callable_pair(site, sources, |old, old_source, new, new_source| {
         check(old, old_source, new, new_source, false)
     })
@@ -65,6 +68,92 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     })
 }
 
+/// 型依存の変更を、宣言とこの引数だけに現れる非公開の props 型まで展開して確かめる。
+pub(crate) fn prove_local_named_property_addition(
+    index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    cache: &mut OptionalRemovalCache,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> Option<CompatibleApiModification> {
+    let lang = site.lang_in(TS_ONLY_LANGS)?;
+    if site.old_path != site.new_path {
+        return None;
+    }
+    let src = sources.get(site)?;
+    if src.original_old() != src.old || src.original_new() != src.new.as_ref() {
+        return None;
+    }
+    let (old_tree, new_tree) = src.parse_pair(lang)?;
+    let (old_root, new_root) = (old_tree.root_node(), new_tree.root_node());
+    let resolve = |root, source: &[u8]| {
+        let (function, statement) =
+            removed_params::unique_function_declaration(root, source, site.name)?;
+        let param = removed_props::only_parameter(function)?;
+        if statement.kind() != "export_statement"
+            || param.child_by_field_name("pattern")?.kind() != "object_pattern"
+        {
+            return None;
+        }
+        let ty = super::super::ts_required_members::only_named_child(
+            param.child_by_field_name("type")?,
+        )?;
+        if ty.kind() != "type_identifier" {
+            return None;
+        }
+        let object = removed_props::exclusive_local_object(root, source, ty, true)?;
+        Some((function, ty, object))
+    };
+    let (old_fn, old_type, old_object) = resolve(old_root, &src.old)?;
+    let (new_fn, new_type, new_object) = resolve(new_root, &src.new)?;
+    if old_type.utf8_text(&src.old).ok()? != new_type.utf8_text(&src.new).ok()? {
+        return None;
+    }
+    let extension = optional_object_props_extension(
+        old_fn,
+        &src.old,
+        new_fn,
+        &src.new,
+        Some(site),
+        Some((old_object, new_object)),
+    )?;
+    if extension.bindings.is_empty()
+        || !added_props::preserves_return(old_fn, &src.old, new_fn, &src.new, &extension)
+    {
+        return None;
+    }
+    // 型依存の変更を例外扱いするので、推論した戻り値も字面の一致だけでは決めない。
+    let declared_return = new_fn.child_by_field_name("return_type");
+    if declared_return.is_none()
+        && !(added_props::returns_jsx(old_fn.child_by_field_name("body")?, &src.old)
+            && added_props::returns_jsx(new_fn.child_by_field_name("body")?, &src.new))
+    {
+        return None;
+    }
+    let mut type_roots = vec![new_object];
+    type_roots.extend(declared_return);
+    if !type_dependencies::property_dependencies_unchanged(
+        site,
+        src,
+        old_root,
+        new_root,
+        cache.evidence(site.dir)?,
+        diff_files,
+        &type_roots,
+    ) || !added_props::repository_accepts(
+        index,
+        site,
+        cache,
+        new_fn,
+        &src.new,
+        extension.parameters,
+        false,
+    ) {
+        return None;
+    }
+    Some(site.compatible("optional_object_props"))
+}
+
 pub(super) struct OptionalPropsExtension<'tree> {
     pub(super) parameters: Vec<added_props::ParameterAddition<'tree>>,
     pub(super) bindings: Vec<pattern_extension::AddedBinding>,
@@ -76,6 +165,7 @@ pub(super) fn optional_object_props_extension<'new>(
     new_fn: tree_sitter::Node<'new>,
     new_source: &[u8],
     site: Option<&CompatibleModSite<'_>>,
+    resolved_object: Option<(Node<'_>, Node<'new>)>,
 ) -> Option<OptionalPropsExtension<'new>> {
     let old_parts = ts_function_signature_parts(old_fn, old_source)?;
     let new_parts = ts_function_signature_parts(new_fn, new_source)?;
@@ -107,14 +197,22 @@ pub(super) fn optional_object_props_extension<'new>(
     {
         let old_text = node_signature_tokens(*old_param, old_source)?;
         let new_text = node_signature_tokens(*new_param, new_source)?;
-        if old_text == new_text {
+        if old_text == new_text && resolved_object.is_none() {
             continue;
         }
+        let types = match resolved_object {
+            Some(types) => types,
+            None => (
+                old_param.child_by_field_name("type")?.named_child(0)?,
+                new_param.child_by_field_name("type")?.named_child(0)?,
+            ),
+        };
         let members = ts_param_pair_optional_object_extension(
             *old_param,
             old_source,
             *new_param,
             new_source,
+            types,
             site,
             &mut added_bindings,
         )?;

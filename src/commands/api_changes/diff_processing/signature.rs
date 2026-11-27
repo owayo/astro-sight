@@ -206,13 +206,9 @@ impl<'a> ChangedSignatureFiles<'a> {
             let site = self.compatible_site(inputs, &candidate);
             let mut sources =
                 SignatureSourceCache::with_base_blobs(inputs.base_blobs, inputs.strip_internal);
-            let decision = local_props_alias_removal_decision(
-                inputs,
-                state.closure_caches,
-                &site,
-                &mut sources,
-            )
-            .unwrap_or(SignatureDecision::Blocking(None));
+            let decision =
+                local_props_alias_decision(inputs, state.closure_caches, &site, &mut sources)
+                    .unwrap_or(SignatureDecision::Blocking(None));
             return (change, decision);
         }
         // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
