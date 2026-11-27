@@ -449,6 +449,8 @@ pub(super) enum UseRule<'a> {
     AddedProps(&'a super::added_props::AddedPropUses<'a>),
     /// 直接呼び出しで、実引数の個数が上限以下 (末尾の省略可能引数の削除)。
     CallArity(usize),
+    /// 個数に制限を設けず、全出現が同じ関数の直接呼び出しかを確認する。
+    DirectCalls,
     /// 直接呼び出しを await して残るキーを読む利用。
     AwaitedProperty(&'a HashSet<String>),
     /// JSX 要素と、`calls_allowed` のときだけ object リテラル 1 個の直接呼び出しで、
@@ -964,15 +966,17 @@ fn prove_file(
                         {
                             return None;
                         }
+                        let imported = spec.child_by_field_name("name")?;
+                        if imported.kind() != "identifier" {
+                            return None;
+                        }
                         let mut cursor = spec.walk();
                         if spec
                             .children(&mut cursor)
                             .any(|child| child.kind() == "type")
+                            && (!matches!(rule, UseRule::DirectCalls)
+                                || imported.utf8_text(source).ok()? == name)
                         {
-                            return None;
-                        }
-                        let imported = spec.child_by_field_name("name")?;
-                        if imported.kind() != "identifier" {
                             return None;
                         }
                         if imported.utf8_text(source).ok()? == name {
@@ -1108,6 +1112,9 @@ fn prove_file(
                 {
                     return None;
                 }
+            }
+            UseRule::DirectCalls => {
+                direct_call_arity(node)?;
             }
             UseRule::CallArity(arity) => {
                 if direct_call_arity(node)? > arity {

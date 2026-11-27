@@ -1310,6 +1310,22 @@ fn unsupported_required_member_additions_do_not_close_on_changed_lines() {
         api.compatible_modified.iter().any(|m| m.name == "Row"),
         "{api:?}"
     );
+    // 同じ factory と reader があっても、戻り値のキー集合や別の引数には影響が残る。
+    for use_site in [
+        "export const keys: Record<keyof ReturnType<typeof toRow>, number> = {id: 1};",
+        "const value = {id: 'a', note: 42}; label(value);",
+    ] {
+        let view = format!("{VIEW_BASE}\n{use_site}\n");
+        let api = api_after(
+            &[("src/row.ts", ROW_BASE), ("src/view.ts", &view)],
+            &[("src/row.ts", &optional)],
+        );
+        assert_eq!(
+            verdict(&api, "Row"),
+            Verdict::Blocking,
+            "{use_site}: {api:?}"
+        );
+    }
 }
 
 #[test]

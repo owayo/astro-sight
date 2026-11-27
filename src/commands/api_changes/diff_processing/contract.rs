@@ -273,8 +273,14 @@ pub(super) fn compatible_modification(
     if let Some(compat) = detect_object_members_compatible_mod(site, sources) {
         return Ok(Some(compat));
     }
-    if let Some(compat) = detect_type_members_compatible_mod(site, sources) {
-        return Ok(Some(compat));
+    if let Some(result) = detect_type_members_compatible_mod(
+        ref_index,
+        site,
+        sources,
+        &mut caches.optional_removal,
+        public_name_differs,
+    ) {
+        return result.map(Some);
     }
     if !public_name_differs
         && let Some(compat) = detect_trailing_default_type_params_compatible_mod(

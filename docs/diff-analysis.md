@@ -208,6 +208,10 @@ The proof handles `void`, primitive types, and mutable/readonly arrays. It limit
 
 The inventory is limited to 512 TS/TSX files, 8 MiB across both versions, 100,000 AST nodes, depth 128, and 2,048 candidate comparisons. Aliased/default/namespace imports, reexports, dynamic loaders, JS or embedded sources, JSDoc, parse/read failures, links, and uncertain configuration (`extends`, `rootDirs`, `moduleSuffixes`, `paths`, or `baseUrl`) prevent this proof. This verifies the observed internal handoffs and bounded consumer dependencies, without establishing general API compatibility or replacing TypeScript checking.
 
+### TypeScript optional properties on exported types
+
+Adding `emphasis?: boolean` to an exported type or interface leaves an existing `const item: Options = { label: "a" }` valid. It also adds `"emphasis"` to `keyof Options`, so a `Record<keyof Options, number>` with only a `label` entry is incomplete. Review reports the exported declaration under `api.mod` when it cannot verify a use of the key set or a module augmentation. This can include a projection that still type-checks.
+
 ### TypeScript Required Property Additions
 
 Adding a required property or a zero-parameter void callback to an exported TS / TSX interface or object type alias can appear in `modified_closed_in_diff` (`api.mod_closed`) when every site that produces a value of the type, and every function that receives one, is followed in the same diff. Each reference to the type must be one of these:

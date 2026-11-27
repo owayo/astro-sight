@@ -339,6 +339,29 @@ fn ts_internal_tag_is_not_hidden_by_compatible_member_additions() {
             .any(|change| change.name == "Options"),
         "{api:?}"
     );
+    // 宣言から消えるプロパティも実装の型検査には残る。
+    for (usage, after) in [
+        (
+            "export const keys: Record<keyof Options, number> = {name: 1, retries: 1};",
+            added.to_owned(),
+        ),
+        (
+            "export const item: Options = {name: 'a', retries: 1};",
+            added.replace("retries: number", "retries: string"),
+        ),
+    ] {
+        let before = format!("{OPTIONS_INTERNAL_MEMBER}{usage}\n");
+        let after = format!("{after}{usage}\n");
+        let api = changed_api(
+            &[("tsconfig.json", STRIP), ("src/lib.ts", &before)],
+            &[("src/lib.ts", &after)],
+            &[],
+        );
+        assert!(
+            api.modified.iter().any(|change| change.name == "Options"),
+            "{api:?}"
+        );
+    }
 }
 
 /// 関数の引数の object 型の `@internal` のメンバーも宣言ファイルから消えるので、その型を変えても

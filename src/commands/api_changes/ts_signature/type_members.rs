@@ -62,42 +62,112 @@ pub(crate) fn declaration_signature(
     }
 }
 
-/// 既存メンバーと宣言ヘッダが不変で、追加分が optional property のみなら互換。
+/// 追加した optional メンバーが既存の型利用を壊さない場合に限り互換。
 pub(crate) fn detect_type_members_compatible_mod(
+    index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
-) -> Option<CompatibleApiModification> {
+    cache: &mut OptionalRemovalCache,
+    public_name_differs: bool,
+) -> Option<Result<CompatibleApiModification, ()>> {
     let lang = site.lang_in(TS_ONLY_LANGS)?;
     if !matches!(site.kind, "type" | "trait" | "interface") {
         return None;
     }
     let src = sources.get(site)?;
     let (old_tree, new_tree) = src.parse_pair(lang)?;
-    if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
+    let change = optional_member_change(
+        old_tree.root_node(),
+        &src.old,
+        new_tree.root_node(),
+        &src.new,
+        site.name,
+    )?;
+    // 宣言ファイル用に隠す前の型も、同じ optional キーだけを追加した場合に限る。
+    let same_source_change = || -> Option<bool> {
+        if src.original_new() == src.new.as_ref() && src.original_old() == src.old.as_slice() {
+            return Some(true);
+        }
+        let old = parser::parse_source(src.original_old(), lang).ok()?;
+        let new = parser::parse_source(src.original_new(), lang).ok()?;
+        let raw = optional_member_change(
+            old.root_node(),
+            src.original_old(),
+            new.root_node(),
+            src.original_new(),
+            site.name,
+        )?;
+        Some(raw.retained.is_some() && raw.added == change.added)
+    };
+    let compatible = !public_name_differs
+        && site.new_path == site.old_path
+        && same_source_change() == Some(true)
+        && change.retained.is_some_and(|retained| {
+            trailing_parameters::prove_optional_member_uses(
+                index,
+                site,
+                cache,
+                src.original_new(),
+                retained,
+                change.added,
+            )
+            .is_some()
+        });
+    Some(
+        compatible
+            .then(|| site.compatible("optional_type_members"))
+            .ok_or(()),
+    )
+}
+
+struct OptionalMemberChange {
+    retained: Option<HashSet<String>>,
+    added: HashSet<String>,
+}
+
+fn optional_member_change(
+    old_root: Node<'_>,
+    old_source: &[u8],
+    new_root: Node<'_>,
+    new_source: &[u8],
+    name: &str,
+) -> Option<OptionalMemberChange> {
+    if old_root.has_error() || new_root.has_error() {
         return None;
     }
-    let (old_decl, old_outer) = unique_type_declaration(old_tree.root_node(), site.name, &src.old)?;
-    let (new_decl, new_outer) = unique_type_declaration(new_tree.root_node(), site.name, &src.new)?;
+    let (old_decl, old_outer) = unique_type_declaration(old_root, name, old_source)?;
+    let (new_decl, new_outer) = unique_type_declaration(new_root, name, new_source)?;
     if old_decl.kind() != new_decl.kind() {
         return None;
     }
     let old_body = type_member_body(old_decl)?;
     let new_body = type_member_body(new_decl)?;
-    if normalized_prefix(old_outer, old_body, &src.old)?
-        != normalized_prefix(new_outer, new_body, &src.new)?
-        || normalized_suffix(old_outer, old_body, &src.old)?
-            != normalized_suffix(new_outer, new_body, &src.new)?
+    if normalized_prefix(old_outer, old_body, old_source)?
+        != normalized_prefix(new_outer, new_body, new_source)?
+        || normalized_suffix(old_outer, old_body, old_source)?
+            != normalized_suffix(new_outer, new_body, new_source)?
     {
         return None;
     }
-    let old_members = normalized_members(old_body, &src.old)?;
-    let new_members = normalized_members(new_body, &src.new)?;
-    if new_members.len() <= old_members.len()
-        || !optional_superset(old_members, new_members, &src.old, &src.new)
-    {
+    let old_members = normalized_members(old_body, old_source)?;
+    let new_members = normalized_members(new_body, new_source)?;
+    if new_members.len() <= old_members.len() {
         return None;
     }
-    Some(site.compatible("optional_type_members"))
+    let retained = old_members
+        .iter()
+        .map(|(_, member)| member_name(*member, old_source).flatten())
+        .collect::<Option<HashSet<_>>>();
+    let added = optional_superset(old_members, new_members, old_source, new_source)?;
+    let plain = new_outer.kind() == "export_statement"
+        && new_decl.child_by_field_name("type_parameters").is_none()
+        && !new_decl
+            .named_children(&mut new_decl.walk())
+            .any(|child| child.kind() == "extends_type_clause");
+    Some(OptionalMemberChange {
+        retained: retained.filter(|_| plain),
+        added,
+    })
 }
 
 fn unique_type_declaration<'a>(
@@ -260,18 +330,16 @@ fn optional_superset(
     new: Vec<(String, Node<'_>)>,
     old_source: &[u8],
     new_source: &[u8],
-) -> bool {
+) -> Option<HashSet<String>> {
     let mut old_names = HashSet::new();
     let mut old_property_names = HashSet::new();
     let mut old_properties = Vec::new();
     let mut old_ordered = Vec::new();
     for (signature, member) in old {
-        let Some(name) = member_name(member, old_source) else {
-            return false;
-        };
+        let name = member_name(member, old_source)?;
         if let Some(name) = name {
             if member.kind() == "property_signature" && !old_property_names.insert(name.clone()) {
-                return false;
+                return None;
             }
             old_names.insert(name);
         }
@@ -296,7 +364,7 @@ fn optional_superset(
             Some(nodes) if !nodes.is_empty() => {
                 nodes.pop();
             }
-            _ => return false,
+            _ => return None,
         }
     }
 
@@ -314,7 +382,7 @@ fn optional_superset(
     };
     for member in new_properties.values().flatten() {
         if !accept_added(*member) {
-            return false;
+            return None;
         }
     }
     let mut old_ordered = old_ordered.into_iter();
@@ -326,10 +394,10 @@ fn optional_superset(
         {
             old_ordered.next();
         } else if !accept_added(member) {
-            return false;
+            return None;
         }
     }
-    old_ordered.next().is_none()
+    old_ordered.next().is_none().then_some(added_names)
 }
 
 #[cfg(test)]
