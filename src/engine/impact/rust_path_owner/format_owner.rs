@@ -724,7 +724,7 @@ impl RustPathOwnerIndex {
     /// 確かめる ([`Self::standard_macro_base`])。`#[macro_export]` は crate root の名前を
     /// 差し替えるので、属性の付いた同名の `macro_rules!` がプロジェクトのどこかにあれば
     /// 標準とみなさない。
-    fn standard_macro_call(
+    pub(in crate::engine::impact) fn standard_macro_call(
         &self,
         invocation: Node<'_>,
         macro_name: &str,
@@ -756,101 +756,185 @@ impl RustPathOwnerIndex {
     }
 }
 
-pub(super) fn stock_expression(
-    node: Node<'_>,
+pub(super) struct StockExpressions {
+    old: bool,
+    modules: std::cell::OnceCell<Option<(Environment, bool)>>,
+    text_scopes: HashMap<usize, bool>,
+}
+
+impl StockExpressions {
+    pub(super) fn new(old: bool) -> Self {
+        Self {
+            old,
+            modules: Default::default(),
+            text_scopes: HashMap::new(),
+        }
+    }
+
+    pub(super) fn proves(
+        &mut self,
+        node: Node<'_>,
+        source: &[u8],
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+        relocated: &[PathBuf],
+    ) -> bool {
+        let mut prove = || {
+            // 旧側の標準の include_str! が直接 let の値であれば、その文字列は
+            // #[doc] の属性にはならない。未知のマクロへの引数やトークンは証拠にしない。
+            let data = self.old && node.kind() == "macro_invocation";
+            let mut invocation = node;
+            let data_block = if data {
+                let binding = node.parent()?;
+                if binding.kind() != "let_declaration"
+                    || binding.child_by_field_name("value")? != node
+                {
+                    return None;
+                }
+                Some(
+                    binding
+                        .parent()
+                        .filter(|block| block.kind() == "block")?
+                        .id(),
+                )
+            } else {
+                loop {
+                    invocation = invocation.parent()?;
+                    match invocation.kind() {
+                        "macro_invocation" => break,
+                        "token_tree" => continue,
+                        _ => return None,
+                    }
+                }
+                None
+            };
+            let callee = invocation.child_by_field_name("macro")?;
+            let macro_name = callee
+                .utf8_text(source)
+                .ok()?
+                .strip_prefix("r#")
+                .unwrap_or(callee.utf8_text(source).ok()?);
+            if callee.kind() != "identifier"
+                || (data && macro_name != "include_str")
+                || (!data
+                    && !matches!(
+                        macro_name,
+                        "assert"
+                            | "assert_eq"
+                            | "assert_ne"
+                            | "debug_assert"
+                            | "debug_assert_eq"
+                            | "debug_assert_ne"
+                            | "matches"
+                            | "format"
+                    ))
+            {
+                return None;
+            }
+            let mut cursor = invocation.walk();
+            let body = invocation
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "token_tree")?;
+            if any_node(body, Children::All, |node| {
+                node.kind() == "!"
+                    && sibling(node, true).is_some_and(|node| node.kind() == "identifier")
+                    && sibling(node, false).is_some_and(|node| node.kind() == "token_tree")
+            }) {
+                return None;
+            }
+            let (base, root_visible) = self
+                .modules
+                .get_or_init(|| {
+                    stock_module_environment(source, dir, ref_path, project, relocated, self.old)
+                })
+                .as_ref()?;
+            let check = || {
+                if data
+                    && (!project.std_project.allows(dir.join(ref_path).to_str()?)
+                        || *root_visible && project.may_define_macro(macro_name))
+                {
+                    return None;
+                }
+                let mut combined = base.clone();
+                let mut ancestor = invocation.parent();
+                while let Some(scope) = ancestor {
+                    if scope.kind() == "block"
+                        || scope.kind() == "declaration_list"
+                            && scope
+                                .parent()
+                                .is_some_and(|parent| parent.kind() == "mod_item")
+                    {
+                        combined.merge(environment(scope, source, Some(invocation.id()), true)?);
+                    }
+                    ancestor = scope.parent();
+                }
+                combined.plain(macro_name).then_some(())
+            };
+            if let Some(block) = data_block {
+                // let の値はスコープ直下の文マクロにならない。environment は同じ
+                // ブロック内の macro_rules! を宣言位置によらず全て照合する。
+                self.text_scopes
+                    .entry(block)
+                    .or_insert_with(|| check().is_some())
+                    .then_some(())
+            } else {
+                check()
+            }
+        };
+        prove().is_some()
+    }
+}
+
+fn stock_module_environment(
     source: &[u8],
     dir: &Path,
     ref_path: &str,
     project: &RustPathOwnerProjectProof,
     relocated: &[PathBuf],
-) -> bool {
-    let prove = || {
-        let mut ancestor = node.parent();
-        let mut invocation = None;
-        while let Some(current) = ancestor {
-            if current.kind() == "macro_invocation" {
-                invocation = Some(current);
-                break;
-            }
-            if current.kind() != "token_tree" {
-                return None;
-            }
-            ancestor = current.parent();
+    old: bool,
+) -> Option<(Environment, bool)> {
+    let (package, _, _) = source_module_path(dir, Path::new(ref_path))?;
+    // 配置走査と同じく、木の中の設定は snapshot、木の外は元の checkout で確かめる。
+    if !project.layout_cargo_settings_known() {
+        return None;
+    }
+    let manifest = read_input_text_file(&dir.join(&package).join("Cargo.toml"))?;
+    let value = toml::from_str::<toml::Value>(&manifest).ok()?;
+    if super::super::rust_std_origin::has_sysroot_dependency(&value, false) {
+        return None;
+    }
+    let mut combined = Environment::default();
+    let mut root_visible = false;
+    for file in enum_owner::ancestor_files(dir, ref_path)? {
+        let canonical = dir.join(&file).canonicalize().ok()?;
+        if relocated.iter().any(|path| canonical.starts_with(path)) {
+            return None;
         }
-        let invocation = invocation?;
-        let callee = invocation.child_by_field_name("macro")?;
-        let macro_name = callee
-            .utf8_text(source)
-            .ok()?
-            .strip_prefix("r#")
-            .unwrap_or(callee.utf8_text(source).ok()?);
-        if callee.kind() != "identifier"
-            || !matches!(
-                macro_name,
-                "assert"
-                    | "assert_eq"
-                    | "assert_ne"
-                    | "debug_assert"
-                    | "debug_assert_eq"
-                    | "debug_assert_ne"
-                    | "matches"
-                    | "format"
-            )
+        let current;
+        let bytes = if let Some(previous) = old
+            .then(|| project.reexport_old_sources.get(&file))
+            .flatten()
         {
+            previous.as_deref()?
+        } else {
+            current = read_input_file(&dir.join(&file))?;
+            &current
+        };
+        if file == Path::new(ref_path) && bytes != source {
             return None;
         }
-        let mut cursor = invocation.walk();
-        let body = invocation
-            .named_children(&mut cursor)
-            .find(|node| node.kind() == "token_tree")?;
-        if any_node(body, Children::All, |node| {
-            node.kind() == "!"
-                && sibling(node, true).is_some_and(|node| node.kind() == "identifier")
-                && sibling(node, false).is_some_and(|node| node.kind() == "token_tree")
-        }) {
+        let tree = parser::parse_source(bytes, LangId::Rust).ok()?;
+        if tree.root_node().has_error() {
             return None;
         }
-        let (package, _, _) = source_module_path(dir, Path::new(ref_path))?;
-        if !project
-            .cargo_configs
-            .keeps_dependency_sources(&dir.join(&package))
-        {
-            return None;
+        // 別ファイルの macro_export が crate root や親 glob を通じて見える場合は、
+        // 通常のマクロ所有元の証明が必要。
+        if file == Path::new(ref_path) {
+            root_visible = matches!(file.file_name()?.to_str()?, "lib.rs" | "main.rs")
+                || has_parent_glob(tree.root_node());
         }
-        let manifest = read_input_text_file(&dir.join(&package).join("Cargo.toml"))?;
-        let value = toml::from_str::<toml::Value>(&manifest).ok()?;
-        if super::super::rust_std_origin::has_sysroot_dependency(&value, false) {
-            return None;
-        }
-        let mut combined = Environment::default();
-        for file in enum_owner::ancestor_files(dir, ref_path)? {
-            let canonical = dir.join(&file).canonicalize().ok()?;
-            if relocated.iter().any(|path| canonical.starts_with(path)) {
-                return None;
-            }
-            let bytes = read_input_file(&dir.join(&file))?;
-            if file == Path::new(ref_path) && bytes != source {
-                return None;
-            }
-            let tree = parser::parse_source(&bytes, LangId::Rust).ok()?;
-            if tree.root_node().has_error() {
-                return None;
-            }
-            combined.merge(environment(tree.root_node(), &bytes, None, true)?);
-        }
-        let mut ancestor = invocation.parent();
-        while let Some(scope) = ancestor {
-            if scope.kind() == "block"
-                || scope.kind() == "declaration_list"
-                    && scope
-                        .parent()
-                        .is_some_and(|parent| parent.kind() == "mod_item")
-            {
-                combined.merge(environment(scope, source, Some(invocation.id()), true)?);
-            }
-            ancestor = scope.parent();
-        }
-        combined.plain(macro_name).then_some(())
-    };
-    prove().is_some()
+        combined.merge(environment(tree.root_node(), bytes, None, true)?);
+    }
+    Some((combined, root_visible))
 }

@@ -57,9 +57,9 @@ fn identifier(name: &str) -> String {
 
 #[derive(Default)]
 pub(super) struct Names {
-    items: HashSet<String>,
-    imports: HashMap<String, Option<(UsePathOrigin, Vec<String>)>>,
-    globs: Vec<(UsePathOrigin, Vec<String>)>,
+    pub(super) items: HashSet<String>,
+    pub(super) imports: HashMap<String, Option<(UsePathOrigin, Vec<String>)>>,
+    pub(super) globs: Vec<(UsePathOrigin, Vec<String>)>,
 }
 
 impl Names {

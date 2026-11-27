@@ -19,7 +19,13 @@ fn is_sysroot(name: &str) -> bool {
 #[derive(Clone)]
 struct Binding {
     root: Option<String>,
-    collection: bool,
+    collection: Option<Collection>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Collection {
+    Sequence,
+    Map,
 }
 
 #[derive(Default)]
@@ -34,7 +40,7 @@ struct Scope {
 }
 
 impl Scope {
-    fn bind(&mut self, name: &str, root: Option<String>, collection: bool) {
+    fn bind(&mut self, name: &str, root: Option<String>, collection: Option<Collection>) {
         self.bindings
             .entry(normalize_identifier(LangId::Rust, name).into_owned())
             .or_default()
@@ -122,7 +128,7 @@ impl RustStdOriginIndex {
         Self::from_source(node, source)
     }
 
-    fn from_source(mut node: Node<'_>, source: &[u8]) -> Option<Self> {
+    pub(super) fn from_source(mut node: Node<'_>, source: &[u8]) -> Option<Self> {
         while let Some(parent) = node.parent() {
             node = parent;
         }
@@ -200,10 +206,7 @@ impl RustStdOriginIndex {
                     .child_by_field_name("alias")
                     .or_else(|| node.child_by_field_name("name"));
                 if let Some(name) = name.and_then(|name| name.utf8_text(source).ok()) {
-                    self.scopes
-                        .get_mut(&active)
-                        .unwrap()
-                        .bind(name, None, false);
+                    self.scopes.get_mut(&active).unwrap().bind(name, None, None);
                 }
             }
             "macro_invocation" => {
@@ -233,10 +236,7 @@ impl RustStdOriginIndex {
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
                 {
-                    self.scopes
-                        .get_mut(&active)
-                        .unwrap()
-                        .bind(name, None, false);
+                    self.scopes.get_mut(&active).unwrap().bind(name, None, None);
                 }
             }
             _ => {}
@@ -448,9 +448,17 @@ impl RustStdOriginIndex {
     }
 }
 
-fn collection_path(path: &[String]) -> bool {
-    matches!(path, [root, module, ty] if matches!(root.as_str(), "std" | "alloc")
-        && matches!((module.as_str(), ty.as_str()), ("vec", "Vec") | ("string", "String")))
+fn collection_path(path: &[String]) -> Option<Collection> {
+    let [root, module, name] = path else {
+        return None;
+    };
+    match (root.as_str(), module.as_str(), name.as_str()) {
+        ("std" | "alloc", "vec", "Vec") | ("std" | "alloc", "string", "String") => {
+            Some(Collection::Sequence)
+        }
+        ("std", "collections", "HashMap" | "BTreeMap") => Some(Collection::Map),
+        _ => None,
+    }
 }
 
 pub(super) struct CollectionBindings {
@@ -526,7 +534,7 @@ impl CollectionBindings {
                 }
                 if let Some(parts) = path_segments(ty, source)
                     && !(parts.len() == 1 && ty.kind() == "scoped_identifier")
-                    && names.collection_type(scope, &parts)
+                    && names.collection_type(scope, &parts) == Some(Collection::Sequence)
                 {
                     members.insert(member.id());
                     if candidates.remove(&node.id()) {
@@ -566,11 +574,51 @@ impl CollectionBindings {
 }
 
 impl RustStdOriginIndex {
-    fn collection_type(&self, scope: usize, path: &[String]) -> bool {
-        if collection_path(path) {
-            return self.root_unbound(scope, &path[0]);
+    fn collection_type(&self, scope: usize, path: &[String]) -> Option<Collection> {
+        if let Some(collection) = collection_path(path) {
+            return self.root_unbound(scope, &path[0]).then_some(collection);
         }
-        let [name] = path else { return false };
+        let [name] = path else { return None };
+        for id in self.scope_chain(scope) {
+            let facts = &self.scopes[&id];
+            if facts.has_glob
+                || facts.has_macro_or_attribute
+                || facts.conditional_use
+                || self.has_shadowed_attribute(id)
+            {
+                return None;
+            }
+            if let Some(bindings) = facts.bindings.get(name) {
+                let [binding] = bindings.as_slice() else {
+                    return None;
+                };
+                return binding.collection.filter(|_| {
+                    binding
+                        .root
+                        .as_ref()
+                        .is_some_and(|root| self.root_unbound(id, root))
+                });
+            }
+            if facts.module_boundary {
+                break;
+            }
+        }
+        matches!(name.as_str(), "Vec" | "String").then_some(Collection::Sequence)
+    }
+
+    pub(super) fn scope_at(&self, node: Node<'_>, inherited: usize) -> usize {
+        if self.scopes.contains_key(&node.id()) {
+            node.id()
+        } else {
+            inherited
+        }
+    }
+
+    pub(super) fn collection_receiver(&self, scope: usize, ty: Node<'_>, source: &[u8]) -> bool {
+        path_segments(ty, source).is_some_and(|parts| self.collection_type(scope, &parts).is_some())
+    }
+
+    pub(super) fn file_type(&self, scope: usize, root: usize, name: &str) -> bool {
         for id in self.scope_chain(scope) {
             let facts = &self.scopes[&id];
             if facts.has_glob
@@ -581,20 +629,13 @@ impl RustStdOriginIndex {
                 return false;
             }
             if let Some(bindings) = facts.bindings.get(name) {
-                let [binding] = bindings.as_slice() else {
-                    return false;
-                };
-                return binding.collection
-                    && binding
-                        .root
-                        .as_ref()
-                        .is_some_and(|root| self.root_unbound(id, root));
+                return id == root && bindings.len() == 1;
             }
             if facts.module_boundary {
                 break;
             }
         }
-        matches!(name.as_str(), "Vec" | "String")
+        false
     }
 }
 
@@ -778,7 +819,7 @@ fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
     Some(manifests)
 }
 
-fn has_foreign_std_alias(root: Node<'_>, source: &[u8]) -> bool {
+pub(super) fn has_foreign_std_alias(root: Node<'_>, source: &[u8]) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.kind() == "extern_crate_declaration"
