@@ -87,6 +87,8 @@ pub(super) struct RefEventMini {
     pub(super) rust_receiver_member: bool,
     /// 関連関数を名指し得ない、マクロの外のドット呼び出し。
     rust_plain_dot_call: bool,
+    /// 属性マクロが所有型や呼び出し方を書き換え得るドット呼び出し。
+    rust_attribute_call: bool,
     /// Receiver member, associated path, or macro token that could name a method.
     pub(super) rust_method_syntax: bool,
     /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
@@ -820,23 +822,26 @@ impl ImpactCollector<'_> {
                 || scoped_function
                     && copied_site.is_some_and(|(_, site, _)| is_rust_receiver_member(site)));
         let rust_dot_call = rust_receiver_member && owner_node.is_some_and(rust_member_is_called);
-        let rust_plain_dot_call = rust_dot_call
-            && rust_macro_site.is_none()
+        let source_dot_call = rust_dot_call && rust_macro_site.is_none();
+        let token_name =
+            self.ref_lang == Some(LangId::Rust) && node.is_some_and(|n| n.kind() == "identifier");
+        let rust_attribute_call = (source_dot_call || token_name)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
-                contexts.iter().any(|&fc_ix| {
-                    self.file_contexts[fc_ix as usize]
-                        .rust_receiverless_associated_names
-                        .contains(&self.all_symbol_names[ix])
+                contexts.iter().any(|&fc| {
+                    let ctx = &self.file_contexts[fc as usize];
+                    ctx.affected_name_by_cikey
+                        .get(&self.all_symbol_names[ix])
+                        .is_some_and(|name| rust_function_only(ctx, name))
                 })
             })
             && node.is_some_and(|node| {
-                !self
-                    .rust_opaque_attributes
-                    .get_or_init(|| {
-                        super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
-                    })
-                    .contains(node)
+                let scopes = self.rust_opaque_attributes.get_or_init(|| {
+                    super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
+                });
+                source_dot_call && scopes.contains(node)
+                    || token_name && scopes.rewrites_token_call(node)
             });
+        let rust_plain_dot_call = source_dot_call && !rust_attribute_call;
         let private_method_target = self.ref_lang == Some(LangId::Rust)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
                 contexts.iter().any(|&fc_ix| {
@@ -871,7 +876,7 @@ impl ImpactCollector<'_> {
                         in_token_tree
                     }
             });
-        let rust_explicit_method_owner_id = if private_method_target {
+        let rust_explicit_method_owner_id = if private_method_target && !rust_attribute_call {
             owner_node
                 .and_then(|node| rust_explicit_method_owner(node, owner_source))
                 .map_or(u32::MAX, |owner| {
@@ -909,6 +914,7 @@ impl ImpactCollector<'_> {
         // 変更した inherent メソッドの参照だけ、パスの修飾が指す型の名前を確かめる (Issue #470)。
         let rust_call_owner_id = if self.ref_lang == Some(LangId::Rust)
             && !is_import
+            && !rust_attribute_call
             && rust_macro_site.is_none()
             && self.sym_to_fc[ix].iter().any(|&fc| {
                 self.file_contexts[fc as usize]
@@ -1450,11 +1456,12 @@ impl ImpactCollector<'_> {
             ts_import_binding_use,
             ts_rebound_const_owner,
             alias_owner,
-            ref_in_macro,
+            ref_in_macro: ref_in_macro || rust_attribute_call,
             rust_macro_evidence,
             rust_macro_callee,
-            rust_receiver_member,
+            rust_receiver_member: rust_receiver_member && !rust_attribute_call,
             rust_plain_dot_call,
+            rust_attribute_call,
             rust_method_syntax,
             rust_explicit_method_owner_id,
             rust_private_call_target,
@@ -2253,6 +2260,7 @@ impl<'a> ImpactCollector<'a> {
                     pool.get(e.rust_explicit_method_owner_id) != owner.name
                 });
         let private_method_unanchored = private_method_candidate
+            && !e.rust_attribute_call
             && facts.has_parent_type
             && !facts.parent_in_this_file
             && e.rust_explicit_method_owner_id == u32::MAX;
@@ -2322,6 +2330,7 @@ impl<'a> ImpactCollector<'a> {
             && facts.has_parent_type
             && !facts.parent_in_this_file
             && !private_method_candidate
+            && !e.rust_attribute_call
         {
             return true;
         }
@@ -2416,6 +2425,7 @@ impl<'a> ImpactCollector<'a> {
             }
             if route == CallerRoute::Normal
                 && !bound_method
+                && !e.rust_attribute_call
                 && ctx
                     .rust_private_method_owners
                     .contains_key(sym_key_canonical)
@@ -2507,6 +2517,7 @@ mod tests {
             rust_macro_callee: false,
             rust_receiver_member: false,
             rust_plain_dot_call: false,
+            rust_attribute_call: false,
             rust_method_syntax: false,
             rust_explicit_method_owner_id: u32::MAX,
             rust_private_call_target: u32::MAX,

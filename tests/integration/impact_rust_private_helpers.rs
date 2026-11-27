@@ -316,6 +316,92 @@ fn rust_associated_function_changes_distinguish_dot_calls_from_paths() {
 }
 
 #[test]
+fn rust_associated_function_keeps_calls_inside_attribute_macro_input() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("weave/src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='host'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nweave={path='weave'}\n",
+    );
+    repo.write(
+        "weave/Cargo.toml",
+        "[package]\nname='weave'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+    );
+    repo.write(
+        "weave/src/lib.rs",
+        r#"use proc_macro::TokenStream;
+#[proc_macro_attribute]
+pub fn mapped(_: TokenStream, item: TokenStream) -> TokenStream {
+    item.to_string().replace("target.", "crate::producer::Item::")
+        .replace("target .", "crate::producer::Item::").parse().unwrap()
+}
+"#,
+    );
+    repo.write("src/lib.rs", "mod producer; mod reader;\n");
+    let producer = "pub struct Item;\npub struct Settings;\npub struct MenuHost;\nimpl Item {\n    pub fn add(_: Settings) {}\n    pub fn r#raw_call(_: Settings) {}\n}\n";
+    repo.write("src/producer.rs", producer);
+    repo.write(
+        "src/reader.rs",
+        r#"use crate::producer::Settings;
+struct Other;
+impl Other { fn add(self, _: Settings) {} fn raw_call(self, _: Settings) {} }
+#[weave::mapped]
+fn mapped() { let target = Other; target.add(Settings); }
+#[inline]
+fn builtin() { let target = Other; target.add(Settings); }
+#[weave::mapped]
+#[allow(unused)]
+impl Other { fn nested() { let target = Other; target.add(Settings); } }
+#[cfg_attr(all(), weave::mapped)]
+mod enclosed {
+    use super::*;
+    pub fn run() { let target = Other; target.add(Settings); }
+}
+fn plain() { let target = Other; target.add(Settings); }
+#[cfg_attr(any(), weave::mapped)]
+fn disabled() { let target = Other; target.add(Settings); }
+macro_rules! eval { ($e:expr) => {{ $e }}; }
+#[weave::mapped]
+fn token_call() { let target = Other; eval!(target.add(Settings)); }
+fn plain_token_call() { let target = Other; eval!(target.add(Settings)); }
+#[weave::mapped]
+fn raw() { let target = Other; target.r#raw_call(Settings); }
+#[cfg_attr(all(), inline, allow(unused))]
+fn inert() { let target = Other; target.add(Settings); }
+#[weave::mapped]
+#[macro_export]
+macro_rules! mapped_rule { () => {{ let target = Other; target.add(Settings); }}; }
+fn expand() { mapped_rule!(); }
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/producer.rs",
+        producer.replace("_: Settings", "_: MenuHost"),
+    );
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            repo.write("src/producer.rs", producer);
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let result = repo.run_json("context", flags);
+        let rows: Vec<_> = result["changes"][0]["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row["path"] == "src/reader.rs")
+            .map(|row| row["line"].as_u64().unwrap() + 1)
+            .collect();
+        assert_eq!(rows, [5, 10, 14, 21, 24, 29], "staged={staged}: {result}");
+    }
+}
+
+#[test]
 fn rust_associated_function_changes_with_a_trait_method_of_the_same_name() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
