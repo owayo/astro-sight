@@ -51,13 +51,8 @@ pub(super) fn builtin_derive(name: &str) -> bool {
 
 /// Only compiler-defined attributes with no ability to introduce a sibling name
 /// can leave the module scope open. Unknown proc macros remain a barrier.
-pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
-    let attribute = node.named_child(0)?;
-    if attribute.kind() != "attribute" || attribute.has_error() {
-        return None;
-    }
-    let name = attribute.named_child(0)?.utf8_text(source).ok()?;
-    if matches!(
+pub(super) fn inert_attribute_name(name: &str) -> bool {
+    matches!(
         name,
         "cfg"
             | "allow"
@@ -73,7 +68,16 @@ pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String
             | "non_exhaustive"
             | "deprecated"
             | "track_caller"
-    ) {
+    )
+}
+
+pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let attribute = node.named_child(0)?;
+    if attribute.kind() != "attribute" || attribute.has_error() {
+        return None;
+    }
+    let name = attribute.named_child(0)?.utf8_text(source).ok()?;
+    if inert_attribute_name(name) {
         return Some(Vec::new());
     }
     if name == "test" {

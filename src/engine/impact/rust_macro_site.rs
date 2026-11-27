@@ -69,8 +69,48 @@ pub(super) fn macro_site(identifier: Node<'_>, source: &[u8]) -> MacroSite {
 /// 組み込みの属性で、import で付け替えられないもの (`#[test]`・`#[derive(..)]` は同じ名前の属性マクロを
 /// import すればそちらが動くので外す)。
 fn builtin_attribute(attribute: Node<'_>, source: &[u8]) -> bool {
-    crate::engine::impact::rust_std_origin::safe_attribute(attribute, source)
-        .is_some_and(|names| names.is_empty())
+    if let Some(names) = crate::engine::impact::rust_std_origin::safe_attribute(attribute, source) {
+        return names.is_empty();
+    }
+    let Some(attr) = attribute.named_child(0) else {
+        return false;
+    };
+    if attr.has_error()
+        || !attr
+            .named_child(0)
+            .is_some_and(|name| name.utf8_text(source) == Ok("cfg_attr"))
+    {
+        return false;
+    }
+    let Some(mut tokens) = attr
+        .child_by_field_name("arguments")
+        .and_then(|tree| delimited(tree, "("))
+    else {
+        return false;
+    };
+    tokens.retain(|token| !comment(*token));
+    let mut arguments = tokens.split(|token| token.kind() == ",");
+    // any() は常に偽。その他の条件では、適用され得る全属性を確かめる。
+    if matches!(arguments.next(), Some([any, empty]) if any.utf8_text(source) == Ok("any")
+        && delimited(*empty, "(").is_some_and(|inner| inner.iter().all(|n| comment(*n))))
+    {
+        return true;
+    }
+    arguments.all(|argument| {
+        let name = match argument {
+            [] => return true,
+            [name] => name,
+            [name, args]
+                if args.kind() == "token_tree"
+                    && args.child(0).is_some_and(|open| open.kind() == "(") =>
+            {
+                name
+            }
+            _ => return false,
+        };
+        name.utf8_text(source)
+            .is_ok_and(super::rust_std_origin::inert_attribute_name)
+    })
 }
 
 /// `node` の直前に並ぶ外側の属性 (`#[..]`) が、どれも組み込みの安全な属性か。
@@ -102,7 +142,11 @@ fn inner_attributes_safe(scope: Node<'_>, source: &[u8]) -> bool {
 }
 
 /// 未知の属性が書き換え得る範囲。前順で範囲全体を飛ばすので、範囲は整列済みで重ならない。
-pub(super) struct OpaqueAttributeScopes(Vec<std::ops::Range<usize>>);
+#[derive(Default)]
+pub(super) struct OpaqueAttributeScopes {
+    spans: Vec<std::ops::Range<usize>>,
+    token_calls: Vec<usize>,
+}
 
 impl OpaqueAttributeScopes {
     pub(super) fn build(mut root: Node<'_>, source: &[u8]) -> Self {
@@ -112,9 +156,10 @@ impl OpaqueAttributeScopes {
         while let Some(parent) = root.parent() {
             root = parent;
         }
-        let mut spans = Vec::new();
+        let mut scopes = Self::default();
         if root.has_error() {
-            spans.push(root.byte_range());
+            scopes.spans.push(root.byte_range());
+            scopes.collect_token_calls(root, source);
         } else if memchr::memchr(b'#', source).is_some()
             || memchr::memmem::find(source, b"macro_rules").is_some()
         {
@@ -123,19 +168,29 @@ impl OpaqueAttributeScopes {
                 pending.resize(depth + 1, false);
                 let action = match node.kind() {
                     "attribute_item" => {
-                        pending[depth] |= !builtin_attribute(node, source);
-                        spans.push(node.byte_range());
+                        // macro_export は公開先を変えるが、規則本体のドット呼び出しは書き換えない。
+                        let exports_rule = node
+                            .named_child(0)
+                            .and_then(|attr| attr.named_child(0))
+                            .is_some_and(|name| name.utf8_text(source) == Ok("macro_export"));
+                        pending[depth] |= !exports_rule && !builtin_attribute(node, source);
+                        scopes.spans.push(node.byte_range());
                         Walk::Skip
                     }
                     "inner_attribute_item" | "macro_definition" => {
-                        spans.push(node.byte_range());
+                        if std::mem::take(&mut pending[depth]) && node.kind() == "macro_definition"
+                        {
+                            scopes.collect_token_calls(node, source);
+                        }
+                        scopes.spans.push(node.byte_range());
                         Walk::Skip
                     }
                     "line_comment" | "block_comment" => Walk::Skip,
                     _ if std::mem::take(&mut pending[depth])
                         || !inner_attributes_safe(node, source) =>
                     {
-                        spans.push(node.byte_range());
+                        scopes.spans.push(node.byte_range());
+                        scopes.collect_token_calls(node, source);
                         Walk::Skip
                     }
                     _ => Walk::Descend,
@@ -143,13 +198,60 @@ impl OpaqueAttributeScopes {
                 ControlFlow::Continue(action)
             });
         }
-        Self(spans)
+        scopes.token_calls.sort_unstable();
+        scopes
     }
 
     pub(super) fn contains(&self, node: Node<'_>) -> bool {
         let start = node.start_byte();
-        let after = self.0.partition_point(|span| span.end <= start);
-        self.0.get(after).is_some_and(|span| span.contains(&start))
+        let after = self.spans.partition_point(|span| span.end <= start);
+        self.spans
+            .get(after)
+            .is_some_and(|span| span.contains(&start))
+    }
+
+    pub(super) fn rewrites_token_call(&self, node: Node<'_>) -> bool {
+        self.token_calls.binary_search(&node.start_byte()).is_ok()
+    }
+
+    /// 属性が受け取る項目の中では、別のマクロの引数も属性の入力になる。
+    /// 各 token tree の直下を一度だけ読み、`.name(...)`・`.name::<...>` の名前を記録する。
+    fn collect_token_calls(&mut self, root: Node<'_>, source: &[u8]) {
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+        use std::ops::ControlFlow;
+
+        if memchr::memchr(b'!', &source[root.byte_range()]).is_none() {
+            return;
+        }
+        let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+            if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+                return ControlFlow::Continue(Walk::Skip);
+            }
+            if node.kind() == "token_tree" {
+                let mut dot = false;
+                let mut member = None;
+                let mut cursor = node.walk();
+                let mut tokens = node
+                    .children(&mut cursor)
+                    .filter(|n| !comment(*n))
+                    .peekable();
+                while let Some(token) = tokens.next() {
+                    if let Some(offset) = member.take()
+                        && (token.kind() == "::"
+                            && tokens.peek().is_some_and(|next| next.kind() == "<")
+                            || token.kind() == "token_tree"
+                                && token.child(0).is_some_and(|open| open.kind() == "("))
+                    {
+                        self.token_calls.push(offset);
+                    }
+                    if dot && token.kind() == "identifier" {
+                        member = Some(token.start_byte());
+                    }
+                    dot = token.kind() == ".";
+                }
+            }
+            ControlFlow::Continue(Walk::Descend)
+        });
     }
 }
 
