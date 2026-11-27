@@ -781,6 +781,8 @@ When a module-level function is removed, `review` also checks uses of its name i
 
 The same check applies when a function is renamed. For example, after `total` becomes `sum_values`, a direct caller can use the new name while `mock.patch("tools.util.total")` still fails with `AttributeError`. Review reports the old name in `api.rm` even when it also lists the rename in `rename_candidates`.
 
+In another module, `total = 7` followed by `assert total == 7` reads that module’s own integer. Once callers of `api.total` have migrated to the new name, the integer read alone does not keep the removal in `api.rm`. An unchanged `from api import total` still keeps the removal blocking.
+
 ### Python member removals with unresolved receivers
 
 `api_changes.removed_unresolved` (`api.rm_unresolved` in hook output) reports confirmed removals whose remaining member reads have unresolved receivers and a restricted type demand. These entries have `confidence: "low"` and do not block the hook. They do not establish that the removed member has no callers; `removed_dead` keeps its existing proof requirements. Shell parse recovery continues to use the separate `uncertain_removals` / `rm_unverified` category.

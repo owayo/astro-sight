@@ -68,6 +68,55 @@ const UTIL_OLD: &str = "def total(x):\n    return x\n\n\ndef keep():\n    return
 const UTIL_NEW: &str = "def keep():\n    return 1\n";
 
 #[test]
+fn python_renamed_function_distinguishes_an_independent_module_assignment() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let declaration = "def total(x):\n    return x + 1\n";
+    let caller = "from api import total\n\ndef run():\n    return total(2)\n";
+    let independent = "total = 7\nassert total == 7\n";
+    repo.write("api.py", declaration);
+    repo.write("caller.py", caller);
+    repo.write("independent.py", independent);
+    repo.commit_all("baseline");
+    repo.write("api.py", declaration.replace("total", "sum_values"));
+    repo.write("caller.py", caller.replace("total", "sum_values"));
+    repo.stage_all();
+    let assert_rename = |args: &[&str], blocks| {
+        let hook = cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"])
+            .args(args)
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+        assert_eq!(hook.status.code(), Some(i32::from(blocks)), "{report}");
+        assert_eq!(
+            report["rename_candidates"][0]["old"]["name"], "total",
+            "{report}"
+        );
+        assert_eq!(
+            report["rename_candidates"][0]["new"]["name"], "sum_values",
+            "{report}"
+        );
+        assert_eq!(
+            report["api"]["rm"]
+                .as_array()
+                .is_some_and(|rm| rm.iter().any(|s| s["f"] == "api.py" && s["n"] == "total")),
+            blocks,
+            "{report}"
+        );
+    };
+    assert_rename(&[], false);
+    repo.write(
+        "independent.py",
+        "from api import total\ntotal = 7\nassert total == 7\n",
+    );
+    assert_rename(&[], true);
+    assert_rename(&["--staged"], false);
+}
+
+#[test]
 fn python_renamed_function_checks_string_users_in_the_review_snapshot() {
     let repo = TestRepo::new();
     repo.init_git();
