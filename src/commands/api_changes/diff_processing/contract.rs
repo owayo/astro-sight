@@ -156,6 +156,9 @@ pub(super) fn static_const_decision(
         super::static_const::StaticConstChange::Unchanged => {
             Some(SignatureDecision::UnchangedStaticConst)
         }
+        super::static_const::StaticConstChange::EquivalentObjectPropertyKeys => Some(
+            SignatureDecision::Compatible(site.compatible("equivalent_object_property_keys")),
+        ),
         super::static_const::StaticConstChange::ValueOnly => Some(SignatureDecision::ConstValue),
         super::static_const::StaticConstChange::NotApplicable => None,
     }

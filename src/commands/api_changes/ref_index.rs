@@ -503,6 +503,14 @@ impl EmbeddedJsSources {
                     .is_none_or(|text| names.iter().any(|name| contains_js_word(text, name)))
             })
     }
+
+    pub(super) fn may_hide_removed_keys(&self, names: &[&str]) -> bool {
+        self.may_mention(names)
+            || self
+                .texts
+                .iter()
+                .any(|text| text.as_ref().is_none_or(|text| text.contains('\\')))
+    }
 }
 
 /// `text` に `name` が JS の識別子の単語として現れるか (前後が識別子の文字でない出現)。
@@ -540,11 +548,7 @@ pub(crate) fn embedded_js_sources_may_hide_removed_keys(
     let sources = caches
         .embedded_js_sources
         .get_or_insert_with(|| std::rc::Rc::new(EmbeddedJsSources::load(dir)));
-    sources.may_mention(names)
-        || sources
-            .texts
-            .iter()
-            .any(|text| text.as_ref().is_none_or(|text| text.contains('\\')))
+    sources.may_hide_removed_keys(names)
 }
 
 /// 無変更の呼び出し式を閉じる追加証拠。TS は共有 const の必須プロパティ追加、

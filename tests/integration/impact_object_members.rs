@@ -48,6 +48,198 @@ fn assert_object_impact(repo: &TestRepo, expected_blocking: bool) {
 }
 
 #[test]
+fn escaped_object_keys_are_compared_by_runtime_name_at_the_unchanged_read() {
+    // 監査はリポジトリ全体のメンバー参照を調べるので、各例のキーを区別する。
+    let cases = [
+        ("Continued", "ts", "\"end\\\npointA\"", "ob.endpointA", true),
+        (
+            "Unicode",
+            "tsx",
+            r#""end\u0070ointB""#,
+            "ob.endpointB",
+            true,
+        ),
+        ("Hex", "js", r#""end\x70ointC""#, "ob.endpointC", true),
+        ("Index", "ts", "endpointD", r#"ob["end\u0070ointD"]"#, true),
+        ("Template", "js", "endpointE", r"ob[`end\x70ointE`]", true),
+        (
+            "Pattern",
+            "tsx",
+            "endpointF",
+            r#"(({ "end\x70ointF": x }) => x)(ob)"#,
+            true,
+        ),
+        ("Identifier", "ts", "endpointG", r"ob.end\u0070ointG", true),
+        ("Pair", "ts", r#""\uD83D\uDE00H""#, "ob['😀H']", true),
+        ("Duplicate", "js", "endpointL", "ob.endpointL", true),
+        (
+            "Dynamic",
+            "ts",
+            r#""end\x70ointM""#,
+            r#"ob[Math.random() < 2 ? "endpointM" : "key"]"#,
+            true,
+        ),
+        ("Unused", "js", r#""end\u0070ointI""#, "ob.key", false),
+        (
+            "LiteralSlash",
+            "js",
+            r#""end\\u0070ointJ""#,
+            "ob.key",
+            false,
+        ),
+        ("Distinct", "ts", "endpointK", r#"ob["ke\x79"]"#, false),
+    ];
+    for cases in cases.chunk_by(|a, b| a.4 == b.4) {
+        let repo = TestRepo::new();
+        repo.init_git();
+        for &(name, ext, key, read, _) in cases {
+            repo.write(
+                format!("{name}.{ext}"),
+                format!("export const {name} = {{\n key: true,\n {key}: true,\n}};\n"),
+            );
+            repo.write(
+                format!("read{name}.{ext}"),
+                format!(
+                    "import {{ {name} }} from './{name}.js';\nexport const read = {};\n",
+                    read.replace("ob", name)
+                ),
+            );
+        }
+        repo.commit_all("base");
+        for &(name, ext, _, _, _) in cases {
+            let after = if name == "Duplicate" {
+                "endpointL: true,\n \"end\\u0070ointL\": false"
+            } else {
+                "renamed: true"
+            };
+            repo.write(
+                format!("{name}.{ext}"),
+                format!("export const {name} = {{\n key: true,\n {after},\n}};\n"),
+            );
+        }
+        repo.stage_all();
+        for flags in [&["--git"][..], &["--git", "--staged"][..]] {
+            let command = |cmd: &str, extra: &[&str]| {
+                cargo_bin()
+                    .arg(cmd)
+                    .arg("--dir")
+                    .arg(repo.root())
+                    .args(flags)
+                    .args(extra)
+                    .output()
+                    .unwrap()
+            };
+            let review = command("review", &["--hook"]);
+            let hook: serde_json::Value =
+                serde_json::from_slice(&review.stderr).unwrap_or_default();
+            let exit = i32::from(cases[0].4);
+            assert_eq!(review.status.code(), Some(exit), "{hook}");
+            let impact = command("impact", &[]);
+            assert_eq!(impact.status.code(), Some(exit), "{flags:?}");
+            let lines = String::from_utf8(impact.stderr).unwrap();
+            let summary = repo.run_json("review", flags);
+            for &(name, ext, _, _, used) in cases {
+                let category = if used {
+                    "modified"
+                } else {
+                    "compatible_modified"
+                };
+                assert!(
+                    summary["api_changes"][category]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|item| item["name"] == name
+                            && (used || item["reason"] == "unused_object_members")),
+                    "{name} {flags:?}: {summary}"
+                );
+                let reader = format!("read{name}.{ext}");
+                assert_eq!(
+                    lines.contains(&format!("{reader}:2 ")),
+                    used,
+                    "{name} {flags:?}: {lines}"
+                );
+                assert_eq!(
+                    hook["impacts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|group| group["refs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|r| r["p"] == reader && r["ln"] == 1)),
+                    used,
+                    "{name} {flags:?}: {hook}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn object_key_spelling_preserves_order_values_and_unrelated_dynamic_reads() {
+    for (before, after, read, blocking) in [
+        (
+            "key: 1, endpoint: 'a b'",
+            r#"key: 1, "end\x70oint": 'a b'"#,
+            r#"recordLayout["end\u0070oint"]"#,
+            false,
+        ),
+        (
+            "key: 1, endpoint: 'a b'",
+            r#"key: 1, "end\x70oint": 'a  b'"#,
+            "recordLayout.endpoint",
+            true,
+        ),
+        (
+            "key: 1, endpoint: 'a b'",
+            r#""end\x70oint": 'a b', key: 1"#,
+            "Object.keys(recordLayout)",
+            true,
+        ),
+        (
+            r#"f(){return 1}, "end\x70oint": true"#,
+            "f(){return 1}, fresh: true",
+            "recordLayout.f()",
+            false,
+        ),
+        (
+            r#"key: 1, "end\x70oint": true"#,
+            "key: 1, fresh: true",
+            r#"recordLayout.key + other[name]"#,
+            false,
+        ),
+    ] {
+        let repo = object_repo(
+            "ts",
+            &format!("export const recordLayout = {{{before}}} as const;\n"),
+            &format!("export const recordLayout = {{{after}}} as const;\n"),
+            &format!("const other = {{foo: 1}}; const name = 'foo';\nexport const read = {read};"),
+        );
+        repo.stage_all();
+        for flags in [&["--git"][..], &["--git", "--staged"][..]] {
+            for (cmd, extra) in [("impact", &[][..]), ("review", &["--hook"][..])] {
+                let out = cargo_bin()
+                    .arg(cmd)
+                    .arg("--dir")
+                    .arg(repo.root())
+                    .args(flags)
+                    .args(extra)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    out.status.code(),
+                    Some(i32::from(blocking)),
+                    "{cmd} {flags:?} {before} → {after}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn impact_object_members_scan_insertions_inside_existing_values() {
     let repo = TestRepo::new();
     repo.init_git();
@@ -487,7 +679,9 @@ fn invalid_quoted_object_keys_keep_the_object_and_unchanged_read_blocking() {
         ("afterQuestion", "endpoint\\?\n", "`v`", false),
         ("invalidZero", r"endpoint\08", "`v`", false),
         ("invalidCodepoint", r"endpoint\u{110000}", "`v`", false),
-        ("continued", "end\\\r\npoint", "`v`", true),
+        // 行継続はキーに残らない。同じ endpoint なら値変更、別の名前なら未使用キーの置換。
+        ("continuedSameKey", "end\\\r\npoint", "`v`", false),
+        ("continued", "end\\\r\npointSuffix", "`v`", true),
         ("escapedNewline", r"end\npoint", "`v`", true),
         ("unicodeSeparator", "end\u{2028}point", "`v`", true),
     ];
@@ -529,16 +723,16 @@ fn invalid_quoted_object_keys_keep_the_object_and_unchanged_read_blocking() {
             let output = cmd.output().unwrap();
             let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
             assert_eq!(output.status.code(), Some(1), "{hook}");
-            for (name, _, _, valid) in cases {
-                let bucket = if valid { "mod_compat" } else { "mod" };
+            for (name, _, _, compatible) in cases {
+                let bucket = if compatible { "mod_compat" } else { "mod" };
                 assert!(
                     hook["api"][bucket]
                         .as_array()
                         .is_some_and(|items| items.iter().any(|item| item["n"] == name
-                            && (!valid || item["reason"] == "unused_object_members"))),
+                            && (!compatible || item["reason"] == "unused_object_members"))),
                     "{ext} {name}: {hook}"
                 );
-                if !valid {
+                if !compatible {
                     let caller = format!("read_{name}.{ext}");
                     assert!(
                         hook["impacts"]
