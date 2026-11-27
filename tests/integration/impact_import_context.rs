@@ -319,3 +319,78 @@ import { helper as other } from "./api"; show("; import fake", other());
         );
     }
 }
+
+#[test]
+fn renamed_typescript_function_imports_report_only_calls_bound_to_the_changed_export() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let before = "export function format(text: string): string { return text; }\n";
+    repo.write("layout.ts", before);
+    repo.write("independent.ts", before);
+    repo.write(
+        "barrel.ts",
+        "export { format as pretty } from './layout.js';\n",
+    );
+    repo.write("reexport.ts", "import { pretty as other } from './barrel';\nexport const cb: (x: string) => string = other;\n");
+    for (path, binding) in [
+        ("direct.ts", "format as other"),
+        ("quoted.tsx", r#""\u0066ormat" as other"#),
+        ("other.mts", "format as o\\u0074her"),
+    ] {
+        repo.write(path, format!("import {{ {binding} }} from './layout.js';\nexport function run() {{ return (other)('a'); }}\nconst nested = (other: () => number) => other();\nexport const again = other?.('b');\n"));
+    }
+    repo.write(
+        "independent-use.ts",
+        "import { format as other } from './independent';\nexport const value = other('a');\n",
+    );
+    repo.write(
+        "unrelated.ts",
+        "const other = (text: string) => text;\nexport const value = other('a');\n",
+    );
+    repo.write("intrinsic.tsx", "import { format as other } from './layout';\ndeclare global { namespace JSX { interface IntrinsicElements { other: unknown } } }\nexport const view = <other/>;\n");
+    repo.commit_all("before");
+    repo.write(
+        "layout.ts",
+        before.replace("(text: string)", "(text: string, extra: string)"),
+    );
+    for staged in [false, true] {
+        if staged {
+            repo.stage_all();
+            repo.write("layout.ts", before);
+            repo.write("direct.ts", "// working tree only\n");
+        }
+        let args: &[&str] = if staged {
+            &["--git", "--staged"]
+        } else {
+            &["--git"]
+        };
+        let context = repo.run_json("context", args);
+        let sites = callers(&context, "impacted_callers");
+        assert!(
+            !sites.contains(&("intrinsic.tsx".to_owned(), 2)),
+            "{context}"
+        );
+        assert!(sites.contains(&("reexport.ts".to_owned(), 1)), "{context}");
+        for file in ["direct.ts", "quoted.tsx", "other.mts"] {
+            for line in [1, 3] {
+                assert!(
+                    sites.contains(&(file.to_owned(), line)),
+                    "{file}:{line} {context}"
+                );
+            }
+            assert!(!sites.contains(&(file.to_owned(), 2)), "{context}");
+        }
+        assert!(
+            !sites.iter().any(|(path, line)| path == "unrelated.ts"
+                || (path == "independent-use.ts" && *line == 1)),
+            "{context}"
+        );
+        let output = cargo_bin()
+            .current_dir(repo.root())
+            .args(["impact", "--dir", "."])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+    }
+}

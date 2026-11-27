@@ -310,7 +310,7 @@ pub(crate) type UnverifiedObjectMembers = HashMap<String, HashSet<String>>;
 #[derive(Default)]
 pub(crate) struct ReviewImpactEvidence {
     pub(crate) unverified_object_members: UnverifiedObjectMembers,
-    pub(crate) const_alias_reads: HashSet<(String, String)>,
+    pub(crate) ts_alias_references: HashSet<(String, String)>,
 }
 
 pub(crate) fn analyze_impact_at_checkout<F>(
@@ -430,7 +430,7 @@ where
         mut low_caller_maps,
         mut informational_caller_maps,
         string_pool,
-        const_alias_reads,
+        ts_alias_references,
     } = pass2_maps;
 
     // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → callback → drop。
@@ -480,7 +480,7 @@ where
 
     Ok(ReviewImpactEvidence {
         unverified_object_members: unverified,
-        const_alias_reads,
+        ts_alias_references,
     })
 }
 

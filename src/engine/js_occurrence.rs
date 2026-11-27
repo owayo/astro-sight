@@ -30,6 +30,29 @@ pub(crate) fn identifier_kind(kind: &str) -> bool {
     COMMON_IDENTIFIER_KINDS.contains(&kind) || TS_IDENTIFIER_KINDS.contains(&kind)
 }
 
+/// 小文字で始まる JSX の要素名 (`<label>`) か。組み込み要素を指し、同名の関数・変数へは
+/// 束縛されない。
+pub(crate) fn is_intrinsic_jsx_name(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    source: &[u8],
+) -> bool {
+    node.kind() == "identifier"
+        && parent.is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+            ) && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+        })
+        && node
+            .utf8_text(source)
+            .ok()
+            .and_then(|text| text.chars().next())
+            .is_some_and(|first| first.is_ascii_lowercase())
+}
+
 const FUNCTION_KINDS: &[&str] = &[
     "function_declaration",
     "function_expression",

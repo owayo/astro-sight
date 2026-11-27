@@ -392,7 +392,7 @@ fn review_attempt_with_swift_protocols(
     for change in &mut api_changes.modified {
         if change.no_resolved_internal_callers
             && impact_evidence
-                .const_alias_reads
+                .ts_alias_references
                 .contains(&(change.file.clone(), change.name.clone()))
         {
             change.no_resolved_internal_callers = false;
