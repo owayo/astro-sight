@@ -552,6 +552,8 @@ An unsupported value assertion such as `as Item` can produce the same reason eve
 
 ### Changes to a TypeScript named export
 
+Moving a function's `export` keyword to a local `export { f }` clause, or moving it back, can leave its public name and function value unchanged. For a diff confined to that file, callers of `f` are informational when the function, the other statements and the order of value exports match on both sides. A change in another file can affect the types used by the function. The declaration still records the change in visibility syntax.
+
 If `export { f }` becomes `export { other as f } from './provider.js'`, importers of `f` receive `provider.other`. Review reports the change under the public name `f`, even when the original function stays in the file as `export { f as legacy }`. If the original function was callable and `other` is `false`, an unchanged call to `f()` now fails type checking.
 
 When the original function moves to another file, existing callers may still import `f` from its old module. For example, `export { other as "f" } from './provider.js'` and `export * from './provider.js'` can both publish a different value under that name. Review keeps the change blocking if the old public name now resolves to that other value.
