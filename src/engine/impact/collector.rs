@@ -114,7 +114,7 @@ pub(super) struct RefEventMini {
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
     pub(super) rust_value_binding: bool,
-    pub(super) rust_scoped_value: bool,
+    pub(super) rust_collection_value: bool,
     /// Python の相対 import または同一ファイルの直下関数の所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
     pub(super) python_attribute_write: bool,
@@ -374,6 +374,8 @@ pub(super) struct ImpactCollector<'a> {
         std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
     pub(super) rust_std_origin:
         std::cell::OnceCell<Option<super::rust_std_origin::RustStdOriginIndex>>,
+    pub(super) rust_collections:
+        std::cell::OnceCell<Option<super::rust_std_origin::CollectionBindings>>,
     /// 参照ファイルが差し替える標準マクロの名前 (`rust_const_value::LocalMacros`)。
     pub(super) rust_local_macros: std::cell::OnceCell<super::rust_const_value::LocalMacros>,
     pub(super) rust_opaque_attributes:
@@ -1014,6 +1016,34 @@ impl ImpactCollector<'_> {
                         .get_or_init(|| self.rust_std_project.allows(self.source_path_str))
             });
 
+        let collection_value = self.ref_lang == Some(LangId::Rust)
+            && self.all_symbol_names[ix] == "new"
+            && self.sym_to_fc[ix].iter().any(|&fc| {
+                self.file_contexts[fc as usize]
+                    .rust_receiverless_associated_names
+                    .contains("new")
+            })
+            && node.is_some_and(|node| {
+                self.rust_collections
+                    .get_or_init(|| {
+                        let bindings = super::rust_std_origin::CollectionBindings::build(
+                            node,
+                            source,
+                            self.rust_std_origin.get()?.as_ref(),
+                        )?;
+                        self.binding_view(source)?
+                            .allows_collection_constructors(Path::new(self.path_str))
+                            .then_some(bindings)
+                    })
+                    .as_ref()
+                    .is_some_and(|b| b.proves(node, source))
+                    && !self
+                        .rust_opaque_attributes
+                        .get_or_init(|| {
+                            super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
+                        })
+                        .contains(node)
+            });
         let python_import_owner_id = if self.ref_lang == Some(LangId::Python) {
             node.and_then(|node| {
                 self.python_imports
@@ -1393,7 +1423,9 @@ impl ImpactCollector<'_> {
             member_owner: u32::MAX,
             jsx_shape_id,
             unproven_module_ref,
-            rust_scoped_value: copied_binding
+            rust_collection_value: collection_value,
+            rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
+                || copied_binding
                 || lexical_binding == LexicalBinding::RustScopedValue
                     && node.is_some_and(|node| {
                         !self
@@ -1402,8 +1434,7 @@ impl ImpactCollector<'_> {
                                 super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
                             })
                             .contains(node)
-                    }),
-            rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
+                    })
                 || (lexical_binding == LexicalBinding::RustMacroValueBinding
                     && self.rust_path_owner_enabled
                     && self.rust_path_owner_project.allows_macro_value_bindings()),
@@ -1902,8 +1933,9 @@ impl<'a> ImpactCollector<'a> {
         {
             return true;
         }
-        if (e.rust_value_binding && rust_function_only(ctx, name))
-            || (e.rust_scoped_value && ctx.rust_free_function_names.contains(name))
+        if (e.rust_value_binding
+            || e.rust_collection_value && ctx.rust_receiverless_associated_names.contains(name))
+            && rust_function_only(ctx, name)
         {
             return true;
         }
@@ -2444,7 +2476,7 @@ mod tests {
             jsx_shape_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
-            rust_scoped_value: false,
+            rust_collection_value: false,
             python_import_owner_id: u32::MAX,
             python_attribute_write: false,
             python_non_method_site: false,

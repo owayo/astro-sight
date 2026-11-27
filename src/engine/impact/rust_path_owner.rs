@@ -191,6 +191,7 @@ pub(super) struct PrivateModule {
 
 pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
+    pub(super) std_project: super::rust_std_origin::RustStdProjectProof,
     /// staged のときも、Cargo の外部設定は元の checkout の祖先にある。
     pub(super) layout_checkout: PathBuf,
     pub(super) staged_binding_diff: Option<Box<str>>,
@@ -280,6 +281,7 @@ impl RustPathOwnerProjectProof {
         }
         Self {
             root: root.to_owned(),
+            std_project: super::rust_std_origin::RustStdProjectProof::new(root),
             layout_checkout: root.to_owned(),
             staged_binding_diff: None,
             callable_cargo_known: reexport_cargo_enabled,
@@ -498,6 +500,18 @@ impl RustPathOwnerProjectProof {
             .expect("relocation cache poisoned")
             .insert(file.to_owned(), result);
         result
+    }
+
+    pub(super) fn allows_collection_constructors(&self, file: &Path) -> bool {
+        self.callable_layout_stable()
+            && !self.reexport_old_sources.contains_key(file)
+            && self.unrelocated(file)
+            && self.alias_cache.collection_prelude(self, file).is_some()
+            && self
+                .root
+                .join(file)
+                .to_str()
+                .is_some_and(|path| self.std_project.allows(path))
     }
 
     fn callable_layout_stable(&self) -> bool {

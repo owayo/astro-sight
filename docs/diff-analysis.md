@@ -357,6 +357,8 @@ For Rust, a private declaration directly in a source file can be used by child m
 
 When a changed Rust associated function has no `self` parameter, a call such as `ptr.add(n)` can be excluded from its callers. Impact analysis checks the declarations with that name in both revisions and the method-call syntax at the reference. Qualified calls such as `Item::add(n)` and function values such as `Item::add` remain candidates. A receiver on either side, an unresolved attribute, or a call inside an opaque macro prevents this exclusion.
 
+Importing `Palette` for a type annotation can coincide with a call to the standard `Vec::new()` and a local variable named `new`. When impact analysis can identify those bindings, a change to `Palette::new` excludes their lines. Both a direct call to `Palette::new()` and a function pointer initialized from `Palette::new` remain possible affected uses.
+
 The same Rust source file can be compiled into two crates, with its private references binding to a different declaration in each crate. Impact analysis keeps same-name references when a macro can reassemble attribute tokens into `#[path]`, or when a Cargo `[patch]` or `[source]` setting can select source files under `target/`.
 
 A Cargo workspace can also select a package under `target/` that compiles files from both crates. For example, the member pattern `targ[^e]t/level/*` matches `target/level/probe` under Cargo's glob rules. A nested workspace can select the same package with a path relative to its own `Cargo.toml`. In either case, `impact` keeps the reference.

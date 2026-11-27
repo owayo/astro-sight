@@ -31,6 +31,7 @@ pub(in super::super) struct PackageCache {
     manifests: Files<toml::Value>,
     files: Files<ModuleItems>,
     packages: Files<Package>,
+    collection_preludes: Files<()>,
 }
 
 pub(super) struct Package {
@@ -42,6 +43,48 @@ pub(super) struct Package {
 }
 
 impl PackageCache {
+    pub(in super::super) fn collection_prelude(
+        &self,
+        project: &RustPathOwnerProjectProof,
+        file: &Path,
+    ) -> Option<()> {
+        let module = project.ordinary_private_module(file)?;
+        if !module.library_only {
+            return None;
+        }
+        let lib = module.src.join("lib.rs");
+        self.collection_preludes
+            .get(&lib, || {
+                let manifest = self.manifest(&project.root, module.src.parent()?)?;
+                // 依存先の lib target はパッケージと別名で extern prelude に入ることがある。
+                let mut tables = vec![manifest.as_ref()];
+                while let Some(value) = tables.pop() {
+                    if let Some(table) = value.as_table() {
+                        for (key, value) in table {
+                            if matches!(
+                                key.as_str(),
+                                "dependencies" | "dev-dependencies" | "dev_dependencies"
+                            ) && value.as_table().is_none_or(|deps| !deps.is_empty())
+                            {
+                                return None;
+                            }
+                            tables.push(value);
+                        }
+                    }
+                }
+                let plain_root = |source: &[u8]| -> Option<()> {
+                    let tree = parser::parse_source(source, LangId::Rust).ok()?;
+                    let names = Names::collect(tree.root_node(), source, &[])?;
+                    names.globs.is_empty().then_some(())
+                };
+                if let Some(old) = project.reexport_old_sources.get(&lib) {
+                    plain_root(old.as_deref()?)?;
+                }
+                plain_root(&read_input_file(&project.root.join(&lib))?)
+            })
+            .map(|_| ())
+    }
+
     pub(in super::super) fn track_method_source(&mut self, root: &Path, file: &Path) {
         if let Some(package) = file
             .ancestors()
