@@ -1163,16 +1163,37 @@ impl ImpactCollector<'_> {
             Some(QualifiedCallOwner::Function(path)) => Some((path, true)),
             _ => None,
         });
-        let rust_owner = rust_owner.or_else(|| {
-            let node = node.filter(|node| {
+        let rule_name = node
+            .filter(|node| {
                 rust_private_function_candidate
-                    && rust_name_site == super::rust_macro_site::MacroSite::Unknown
+                    && matches!(
+                        rust_name_site,
+                        super::rust_macro_site::MacroSite::Unknown
+                            | super::rust_macro_site::MacroSite::RuleBody
+                    )
                     && node.kind() == "identifier"
-            })?;
-            let index = self
-                .rust_path_owner
-                .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source));
-            let path = index.definition_crate_path(node, source)?;
+            })
+            .and_then(|node| {
+                let index = self.rust_path_owner.get_or_init(|| {
+                    super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                });
+                index.rule_name(node, source)
+            });
+        use super::rust_path_owner::RuleName;
+        let rust_name_site =
+            if matches!(rule_name, Some(RuleName::Macro)) && self.binding_view(source).is_some() {
+                super::rust_macro_site::MacroSite::RuleMacroName
+            } else {
+                rust_name_site
+            };
+        let rust_owner = rust_owner.or_else(|| {
+            let (
+                super::rust_macro_site::MacroSite::Unknown,
+                Some(RuleName::DefinitionCratePath(path)),
+            ) = (rust_name_site, rule_name)
+            else {
+                return None;
+            };
             self.binding_view(source)?
                 .macro_function(Path::new(self.path_str), path)
                 .map(|file| (file, true))
@@ -2057,6 +2078,12 @@ impl<'a> ImpactCollector<'a> {
         let visibility_only_informational = private_visibility_informational
             || explicit_visibility_informational
             || parent_glob_visibility_informational;
+        if !filter_disabled
+            && e.rust_name_site == super::rust_macro_site::MacroSite::RuleMacroName
+            && ctx.rust_private_root_functions.contains(name)
+        {
+            return None;
+        }
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)

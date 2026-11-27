@@ -1210,6 +1210,10 @@ fn macro_caller_case<'a>(child: &str) -> Case<'a> {
 }
 
 fn assert_macro_caller_lines(case: &Case<'_>, expected: &[u64]) {
+    assert_macro_caller_files(case, &[("b/src/lib.rs", expected)]);
+}
+
+fn assert_macro_caller_files(case: &Case<'_>, expected: &[(&str, &[u64])]) {
     let repo = case.changed_repo();
     for staged in [false, true] {
         let mut args = vec!["--git"];
@@ -1225,21 +1229,23 @@ fn assert_macro_caller_lines(case: &Case<'_>, expected: &[u64]) {
             .iter()
             .find(|f| f["path"] == "a/src/lib.rs")
             .unwrap();
-        let lines: Vec<_> = changed["impacted_callers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|caller| {
-                caller["path"] == "b/src/lib.rs"
-                    && caller["symbols"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|name| name == "translate")
-            })
-            .map(|caller| caller["line"].as_u64().unwrap() + 1)
-            .collect();
-        assert_eq!(lines, expected, "staged={staged}: {changed}");
+        for &(file, expected) in expected {
+            let lines: Vec<_> = changed["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|caller| {
+                    caller["path"] == file
+                        && caller["symbols"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|name| name == "translate")
+                })
+                .map(|caller| caller["line"].as_u64().unwrap() + 1)
+                .collect();
+            assert_eq!(lines, expected, "{file}, staged={staged}: {changed}");
+        }
     }
 }
 
@@ -1278,6 +1284,41 @@ fn private_function_macro_body_checks_other_local_expansions() {
         case.b_lib = &source;
         assert_macro_caller_lines(&case, lines);
     }
+}
+
+#[test]
+fn private_function_macro_body_distinguishes_macro_callees_from_functions() {
+    let mut case = macro_caller_case("mod child;\n")
+        .depends("client", "a = { path = '../a' }\nb = { path = '../b' }\n")
+        .file(
+            "client/src/lib.rs",
+            r#"use a::api::translate;
+macro_rules! translate { ($x:expr) => { () }; }
+macro_rules! forward { ($name:ident ! ($x:expr)) => { $name($x) }; }
+pub fn run() {
+    b::run!(direct); b::run!(brackets); b::run!(qualified);
+    b::run!(call); b::run!(passed); b::run!(same_line); b::run!(generated);
+}
+"#,
+        );
+    case.members.push("client");
+    case.b_lib = r#"#[macro_export]
+macro_rules! run {
+    (direct) => { translate!(1) };
+    (brackets) => {{ translate /* name */ ![1]; translate!{1}; }};
+    (qualified) => { $crate::r#translate!(1) };
+    (call) => { translate(1) };
+    (passed) => { forward!(translate!(1)) };
+    (same_line) => {{ translate!(1); translate(1); }};
+    (generated) => {{ macro_rules! again { () => { translate(1) }; } again!(); }};
+}
+#[macro_export]
+macro_rules! translate { ($x:expr) => { () }; }
+"#;
+    assert_macro_caller_files(
+        &case,
+        &[("b/src/lib.rs", &[6, 7, 8, 9]), ("client/src/lib.rs", &[])],
+    );
 }
 
 #[test]

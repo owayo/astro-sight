@@ -30,6 +30,7 @@ mod registry_macros;
 mod workspace_members;
 
 pub(super) use macro_copy::MacroCopy;
+pub(super) use macro_crate::RuleName;
 
 struct FileEvidence {
     types: HashSet<String>,
@@ -128,7 +129,7 @@ pub(super) struct RustPathOwnerIndex {
     direct_imports: HashMap<String, Vec<String>>,
     qualified_call_owners: RefCell<HashMap<Vec<String>, Option<QualifiedCallOwner>>>,
     field_types: std::cell::OnceCell<HashSet<String>>,
-    macro_paths: std::cell::OnceCell<HashMap<usize, Vec<String>>>,
+    macro_paths: std::cell::OnceCell<HashMap<usize, RuleName>>,
     json_calls: RefCell<HashMap<usize, bool>>,
     local_type_names: HashSet<String>,
     local_value_names: HashSet<String>,

@@ -10,6 +10,11 @@ enum Declaration {
 pub(super) struct Functions(Vec<HashMap<String, Declaration>>);
 pub(super) type FunctionFiles = Mutex<HashMap<PathBuf, Arc<OnceLock<Option<Vec<Functions>>>>>>;
 
+pub(in crate::engine::impact) enum RuleName {
+    DefinitionCratePath(Vec<String>),
+    Macro,
+}
+
 fn plain_scope(scope: Node<'_>, source: &[u8]) -> bool {
     !scope.has_error()
         && scope.named_children(&mut scope.walk()).all(|item| {
@@ -148,11 +153,11 @@ impl RustPathOwnerProjectProof {
 }
 
 impl RustPathOwnerIndex {
-    pub(in crate::engine::impact) fn definition_crate_path(
+    pub(in crate::engine::impact) fn rule_name(
         &self,
         node: Node<'_>,
         source: &[u8],
-    ) -> Option<&[String]> {
+    ) -> Option<&RuleName> {
         let paths = self.macro_paths.get_or_init(|| {
             let mut root = node;
             while let Some(parent) = root.parent() {
@@ -160,12 +165,12 @@ impl RustPathOwnerIndex {
             }
             definition_paths(root, source)
         });
-        paths.get(&node.id()).map(Vec::as_slice)
+        paths.get(&node.id())
     }
 }
 
 /// マクロや属性に渡す入力、生成する定義には入らず、通常のモジュールのマクロ定義だけを調べる。
-fn definition_paths(root: Node<'_>, source: &[u8]) -> HashMap<usize, Vec<String>> {
+fn definition_paths(root: Node<'_>, source: &[u8]) -> HashMap<usize, RuleName> {
     let mut result = HashMap::new();
     let mut scopes = vec![root];
     while let Some(scope) = scopes.pop() {
@@ -184,6 +189,9 @@ fn definition_paths(root: Node<'_>, source: &[u8]) -> HashMap<usize, Vec<String>
                 }
                 "mod_item" if !opaque => scopes.extend(item.child_by_field_name("body")),
                 "macro_definition" if !opaque => {
+                    if let Some(name) = item.child_by_field_name("name") {
+                        result.insert(name.id(), RuleName::Macro);
+                    }
                     for rule in item
                         .named_children(&mut item.walk())
                         .filter(|i| i.kind() == "macro_rule")
@@ -206,7 +214,7 @@ fn group(node: Node<'_>, open: &str) -> bool {
 }
 
 /// 文として直接評価するパス、またはその呼び出しだけを記録する。
-fn record_rule_paths(body: Node<'_>, source: &[u8], paths: &mut HashMap<usize, Vec<String>>) {
+fn record_rule_paths(body: Node<'_>, source: &[u8], paths: &mut HashMap<usize, RuleName>) {
     let mut pending = vec![body];
     while let Some(tree) = pending.pop() {
         let tokens: Vec<_> = tree
@@ -223,14 +231,42 @@ fn record_rule_paths(body: Node<'_>, source: &[u8], paths: &mut HashMap<usize, V
                 if rest.is_empty() || matches!(rest, [args] if group(*args, "(")) {
                     pending.push(first);
                 }
+            } else if let Some(name) = invocation_name(statement, source) {
+                paths.insert(name, RuleName::Macro);
             } else if first.kind() == "metavariable"
                 && first.utf8_text(source).ok() == Some("$crate")
                 && let Some((id, path)) = function_path(rest, source)
             {
-                paths.insert(id, path);
+                paths.insert(id, RuleName::DefinitionCratePath(path));
             }
         }
     }
+}
+
+/// マクロに渡す token tree の内部は読まず、直接の呼び出しの末尾名だけを取る。
+fn invocation_name(statement: &[Node<'_>], source: &[u8]) -> Option<usize> {
+    let [path @ .., name, bang, arguments] = statement else {
+        return None;
+    };
+    if name.kind() != "identifier" || bang.kind() != "!" || arguments.kind() != "token_tree" {
+        return None;
+    }
+    let mut prefix = path;
+    if let [root, rest @ ..] = prefix
+        && root.kind() == "::"
+    {
+        prefix = rest;
+    }
+    while let [segment, separator, rest @ ..] = prefix {
+        if separator.kind() != "::"
+            || !(matches!(segment.kind(), "identifier" | "crate" | "self" | "super")
+                || segment.utf8_text(source).ok() == Some("$crate"))
+        {
+            return None;
+        }
+        prefix = rest;
+    }
+    prefix.is_empty().then_some(name.id())
 }
 
 fn function_path(mut tokens: &[Node<'_>], source: &[u8]) -> Option<(usize, Vec<String>)> {
