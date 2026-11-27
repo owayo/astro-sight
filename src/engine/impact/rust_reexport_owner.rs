@@ -893,7 +893,7 @@ fn binding_versions(
     parsed
 }
 
-fn stable_module_chain(
+pub(super) fn stable_module_chain(
     dir: &Path,
     src: &Path,
     module: &[String],

@@ -474,9 +474,9 @@ pub(super) fn stream_caller_maps(
     );
     rust_path_owner_project.layout_checkout = checkout.to_owned();
     if options.new_side == crate::models::impact::DiffNewSide::Index
-        && file_contexts
-            .iter()
-            .any(|ctx| !ctx.rust_super_functions.is_empty())
+        && file_contexts.iter().any(|ctx| {
+            !ctx.rust_super_functions.is_empty() || !ctx.rust_private_root_functions.is_empty()
+        })
     {
         rust_path_owner_project.staged_binding_diff = Some(rust_diff_input.into());
     }

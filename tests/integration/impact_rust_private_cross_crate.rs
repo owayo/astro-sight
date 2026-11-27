@@ -1281,6 +1281,59 @@ fn private_function_macro_body_checks_other_local_expansions() {
 }
 
 #[test]
+fn private_function_macro_body_resolves_the_definition_crates_function() {
+    let mut case = macro_caller_case("mod child;\n")
+        .depends("b", "a = { path = '../a' }\n")
+        .depends("client", "a = { path = '../a' }\nb = { path = '../b' }\n")
+        .file(
+            "client/src/lib.rs",
+            r#"use a::api::*;
+macro_rules! forward { ($root:tt :: $name:ident) => { $name(1) }; }
+pub fn run() {
+    b::root_translate!();
+    b::call_translate!();
+    b::call_translate!(bare);
+    b::call_translate!(via);
+    b::call_translate!(tokens);
+    b::call_translate!(conditional);
+    b::call_translate!(conditional_fn);
+}
+"#,
+        );
+    case.members.push("client");
+    case.b_lib = r#"mod rules {
+#[macro_export]
+macro_rules! call_translate {
+    () => {{
+        let x = 1;
+        $crate::translate(x);
+        ($crate /* root */ ::tools::r#translate)(x);
+    }};
+    (bare) => { translate(1) };
+    (via) => { $crate::forward::translate(1) };
+    (tokens) => { forward!($crate::translate) };
+    (conditional) => { $crate::selected::translate(1) };
+    (conditional_fn) => { $crate::selected_fn::translate(1) };
+}
+}
+#[macro_export]
+macro_rules! root_translate {
+    () => { $crate::translate(1) };
+}
+pub mod tools { pub fn translate(_: u8) {} }
+pub mod forward { pub use a::api::translate; }
+pub mod selected { #![cfg(any())] pub fn translate(_: u8) {} }
+pub use a::api as selected;
+pub mod selected_fn {
+    pub fn translate(_: u8) { #![cfg(any())] }
+    pub use a::api::translate;
+}
+pub fn translate(_: u8) {}
+"#;
+    assert_macro_caller_lines(&case, &[9, 10, 11, 12, 13]);
+}
+
+#[test]
 fn private_function_macro_body_keeps_definition_crate_paths() {
     for (binding, lines) in [
         ("pub fn translate(_: u8) {}", &[][..]),
