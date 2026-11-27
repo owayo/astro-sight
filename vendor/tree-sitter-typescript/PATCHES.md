@@ -118,6 +118,14 @@ and more substitutions. This preserves the syntax error when a raw escape
 occurs on either side of a substitution. Value expressions continue to use
 their existing tagged and untagged template grammar.
 
+## Type-only star exports (#567)
+
+The shared TypeScript and TSX `export_statement` rule accepts
+`export type * from "./types.js"` and `export type * as Rows from "./types.js"`.
+Both forms keep the `type` token directly under `export_statement` and require
+a module string in its `source` field. The namespace form uses the existing
+`namespace_export` node for `* as Rows`. [Issue #567](https://github.com/owayo/astro-sight/issues/567)
+
 ## Regenerate
 
 Use tree-sitter CLI **0.26.6**, with grammar ABI **14**, and Node.js/npm:
