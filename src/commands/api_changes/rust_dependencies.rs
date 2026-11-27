@@ -2402,15 +2402,10 @@ mod tests {
                     module.reverse();
                     return RustDeclarationContext {
                         inline_module: module.join("::"),
-                        owner: Vec::new(),
-                        conditions: Vec::new(),
                         start: (start.row, start.column),
-                        container_header: Vec::new(),
                         availability: item_availability(node, source.as_bytes()).0,
-                        availability_raw: Vec::new(),
                         inline_public: true,
-                        macro_attributes: false,
-                        container_macro_attributes: false,
+                        ..RustDeclarationContext::default()
                     };
                 }
                 let mut cursor = node.walk();

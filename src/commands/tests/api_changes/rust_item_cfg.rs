@@ -67,6 +67,49 @@ fn cfg(old: &[&[&str]], new: &[&[&str]]) -> Option<CfgAvailability> {
     })
 }
 
+#[test]
+fn rust_foreign_function_contracts_follow_possible_cfg_branches() {
+    let old = r#"
+pub mod api {
+    unsafe extern "C" {
+        #[cfg(any())] pub fn ghost(x: u8);
+        #[cfg_attr(all(), cfg(any()))] pub fn duplicate(x: u8);
+        pub fn duplicate(x: u32);
+        #[cfg(any())] pub fn live(x: u32);
+        #[cfg(feature = "x")] pub fn live(x: u8);
+        #[cfg(all(unix, windows))] pub fn custom_target(x: u8);
+    }
+    #[cfg(any())]
+    unsafe extern "C" { pub fn hidden_block(x: u8); }
+    #[projector::expose]
+    unsafe extern "C" { #[cfg(any())] pub fn projected(x: u8); }
+}
+#[projector::expose]
+pub mod generated { unsafe extern "C" { #[cfg(any())] pub fn nested(x: u8); } }
+#[cfg(feature = "x")]
+pub mod feature_api {
+    unsafe extern "C" { #[cfg(not(feature = "x"))] pub fn impossible(x: u8); }
+}
+"#;
+    let new = old.replace("x: u8", "x: i32");
+    let api = api_changes(&[("src/lib.rs", old)], &[("src/lib.rs", &new)]);
+    for name in ["ghost", "duplicate", "hidden_block", "impossible"] {
+        assert_eq!(classify(&api, name), ("none", None), "{name}");
+    }
+    for name in ["live", "custom_target", "projected", "nested"] {
+        assert_eq!(classify(&api, name), ("mod", None), "{name}");
+    }
+    let enabled = old.replace(
+        "#[cfg(any())] pub fn ghost(x: u8);",
+        "pub fn ghost(x: i32);",
+    );
+    for (before, after, expected) in [(old, enabled.as_str(), "add"), (&enabled, old, "rm_dead")] {
+        let api = api_changes(&[("src/lib.rs", before)], &[("src/lib.rs", after)]);
+        assert_eq!(classify(&api, "ghost").0, expected);
+        assert!(api.modified.iter().all(|change| change.name != "ghost"));
+    }
+}
+
 /// Issue の再現: 公開の関数・構造体・enum に `#[cfg]` を足すと、足さなかった設定から消える。
 /// 削除と同じく、参照が残らなければ removed_dead、残れば removed (blocking)。
 #[test]

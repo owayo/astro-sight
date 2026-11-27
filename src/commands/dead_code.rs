@@ -200,7 +200,7 @@ fn detect_dead_symbols_with_budget(
     let python_tests = if needs_python_test_liveness(&candidates, &ref_counts.counts) {
         let python_tests = PythonTestLiveness::build(
             &candidates.all_syms,
-            &candidates.python_starts,
+            &candidates.declaration_starts,
             std::mem::take(&mut candidates.python_facts),
             &canonical_dir,
             &scan.files,
@@ -324,7 +324,7 @@ fn needs_python_test_liveness(
     candidates
         .all_syms
         .iter()
-        .zip(&candidates.python_starts)
+        .zip(&candidates.declaration_starts)
         .any(|((name, kind, _, lang), start)| {
             *lang == crate::language::LangId::Python
                 && start.is_some()
@@ -336,7 +336,7 @@ fn needs_python_test_liveness(
 }
 
 /// Python のテストランナーが集めるか名前で呼ぶと分かった候補を外す (並びを共有する
-/// `swift_signatures` と `python_starts` も同じだけ外す)。呼び出し側は外したあとに同名の数を
+/// `swift_signatures` と `declaration_starts` も同じだけ外す)。呼び出し側は外したあとに同名の数を
 /// 数え直すので、同じ bare name の残った候補は一意になって参照の数で判定される (その数には
 /// 外した候補あての参照も入るので、生存の側に倒れるだけ。ファイル単位の除外と同じ扱い)。
 fn exclude_python_test_entrypoints(
@@ -344,27 +344,30 @@ fn exclude_python_test_entrypoints(
     liveness: &PythonTestLiveness,
 ) {
     debug_assert_eq!(candidates.all_syms.len(), candidates.swift_signatures.len());
-    debug_assert_eq!(candidates.all_syms.len(), candidates.python_starts.len());
+    debug_assert_eq!(
+        candidates.all_syms.len(),
+        candidates.declaration_starts.len()
+    );
     let count = candidates.all_syms.len();
     let mut all_syms = Vec::with_capacity(count);
     let mut swift_signatures = Vec::with_capacity(count);
-    let mut python_starts = Vec::with_capacity(count);
+    let mut declaration_starts = Vec::with_capacity(count);
     for ((candidate, signature), start) in candidates
         .all_syms
         .drain(..)
         .zip(candidates.swift_signatures.drain(..))
-        .zip(candidates.python_starts.drain(..))
+        .zip(candidates.declaration_starts.drain(..))
     {
         if candidate.3 == crate::language::LangId::Python && liveness.is_live(&candidate.2, start) {
             continue;
         }
         all_syms.push(candidate);
         swift_signatures.push(signature);
-        python_starts.push(start);
+        declaration_starts.push(start);
     }
     candidates.all_syms = all_syms;
     candidates.swift_signatures = swift_signatures;
-    candidates.python_starts = python_starts;
+    candidates.declaration_starts = declaration_starts;
 }
 
 fn exclude_swift_protocol_witnesses(
@@ -383,20 +386,23 @@ fn exclude_swift_protocol_witnesses(
                 .or_insert(0) += 1;
         }
     }
-    // 並びを共有する `swift_signatures` と `python_starts` も同じだけ外す (外さないと、後ろの
+    // 並びを共有する `swift_signatures` と `declaration_starts` も同じだけ外す (外さないと、後ろの
     // Python の候補が前の候補の開始位置を引く)。
     debug_assert_eq!(candidates.all_syms.len(), candidates.swift_signatures.len());
-    debug_assert_eq!(candidates.all_syms.len(), candidates.python_starts.len());
+    debug_assert_eq!(
+        candidates.all_syms.len(),
+        candidates.declaration_starts.len()
+    );
     let count = candidates.all_syms.len();
     let mut kept = Vec::with_capacity(count);
     let mut lines = Vec::with_capacity(count);
     let mut signatures = Vec::with_capacity(count);
-    let mut python_starts = Vec::with_capacity(count);
+    let mut declaration_starts = Vec::with_capacity(count);
     for ((candidate, signature), start) in candidates
         .all_syms
         .drain(..)
         .zip(candidates.swift_signatures.drain(..))
-        .zip(candidates.python_starts.drain(..))
+        .zip(candidates.declaration_starts.drain(..))
     {
         let (name, _, file, _) = &candidate;
         if signature.as_deref().is_some_and(|signature| {
@@ -412,12 +418,12 @@ fn exclude_swift_protocol_witnesses(
         );
         kept.push(candidate);
         signatures.push(signature);
-        python_starts.push(start);
+        declaration_starts.push(start);
     }
     candidates.all_syms = kept;
     candidates.swift_lines = lines;
     candidates.swift_signatures = signatures;
-    candidates.python_starts = python_starts;
+    candidates.declaration_starts = declaration_starts;
 }
 
 #[cfg(test)]
@@ -655,10 +661,10 @@ fn attach_declaration_lines(dir: &str, dead: &mut [DeadSymbol], test_only: &mut 
     use std::collections::HashMap;
     let mut cache: HashMap<String, DeclarationLines> = HashMap::new();
     for sym in dead.iter_mut().chain(test_only.iter_mut()) {
-        let lines = cache
-            .entry(sym.file.clone())
-            .or_insert_with(|| DeclarationLines::load(dir, &sym.file));
         if sym.line.is_none() {
+            let lines = cache
+                .entry(sym.file.clone())
+                .or_insert_with(|| DeclarationLines::load(dir, &sym.file));
             sym.line = lines.line_of(&sym.name);
         }
     }
@@ -730,8 +736,8 @@ struct DeadCodeCandidates {
     all_syms: Vec<(String, String, String, crate::language::LangId)>,
     swift_signatures: Vec<Option<String>>,
     swift_lines: Vec<Option<usize>>,
-    /// `all_syms` と同じ順の、Python の候補の定義の開始位置 (ほかの言語は `None`)。
-    python_starts: Vec<Option<(usize, usize)>>,
+    /// `all_syms` と同じ順の、Python の候補と Rust の関数の定義の開始位置。
+    declaration_starts: Vec<Option<(usize, usize)>>,
     /// Python の候補のファイル (`dir` 相対) → 候補の抽出で作ったファイル単位の facts。
     /// モジュールをまたぐテストの判定に渡す (構文解析をやり直さない)。
     python_facts: std::collections::HashMap<String, crate::engine::symbols::PythonModuleFacts>,
@@ -789,7 +795,7 @@ fn collect_dead_code_candidates(
     let mut generated_skipped: Vec<String> = Vec::new();
     let mut generated_undetermined = Vec::new();
     let mut swift_signatures = Vec::new();
-    let mut python_starts = Vec::new();
+    let mut declaration_starts = Vec::new();
     let mut python_facts = std::collections::HashMap::new();
     let mut exports = std::collections::HashMap::new();
     for (file, undetermined) in scanned {
@@ -813,7 +819,11 @@ fn collect_dead_code_candidates(
                 for (index, (name, kind, signature)) in symbols.into_iter().enumerate() {
                     swift_signatures
                         .push((lang == crate::language::LangId::Swift).then_some(signature));
-                    python_starts.push(starts.get(index).copied().filter(|_| python_file));
+                    declaration_starts.push(
+                        starts.get(index).copied().filter(|_| {
+                            python_file || (lang == LangId::Rust && kind == "function")
+                        }),
+                    );
                     all_syms.push((name, kind, rel.clone(), lang));
                 }
                 for (sym, extras) in cpp_liveness {
@@ -831,7 +841,7 @@ fn collect_dead_code_candidates(
         all_syms,
         swift_signatures,
         swift_lines: Vec::new(),
-        python_starts,
+        declaration_starts,
         python_facts,
         liveness_raw,
         generated_skipped,
@@ -1241,7 +1251,7 @@ fn classify_dead_symbols(
                     name,
                     kind,
                     candidates
-                        .python_starts
+                        .declaration_starts
                         .get(candidate_index)
                         .copied()
                         .flatten(),
@@ -1253,13 +1263,16 @@ fn classify_dead_symbols(
             name: name.clone(),
             kind: kind.clone(),
             file: file.clone(),
-            // 宣言行は attach_declaration_lines で後付けする
-            // (per-file の parse を 1 回に集約するため)。
-            line: candidates
-                .swift_lines
-                .get(candidate_index)
-                .copied()
-                .flatten(),
+            // Rust の無効な同名関数を除いた後は、名前で引き直すと別の宣言の行を拾う。
+            line: if *lang == LangId::Rust {
+                candidates.declaration_starts[candidate_index].map(|(line, _)| line)
+            } else {
+                candidates
+                    .swift_lines
+                    .get(candidate_index)
+                    .copied()
+                    .flatten()
+            },
         };
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップする。
         // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
@@ -1436,6 +1449,15 @@ pub(crate) fn filter_dead_by_touched_symbols(
                 .or_insert_with(|| {
                     crate::engine::diff::extract_changed_new_lines(diff_input, &ds.file)
                 });
+            if ds.kind == "function"
+                && matches!(
+                    LangId::from_path(camino::Utf8Path::new(&ds.file)),
+                    Ok(LangId::Rust)
+                )
+                && let Some(line) = ds.line
+            {
+                return changed_lines.contains(&line);
+            }
             let lines = sym_lines_cache
                 .entry(ds.file.clone())
                 .or_insert_with(|| DeclarationLines::load(dir, &ds.file));
