@@ -121,7 +121,7 @@ Python で `from producer import total as calculate` と書くと、`producer.to
 
 宣言を複数行に折り返している場合、`signature_changes` の署名は本体を除いたヘッダ全体を正規化した文字列になる (新旧の宣言を 1 つずつ確認でき、契約も違うときに限る)。行の差分だけでは宣言の名前がある行しか取れず、`def f(` のように途中で切れるため。1 行の宣言は従来どおり差分の行をそのまま載せる。
 
-Rust の `extern` ブロックにある関数宣言は `symbols` に出る。公開宣言を `pub fn translate(x: u8);` から `pub fn translate();` に変えると、`review` は変更前後の署名を、`impact` は別クレートの `api::translate(1)` などの呼び出し元を報告する。 関数の ABI は所属するブロックが決める。`extern "C"` を `extern "C-unwind"` に変更すると、宣言行を編集していなくてもそのブロックの各関数の契約が変わり、従来の `unsafe extern "C" fn(u8)` 型のポインタには代入できなくなる。ABI の省略と `"C"` の明記は同じ扱いになる。外部の `static` には呼び出し規約がない。
+Rust の `extern` ブロックにある関数宣言は `symbols` に出る。公開宣言を `pub fn translate(x: u8);` から `pub fn translate();` に変えると、`review` は変更前後の署名を、`impact` は別クレートの `api::translate(1)` などの呼び出し元を報告する。 関数の ABI は所属するブロックが決める。`extern "C"` を `extern "C-unwind"` に変更すると、宣言行を編集していなくてもそのブロックの各関数の契約が変わり、従来の `unsafe extern "C" fn(u8)` 型のポインタには代入できなくなる。ABI の省略と `"C"` の明記は同じ扱いになる。外部の `static` には呼び出し規約がない。 `unsafe extern` ブロックでは、`pub safe fn value(x: i32);` のように `safe` または `unsafe` を明記した関数と `static` も `ast`・`symbols` で解析できる。
 
 Rust の署名の帰属は、AST の関数宣言の名前で確認する。`apply(text: &str)` の引数名 `text` を、別の `text` メソッドの署名として扱わない。削除と追加が混ざる hunk でも、ファイル直下の inherent impl に直接属する一意な callable の全行が追加され、旧 AST に同名の callable・関連項目・import が無いと確認できれば、新規メソッドを `added` にする。同名の旧項目、trait / nested impl、生成可能な macro / attribute、Unicode 名の同一性が不明な場合、解析・旧ソース復元の失敗、他ファイルでの削除の可能性があれば保守的な分類を維持する。本体だけの変更・互換性・private メソッドの既存の証明条件は変えない。
 

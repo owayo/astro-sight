@@ -32,6 +32,14 @@ For example, Rust accepts `unsafe extern r#"C"# { pub fn run(); }`. Its
 declaration list stays inside the foreign block, so the analyzer can compare
 the ABI for each function in that block.
 
+Inside an `unsafe extern` block, the grammar accepts `safe fn`, `safe static`
+and `unsafe static` declarations. They retain the existing
+`function_signature_item` and `static_item` nodes and their fields.
+`safe` remains an identifier in types and patterns. At the start of an
+external declaration, a macro can also use that name directly (`safe!()`) or
+as the first segment of its path (`safe::items!()`).
+See [External blocks in the Rust Reference](https://doc.rust-lang.org/reference/items/external-blocks.html).
+
 Parser regressions exercise ordinary strings, character literals, C strings,
 repeated and trailing underscores, case and zero-padded six-digit scalar values,
 raw strings, escaped backslashes and malformed braced escapes. They also check
@@ -58,6 +66,8 @@ language metadata's patch version from 1 to 2, matching `tree-sitter.json`'s
 The Unicode change updates two escape regular expressions and their lexer
 states. The ABI change updates `grammar.json`, the permitted children of
 `extern_modifier` in `node-types.json`, and the generated parse tables.
+The safety-qualifier change adds productions for declarations inside an
+`unsafe extern` block and regenerates the grammar metadata and parse tables.
 
 Before removing this patch in favor of an upstream release, run the Rust parser
 and CLI regressions and the upstream corpus.
