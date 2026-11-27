@@ -551,6 +551,102 @@ fn rebound() {
 }
 
 #[test]
+fn private_inherent_staged_call_uses_the_index_module_binding() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/producer");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='library'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/lib.rs", "mod producer; mod consumer;\n");
+    repo.write(
+        "src/consumer.rs",
+        "pub struct Names; impl Names { pub fn collect() -> Self { Self } }\n",
+    );
+    let old = "struct Names;\nimpl Names {\n    fn collect() -> Self { Self }\n}\nmod child;\n";
+    let caller =
+        "use super::Names;\npub(super) fn use_names() { let _name: Names = Names::collect(); }\n";
+    let file = "src/producer/child.rs";
+    repo.write("src/producer.rs", old);
+    repo.write(file, caller);
+    repo.init_git();
+    repo.git(["config", "core.autocrlf", "false"]);
+    repo.commit_all("base");
+    repo.write(
+        "src/producer.rs",
+        old.replace("collect()", "collect(_: u8)"),
+    );
+    repo.stage_all();
+
+    let check = |expected: bool| {
+        let context = repo.run_json("context", &["--git", "--staged"]);
+        let changed = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == "src/producer.rs")
+            .unwrap();
+        let contains = |bucket: &str| {
+            changed[bucket].as_array().into_iter().flatten().any(|c| {
+                c["path"] == file
+                    && c["line"] == 1
+                    && c["symbols"] == serde_json::json!(["collect"])
+            })
+        };
+        assert_eq!(contains("impacted_callers"), expected, "{changed}");
+        assert_ne!(contains("low_confidence_callers"), expected, "{changed}");
+        let result = cargo_bin()
+            .current_dir(repo.root())
+            .args(["impact", "--dir", ".", "--git", "--staged"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(i32::from(expected)),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    check(true);
+    // 親の接続を作業ツリーだけで外しても、index 上の親子関係を使う。
+    repo.write("src/producer.rs", old.replace("mod child;", ""));
+    repo.write(file, caller.replace('\n', "\r\n"));
+    check(true);
+    // 同じ呼び出し文字列でも、作業ツリーで import だけが変われば index の型とは断定できない。
+    repo.write(
+        file,
+        caller.replace("super::Names", "crate::consumer::Names"),
+    );
+    check(false);
+
+    // index 側で元から存在する gitlink を snapshot が省いても、通常の配置とはみなさない。
+    repo.write(file, caller);
+    repo.git(["restore", "--staged", "src/producer.rs"]);
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.root())
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let oid = String::from_utf8(head.stdout).unwrap();
+    repo.git([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000",
+        oid.trim(),
+        "extra",
+    ]);
+    repo.git(["commit", "-m", "record omitted submodule"]);
+    repo.write(
+        "src/producer.rs",
+        old.replace("collect()", "collect(_: u8)"),
+    );
+    repo.git(["add", "src/producer.rs"]);
+    check(false);
+}
+
+#[test]
 fn private_inherent_call_keeps_a_conditional_method_uncertain() {
     for implementation in [
         "impl S {\n    #[cfg(any())]\n    fn translate(_: u8) {}\n}",

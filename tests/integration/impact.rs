@@ -1577,8 +1577,9 @@ fn impact_rust_private_impl_method_reaches_descendants_only() {
     let child_lines: Vec<_> = callers
         .iter()
         .filter(|caller| caller["path"] == "src/foo/child.rs")
+        .map(|caller| caller["line"].as_u64().unwrap())
         .collect();
-    assert_eq!(child_lines.len(), 2, "{context}");
+    assert_eq!(child_lines, [3, 4], "{context}");
     assert!(
         change["low_confidence_callers"]
             .as_array()
@@ -1617,20 +1618,36 @@ fn impact_rust_private_impl_method_reaches_descendants_only() {
     repo.stage_all();
     let staged = repo.run_json("context", &["--git", "--staged"]);
     let staged_change = &staged["changes"][0];
-    assert!(
-        staged_change["impacted_callers"]
+    let sites = |bucket: &str| {
+        staged_change[bucket]
             .as_array()
-            .is_none_or(Vec::is_empty),
+            .into_iter()
+            .flatten()
+            .map(|caller| {
+                assert_eq!(caller["symbols"], serde_json::json!(["helper"]), "{staged}");
+                (
+                    caller["path"].as_str().unwrap(),
+                    caller["line"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // index で所有元が確定する super::Foo::helper だけを昇格する。
+    assert_eq!(
+        sites("impacted_callers"),
+        [("src/foo/child.rs", 4)],
         "{staged}"
     );
-    assert!(
-        staged_change["low_confidence_callers"]
-            .as_array()
-            .is_some_and(|callers| callers
-                .iter()
-                .any(|caller| caller["path"] == "src/foo/child.rs")),
+    assert_eq!(
+        sites("low_confidence_callers"),
+        [
+            ("src/bar.rs", 4),
+            ("src/foo/child.rs", 3),
+            ("src/foo/child/grand.rs", 0)
+        ],
         "{staged}"
     );
+    assert!(sites("informational_callers").is_empty(), "{staged}");
 }
 
 #[test]

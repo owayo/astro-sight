@@ -205,6 +205,7 @@ pub(super) struct RustPathOwnerProjectProof {
     /// staged のときも、Cargo の外部設定は元の checkout の祖先にある。
     pub(super) layout_checkout: PathBuf,
     pub(super) staged_binding_diff: Option<Box<str>>,
+    staged_private_call_wiring: OnceLock<bool>,
     callable_cargo_known: bool,
     registry_macros: Mutex<HashMap<String, bool>>,
     lockfile_unchanged: bool,
@@ -295,6 +296,7 @@ impl RustPathOwnerProjectProof {
             std_project: super::rust_std_origin::RustStdProjectProof::new(root),
             layout_checkout: root.to_owned(),
             staged_binding_diff: None,
+            staged_private_call_wiring: OnceLock::new(),
             callable_cargo_known: reexport_cargo_enabled,
             registry_macros: Mutex::default(),
             lockfile_unchanged: !diff_files.iter().any(|file| {
@@ -1626,8 +1628,25 @@ impl RustPathOwnerProjectProof {
         proof.classify(&source.modules, &reference.modules)
     }
 
+    /// 参照を昇格する前に変更前後の mod / use / 属性を同じソースの写しで比べる。
+    pub(super) fn private_call_project(&self) -> Option<&Self> {
+        let Some(input) = self.staged_binding_diff.as_deref() else {
+            return self.private_scope_wiring_unchanged.then_some(self);
+        };
+        let view = self.staged_bindings()?;
+        let verified = self.staged_private_call_wiring.get_or_init(|| {
+            let files = crate::engine::diff::parse_unified_diff(input);
+            super::rust_cargo_inputs_unchanged(
+                &crate::engine::diff::scan_blocks(input),
+                &files,
+                false,
+            ) && private_scope_wiring_unchanged(&view.root, &files, input)
+        });
+        verified.then_some(view)
+    }
+
     pub(super) fn private_call_module(&self, file: &Path) -> Option<VisibilityModule> {
-        if !self.private_scope_wiring_unchanged || !self.unrelocated(file) || !self.macro_free() {
+        if !self.unrelocated(file) || !self.macro_free() {
             return None;
         }
         self.visibility_module(file)
