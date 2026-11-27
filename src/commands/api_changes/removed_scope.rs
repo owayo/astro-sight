@@ -35,7 +35,7 @@ fn nodes(root: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
-/// Python は一意な通常のモジュール直下 def と、確定した読み取り位置だけを証明する。
+/// Python はモジュール直下の関数宣言・リテラル代入から確定できた出現だけを証明する。
 /// 未知の束縛、動的名前解決、構文エラーがあればファイル単位で証明を諦める。
 pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: &str) -> Positions {
     if root.has_error() {
@@ -45,24 +45,20 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
     if !python_names_are_static(&all, source, name) {
         return Positions::new();
     }
-    let definitions: Vec<_> = all
-        .iter()
-        .copied()
+    let mut cursor = root.walk();
+    let mut definitions = root
+        .named_children(&mut cursor)
         .filter(|n| {
-            n.kind() == "function_definition"
-                && n.parent().is_some_and(|p| p.id() == root.id())
-                && n.child(0).is_none_or(|c| c.kind() != "async")
-                && n.child_by_field_name("name")
-                    .and_then(|c| c.utf8_text(source).ok())
-                    == Some(name)
+            n.kind() == "function_definition" && n.child(0).is_none_or(|c| c.kind() != "async")
         })
-        .collect();
-    if definitions.len() != 1 {
+        .filter_map(|n| n.child_by_field_name("name"))
+        .filter(|n| n.utf8_text(source).ok() == Some(name));
+    let Some(def) = definitions.next() else {
+        return python_module_value_positions(root, &all, source, name);
+    };
+    if definitions.next().is_some() {
         return Positions::new();
     }
-    let Some(def) = definitions[0].child_by_field_name("name") else {
-        return Positions::new();
-    };
     let mut out = Positions::new();
     for node in all
         .into_iter()
@@ -88,6 +84,92 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
         out.insert(position(node));
     }
     out
+}
+
+/// 直下の代入から、外部のコードが動き得る最初の文までが証明範囲。
+/// 後で実行される関数の本体や、同じ文の先行オペランドによる書き換えを読み飛ばさない。
+fn python_module_value_positions(
+    root: Node<'_>,
+    all: &[Node<'_>],
+    source: &[u8],
+    name: &str,
+) -> Positions {
+    let mut cursor = root.walk();
+    let mut statements = root.named_children(&mut cursor);
+    let mut first_statement = true;
+    let Some((target, start)) = statements.find_map(|stmt| {
+        let first = first_statement;
+        first_statement &= stmt.is_extra();
+        let assignment = (stmt.kind() == "expression_statement")
+            .then(|| stmt.named_child(0))
+            .flatten()
+            .filter(|n| n.kind() == "assignment")?;
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() != "identifier" || left.utf8_text(source).ok() != Some(name) {
+            return None;
+        }
+        // Python 3.12 は値を束縛した後で注釈を評価する。先行する処理による
+        // __annotations__ の差し替えも、リテラルを束縛したという証明に持ち込まない。
+        if let Some(annotation) = assignment.child_by_field_name("type")
+            && (!first
+                || annotation
+                    .named_child(0)
+                    .is_none_or(|n| n.kind() != "identifier"))
+        {
+            return None;
+        }
+        python_scalar_expression(assignment.child_by_field_name("right")?, source, None)
+            .then_some((left, assignment.end_byte()))
+    }) else {
+        return Positions::new();
+    };
+    if python_mentions_reflective_name(all, source) || python_strings_mention(all, source, name) {
+        return Positions::new();
+    }
+    let end = statements
+        .find(|stmt| !python_scalar_expression(*stmt, source, Some(name)))
+        .map_or(root.end_byte(), |stmt| stmt.start_byte());
+    all.iter()
+        .copied()
+        .filter(|node| {
+            node.id() == target.id()
+                || ((start..end).contains(&node.start_byte())
+                    && node.kind() == "identifier"
+                    && node.utf8_text(source).ok() == Some(name))
+        })
+        .map(position)
+        .collect()
+}
+
+fn python_scalar_expression(root: Node<'_>, source: &[u8], name: Option<&str>) -> bool {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    walk_preorder(root, Children::Named, |node, _| match node.kind() {
+        "integer" | "float" | "true" | "false" | "none" | "comment" => {
+            ControlFlow::Continue(Walk::Skip)
+        }
+        "string"
+            if !node
+                .named_children(&mut node.walk())
+                .any(|n| n.kind() == "interpolation") =>
+        {
+            ControlFlow::Continue(Walk::Skip)
+        }
+        "identifier" if name.is_some_and(|name| node.utf8_text(source).ok() == Some(name)) => {
+            ControlFlow::Continue(Walk::Skip)
+        }
+        "assert_statement"
+        | "expression_statement"
+        | "parenthesized_expression"
+        | "concatenated_string"
+        | "unary_operator"
+        | "binary_operator"
+        | "comparison_operator"
+        | "boolean_operator"
+        | "not_operator" => ControlFlow::Continue(Walk::Descend),
+        _ => ControlFlow::Break(()),
+    })
+    .is_continue()
 }
 
 /// Python の関数の中で、`global`・`nonlocal` の宣言なしに束縛した名前の出現 (関数のローカル
@@ -613,6 +695,37 @@ mod tests {
                 .unwrap();
         assert!(!tree.root_node().has_error(), "{src}");
         python_independent_positions(tree.root_node(), src.as_bytes(), "abort")
+    }
+
+    #[test]
+    fn python_module_value_reads_stop_before_external_code_or_an_uncertain_store() {
+        assert_eq!(
+            abort_positions("abort: int = -(7)\nassert abort == -7\nassert abort + 8 == 1\n"),
+            Positions::from([(0, 0), (1, 7), (2, 7)]),
+        );
+        for statement in [
+            "install()\nassert abort == 7",
+            "import install\nassert abort == 7",
+            "assert install() or abort == 7",
+            "def read(): return abort",
+            "abort = source()\nassert abort == 7",
+        ] {
+            let source = format!("abort = 7\n{statement}\n");
+            assert_eq!(
+                abort_positions(&source),
+                Positions::from([(0, 0)]),
+                "{source}"
+            );
+        }
+        for source in [
+            "if flag: abort = 7\nassert abort == 7\n",
+            "abort: install() = 7\nassert abort == 7\n",
+            "from api import *\nabort = 7\nassert abort == 7\n",
+            "abort = globals()['value']\nassert abort == 7\n",
+        ] {
+            assert!(abort_positions(source).is_empty(), "{source}");
+        }
+        assert!(!abort_positions("print(abort)\nabort = 7\n").contains(&(0, 6)));
     }
 
     /// 名前を文字列リテラルで渡す getattr は、同名の定義と呼び出しの証明を止めない。

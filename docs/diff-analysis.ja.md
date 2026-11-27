@@ -785,6 +785,8 @@ Python の関数定義を、無条件の明示的なローカル `from ... impor
 
 関数を改名した場合も同じ参照を調べる。たとえば `total` を `sum_values` に改名して直接の呼び出しを直しても、`mock.patch("tools.util.total")` は旧名を探して `AttributeError` になる。`review` は改名を `rename_candidates` に記録した場合も、残った参照が指す旧名を `api.rm` に出す。
 
+別のモジュールで `total = 7` と代入してから `assert total == 7` と書いた場合、その `total` は当該モジュールの整数を指す。`api.total` の呼び出し側が改名に追随していれば、この整数の読み取りだけで `api.rm` にはならない。旧名を取り込む `from api import total` が残れば、削除は引き続き `api.rm` に入る。
+
 ### Python の受け手が未解決なメンバー削除
 
 `api_changes.removed_unresolved`（hook では `api.rm_unresolved`）は、削除が確定していても、残った属性参照の受け手を特定できず、使用位置の型要求だけが分かる候補を報告する。`confidence: "low"` の情報提供として扱い、hook を止めない。削除メンバーへの参照の有無は未確定で、`removed_dead` の証明条件は変えない。シェルの解析エラーで削除自体を確定できない `uncertain_removals` / `rm_unverified` も別区分のまま維持する。
