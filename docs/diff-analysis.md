@@ -964,6 +964,8 @@ Output:
 
 `line` is the line of the declaration (0-based). Symbols referenced only from tests are not included in `dead_symbols`; they are listed separately in `test_only_symbols`.
 
+In JavaScript and TypeScript, `api["f"]()` after `import * as api from "./lib.js"` counts as a reference to the exported function `f` in the resolved module. The same function is referenced by `api["\u0066"]()` and by the quoted import `import { "f" as call } from "./lib.js"`.
+
 For JavaScript, TypeScript, and TSX, named default-exported functions and classes also receive references from module dependencies. This covers static default imports, namespace imports, default and namespace re-exports, `require()`, and dynamic `import()` with a string or a template literal without substitutions. Type-only forms such as `import type` and `typeof import()` also count as dependencies. A namespace can be passed to a loader such as `React.lazy`, so these dependencies conservatively keep the default declaration alive even without a local `.default` access. Other named exports and class members keep their existing reference rules; side-effect-only static imports and `export *` do not consume the default export. Dependencies found only in test files produce `test_only_symbols`.
 
 This module lookup supports relative paths, extensionless and `index` paths, and source extension substitution such as `./panel.js` referring to `panel.tsx`. It checks candidate paths within the workspace and retains all plausible matches. It does not resolve package names, configured path aliases, escaped specifiers, or bundler query strings. Identifier occurrences returned by `refs` are unchanged.

@@ -13,7 +13,7 @@ use crate::models::review::DeadSymbol;
 #[cfg(test)]
 use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{ExportedSymbols, bare_name, filter_dead_code_candidates};
-use super::dead_code_default_liveness::DefaultExportLiveness;
+use super::dead_code_default_liveness::{ExportLiveness, ExportNames};
 use super::dead_code_member_liveness::{
     JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RubyConstructorLiveness,
     RustMemberLiveness,
@@ -230,8 +230,12 @@ fn detect_dead_symbols_with_budget(
     }
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
-    let default_liveness =
-        DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
+    let export_liveness = ExportLiveness::build(
+        &candidates.exports,
+        &canonical_dir,
+        &scan.files,
+        parse_budget,
+    );
     let rust_member_liveness =
         RustMemberLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files, is_test);
 
@@ -240,7 +244,7 @@ fn detect_dead_symbols_with_budget(
         &index,
         &ref_counts.counts,
         &asset_refs,
-        &default_liveness,
+        &export_liveness,
         &rust_member_liveness,
         &unobserved,
         &python_tests,
@@ -272,7 +276,7 @@ fn detect_dead_symbols_with_budget(
     let uncounted = uncounted_truncations(
         &canonical_dir,
         &ref_counts.uncounted,
-        default_liveness.unobserved_files(),
+        export_liveness.unobserved_files(),
         python_tests.unobserved_files(),
         classified.unverified.len(),
     );
@@ -288,6 +292,7 @@ fn detect_dead_symbols_with_budget(
         &mut classified.test_only,
         &mut classified.unverified,
         &evidence_diagnostics,
+        &export_liveness,
     );
     let external_entry = host_entries
         .map(|entries| {
@@ -548,8 +553,8 @@ fn uncounted_truncations(
     {
         entries.entry(rel.clone()).or_insert_with(|| {
             format!(
-                "default imports in this file were not counted ({cause}); \
-                 default-export candidates are not reported as dead"
+                "JS/TS module imports in this file were not counted ({cause}); \
+                 potentially referenced exports are not reported as dead"
             )
         });
     }
@@ -719,6 +724,7 @@ fn extract_file_symbols(dir: &str, file_path: &str) -> Option<Vec<crate::models:
 
 /// 候補収集の中間状態。dead-code 候補シンボルと C/C++ liveness 補助情報を保持する。
 struct DeadCodeCandidates {
+    exports: std::collections::HashMap<String, ExportNames>,
     /// 全ファイルのエクスポートシンボル (original_name, kind, file, lang_id)。
     /// case-insensitive 言語では lang_id でシンボル名を正規化した比較を行うため lang も保持する。
     all_syms: Vec<(String, String, String, crate::language::LangId)>,
@@ -785,6 +791,7 @@ fn collect_dead_code_candidates(
     let mut swift_signatures = Vec::new();
     let mut python_starts = Vec::new();
     let mut python_facts = std::collections::HashMap::new();
+    let mut exports = std::collections::HashMap::new();
     for (file, undetermined) in scanned {
         generated_undetermined.extend(undetermined);
         match file {
@@ -797,7 +804,11 @@ fn collect_dead_code_candidates(
                     starts,
                     cpp_liveness,
                     python,
+                    module_exports,
                 } = candidates;
+                if !module_exports.is_empty() {
+                    exports.insert(rel.clone(), module_exports);
+                }
                 let python_file = lang == crate::language::LangId::Python;
                 for (index, (name, kind, signature)) in symbols.into_iter().enumerate() {
                     swift_signatures
@@ -816,6 +827,7 @@ fn collect_dead_code_candidates(
     }
 
     DeadCodeCandidates {
+        exports,
         all_syms,
         swift_signatures,
         swift_lines: Vec::new(),
@@ -886,6 +898,7 @@ fn scan_candidate_file(
 
 /// 1 ファイルぶんの dead-code 候補。
 struct FileCandidates {
+    module_exports: ExportNames,
     lang: crate::language::LangId,
     /// エクスポートシンボル (name, kind, signature)。trait impl メソッドと
     /// フレームワークの実行時入口は除外済み。
@@ -922,6 +935,7 @@ fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates>
     // export 相当のシンボルを抽出する。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected() {
         return Some(FileCandidates {
+            module_exports: ExportNames::default(),
             lang,
             symbols: crate::engine::lexer::extract_exported_symbols(&source, lexer_lang, true),
             starts: Vec::new(),
@@ -945,6 +959,7 @@ fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates>
         Vec::new()
     };
     Some(FileCandidates {
+        module_exports: ExportNames::collect(root, &source, file_path, lang, &symbols),
         lang,
         symbols,
         starts,
@@ -1195,7 +1210,7 @@ fn classify_dead_symbols(
     index: &DeadCodeNameIndex,
     counts: &std::collections::HashMap<String, (usize, usize)>,
     asset_refs: &FrameworkAssetRefs,
-    default_liveness: &DefaultExportLiveness,
+    export_liveness: &ExportLiveness,
     rust_member_liveness: &RustMemberLiveness,
     unobserved: &UnobservedReferences,
     python_tests: &PythonTestLiveness,
@@ -1218,8 +1233,7 @@ fn classify_dead_symbols(
                 keys.extend(extra.iter().map(String::as_str));
             }
             let (prod, test) = unobserved.may_be_referenced(&keys);
-            let (default_prod, default_test) =
-                default_liveness.may_have_unobserved_uses(file, name);
+            let (default_prod, default_test) = export_liveness.may_have_unobserved_uses(file, name);
             // テストランナーが集めるかどうか分からない Python の候補は、テストから使われうる。
             let python_test = *lang == crate::language::LangId::Python
                 && python_tests.is_uncertain(
@@ -1284,7 +1298,7 @@ fn classify_dead_symbols(
         }
 
         let (prod_cnt, test_cnt) = ref_counts_with_liveness(&key, file, index, counts);
-        let (default_prod, default_test) = default_liveness.counts_for(file, name);
+        let (default_prod, default_test) = export_liveness.counts_for(file, name);
         let (constructor_prod, constructor_test) = if *lang == crate::language::LangId::Ruby {
             index.ruby_constructor_liveness.counts_for(file, name)
         } else {

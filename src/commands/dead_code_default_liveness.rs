@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
+use crate::engine::parse_budget::{ParseBudget, map_with_budget};
+use crate::models::reference_evidence::ReferenceObservations;
+
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, QueryCursor};
 
@@ -9,14 +11,61 @@ use crate::engine::{parser, query_cache};
 use crate::git_support::normalize_workspace_separators;
 use crate::language::LangId;
 
-/// default は宣言名ではなくモジュールの依存辺から利用される。refs の出現は変更しない。
+mod string_names;
+
+/// JS/TS のモジュールを特定できる、識別子以外の参照。
 #[derive(Default)]
-pub(super) struct DefaultExportLiveness {
-    counts: HashMap<String, HashMap<String, (usize, usize)>>,
-    /// 読み込み・構文解析に失敗し、default の import を数えられなかった JS/TS のファイル。
-    /// default の import は宣言名と別の名前で書けるので、名前の出現では絞れない。
-    /// 1 件でもあれば、対象の default export を dead / test_only と断定しない。
-    unobserved: UnobservedFiles,
+pub(super) struct ExportLiveness<'a> {
+    targets: Option<&'a HashMap<String, ExportNames>>,
+    imports: FileUses,
+}
+
+type NamedUses = HashMap<String, HashMap<String, ReferenceObservations>>;
+
+#[derive(Default)]
+pub(super) struct ExportNames {
+    defaults: Vec<String>,
+    named: HashSet<String>,
+}
+
+impl ExportNames {
+    pub(super) fn is_empty(&self) -> bool {
+        self.defaults.is_empty() && self.named.is_empty()
+    }
+
+    pub(super) fn collect(
+        root: Node<'_>,
+        source: &[u8],
+        file: &str,
+        lang: LangId,
+        symbols: &super::api_changes::ExportedSymbols,
+    ) -> Self {
+        let mut result = Self::default();
+        if !is_js_ts(lang)
+            || file.ends_with(".d.ts")
+            || file.ends_with(".d.mts")
+            || file.ends_with(".d.cts")
+        {
+            return result;
+        }
+        let candidates: HashSet<_> = symbols
+            .iter()
+            .filter(|(_, kind, _)| matches!(kind.as_str(), "function" | "class"))
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        if !candidates.is_empty() {
+            visit_export_declarations(root, source, |name, default| {
+                if candidates.contains(name) {
+                    if default {
+                        result.defaults.push(name.to_owned());
+                    } else {
+                        result.named.insert(name.to_owned());
+                    }
+                }
+            });
+        }
+        result
+    }
 }
 
 /// 中身を数えられなかったファイル (`dir` 相対のパスと失敗の内容)。
@@ -24,129 +73,133 @@ pub(super) struct DefaultExportLiveness {
 pub(super) struct UnobservedFiles {
     pub(super) prod: Vec<(String, String)>,
     pub(super) test: Vec<(String, String)>,
+    escaped_prod: bool,
+    escaped_test: bool,
 }
 
-impl UnobservedFiles {
-    fn merge(&mut self, other: Self) {
-        self.prod.extend(other.prod);
-        self.test.extend(other.test);
-    }
-}
-
-/// worker ごとの集計。
 #[derive(Default)]
 struct FileUses {
-    counts: HashMap<String, (usize, usize)>,
+    defaults: HashMap<String, (usize, usize)>,
+    named: NamedUses,
     unobserved: UnobservedFiles,
 }
 
-impl DefaultExportLiveness {
+impl<'a> ExportLiveness<'a> {
     pub(super) fn build(
-        candidates: &[(String, String, String, LangId)],
+        targets: &'a HashMap<String, ExportNames>,
         root: &Path,
         scan_files: &[PathBuf],
+        budget: ParseBudget,
     ) -> Self {
-        let mut candidate_names: HashMap<&str, HashSet<&str>> = HashMap::new();
-        for (name, kind, file, lang) in candidates {
-            if is_js_ts(*lang) && matches!(kind.as_str(), "function" | "class") {
-                candidate_names.entry(file).or_default().insert(name);
-            }
-        }
-        let targets: HashMap<_, _> = candidate_names
-            .into_par_iter()
-            .filter_map(|(file, names)| {
-                if file.ends_with(".d.ts") || file.ends_with(".d.mts") || file.ends_with(".d.cts") {
-                    return None;
-                }
-                let path = root.join(file);
-                let path = camino::Utf8Path::from_path(&path)?;
-                let source = parser::read_file(path).ok()?;
-                if memchr::memmem::find(&source, b"default").is_none()
-                    || memchr::memmem::find(&source, b"export").is_none()
-                {
-                    return None;
-                }
-                let (tree, lang) = parser::parse_file(path, &source).ok()?;
-                if !is_js_ts(lang) {
-                    return None;
-                }
-                let defaults: Vec<_> = default_declaration_names(tree.root_node(), &source)
-                    .into_iter()
-                    .filter(|name| names.contains(name.as_str()))
-                    .collect();
-                (!defaults.is_empty()).then(|| (file.to_string(), defaults))
-            })
-            .collect();
         if targets.is_empty() {
             return Self::default();
         }
-        let prefilter = specifier_prefilter(&targets);
-
-        // ファイル毎に一度だけ解析し、worker 内で集計する。参照全件の中間 Vec は作らない。
-        let imports = scan_files
-            .par_iter()
-            .fold(FileUses::default, |mut uses, path| {
-                collect_file_uses(root, path, &targets, prefilter.as_ref(), &mut uses);
-                uses
-            })
-            .reduce(FileUses::default, |mut uses, other| {
-                for (file, (prod, tests)) in other.counts {
-                    let entry = uses.counts.entry(file).or_insert((0usize, 0usize));
-                    entry.0 = entry.0.saturating_add(prod);
-                    entry.1 = entry.1.saturating_add(tests);
+        let prefilter = specifier_prefilter(targets);
+        let has_defaults = targets.values().any(|target| !target.defaults.is_empty());
+        let collected = std::sync::Mutex::new(FileUses::default());
+        let collect = |path: &PathBuf| {
+            let mut file = FileUses::default();
+            collect_file_uses(
+                root,
+                path,
+                targets,
+                prefilter.as_ref(),
+                has_defaults,
+                &mut file,
+            );
+            if file.defaults.is_empty()
+                && file.named.is_empty()
+                && file.unobserved.prod.is_empty()
+                && file.unobserved.test.is_empty()
+            {
+                return;
+            }
+            let mut all = collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (file, (prod, test)) in file.defaults {
+                let entry = all.defaults.entry(file).or_default();
+                entry.0 += prod;
+                entry.1 += test;
+            }
+            for (path, names) in file.named {
+                let target = all.named.entry(path).or_default();
+                for (name, refs) in names {
+                    super::reference_evidence::merge_observations(
+                        target.entry(name).or_default(),
+                        &refs,
+                    );
                 }
-                uses.unobserved.merge(other.unobserved);
-                uses
+            }
+            all.unobserved.escaped_prod |= file.unobserved.escaped_prod;
+            all.unobserved.escaped_test |= file.unobserved.escaped_test;
+            all.unobserved.prod.extend(file.unobserved.prod);
+            all.unobserved.test.extend(file.unobserved.test);
+        };
+        let size = |path: &PathBuf| std::fs::metadata(path).map_or(0, |m| m.len());
+        let complete = crate::engine::refs::build_bounded_pool()
+            .ok()
+            .is_some_and(|pool| {
+                pool.install(|| map_with_budget(scan_files, budget, size, collect))
+                    .is_ok()
             });
-        let mut counts = HashMap::new();
-        for (file, uses) in imports.counts {
-            let mut names = HashMap::new();
-            for name in &targets[&file] {
-                names.insert(name.clone(), uses);
-            }
-            counts.insert(file, names);
+        if !complete {
+            *collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = FileUses::default();
+            scan_files.iter().for_each(collect);
         }
-        // 未観測の default export も「対象である」ことは表に残す (件数 0)。
-        for (file, names) in &targets {
-            let entry = counts.entry(file.clone()).or_default();
-            for name in names {
-                entry.entry(name.clone()).or_insert((0, 0));
-            }
+        let mut imports = collected
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        imports.unobserved.prod.sort();
+        imports.unobserved.test.sort();
+        Self {
+            targets: Some(targets),
+            imports,
         }
-        let mut unobserved = imports.unobserved;
-        // rayon の集約順に依らず決定論的にする。
-        unobserved.prod.sort();
-        unobserved.test.sort();
-        Self { counts, unobserved }
+    }
+
+    pub(super) fn named_observations(
+        &self,
+        file: &str,
+        name: &str,
+    ) -> Option<&ReferenceObservations> {
+        self.imports.named.get(file)?.get(name)
     }
 
     pub(super) fn counts_for(&self, file: &str, name: &str) -> (usize, usize) {
-        self.counts
-            .get(file)
-            .and_then(|names| names.get(name))
-            .copied()
-            .unwrap_or_default()
+        if let Some(refs) = self.named_observations(file, name) {
+            return (refs.production_total, refs.test_total);
+        }
+        if self
+            .targets
+            .and_then(|t| t.get(file))
+            .is_some_and(|t| t.defaults.iter().any(|n| n == name))
+        {
+            return self.imports.defaults.get(file).copied().unwrap_or_default();
+        }
+        (0, 0)
     }
 
-    /// `file` の `name` が default export の対象で、数えられなかったファイルからの
-    /// default import がありうるか。(production から, test から) の組で返す。
     pub(super) fn may_have_unobserved_uses(&self, file: &str, name: &str) -> (bool, bool) {
-        let is_target = self
-            .counts
-            .get(file)
-            .is_some_and(|names| names.contains_key(name));
-        if !is_target {
+        let Some(target) = self.targets.and_then(|t| t.get(file)) else {
             return (false, false);
+        };
+        let unobserved = &self.imports.unobserved;
+        if target.defaults.iter().any(|n| n == name) {
+            return (!unobserved.prod.is_empty(), !unobserved.test.is_empty());
         }
-        (
-            !self.unobserved.prod.is_empty(),
-            !self.unobserved.test.is_empty(),
-        )
+        // 名前の生の綴りは refs のストリーム走査で確認済み。エスケープもあり得るときは断定を控える。
+        if target.named.contains(name) {
+            return (unobserved.escaped_prod, unobserved.escaped_test);
+        }
+        (false, false)
     }
 
     /// 数えられなかった JS/TS のファイル (`dir` 相対、パス順)。
     pub(super) fn unobserved_files(&self) -> &UnobservedFiles {
-        &self.unobserved
+        &self.imports.unobserved
     }
 }
 
@@ -154,20 +207,16 @@ fn is_js_ts(lang: LangId) -> bool {
     matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
 }
 
-fn default_declaration_names(root: Node<'_>, source: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
+fn visit_export_declarations(root: Node<'_>, source: &[u8], mut visit: impl FnMut(&str, bool)) {
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
         if statement.kind() != "export_statement" {
             continue;
         }
         let mut children = statement.walk();
-        if !statement
+        let default = statement
             .children(&mut children)
-            .any(|child| !child.is_named() && child.kind() == "default")
-        {
-            continue;
-        }
+            .any(|child| !child.is_named() && child.kind() == "default");
         let Some(declaration) = statement.child_by_field_name("declaration") else {
             continue;
         };
@@ -180,17 +229,17 @@ fn default_declaration_names(root: Node<'_>, source: &[u8]) -> Vec<String> {
         ) && let Some(name) = declaration.child_by_field_name("name")
             && let Ok(name) = name.utf8_text(source)
         {
-            names.push(name.to_string());
+            visit(name, default);
         }
     }
-    names
 }
 
 fn collect_file_uses(
     root: &Path,
     path: &Path,
-    targets: &HashMap<String, Vec<String>>,
+    targets: &HashMap<String, ExportNames>,
     prefilter: Option<&aho_corasick::AhoCorasick>,
+    has_defaults: bool,
     uses: &mut FileUses,
 ) {
     let Some(lang) = crate::engine::refs::detect_source_lang(path) else {
@@ -210,7 +259,12 @@ fn collect_file_uses(
     // 全参照をテスト扱いにしない)。
     let is_test = super::dead_code::is_test_path(Path::new(&relative));
     // 読めない・解析できないファイルは黙って飛ばさず記録する (default import を数えられない)。
-    let mut unobserved = |cause: String| {
+    let mut unobserved = |cause: String, escaped: bool| {
+        if is_test {
+            uses.unobserved.escaped_test |= escaped;
+        } else {
+            uses.unobserved.escaped_prod |= escaped;
+        }
         let bucket = if is_test {
             &mut uses.unobserved.test
         } else {
@@ -219,27 +273,53 @@ fn collect_file_uses(
         bucket.push((relative.clone(), cause));
     };
     let Some(path_utf8) = camino::Utf8Path::from_path(&canonical) else {
-        unobserved("the path is not valid UTF-8".to_string());
+        unobserved("the path is not valid UTF-8".to_string(), true);
         return;
     };
     let source = match parser::read_file(path_utf8) {
         Ok(source) => source,
         Err(_) => {
-            unobserved(crate::engine::refs::read_failure_cause(&canonical));
+            unobserved(
+                crate::engine::refs::read_failure_cause(&canonical),
+                crate::engine::refs::uncounted_file_may_contain_escape(path_utf8),
+            );
             return;
         }
     };
-    if prefilter.is_some_and(|prefilter| !prefilter.is_match(&source[..])) {
+    if !source.contains(&b'\\')
+        && prefilter.is_some_and(|prefilter| !prefilter.is_match(&source[..]))
+    {
+        return;
+    }
+    let may_have_named = memchr::memmem::find(&source, b"import").is_some()
+        && memchr::memmem::find(&source, b"as").is_some();
+    if !has_defaults && !may_have_named {
         return;
     }
     let tree = match parser::parse_source(&source, lang) {
         Ok(tree) => tree,
         Err(_) => {
-            unobserved(crate::engine::refs::PARSE_FAILURE_CAUSE.to_string());
+            unobserved(
+                crate::engine::refs::PARSE_FAILURE_CAUSE.to_string(),
+                source.contains(&b'\\'),
+            );
             return;
         }
     };
-    let counts = &mut uses.counts;
+    if may_have_named {
+        string_names::collect(
+            tree.root_node(),
+            &source,
+            root,
+            &relative,
+            targets,
+            &mut uses.named,
+        );
+    }
+    if !has_defaults {
+        return;
+    }
+    let counts = &mut uses.defaults;
     let queries = [
         Some(DEFAULT_USE_QUERY),
         matches!(lang, LangId::Typescript | LangId::Tsx).then_some(TS_IMPORT_REQUIRE_QUERY),
@@ -265,7 +345,9 @@ fn collect_file_uses(
             let Some(specifier) = static_specifier(source_node, &source) else {
                 continue;
             };
-            for target in resolve_relative_specifier(&relative, specifier, targets) {
+            for target in matching_relative_paths(&relative, specifier, |p| {
+                targets.get(p).is_some_and(|t| !t.defaults.is_empty())
+            }) {
                 let entry = counts.entry(target).or_default();
                 if is_test {
                     entry.1 = entry.1.saturating_add(1);
@@ -337,6 +419,14 @@ pub(super) fn resolve_relative_specifier(
     specifier: &str,
     targets: &HashMap<String, Vec<String>>,
 ) -> Vec<String> {
+    matching_relative_paths(importer, specifier, |p| targets.contains_key(p))
+}
+
+fn matching_relative_paths(
+    importer: &str,
+    specifier: &str,
+    contains: impl Fn(&str) -> bool,
+) -> Vec<String> {
     if !(specifier.starts_with("./")
         || specifier.starts_with("../")
         || matches!(specifier, "." | ".."))
@@ -359,7 +449,7 @@ pub(super) fn resolve_relative_specifier(
     let joined = parts.join("/");
     let mut resolved = Vec::new();
     let mut add = |path: String| {
-        if targets.contains_key(&path) && !resolved.contains(&path) {
+        if contains(&path) && !resolved.contains(&path) {
             resolved.push(path);
         }
     };
@@ -396,9 +486,7 @@ pub(super) fn resolve_relative_specifier(
 }
 
 /// 解決先の最後の要素は必ず specifier に現れる。index の省略と . / .. だけの経路も残す。
-fn specifier_prefilter(
-    targets: &HashMap<String, Vec<String>>,
-) -> Option<aho_corasick::AhoCorasick> {
+fn specifier_prefilter<T>(targets: &HashMap<String, T>) -> Option<aho_corasick::AhoCorasick> {
     let mut needles = HashSet::new();
     for file in targets.keys() {
         let (parent, name) = file.rsplit_once('/').unwrap_or(("", file));
@@ -467,7 +555,7 @@ mod tests {
             "module.cts",
         ]
         .into_iter()
-        .map(|file| (file.to_string(), Vec::new()))
+        .map(|file| (file.to_string(), Vec::<String>::new()))
         .collect();
         assert_eq!(
             resolve_relative_specifier("app.ts", "./panel.js", &targets),
@@ -526,7 +614,19 @@ mod tests {
             let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
             assert!(!tree.root_node().has_error(), "{source}");
             assert_eq!(
-                default_declaration_names(tree.root_node(), source.as_bytes()),
+                {
+                    let mut names = Vec::new();
+                    visit_export_declarations(
+                        tree.root_node(),
+                        source.as_bytes(),
+                        |name, default| {
+                            if default {
+                                names.push(name.to_owned());
+                            }
+                        },
+                    );
+                    names
+                },
                 expected
             );
         }
@@ -541,7 +641,7 @@ mod tests {
             ".panel.tsx",
         ]
         .into_iter()
-        .map(|file| (file.to_string(), Vec::new()))
+        .map(|file| (file.to_string(), Vec::<String>::new()))
         .collect();
         let prefilter = specifier_prefilter(&targets).unwrap();
         for specifier in [
