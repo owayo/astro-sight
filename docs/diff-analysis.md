@@ -600,6 +600,8 @@ For TS and TSX, an unannotated `const` initialized directly with an untagged tem
 
 The default hook treats these value changes as informational. `--strict-public-const-values` makes them blocking and can also report affected consumers under `impacts`. For example, changing a regular expression flag such as `g` or `y` can alter its behavior. Tagged templates, type assertions, `satisfies`, and changes between initializer kinds use the existing declaration and initializer checks. Static objects and arrays have separate rules for their scalar leaves.
 
+When an object gains a property, impact analysis also checks the values of properties that remain. Changing `endpoint: "a b"` to `endpoint: "a  b"` affects a reader of `ob.endpoint`, even if the newly added property is unused. Extra spacing around the string literal preserves its value.
+
 In TS and TSX, spaces in the fixed text of a template literal type are part of the exported type. For example, changing `` `a b${string}` `` to `` `a  b${string}` `` adds a second space. When an exported `const` changes both that type and its initializer, the hook reports `api.mod` and includes affected references in `impacts`. When only the annotation changes, the hook reports `api.type_annotation`. Use `--strict-public-type-annotations` to make that category blocking.
 
 ### JavaScript and TypeScript removals and non-relative imports

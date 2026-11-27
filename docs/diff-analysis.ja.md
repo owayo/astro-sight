@@ -604,6 +604,8 @@ TS / TSX では、型注釈のない `const` にタグなしのテンプレー�
 
 既定の hook は値変更を情報として報告する。`--strict-public-const-values` 指定時は blocking とし、影響を受ける利用側も `impacts` に出る場合がある。たとえば正規表現の `g`・`y` などのフラグの変更は、利用側での動作を変えうる。タグ付きテンプレート、型アサーション、`satisfies`、初期化子の種類が変わる場合には、宣言と初期化子に応じた判定を使う。静的な object / array の中のスカラー値は別に判定する。
 
+オブジェクトにプロパティを追加したときは、既存プロパティの値も照合する。たとえば `endpoint: "a b"` を `endpoint: "a  b"` に変えると、追加プロパティが未使用でも `ob.endpoint` を読む行に影響する。文字列リテラルの外側に空白を足しただけなら、読み取る値は変わらない。
+
 TS と TSX のテンプレートリテラル型では、固定文字列に含まれる空白の数も公開型の一部になる。たとえば `` `a b${string}` `` の空白を2個にして `` `a  b${string}` `` にし、公開 `const` の初期化子も変えた場合、hook は `api.mod` を出し、影響を受ける参照を `impacts` に載せる。型注釈だけを変えた場合は `api.type_annotation` に入り、`--strict-public-type-annotations` を指定すると blocking になる。
 
 ### JavaScript / TypeScript の削除と相対でない import

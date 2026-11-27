@@ -33,7 +33,9 @@ pub(crate) mod type_members;
 pub(crate) use dependency_changes::compatible_dependencies_unchanged;
 pub(crate) use dependency_changes::{DependencyChanges, DependencySnapshot, DependencyStatus};
 
-use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens_in_range};
+use super::signature_tokens::{
+    SigTokens, js_literal_text, node_signature_tokens, signature_tokens_in_range,
+};
 pub(super) use callable::ts_const_value_header_guard;
 use callable::with_resolved_ts_callable_pair;
 
@@ -1194,8 +1196,7 @@ pub(crate) fn ts_params_prefix_same_with_optional_tail(
 pub(crate) struct ObjectMemberKeys {
     pub(crate) member_keys: HashSet<String>,
     pub(crate) record_keys: Option<HashSet<String>>,
-    /// flat object のとき: top-level key → 値の正規化テキスト (空白を 1 個に畳んだもの)。
-    /// record のとき: (record key, member key) → nested 値の正規化テキスト。
+    /// flat object は top-level key、record は (record key, member key) ごとの値の比較用テキスト。
     ///
     /// キー集合だけでは「既存キーの値が別物に差し替わった」破壊的変更
     /// (`{a: () => {}}` → `{a: 42, b: () => {}}`) を検出できないため、
@@ -1229,24 +1230,55 @@ pub(crate) struct ObjectMemberKeys {
 /// `entry_values` のキー。flat は top-level key 単独、record は (record key, member key)。
 pub(crate) type ObjectEntryKey = (String, Option<String>);
 
-/// 値ノードのソーステキストを、空白の連なりを 1 個の空白に畳んで正規化する。
-/// 整形 (prettier 等) の差分だけで破壊的変更と誤判定しないための最小限の正規化。
-fn normalized_value_text(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let raw = node.utf8_text(source).ok()?;
-    let mut out = String::with_capacity(raw.len());
-    let mut in_ws = false;
-    for ch in raw.chars() {
-        if ch.is_whitespace() {
-            in_ws = true;
-            continue;
+/// 構文上のトークン間だけ、空白の連なりを 1 個にそろえる。JSX の子要素間とテンプレートの
+/// 固定部分の隙間は値に含まれる。関数・クラスも toString() でソースを読めるので原文で比べる。
+fn normalized_value_text(value: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+
+    let raw = value.utf8_text(source).ok()?;
+    let mut result = String::with_capacity(raw.len());
+    let mut covered = value.start_byte();
+    let mut literal_gaps = Vec::new();
+    let walked = walk_preorder(value, Children::All, |node, depth| {
+        literal_gaps.truncate(depth);
+        let Some(gap) = source
+            .get(covered..node.start_byte())
+            .and_then(|s| std::str::from_utf8(s).ok())
+        else {
+            return ControlFlow::Break(());
+        };
+        if !gap.is_empty() {
+            if literal_gaps.last() == Some(&true) || !gap.chars().all(char::is_whitespace) {
+                result.push_str(gap);
+            } else {
+                result.push(' ');
+            }
         }
-        if in_ws && !out.is_empty() {
-            out.push(' ');
+        let kind = node.kind();
+        if node.child_count() == 0
+            || js_literal_text(kind)
+            || matches!(
+                kind,
+                "arrow_function" | "function_expression" | "generator_function" | "class"
+            )
+        {
+            let Ok(text) = node.utf8_text(source) else {
+                return ControlFlow::Break(());
+            };
+            if kind == "comment" && !text.starts_with("/**") && !text.contains('@') {
+                result.push_str(&crate::engine::normalize_whitespace(text.as_bytes()));
+            } else {
+                result.push_str(text);
+            }
+            covered = node.end_byte();
+            return ControlFlow::Continue(Walk::Skip);
         }
-        in_ws = false;
-        out.push(ch);
-    }
-    Some(out)
+        covered = node.start_byte();
+        literal_gaps.push(matches!(kind, "jsx_element" | "template_string"));
+        ControlFlow::Continue(Walk::Descend)
+    });
+    (walked.is_continue() && covered == value.end_byte()).then_some(result)
 }
 
 /// TS/TSX/JS ソースから、トップレベル exported な `name` の初期化子 object literal の
@@ -1980,6 +2012,33 @@ mod tests {
         let r = keys(src, "config").expect("通常 object literal を抽出できるべき");
         let expected: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
         assert_eq!(r.member_keys, expected);
+    }
+
+    #[test]
+    fn object_member_values_keep_observable_whitespace() {
+        for (old, new, unchanged) in [
+            ("1+\u{feff}2", "1+\u{feff}2", true),
+            ("Math.abs(/* a b */ -1)", "Math.abs(/* a   b */ -1)", true),
+            ("['a b']", "['a  b']", false),
+            ("{child: 'a b'}", "{child: 'a  b'}", false),
+            ("/a b/", "/a  b/", false),
+            ("`a b`", "`a  b`", false),
+            ("`a ${x} b`", "`a  ${x} b`", false),
+            ("`a ${x} b`", "`a ${x}  b`", false),
+            ("`a${1 + 2}b`", "`a${1   + 2}b`", true),
+            ("<p>a b</p>", "<p>a  b</p>", false),
+            ("<p title='x' />", "<p  title='x' />", true),
+            ("()=>'x'", "() => 'x'", false),
+            ("() => { return 'x'; }", "() => { return\n'x'; }", false),
+        ] {
+            let values = |value| {
+                let source = format!("export const cfg = {{ endpoint: {value} }};");
+                extract_object_member_keys(source.as_bytes(), LangId::Tsx, "cfg")
+                    .unwrap()
+                    .entry_values
+            };
+            assert_eq!(values(old) == values(new), unchanged, "{old:?} -> {new:?}");
+        }
     }
 
     fn literal_values(source: &str, name: &str) -> Option<BTreeSet<TsLiteralValue>> {
