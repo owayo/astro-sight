@@ -114,6 +114,7 @@ struct StaticConstContract {
 pub(super) enum StaticConstChange {
     NotApplicable,
     Unchanged,
+    EquivalentObjectPropertyKeys,
     ValueOnly,
 }
 
@@ -171,11 +172,35 @@ pub(super) fn classify_static_const_change(
     ) else {
         return StaticConstChange::NotApplicable;
     };
-    if old.shape == new.shape && old_tokens == new_tokens {
+    let unchanged = old.shape == new.shape && old_tokens == new_tokens;
+    if has_escaped_property_key(old_value, &source.old)
+        || has_escaped_property_key(new_value, &source.new)
+    {
+        // キーの綴りの差だけを除く。値や順序も変われば、従来の互換性判定を続ける。
+        if unchanged {
+            StaticConstChange::EquivalentObjectPropertyKeys
+        } else {
+            StaticConstChange::NotApplicable
+        }
+    } else if unchanged {
         StaticConstChange::Unchanged
     } else {
         StaticConstChange::ValueOnly
     }
+}
+
+fn has_escaped_property_key(value: Node<'_>, source: &[u8]) -> bool {
+    source[value.byte_range()].contains(&b'\\')
+        && crate::engine::tree_walk::any_node(
+            value,
+            crate::engine::tree_walk::Children::Named,
+            |node| {
+                node.kind() == "pair"
+                    && node
+                        .child_by_field_name("key")
+                        .is_some_and(|key| source[key.byte_range()].contains(&b'\\'))
+            },
+        )
 }
 
 fn same_contract(old: &StaticConstContract, new: &StaticConstContract) -> bool {
@@ -504,18 +529,7 @@ fn object_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Op
 }
 
 fn property_key(node: Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "property_identifier" => {
-            let text = node.utf8_text(source).ok()?;
-            (!text.contains('\\')).then(|| text.to_string())
-        }
-        "string" => {
-            let inner = crate::engine::js_string::quoted_contents(node.utf8_text(source).ok()?)?;
-            (!inner.contains('\\')).then(|| inner.to_owned())
-        }
-        // 数値キーの Number→String 変換は推測しない。
-        _ => None,
-    }
+    super::ts_signature::decoded_member_key(node, source).map(|key| key.into_owned())
 }
 
 fn array_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Option<StaticShape> {
@@ -630,6 +644,8 @@ mod tests {
                 ),
                 ("[1, { a: -2 }, []]", "[3, { a: 4 }, []]"),
                 ("({ a: 1 })", "{ a: 2 }"),
+                ("{ a: 1 }", r"{ '\u0061': 1 }"),
+                ("{ a: 1 }", r"{ \u0061: 1 }"),
             ] {
                 let old = initializer(old, lang).unwrap();
                 assert_eq!(Some(old), initializer(new, lang), "{lang:?}: {new}");
@@ -737,8 +753,9 @@ mod tests {
                 "{ a: 1, 'a': 2 }",
                 "{ __proto__: null }",
                 "{ '__proto__': { a: 1 } }",
-                "{ '\\u0061': 1 }",
-                "{ \\u0061: 1 }",
+                r"{ a: 1, '\u0061': 2 }",
+                r"{ a: 1, \u0061: 2 }",
+                r"{ '__pr\x6fto__': null }",
                 "{ 1: 1 }",
                 "[1,,2]",
                 "[,]",

@@ -1201,6 +1201,7 @@ pub(crate) struct ObjectMemberKeys {
     /// (`{a: () => {}}` → `{a: 42, b: () => {}}`) を検出できないため、
     /// 両側に残存するキーの値同一性を照合する用途で持つ。
     pub(crate) entry_values: HashMap<ObjectEntryKey, String>,
+    methods: HashMap<ObjectEntryKey, String>,
     /// `variable_declarator` の型注釈 (`const cfg: { alpha: number } = ...`) の token 列。
     /// 注釈が無ければ `None`。
     ///
@@ -1361,48 +1362,58 @@ pub(crate) fn collect_object_keys(
 ) -> Option<ObjectMemberKeys> {
     let mut top_level_keys = HashSet::new();
     let mut entry_values: HashMap<ObjectEntryKey, String> = HashMap::new();
+    let mut methods = HashMap::new();
     let mut record_member_keys: Option<HashSet<String>> = None;
     let mut entry_wrappers: HashMap<String, Vec<ObjectLiteralWrapper>> = HashMap::new();
     let mut has_object_value = false;
     let mut has_non_object_value = false;
     let mut cursor = obj.walk();
-    for child in obj.named_children(&mut cursor) {
-        match child.kind() {
-            "pair" => {
-                let key = child.child_by_field_name("key")?;
-                let key_text = object_key_text(key, source)?;
-                top_level_keys.insert(key_text.clone());
-                let value = child.child_by_field_name("value")?;
-                if let Some((nested, nested_wrappers)) =
-                    unwrap_to_object_literal_with_wrappers(value, source)
-                {
-                    has_object_value = true;
-                    entry_wrappers.insert(key_text.clone(), nested_wrappers);
-                    let nested_keys = collect_flat_object_keys(nested, source)?;
-                    // record は nested の member 単位で値を持つ。entry 全体をまとめて
-                    // 比較すると member キーの追加/削除だけで差分になり、本判定の
-                    // 目的 (未参照 member キーの削除を降格する) が成立しなくなる。
-                    collect_flat_object_values(nested, source, &key_text, &mut entry_values)?;
-                    match &record_member_keys {
-                        Some(existing) if existing != &nested_keys => return None,
-                        Some(_) => {}
-                        None => record_member_keys = Some(nested_keys),
-                    }
-                } else {
-                    has_non_object_value = true;
-                    entry_values.insert((key_text, None), normalized_value_text(value, source)?);
+    for child in obj
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+    {
+        let (key, value) = contract_member(child, source)?;
+        if !top_level_keys.insert(key.clone()) {
+            return None;
+        }
+        if value.kind() == "method_definition" {
+            methods.insert((key, None), value.utf8_text(source).ok()?.to_owned());
+            continue;
+        }
+        if let Some((nested, nested_wrappers)) =
+            unwrap_to_object_literal_with_wrappers(value, source)
+        {
+            has_object_value = true;
+            entry_wrappers.insert(key.clone(), nested_wrappers);
+            let mut nested_keys = HashSet::new();
+            for member in nested
+                .named_children(&mut nested.walk())
+                .filter(|n| !n.is_extra())
+            {
+                let (name, value) = contract_member(member, source)?;
+                if !nested_keys.insert(name.clone()) {
+                    return None;
                 }
+                if value.kind() == "method_definition" {
+                    methods.insert(
+                        (key.clone(), Some(name)),
+                        value.utf8_text(source).ok()?.to_owned(),
+                    );
+                    continue;
+                }
+                entry_values.insert(
+                    (key.clone(), Some(name)),
+                    normalized_value_text(value, source)?,
+                );
             }
-            "shorthand_property_identifier" => {
-                // `{ foo }` は値が識別子そのもの。キー名と同一テキストになる。
-                let key_text = child.utf8_text(source).ok()?.to_string();
-                top_level_keys.insert(key_text.clone());
-                entry_values.insert((key_text.clone(), None), key_text);
-                has_non_object_value = true;
+            match &record_member_keys {
+                Some(existing) if existing != &nested_keys => return None,
+                Some(_) => {}
+                None => record_member_keys = Some(nested_keys),
             }
-            // spread は shape を静的確定できないので blocking
-            "spread_element" => return None,
-            _ => {}
+        } else {
+            has_non_object_value = true;
+            entry_values.insert((key, None), normalized_value_text(value, source)?);
         }
     }
     if has_object_value && has_non_object_value {
@@ -1413,6 +1424,7 @@ pub(crate) fn collect_object_keys(
             member_keys: record_member_keys?,
             record_keys: Some(top_level_keys),
             entry_values,
+            methods,
             // 宣言側の情報は object literal から見えないので、呼び出し元
             // (`extract_object_member_keys`) が埋める。
             declarator_type: None,
@@ -1424,41 +1436,53 @@ pub(crate) fn collect_object_keys(
         member_keys: top_level_keys,
         record_keys: None,
         entry_values,
+        methods,
         declarator_type: None,
         wrappers: Vec::new(),
         entry_wrappers,
     })
 }
 
-/// record の 1 entry (nested object) から (record key, member key) → 値テキストを集める。
-/// nested object は再帰しない (`collect_flat_object_keys` と同じ 1 階層のみ)。
-fn collect_flat_object_values(
-    obj: tree_sitter::Node,
+/// 公開オブジェクトの実行時のキーと値。計算キーや spread は上書き先を証明できない。
+fn contract_member<'tree>(
+    member: tree_sitter::Node<'tree>,
     source: &[u8],
-    record_key: &str,
-    out: &mut HashMap<ObjectEntryKey, String>,
-) -> Option<()> {
-    let mut cursor = obj.walk();
-    for child in obj.named_children(&mut cursor) {
-        match child.kind() {
-            "pair" => {
-                let key = child.child_by_field_name("key")?;
-                let member = object_key_text(key, source)?;
-                let value = child.child_by_field_name("value")?;
-                out.insert(
-                    (record_key.to_string(), Some(member)),
-                    normalized_value_text(value, source)?,
-                );
+) -> Option<(String, tree_sitter::Node<'tree>)> {
+    let (key, value) = match member.kind() {
+        "pair" => (
+            member.child_by_field_name("key")?,
+            member.child_by_field_name("value")?,
+        ),
+        "shorthand_property_identifier" => (member, member),
+        "method_definition" => (member.child_by_field_name("name")?, member),
+        _ => return None,
+    };
+    let name = decoded_member_key(key, source)?;
+    (name != "__proto__").then(|| (name.into_owned(), value))
+}
+
+pub(super) fn decoded_member_key<'a>(
+    key: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<std::borrow::Cow<'a, str>> {
+    use crate::engine::js_string::{decoded, quoted_contents};
+    let raw = key.utf8_text(source).ok()?;
+    match key.kind() {
+        "property_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern" => decoded(raw),
+        "string" => decoded(quoted_contents(raw)?),
+        "template_string" | "template_literal_type" => {
+            let body = raw.strip_prefix('`')?.strip_suffix('`')?;
+            if body.contains('\r') {
+                // テンプレートの生の CR と CRLF は、値ではどちらも LF になる。
+                return decoded(&body.replace("\r\n", "\n").replace('\r', "\n"))
+                    .map(|s| std::borrow::Cow::Owned(s.into_owned()));
             }
-            "shorthand_property_identifier" => {
-                let member = child.utf8_text(source).ok()?.to_string();
-                out.insert((record_key.to_string(), Some(member.clone())), member);
-            }
-            "spread_element" => return None,
-            _ => {}
+            decoded(body)
         }
+        _ => None,
     }
-    Some(())
 }
 
 /// flat object として 1 階層分の property キーだけを抽出する。nested object を再帰しない。
@@ -1497,7 +1521,7 @@ pub(crate) fn object_key_text(key: tree_sitter::Node, source: &[u8]) -> Option<S
 
 /// `keys` のいずれかへの member access (`.key` / `['key']` / `["key"]`) が repo 全体に
 /// 残っているか。解析失敗は保守的に true (残存ありとみなし blocking)。
-fn member_access_keys_have_ref(dir: &str, keys: &HashSet<&str>) -> bool {
+fn member_access_keys_have_ref(dir: &str, keys: &HashSet<&str>, owner: &str) -> bool {
     if keys.is_empty() {
         return false;
     }
@@ -1516,19 +1540,19 @@ fn member_access_keys_have_ref(dir: &str, keys: &HashSet<&str>) -> bool {
     // `.vue` などの解析できない埋め込みソースにある `config.b` は走査できない。削除キーが単語として
     // 現れ得るソースがあれば、削除キーが使われていないとは言えない。
     let key_list: Vec<&str> = keys.iter().copied().collect();
-    if super::EmbeddedJsSources::from_collection(&collection).may_mention(&key_list) {
+    if super::EmbeddedJsSources::from_collection(&collection).may_hide_removed_keys(&key_list) {
         return true;
     }
-    collection
-        .files
-        .into_par_iter()
-        .any(|path| file_has_any_member_access_ref(path.as_path(), keys, &ac).unwrap_or(true))
+    collection.files.into_par_iter().any(|path| {
+        file_has_any_member_access_ref(path.as_path(), keys, &ac, owner).unwrap_or(true)
+    })
 }
 
 fn file_has_any_member_access_ref(
     path: &std::path::Path,
     keys: &HashSet<&str>,
     ac: &aho_corasick::AhoCorasick,
+    owner: &str,
 ) -> Result<bool> {
     use crate::language::LangId;
     let Some(path_str) = path.to_str() else {
@@ -1541,7 +1565,13 @@ fn file_has_any_member_access_ref(
             let source = parser::read_file(utf8_path)?;
             return match LangId::detect(utf8_path, source.as_bytes()) {
                 Ok(lang @ (LangId::Javascript | LangId::Typescript | LangId::Tsx)) => {
-                    source_has_any_member_access_ref_with_ac(source.as_bytes(), lang, keys, ac)
+                    source_has_any_member_access_ref_with_ac(
+                        source.as_bytes(),
+                        lang,
+                        keys,
+                        ac,
+                        Some(owner),
+                    )
                 }
                 Ok(_) | Err(_) => Ok(false),
             };
@@ -1549,7 +1579,7 @@ fn file_has_any_member_access_ref(
         Ok(_) | Err(_) => return Ok(false),
     };
     let source = parser::read_file(utf8_path)?;
-    source_has_any_member_access_ref_with_ac(source.as_bytes(), lang, keys, ac)
+    source_has_any_member_access_ref_with_ac(source.as_bytes(), lang, keys, ac, Some(owner))
 }
 
 #[cfg(test)]
@@ -1558,11 +1588,7 @@ pub(crate) fn source_has_member_access_ref(
     lang: crate::language::LangId,
     key: &str,
 ) -> Result<bool> {
-    if memchr::memmem::find(source, key.as_bytes()).is_none() {
-        return Ok(false);
-    }
-    let tree = parser::parse_source(source, lang)?;
-    Ok(ast_has_member_access_ref(tree.root_node(), source, key))
+    source_has_any_member_access_ref(source, lang, &HashSet::from([key]))
 }
 
 /// 複数キー版の source 判定。テストから batch 経路の意味論を直接固定するため公開する。
@@ -1576,7 +1602,7 @@ pub(crate) fn source_has_any_member_access_ref(
         return Ok(false);
     }
     let ac = aho_corasick::AhoCorasick::new(keys.iter().copied())?;
-    source_has_any_member_access_ref_with_ac(source, lang, keys, &ac)
+    source_has_any_member_access_ref_with_ac(source, lang, keys, &ac, None)
 }
 
 fn source_has_any_member_access_ref_with_ac(
@@ -1584,26 +1610,25 @@ fn source_has_any_member_access_ref_with_ac(
     lang: crate::language::LangId,
     keys: &HashSet<&str>,
     ac: &aho_corasick::AhoCorasick,
+    owner: Option<&str>,
 ) -> Result<bool> {
-    if !ac.is_match(source) {
+    let dynamic_owner = owner.filter(|name| {
+        source.contains(&b'[')
+            && (memchr::memmem::find(source, name.as_bytes()).is_some() || source.contains(&b'\\'))
+    });
+    if !ac.is_match(source)
+        && !source.contains(&b'\\')
+        && !(keys.iter().any(|k| k.contains('\n')) && source.contains(&b'\r'))
+        && dynamic_owner.is_none()
+    {
         return Ok(false);
     }
     let tree = parser::parse_source(source, lang)?;
-    Ok(ast_has_any_member_access_ref(
-        tree.root_node(),
-        source,
-        keys,
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn ast_has_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
-    if node_is_member_access_ref(node, source, key) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| ast_has_member_access_ref(child, source, key))
+    Ok(tree.root_node().has_error()
+        || ast_has_any_member_access_ref(tree.root_node(), source, keys)
+        || dynamic_owner.is_some_and(|name| {
+            object_members::may_read_dynamic_key(tree.root_node(), source, name)
+        }))
 }
 
 fn ast_has_any_member_access_ref(
@@ -1613,41 +1638,50 @@ fn ast_has_any_member_access_ref(
 ) -> bool {
     // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
     crate::engine::tree_walk::any_node(node, crate::engine::tree_walk::Children::Named, |node| {
-        member_access_ref_key(node, source).is_some_and(|key| keys.contains(key))
+        reads_member_key(node, source, keys)
     })
 }
 
-#[cfg(test)]
-pub(crate) fn node_is_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
-    member_access_ref_key(node, source) == Some(key)
-}
-
-fn member_access_ref_key<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Option<&'a str> {
-    match node.kind() {
+fn reads_member_key(node: tree_sitter::Node, source: &[u8], keys: &HashSet<&str>) -> bool {
+    let key = match node.kind() {
         "member_expression" => node
             .child_by_field_name("property")
-            .and_then(|property| property.utf8_text(source).ok()),
-        // 置換を含まない template literal (`` config[`b`] ``) も `config["b"]` と同じ静的な
-        // キーアクセス。置換を含むものは `config[key]` と同じく動的なので数えない。
-        "subscript_expression" => node
-            .child_by_field_name("index")
-            .filter(|index| {
-                index.kind() == "string"
-                    || (index.kind() == "template_string" && !template_has_substitution(*index))
-            })
-            .and_then(|index| static_js_string_text(index, source)),
-        // destructuring (`const { beta } = config;`) も member の実利用。
-        // shorthand (`{ beta }` / `{ beta = 1 }` の左辺) は
-        // shorthand_property_identifier_pattern、rename (`{ beta: b }`) は pair_pattern の
-        // key に現れる。見落とすと破壊的な member 削除が unused_object_members に降格する。
-        "shorthand_property_identifier_pattern" => node.utf8_text(source).ok(),
-        "pair_pattern" => {
-            let key_node = node.child_by_field_name("key")?;
-            match key_node.kind() {
-                "string" => static_js_string_text(key_node, source),
-                _ => key_node.utf8_text(source).ok(),
+            .filter(|p| p.kind() == "property_identifier"),
+        "subscript_expression" => node.child_by_field_name("index").and_then(static_index_key),
+        "shorthand_property_identifier_pattern" => Some(node),
+        "pair_pattern" => node.child_by_field_name("key").and_then(|key| {
+            if key.kind() == "computed_property_name" {
+                key.named_children(&mut key.walk())
+                    .find(|n| !n.is_extra())
+                    .and_then(static_index_key)
+            } else {
+                Some(key)
             }
-        }
+        }),
+        "lookup_type" => node
+            .named_children(&mut node.walk())
+            .filter(|n| !n.is_extra())
+            .nth(1)
+            .and_then(static_index_key),
+        _ => None,
+    };
+    key.is_some_and(|key| {
+        decoded_member_key(key, source).is_none_or(|name| keys.contains(name.as_ref()))
+    })
+}
+
+fn static_index_key(mut key: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    while matches!(
+        key.kind(),
+        "literal_type" | "parenthesized_type" | "parenthesized_expression"
+    ) {
+        key = key
+            .named_children(&mut key.walk())
+            .find(|n| !n.is_extra())?;
+    }
+    match key.kind() {
+        "string" => Some(key),
+        "template_string" | "template_literal_type" if !template_has_substitution(key) => Some(key),
         _ => None,
     }
 }
@@ -1656,7 +1690,7 @@ fn member_access_ref_key<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Optio
 fn template_has_substitution(node: tree_sitter::Node) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .any(|child| child.kind() == "template_substitution")
+        .any(|child| matches!(child.kind(), "template_substitution" | "template_type"))
 }
 
 pub(crate) fn static_js_string_text<'a>(
@@ -2026,7 +2060,7 @@ mod tests {
         source: &[u8],
         keys: &HashSet<&str>,
     ) -> bool {
-        if member_access_ref_key(node, source).is_some_and(|key| keys.contains(key)) {
+        if reads_member_key(node, source, keys) {
             return true;
         }
         let mut cursor = node.walk();

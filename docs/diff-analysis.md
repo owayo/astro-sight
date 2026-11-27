@@ -166,6 +166,8 @@ Parse errors, clues for `with` or `eval`, ambient declarations, and declaration 
 
 A raw LF or CR inside a single- or double-quoted property name makes the module invalid. Reads of other properties can fail when the module is loaded, so review keeps the change blocking even if the edited property has no readers. A backslash followed by a line break is a valid line continuation. The two-character escape `\n` is also valid and adds a newline to the property name.
 
+Property declarations and bracket reads are compared using the value of the key after escape sequences are decoded. Removing `"end\u0070oint"` therefore affects both `ob.endpoint` and `ob["end\x70oint"]`. A line continuation contributes no character to the key. When only the spelling changes in a static object and the key order and values are provably unchanged, `api.mod_compat` reports `equivalent_object_property_keys`.
+
 ### Writes to exported JavaScript and TypeScript objects
 
 Changing `SETTINGS.endpoint` can affect a reader of `SETTINGS.label` when another module assigns `SETTINGS.label = SETTINGS.endpoint`. The same dependency can arise when the declaring module writes through its own namespace import or replaces its CommonJS export. In these cases `impact` and `review` keep the read of `label` among the possible impacts.

@@ -15,6 +15,7 @@ pub(crate) fn detect_object_members_compatible_mod(
     }
     if old_keys.declarator_type != new_keys.declarator_type
         || old_keys.wrappers != new_keys.wrappers
+        || old_keys.methods != new_keys.methods
     {
         return None;
     }
@@ -56,8 +57,89 @@ pub(crate) fn detect_object_members_compatible_mod(
     }
     let removed_member_set: HashSet<&str> =
         removed_members.iter().map(|key| key.as_str()).collect();
-    if member_access_keys_have_ref(site.dir, &removed_member_set) {
+    if member_access_keys_have_ref(site.dir, &removed_member_set, site.name) {
         return None;
     }
     Some(site.compatible("unused_object_members"))
+}
+
+/// キーが確定しない添字と、このオブジェクトを渡し得る参照が両方あるかを調べる。
+pub(super) fn may_read_dynamic_key(root: tree_sitter::Node, source: &[u8], owner: &str) -> bool {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    let mut dynamic = false;
+    let mut exposed = false;
+    let mut ancestors = Vec::new();
+    walk_preorder(root, Children::Named, |node, depth| {
+        ancestors.truncate(depth);
+        let index = match node.kind() {
+            "subscript_expression" => node.child_by_field_name("index"),
+            "lookup_type" => node
+                .named_children(&mut node.walk())
+                .filter(|n| !n.is_extra())
+                .nth(1),
+            "computed_property_name" => node
+                .named_children(&mut node.walk())
+                .find(|n| !n.is_extra()),
+            _ => None,
+        };
+        dynamic |= index.is_some_and(|key| static_index_key(key).is_none());
+        if !exposed
+            && matches!(
+                node.kind(),
+                "identifier" | "property_identifier" | "shorthand_property_identifier"
+            )
+            && node
+                .utf8_text(source)
+                .ok()
+                .and_then(crate::engine::js_string::decoded)
+                .as_deref()
+                == Some(owner)
+        {
+            exposed = outside_static_read(node, &ancestors);
+        }
+        if dynamic && exposed {
+            return ControlFlow::Break(());
+        }
+        ancestors.push(node);
+        ControlFlow::Continue(Walk::Descend)
+    })
+    .is_break()
+}
+
+fn outside_static_read<'a>(
+    mut node: tree_sitter::Node<'a>,
+    ancestors: &[tree_sitter::Node<'a>],
+) -> bool {
+    let mut selected_member = false;
+    for &parent in ancestors.iter().rev() {
+        match parent.kind() {
+            "variable_declarator" if parent.child_by_field_name("name") == Some(node) => {
+                return false;
+            }
+            "import_specifier" => return parent.child_by_field_name("alias").is_some(),
+            "pair" if parent.child_by_field_name("key") == Some(node) => return false,
+            "member_expression" if parent.child_by_field_name("property") == Some(node) => {}
+            "member_expression" if parent.child_by_field_name("object") == Some(node) => {
+                selected_member = true;
+            }
+            "subscript_expression" if parent.child_by_field_name("object") == Some(node) => {
+                if parent
+                    .child_by_field_name("index")
+                    .and_then(static_index_key)
+                    .is_none()
+                {
+                    return true;
+                }
+                selected_member = true;
+            }
+            "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+            | "parenthesized_expression" => {}
+            _ => break,
+        }
+        node = parent;
+    }
+    !selected_member
 }
