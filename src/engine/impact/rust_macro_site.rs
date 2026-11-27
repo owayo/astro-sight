@@ -23,6 +23,8 @@ pub(super) enum MacroSite {
     DefineClassBody,
     /// `macro_rules!` の右辺。名前は定義ファイルではなく展開先で解決し得る。
     RuleBody,
+    /// 字句どおりに宣言または呼び出され、値の名前空間を使わないマクロ名。
+    RuleMacroName,
     /// ほかのマクロの引数・属性マクロを付けた項目など。
     Unknown,
 }
