@@ -85,6 +85,154 @@ fn only_headers_changed(
         && super::super::rust_line_endings::same_text(&before[left..], &after[right..])
 }
 
+#[cfg(test)]
+#[test]
+fn foreign_pointers_require_an_independent_link_and_unchanged_context() {
+    let source = r#"pub mod api { unsafe extern "C" { #[link_name="main"] pub fn f(x:u8); } }
+pub mod other { unsafe extern "C" { #[link_name="second"] pub fn f(x:u8); } }"#;
+    let prove = |source: &str| {
+        let changed = source.replacen("f(x:u8)", "f(x:i32)", 1);
+        unchanged_foreign_pointers(source.as_bytes(), changed.as_bytes()).unwrap_or_default()
+    };
+    assert_eq!(prove(source), HashSet::from(["other::f".to_owned()]));
+    for another in ["main", r"\x6dain", r"\u{6d}ain"] {
+        assert!(prove(&source.replace("second", another)).is_empty());
+    }
+    assert!(
+        prove(&source.replace(
+            "#[link_name=\"second\"]",
+            "#[link_name=\"main\"] #[link_name=\"second\"]"
+        ))
+        .is_empty()
+    );
+    assert!(prove(&source.replace("pub mod other", "#[cfg(all())] pub mod other")).is_empty());
+    let both = source.replace("f(x:u8)", "f(x:i32)");
+    assert!(
+        unchanged_foreign_pointers(source.as_bytes(), both.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// ソース全体で、無条件の外部関数の引数だけを変更しているか。
+/// 同じリンク名を共有する別宣言も、そのリンク名が変化した場合は除外の証拠にしない。
+pub(in crate::engine::impact) fn unchanged_foreign_pointers(
+    before: &[u8],
+    after: &[u8],
+) -> Option<HashSet<String>> {
+    struct Member<'a> {
+        path: String,
+        link: &'a str,
+        parameters: std::ops::Range<usize>,
+    }
+    fn members(source: &[u8]) -> Option<Vec<Member<'_>>> {
+        let tree = crate::engine::parser::parse_source(source, LangId::Rust).ok()?;
+        let root = tree.root_node();
+        if root.has_error()
+            || crate::engine::tree_walk::any_node(root, Children::Named, |n| {
+                matches!(n.kind(), "inner_attribute_item" | "attribute_item")
+                    && link_name(n, source).is_none()
+            })
+        {
+            return None;
+        }
+        let mut members = Vec::new();
+        for owner in module_blocks(root, source) {
+            let mut link = None;
+            for item in owner
+                .block
+                .body
+                .named_children(&mut owner.block.body.walk())
+            {
+                match item.kind() {
+                    "line_comment" | "block_comment" => continue,
+                    "attribute_item" => {
+                        if link.replace(link_name(item, source)?).is_some() {
+                            return None;
+                        }
+                    }
+                    "function_signature_item" => {
+                        let name = item
+                            .child_by_field_name("name")?
+                            .utf8_text(source)
+                            .ok()?
+                            .trim_start_matches("r#");
+                        if !name.is_ascii() {
+                            return None;
+                        }
+                        let path = if owner.module.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("{}::{name}", owner.module)
+                        };
+                        members.push(Member {
+                            path,
+                            link: link.take().unwrap_or(name),
+                            parameters: item.child_by_field_name("parameters")?.byte_range(),
+                        });
+                    }
+                    _ => {
+                        link = None;
+                    }
+                }
+            }
+        }
+        Some(members)
+    }
+    fn link_name<'a>(item: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+        let attr = item.named_child(0)?;
+        if attr.named_child(0)?.utf8_text(source).ok()? != "link_name" {
+            return None;
+        }
+        let value = attr.child_by_field_name("value")?;
+        let text = value
+            .utf8_text(source)
+            .ok()?
+            .strip_prefix('"')?
+            .strip_suffix('"')?;
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+            .then_some(text)
+    }
+    let left = members(before)?;
+    let right = members(after)?;
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut old_end = 0;
+    let mut new_end = 0;
+    let mut changed_links = HashSet::new();
+    let same = super::super::rust_line_endings::same_text;
+    for (old, new) in left.iter().zip(&right) {
+        if old.path != new.path
+            || old.link != new.link
+            || !same(
+                &before[old_end..old.parameters.start],
+                &after[new_end..new.parameters.start],
+            )
+        {
+            return None;
+        }
+        if !same(
+            &before[old.parameters.clone()],
+            &after[new.parameters.clone()],
+        ) {
+            changed_links.insert(new.link);
+        }
+        old_end = old.parameters.end;
+        new_end = new.parameters.end;
+    }
+    if changed_links.is_empty() || !same(&before[old_end..], &after[new_end..]) {
+        return None;
+    }
+    Some(
+        right
+            .into_iter()
+            .filter(|member| !changed_links.contains(member.link))
+            .map(|member| member.path)
+            .collect(),
+    )
+}
+
 impl ForeignChanges {
     fn record(
         &mut self,

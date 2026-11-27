@@ -116,6 +116,7 @@ pub(super) struct RefEventMini {
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
     pub(super) rust_value_binding: bool,
+    pub(super) rust_independent_pointer: bool,
     pub(super) rust_collection_value: bool,
     /// Python の相対 import または同一ファイルの直下関数の所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
@@ -1187,6 +1188,27 @@ impl ImpactCollector<'_> {
                 )
                 .map(|path| (path, false))
         });
+        let rust_independent_pointer = self.ref_lang == Some(LangId::Rust)
+            && node.is_some_and(|n| {
+                n.kind() == "identifier"
+                    && n.parent().is_some_and(|p| {
+                        p.kind() == "scoped_identifier" && p.child_by_field_name("name") == Some(n)
+                    })
+                    && self.sym_to_fc[ix].iter().any(|&fc| {
+                        !self.file_contexts[fc as usize].sig_changes.is_empty()
+                            && self.file_contexts[fc as usize]
+                                .rust_function_names
+                                .contains(&self.all_symbol_names[ix])
+                    })
+                    && super::rust_path_owner::RustPathOwnerIndex::in_pointer_initializer(n)
+                    && self.binding_view(source).is_some_and(|view| {
+                        self.rust_path_owner
+                            .get_or_init(|| {
+                                super::rust_path_owner::RustPathOwnerIndex::build(n, source)
+                            })
+                            .independent_pointer(n, source, Path::new(self.path_str), view)
+                    })
+            });
         let scoped_node = node.filter(|n| {
             scoped_function
                 && !self
@@ -1513,6 +1535,7 @@ impl ImpactCollector<'_> {
             jsx_shape_id,
             unproven_module_ref,
             rust_collection_value: collection_value,
+            rust_independent_pointer,
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
                 || copied_binding
                 || lexical_binding == LexicalBinding::RustScopedValue
@@ -2023,6 +2046,7 @@ impl<'a> ImpactCollector<'a> {
             return true;
         }
         if (e.rust_value_binding
+            || e.rust_independent_pointer
             || e.rust_collection_value && ctx.rust_receiverless_associated_names.contains(name))
             && rust_function_only(ctx, name)
         {
@@ -2568,6 +2592,7 @@ mod tests {
             member_owner: u32::MAX,
             jsx_shape_id: u32::MAX,
             unproven_module_ref: false,
+            rust_independent_pointer: false,
             rust_value_binding: false,
             rust_collection_value: false,
             python_import_owner_id: u32::MAX,

@@ -24,6 +24,7 @@ use crate::models::impact::DiffFile;
 
 mod enum_owner;
 mod format_owner;
+mod function_pointer;
 mod macro_copy;
 mod macro_crate;
 mod nominal;
@@ -132,6 +133,7 @@ pub(super) struct RustPathOwnerIndex {
     qualified_call_owners: RefCell<HashMap<Vec<String>, Option<QualifiedCallOwner>>>,
     field_types: std::cell::OnceCell<HashSet<String>>,
     macro_paths: std::cell::OnceCell<HashMap<usize, RuleName>>,
+    independent_pointers: std::cell::OnceCell<HashSet<usize>>,
     json_calls: RefCell<HashMap<usize, bool>>,
     tracing_fields: std::cell::OnceCell<Option<HashSet<usize>>>,
     local_type_names: HashSet<String>,
@@ -207,6 +209,7 @@ pub(super) struct RustPathOwnerProjectProof {
     macro_glob_names: Mutex<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>,
     ordinary_files: Mutex<HashMap<RustModuleKey, Option<PathBuf>>>,
     macro_functions: macro_crate::FunctionFiles,
+    foreign_pointers: OnceLock<Option<(PathBuf, HashSet<String>)>>,
     staged_bindings: OnceLock<Option<Box<(crate::commands::git_snapshot::IndexSnapshot, Self)>>>,
     layout_cargo_settings: OnceLock<bool>,
     pub(super) canonical_root: Option<PathBuf>,
@@ -301,6 +304,7 @@ impl RustPathOwnerProjectProof {
             macros_may_export_tokens: OnceLock::new(),
             macro_glob_names: Mutex::default(),
             ordinary_files: Mutex::default(),
+            foreign_pointers: Default::default(),
             macro_functions: Default::default(),
             staged_bindings: OnceLock::new(),
             layout_cargo_settings: OnceLock::new(),
@@ -2334,6 +2338,7 @@ impl RustPathOwnerIndex {
             direct_imports,
             qualified_call_owners: RefCell::new(HashMap::new()),
             field_types: std::cell::OnceCell::new(),
+            independent_pointers: Default::default(),
             macro_paths: std::cell::OnceCell::new(),
             json_calls: RefCell::default(),
             tracing_fields: Default::default(),

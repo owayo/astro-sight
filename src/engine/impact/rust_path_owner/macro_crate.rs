@@ -15,7 +15,7 @@ pub(in crate::engine::impact) enum RuleName {
     Macro,
 }
 
-fn plain_scope(scope: Node<'_>, source: &[u8]) -> bool {
+pub(super) fn plain_scope(scope: Node<'_>, source: &[u8]) -> bool {
     !scope.has_error()
         && scope.named_children(&mut scope.walk()).all(|item| {
             item.kind() != "inner_attribute_item"

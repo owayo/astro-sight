@@ -367,3 +367,100 @@ fn impact_rust_owner_paths_allow_unshadowed_builtin_derive() {
     repo.write("engine/src/server/admin.rs", derive(ADMIN_NEW));
     assert!(caller_lines(&repo, "new", &[]).0.contains(OTHER_CALLS[0]));
 }
+
+#[test]
+fn rust_function_pointers_distinguish_qualified_module_declarations() {
+    let repo = TestRepo::new();
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers=['a','b']\nresolver='3'\n",
+    );
+    for (name, dependencies) in [("a", ""), ("b", "[dependencies]\na={path='../a'}")] {
+        repo.create_dir_all(format!("{name}/src"));
+        repo.write(
+            format!("{name}/Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n{dependencies}\n"),
+        );
+    }
+    let foreign = |module, link, ty| {
+        format!(
+            "pub mod {module} {{\n unsafe extern \"C\" {{\n #[link_name=\"{link}\"]\n pub fn translate(x:{ty});\n }}\n}}\n"
+        )
+    };
+    let producer = |ty| {
+        format!(
+            "{}{}pub mod forwarded {{ pub use crate::api::translate; }}\nfn poll(_:u8) {{}}\npub mod ptr {{\n pub const OWN:fn(u8)=super::poll;\n}}\n",
+            foreign("api", "main_translate", ty),
+            foreign("other", "other_translate", "u8")
+        )
+    };
+    repo.write("a/src/lib.rs", producer("u8"));
+    let readers = "pub const ONE:unsafe extern \"C\" fn(u8)=a::other::translate;\npub const TWO:unsafe extern \"C\" fn(u8)=a::api::translate;\npub const THREE:unsafe extern \"C\" fn(u8)=a::forwarded::translate;\n";
+    repo.write(
+        "b/src/lib.rs",
+        format!("{readers}mod check;\npub fn poll(_:u8) {{}}\n"),
+    );
+    repo.write("b/src/check.rs", "pub const CHECK:fn(u8)=crate::poll;\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    let lines = |context: &serde_json::Value, target: &str, consumer: &str| {
+        context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ch| ch["path"] == target)
+            .unwrap()["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row["path"] == consumer)
+            .map(|row| repo.caller_source_line(row))
+            .collect::<BTreeSet<_>>()
+    };
+    repo.write("a/src/lib.rs", producer("i32"));
+    repo.stage_all();
+    for extra in [&["--git"][..], &["--git", "--staged"]] {
+        let rows = lines(
+            &repo.run_json("context", extra),
+            "a/src/lib.rs",
+            "b/src/lib.rs",
+        );
+        assert_eq!(rows, readers.lines().skip(1).map(str::to_owned).collect());
+    }
+    repo.write("a/src/lib.rs", producer("u8"));
+    let staged = repo.run_json("review", &["--git", "--staged"]);
+    assert_eq!(
+        lines(&staged["impact"], "a/src/lib.rs", "b/src/lib.rs"),
+        readers.lines().skip(1).map(str::to_owned).collect()
+    );
+    repo.stage_all();
+    repo.write(
+        "b/src/lib.rs",
+        format!("{readers}mod check;\npub fn poll(_:i32) {{}}\n"),
+    );
+    repo.stage_all();
+    for extra in [&["--git"][..], &["--git", "--staged"]] {
+        let cx = repo.run_json("context", extra);
+        assert!(
+            lines(&cx, "b/src/lib.rs", "a/src/lib.rs").is_empty(),
+            "{cx}"
+        );
+        assert!(
+            !lines(&cx, "b/src/lib.rs", "b/src/check.rs").is_empty(),
+            "{cx}"
+        );
+    }
+    let via_root = "extern crate self as a;\nextern crate a as dependency;\npub mod other {pub use crate::dependency::api::translate;}\npub const ALIAS:unsafe extern \"C\" fn(u8)=::a::other::translate;\n";
+    repo.write("b/src/lib.rs", via_root);
+    repo.commit_all("extern crate alias");
+    repo.write("a/src/lib.rs", producer("i32"));
+    repo.stage_all();
+    let pointer = via_root.lines().last().unwrap();
+    for extra in [&["--git"][..], &["--git", "--staged"]] {
+        let cx = repo.run_json("context", extra);
+        assert!(
+            lines(&cx, "a/src/lib.rs", "b/src/lib.rs").contains(pointer),
+            "{cx}"
+        );
+    }
+}

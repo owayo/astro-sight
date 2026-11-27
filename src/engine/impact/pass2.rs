@@ -509,7 +509,8 @@ pub(super) fn stream_caller_maps(
     if options.new_side == crate::models::impact::DiffNewSide::Index
         && (!rust_nominal_names.is_empty()
             || file_contexts.iter().any(|ctx| {
-                !ctx.rust_free_function_names.is_empty()
+                !ctx.rust_function_names.is_empty() && !ctx.sig_changes.is_empty()
+                    || !ctx.rust_free_function_names.is_empty()
                     || !ctx.rust_super_functions.is_empty()
                     || !ctx.rust_private_root_functions.is_empty()
                     || ctx.rust_receiverless_associated_names.contains("new")

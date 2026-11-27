@@ -28,7 +28,7 @@ use crate::models::symbol::{Symbol, SymbolKind};
 use super::signature::find_signature_in_lines;
 
 mod foreign;
-pub(super) use foreign::ForeignChanges;
+pub(super) use foreign::{ForeignChanges, unchanged_foreign_pointers};
 mod ts_function_exports;
 pub(super) use ts_function_exports::equivalent_function_exports;
 

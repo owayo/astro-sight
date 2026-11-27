@@ -32,6 +32,7 @@ pub(in super::super) struct PackageCache {
     files: Files<ModuleItems>,
     packages: Files<Package>,
     collection_preludes: Files<()>,
+    pointer_preludes: Files<()>,
 }
 
 pub(super) struct Package {
@@ -43,6 +44,28 @@ pub(super) struct Package {
 }
 
 impl PackageCache {
+    /// crate root の `extern crate … as name` や、それを生成し得る項目があれば
+    /// `::name` も Cargo の依存キーだけでは決まらない。
+    pub(in crate::engine::impact) fn pointer_prelude(
+        &self,
+        project: &RustPathOwnerProjectProof,
+        root_file: &Path,
+    ) -> bool {
+        self.pointer_preludes
+            .get(root_file, || {
+                if project.reexport_old_sources.contains_key(root_file) {
+                    return None;
+                }
+                let source = read_input_file(&project.root.join(root_file))?;
+                let tree = parser::parse_source(&source, LangId::Rust).ok()?;
+                Names::collect(tree.root_node(), &source, &[])?
+                    .globs
+                    .is_empty()
+                    .then_some(())
+            })
+            .is_some()
+    }
+
     pub(in super::super) fn collection_prelude(
         &self,
         project: &RustPathOwnerProjectProof,
@@ -314,7 +337,7 @@ impl ModuleItems {
     }
 }
 
-pub(super) fn items_with_attributes<'a>(
+pub(in crate::engine::impact) fn items_with_attributes<'a>(
     items: impl Iterator<Item = Node<'a>>,
 ) -> impl Iterator<Item = (Node<'a>, bool)> {
     let mut attributed = false;
