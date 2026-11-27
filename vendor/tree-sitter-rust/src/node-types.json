@@ -1725,6 +1725,10 @@
       "required": false,
       "types": [
         {
+          "type": "raw_string_literal",
+          "named": true
+        },
+        {
           "type": "string_literal",
           "named": true
         }

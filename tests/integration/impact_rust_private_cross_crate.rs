@@ -234,6 +234,153 @@ fn rust_extern_signature_change_reaches_the_dependent_crate() {
 }
 
 #[test]
+fn rust_foreign_block_abi_changes_reach_function_pointer_users() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old = "pub mod api {\nunsafe extern \"C\" {\n    pub fn translate(x: u8);\n    pub fn second(x: u8);\n    pub static NUMBER: u8;\n}\nunsafe extern \"C\" { pub fn stable(x: u8); }\n}\n".into();
+    case.a_new = case.a_old.replacen("\"C\"", "\"C-unwind\"", 1);
+    case.b_lib = "pub const CALL: unsafe extern \"C\" fn(u8) = a::api::translate;\npub const SECOND: unsafe extern \"C\" fn(u8) = a::api::second;\npub const STABLE: unsafe extern \"C\" fn(u8) = a::api::stable;\n";
+    let repo = case.changed_repo();
+    for staged in [false, true] {
+        let mut args = vec!["--git"];
+        if staged {
+            repo.stage_all();
+            repo.write("a/src/lib.rs", &case.a_old);
+            args.push("--staged");
+        }
+        let review = repo.run_json("review", &args);
+        let modified = review["api_changes"]["modified"].as_array().unwrap();
+        let change = &review["impact"]["changes"][0];
+        let signatures = change["signature_changes"].as_array().unwrap();
+        for rows in [modified, signatures] {
+            let mut names: Vec<_> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["second", "translate"], "{review}");
+            for row in rows {
+                assert!(
+                    row["old_signature"].as_str().unwrap().contains("\"C\""),
+                    "{row}"
+                );
+                assert!(
+                    row["new_signature"]
+                        .as_str()
+                        .unwrap()
+                        .contains("\"C-unwind\""),
+                    "{row}"
+                );
+            }
+        }
+        let mut lines: Vec<_> = change["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["path"] == "b/src/lib.rs")
+            .map(|row| row["line"].as_u64().unwrap())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, [0, 1], "{change}");
+    }
+}
+
+#[test]
+fn rust_foreign_equivalent_abi_spellings_keep_the_function_contract() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old = r#"unsafe extern { pub fn omitted(); }
+unsafe extern "C" { pub fn escaped(); }
+unsafe extern "C" { pub fn raw(); }
+unsafe extern "C" { pub static VALUE: u8; }
+"#
+    .into();
+    case.a_new = r##"unsafe extern /* "C-unwind" */ "C" { pub fn omitted(); }
+unsafe extern "\u{43}" { pub fn escaped(); }
+unsafe extern r#"C"# { pub fn raw(); }
+unsafe extern "C-unwind" { pub static VALUE: u8; }
+"##
+    .into();
+    case.b_lib = "pub const POINTERS: [unsafe extern \"C\" fn(); 3] = [a::omitted, a::escaped, a::raw];\npub fn value() -> u8 { unsafe { a::VALUE } }\n";
+    let repo = case.changed_repo();
+    for command in ["review", "impact"] {
+        let output = cargo_bin()
+            .current_dir(repo.root())
+            .args([command, "--dir", ".", "--git", "--hook"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn rust_foreign_function_moved_between_abi_blocks_keeps_its_pointer_user() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old = r##"pub mod api {
+unsafe extern {
+    pub fn translate(x: u8);
+}
+unsafe extern "C-unwind" {
+    pub fn sibling();
+}
+}
+pub mod other {
+    unsafe extern "C" { #[link_name = "other_translate"] pub fn translate(x: u8); }
+}
+"##
+    .into();
+    case.a_new = case
+        .a_old
+        .replace(
+            "extern {\n    pub fn translate(x: u8);",
+            "extern /* C-unwind */ r#\"C\"# {",
+        )
+        .replace(
+            "    pub fn sibling();",
+            "    pub fn translate(x: u8);\n    pub fn sibling();",
+        )
+        .replace("extern \"C\"", "extern \"\\x43\"");
+    case.b_lib = "pub const CALL: unsafe extern \"C\" fn(u8) = a::api::translate;\n";
+    let repo = case.changed_repo();
+    let review = repo.run_json("review", &["--git"]);
+    let modified = review["api_changes"]["modified"].as_array().unwrap();
+    assert_eq!(modified.len(), 1, "{review}");
+    assert_eq!(modified[0]["name"], "translate", "{review}");
+    let calls = review["impact"]["changes"][0]["impacted_callers"]
+        .as_array()
+        .unwrap();
+    assert!(
+        calls.iter().any(|row| row["path"] == "b/src/lib.rs"),
+        "{review}"
+    );
+}
+
+#[test]
+fn rust_foreign_function_in_an_unchanged_cfg_branch_keeps_its_abi() {
+    let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
+    case.a_old = r#"unsafe extern "C" {
+    #[cfg(windows)]
+    pub fn translate(x: u8);
+    pub fn sibling(x: u8);
+}
+unsafe extern "C-unwind" {
+    #[cfg(not(windows))]
+    pub fn translate(x: u8);
+}
+"#
+    .into();
+    case.a_new = case.a_old.replace("sibling(x: u8)", "sibling(x: u16)");
+    case.b_lib = "pub const SIBLING: unsafe extern \"C\" fn(u8) = a::sibling;\n";
+    let repo = case.changed_repo();
+    let review = repo.run_json("review", &["--git"]);
+    let signatures = review["impact"]["changes"][0]["signature_changes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(signatures.len(), 1, "{review}");
+    assert_eq!(signatures[0]["name"], "sibling", "{review}");
+}
+
+#[test]
 fn rust_extern_formatting_preserves_the_caller_with_crlf() {
     let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
     case.a_old = "unsafe extern \"C\" {\r\n    pub fn render(x: u8);\r\n}\r\n".to_owned();

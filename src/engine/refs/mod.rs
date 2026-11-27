@@ -29,7 +29,9 @@ use crate::models::truncation::TruncationInfo;
 pub(crate) use definition::rust::{
     is_rust_shadowable_value_identifier, is_rust_struct_field_non_callable,
 };
-pub(crate) use definition::rust_format::is_capture_format_macro;
+pub(crate) use definition::rust_format::{
+    decode_escapes as decode_rust_string_escapes, is_capture_format_macro,
+};
 pub use files::{
     FileCollection, FileScanOptions, UnsupportedScope, collect_files, collect_files_scan,
     collect_files_scan_with_excludes, merge_extra_files, skipped_files_from_relative,

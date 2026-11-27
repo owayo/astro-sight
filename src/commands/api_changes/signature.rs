@@ -164,6 +164,12 @@ pub(crate) fn extract_api_signature_with_original(
                         let s = cur.start_byte();
                         let e =
                             function_body_start_byte(cur).unwrap_or_else(|| cur.end_byte());
+                        if lang_id == crate::language::LangId::Rust
+                            && let Some(block) = crate::engine::rust_signature::foreign::Block::for_function(cur, source)
+                            && let Some(signature) = block.signature(cur)
+                        {
+                            return signature;
+                        }
                         // 分割代入の引数は、型注釈がないと束縛の形から公開型が決まる。
                         if matches!(
                             lang_id,

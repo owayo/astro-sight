@@ -25,7 +25,12 @@ This patch preserves the upstream rule's unbounded digit count, its legacy
 unbraced escapes and its handling of prefixes. It does not add Unicode scalar
 validation or byte-literal restrictions. No source preprocessing is performed:
 all ranges and byte columns refer to the original input.
-The scanner, queries, Rust bindings, node kinds and fields remain unchanged.
+The scanner, queries and Rust bindings remain unchanged.
+
+The `extern_modifier` rule also accepts a raw string literal for an ABI name.
+For example, Rust accepts `unsafe extern r#"C"# { pub fn run(); }`. Its
+declaration list stays inside the foreign block, so the analyzer can compare
+the ABI for each function in that block.
 
 Parser regressions exercise ordinary strings, character literals, C strings,
 repeated and trailing underscores, case and zero-padded six-digit scalar values,
@@ -46,12 +51,13 @@ tree-sitter generate --abi 15
 Generated C parser, headers and grammar metadata are checked in, so normal Cargo
 builds need no Node.js or grammar generator. Compare regenerations of the
 unmodified and patched grammar with the same CLI before upgrading the generator.
-The published and regenerated `node-types.json` and all three parser headers
-are byte-identical. An unmodified regeneration changes only the generated C
+The three parser headers are byte-identical to the published versions.
+An unmodified regeneration changes only the generated C
 language metadata's patch version from 1 to 2, matching `tree-sitter.json`'s
 0.24.2; the patched regeneration also includes this metadata correction.
-The grammar patch itself changes only the two escape regular expressions in
-`grammar.json` and their lexer states in `parser.c`.
+The Unicode change updates two escape regular expressions and their lexer
+states. The ABI change updates `grammar.json`, the permitted children of
+`extern_modifier` in `node-types.json`, and the generated parse tables.
 
 Before removing this patch in favor of an upstream release, run the Rust parser
 and CLI regressions and the upstream corpus.

@@ -702,7 +702,7 @@ module.exports = grammar({
 
     extern_modifier: $ => seq(
       'extern',
-      optional($.string_literal),
+      optional(choice($.string_literal, $.raw_string_literal)),
     ),
 
     visibility_modifier: $ => choice(
