@@ -127,7 +127,7 @@ fn attributes(mut node: Node<'_>, source: &[u8], out: &mut Vec<Vec<u8>>) {
 
 /// 所属する module/impl/trait のヘッダ・属性と各スコープの inner attribute を保つ。
 /// 本体の別宣言を変更していても対象を比較できるが、所属変更や不明な構造は閉じない。
-fn scope(
+pub(super) fn scope(
     mut node: Node<'_>,
     source: &[u8],
     inner_cache: &mut HashMap<usize, Vec<Vec<u8>>>,

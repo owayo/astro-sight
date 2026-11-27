@@ -376,6 +376,8 @@ fn analyze_changed_file(
     };
     let mut old_side = declaration::LazyOldSide::default();
     let foreign = declaration::ForeignChanges::collect(&declaration_input, &old_side);
+    let mut neighbors =
+        declaration::compare_neighbors(&declaration_input, &old_side, inputs.receiver_layout);
     let start =
         |sym: &Symbol| tree_sitter::Point::new(sym.range.start.line, sym.range.start.column);
     let eol_unchanged = if lang_id == LangId::Rust {
@@ -422,6 +424,7 @@ fn analyze_changed_file(
             let classification = if foreign.changed.contains_key(&pos) {
                 Some("modified")
             } else if foreign.unchanged.contains(&pos)
+                || neighbors.unchanged.contains(&pos)
                 || eol_unchanged.contains(&(sym.name.as_str(), symbol_kind_str(sym.kind)))
             {
                 None
@@ -531,6 +534,15 @@ fn analyze_changed_file(
         &mut affected,
         &mut sig_changes,
     );
+    for change in &mut sig_changes {
+        if let Some((old, new)) = neighbors
+            .signatures
+            .remove(change.name.trim_start_matches("r#"))
+        {
+            change.old_signature = old;
+            change.new_signature = new;
+        }
+    }
     if !foreign.changed.is_empty() {
         // 行比較の結果があっても、外側の ABI を含めた宣言を表示する。
         let mut replaced: HashSet<&str> = foreign

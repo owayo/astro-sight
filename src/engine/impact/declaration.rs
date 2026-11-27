@@ -27,8 +27,10 @@ use crate::models::symbol::{Symbol, SymbolKind};
 
 use super::signature::find_signature_in_lines;
 
+mod adjacent_rust;
 mod foreign;
 mod imported_parameters;
+pub(super) use adjacent_rust::compare_neighbors;
 pub(super) use foreign::{ForeignChanges, unchanged_foreign_pointers};
 mod ts_function_exports;
 pub(super) use ts_function_exports::equivalent_function_exports;
