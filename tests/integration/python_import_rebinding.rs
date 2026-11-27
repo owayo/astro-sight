@@ -120,6 +120,11 @@ fn python_import_rebinding_hook_distinguishes_unverified_binding_and_true_remova
         ),
         ("", FUNCTION, "rm"),
         (
+            "from shared import decorate\n",
+            "async def decorate(value: str) -> str:\n    return '<' + value + '>'\n",
+            "rm",
+        ),
+        (
             "if True:\n    from shared import decorate as decorate\n",
             FUNCTION,
             "rm",
@@ -149,5 +154,133 @@ fn python_import_rebinding_hook_distinguishes_unverified_binding_and_true_remova
                 "{json}"
             );
         }
+    }
+}
+
+#[test]
+fn python_local_function_alias_preserves_name_with_unverified_compatibility() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let original = "def total(x):\n    return x + 1\n";
+    let renamed = original.replace("total", "sum_values");
+    let caller = "from api import total\n\ndef run():\n    return total(2)\n";
+    repo.write("api.py", original);
+    repo.write("caller.py", caller);
+    repo.write("legacy.py", "from api import total\nassert total(2) == 3\n");
+    repo.commit_all("base");
+    repo.write("caller.py", caller.replace("total", "sum_values"));
+    repo.write("api.py", format!("{renamed}\ntotal = sum_values\n"));
+
+    let assert_row = |staged, expected| {
+        let output = hook(&repo, staged);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let result: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        let has_old = |bucket: &str| {
+            result["api"][bucket].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["n"] == "total" && entry["f"] == "api.py")
+            })
+        };
+        assert_eq!((has_old("mod"), has_old("rm")), expected, "{result}");
+        assert!(!has_old("mod_compat"), "{result}");
+    };
+    let json = repo.run_json("review", &["--git"]);
+    let api = &json["api_changes"];
+    assert!(
+        api["modified"].as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry["name"] == "total"
+                && entry["new_signature"] == "def sum_values(x):"
+                && entry["unverified"]["reason"] == "compatibility_unverified")),
+        "{api}"
+    );
+    assert!(
+        api["import_rebindings"]
+            .as_array()
+            .is_none_or(|entries| entries.is_empty()),
+        "{api}"
+    );
+    assert_row(false, (true, false));
+    repo.stage_all();
+    for body in [
+        renamed.clone(),
+        format!("{renamed}\nif False:\n    total = sum_values\n"),
+        format!("{renamed}\ntotal = sum_values\ntotal = 0\n"),
+        format!("{renamed}\ntotal = sum_values\ndel total\n"),
+        format!("@decorate\n{renamed}\ntotal = sum_values\n"),
+        format!("{renamed}\ntotal = sum_values\nglobals().pop('total')\n"),
+        format!("total = sum_values\n{renamed}"),
+        format!("{renamed}\ntotal = sum_values\n\u{ff54}otal = 0\n"),
+    ] {
+        repo.write("api.py", body);
+        assert_row(false, (false, true));
+    }
+    assert_row(true, (true, false));
+    repo.write("api.py", format!("{renamed}\ntotal = (sum_values)\n"));
+    assert_row(false, (true, false));
+    for target in [
+        renamed.replace("x + 1", "x + 9"),
+        renamed.replace("(x)", "(x, y)"),
+    ] {
+        repo.write("api.py", format!("{target}\ntotal = sum_values\n"));
+        assert_row(false, (true, false));
+    }
+}
+
+#[test]
+fn python_local_alias_does_not_extend_import_equivalence() {
+    let repo = fixture();
+    repo.write("api.py", "from shared import decorate\n");
+    for suffix in [
+        "alias = decorate\n",
+        "alias = decorate\nexec('del decorate')\n",
+    ] {
+        repo.write("shared.py", format!("{FUNCTION}\n{suffix}"));
+        let output = hook(&repo, false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let result: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{result}");
+        assert!(
+            result["api"]["rm"].as_array().is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry["f"] == "api.py" && entry["n"] == "decorate")),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn python_local_async_function_alias_distinguishes_retention_and_removal() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let old = "async def total(x):\n    return x + 1\n";
+    let renamed = old.replace("total", "sum_values");
+    repo.write("api.py", old);
+    repo.write(
+        "legacy.py",
+        "from api import total\nfrom asyncio import run\nassert run(total(2)) == 3\n",
+    );
+    repo.commit_all("base");
+
+    for (body, bucket) in [
+        (format!("{renamed}\ntotal = sum_values\n"), "mod"),
+        (
+            format!("{}\ntotal = sum_values\n", renamed.replace("(x)", "(x, y)")),
+            "mod",
+        ),
+        (renamed, "rm"),
+    ] {
+        repo.write("api.py", body);
+        let output = hook(&repo, false);
+        let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{result}");
+        assert!(
+            result["api"][bucket].as_array().is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["n"] == "total" && row["f"] == "api.py")),
+            "{result}"
+        );
     }
 }

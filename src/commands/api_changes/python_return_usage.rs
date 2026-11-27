@@ -563,7 +563,7 @@ fn string_literal_is_bytes(node: Node<'_>, source: &[u8]) -> Option<bool> {
 }
 
 /// 括弧で 1 つの式だけを囲んだものを外す。
-fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
+pub(super) fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
     while node.kind() == "parenthesized_expression" {
         match named_children(node).as_slice() {
             [inner] => node = *inner,

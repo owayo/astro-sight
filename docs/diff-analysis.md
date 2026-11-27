@@ -769,6 +769,8 @@ Python function definitions replaced by an unconditional explicit local `from ..
 
 The `python_import_rebinding` compatible reason requires a separate narrow proof: matching plain function ASTs with inert primitive annotations/defaults, a return expression containing only parameters and literals/operators, no module-global dependency, static local import graphs without cycles or import-time effects, and a complete repository scan that rejects function-value escape, aliases, introspection and dynamic binding. Conditional/function-local imports, decorators, unresolved imports, namespace imports, and unproved contracts remain blocking. The original `refs` occurrences are retained. Staged review uses the index snapshot; fallback worktree evidence is discarded when it cannot represent the index.
 
+When `def total(x)` is renamed to `def sum_values(x)` in the same module and an unconditional `total = sum_values` is proven to be the final binding, callers can still import `total`. Review reports `total` under `api.mod`. Even with the same parameters and return value, `total.__name__` becomes `"sum_values"`, so compatibility remains unverified.
+
 ### Python module aliases in removal checks
 
 For an attribute call such as `u.total()`, `review` resolves `u` in the scope containing that use. An `import math as u` inside a different function has no effect on the module-level `u`. Conflicting or conditional imports keep the removal blocking when the receiver cannot be resolved.

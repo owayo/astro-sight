@@ -1,4 +1,4 @@
-//! Python の公開名を残す明示 import と、独立した狭い同値証明。
+//! Python の公開名を残す明示 import・関数への別名代入と、import に対する同値証明。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -21,7 +21,8 @@ use crate::models::review::{
 
 #[derive(Clone)]
 enum Binding {
-    Function,
+    Function(usize),
+    LocalAlias(String),
     Other,
     Import { module: String, name: String },
 }
@@ -31,6 +32,7 @@ struct Module {
     tree: Tree,
     bindings: BTreeMap<String, Vec<Binding>>,
     imports: Vec<String>,
+    local_alias_proof_only: bool,
 }
 
 #[derive(Default)]
@@ -40,6 +42,12 @@ struct Cache {
 }
 
 impl Cache {
+    fn import_file(&mut self, dir: &str, path: &str) -> Option<Rc<Module>> {
+        // import 元・先の同値証明は、別名代入から公開名の存在だけを確認する証明と分ける。
+        self.file(dir, path)
+            .filter(|file| !file.local_alias_proof_only)
+    }
+
     fn file(&mut self, dir: &str, path: &str) -> Option<Rc<Module>> {
         if let Some(file) = self.files.get(path) {
             return file.clone();
@@ -70,7 +78,7 @@ impl Cache {
                 Some(2) => continue,
                 _ => {}
             }
-            let Some(file) = self.file(dir, &path) else {
+            let Some(file) = self.import_file(dir, &path) else {
                 return false;
             };
             states.insert(path.clone(), 1);
@@ -94,17 +102,20 @@ impl Module {
         }
         let mut bindings: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
         let mut imports = Vec::new();
-        for statement in children(tree.root_node()) {
+        let mut local_alias_proof_only = false;
+        for (index, statement) in children(tree.root_node()).into_iter().enumerate() {
             match statement.kind() {
                 "function_definition" => {
                     if !inert_header(statement, &source) {
                         return None;
                     }
+                    local_alias_proof_only |=
+                        statement.child(0).is_some_and(|n| n.kind() == "async");
                     let name = text(statement.child_by_field_name("name")?, &source)?;
                     bindings
                         .entry(name.to_owned())
                         .or_default()
-                        .push(Binding::Function);
+                        .push(Binding::Function(index));
                 }
                 "import_from_statement" => {
                     let module = statement.child_by_field_name("module_name")?;
@@ -138,37 +149,58 @@ impl Module {
                     if assignment.kind() != "assignment"
                         || left.kind() != "identifier"
                         || assignment.child_by_field_name("type").is_some()
-                        || !literal(assignment.child_by_field_name("right")?, &source)
                     {
                         return None;
                     }
+                    let right = assignment.child_by_field_name("right")?;
+                    let binding = if literal(right, &source) {
+                        Binding::Other
+                    } else {
+                        let right = super::python_return_usage::unparenthesized(right);
+                        let name = text(right, &source)?;
+                        if right.kind() != "identifier"
+                            || !matches!(
+                                bindings.get(name).map(Vec::as_slice),
+                                Some([Binding::Function(_)])
+                            )
+                        {
+                            return None;
+                        }
+                        local_alias_proof_only = true;
+                        Binding::LocalAlias(name.to_owned())
+                    };
                     bindings
                         .entry(text(left, &source)?.to_owned())
                         .or_default()
-                        .push(Binding::Other);
+                        .push(binding);
                 }
                 _ => return None,
             }
+        }
+        // import の副作用や __all__、NFKC で重なる別綴りがあれば公開名の存在を保留する。
+        if local_alias_proof_only
+            && (!imports.is_empty()
+                || bindings.contains_key("__all__")
+                || bindings
+                    .keys()
+                    .any(|name| !name.is_ascii() && !unicode_normalization::is_nfkc(name)))
+        {
+            return None;
         }
         Some(Self {
             source,
             tree,
             bindings,
             imports,
+            local_alias_proof_only,
         })
     }
 
     fn function(&self, name: &str) -> Option<Node<'_>> {
-        if !matches!(self.bindings.get(name)?.as_slice(), [Binding::Function]) {
+        let [Binding::Function(index)] = self.bindings.get(name)?.as_slice() else {
             return None;
-        }
-        children(self.tree.root_node()).into_iter().find(|node| {
-            node.kind() == "function_definition"
-                && node
-                    .child_by_field_name("name")
-                    .and_then(|node| text(node, &self.source))
-                    == Some(name)
-        })
+        };
+        self.tree.root_node().named_child(*index as u32)
     }
 }
 
@@ -200,7 +232,7 @@ pub(super) fn index_names(
                 && !new.iter().any(|(current, _, _)| current == name)
                 && matches!(
                     current.bindings.get(name).map(Vec::as_slice),
-                    Some([Binding::Import { .. }])
+                    Some([Binding::Import { .. } | Binding::LocalAlias(_)])
                 )
             {
                 names.insert(name.clone());
@@ -208,6 +240,11 @@ pub(super) fn index_names(
         }
     }
     names
+}
+
+enum Rebinding {
+    Import(PythonImportRebinding),
+    LocalAlias,
 }
 
 pub(super) fn partition(
@@ -223,22 +260,21 @@ pub(super) fn partition(
             removed.push(candidate);
             continue;
         };
-        if evidence.equivalence == RebindingEquivalence::Proven {
-            buckets.compatible_modified.push(CompatibleApiModification {
-                change_evidence: None,
-                name: candidate.name,
-                inline_module: candidate.inline_module,
-                kind: candidate.kind,
-                file: candidate.file,
-                old_signature: Some(candidate.signature),
-                new_signature: Some(new_signature),
-                reason: "python_import_rebinding".to_owned(),
-            });
-        } else {
+        let unverified = match evidence {
+            Rebinding::Import(evidence) => {
+                let reason = (evidence.equivalence != RebindingEquivalence::Proven)
+                    .then_some(ApiModificationUnverifiedReason::PythonImportRebindingUnverified);
+                rebindings.push(evidence);
+                reason
+            }
+            // __name__ や __qualname__ は代入先の関数の名前を返す。
+            Rebinding::LocalAlias => Some(ApiModificationUnverifiedReason::CompatibilityUnverified),
+        };
+        if let Some(reason) = unverified {
             buckets.modified.push(ApiSymbolChange {
                 inline_module: candidate.inline_module,
                 unverified: Some(ApiModificationUnverified {
-                    reason: ApiModificationUnverifiedReason::PythonImportRebindingUnverified,
+                    reason,
                     first_unproven: None,
                 }),
                 ..ApiSymbolChange::new(
@@ -249,8 +285,18 @@ pub(super) fn partition(
                     Some(new_signature),
                 )
             });
+        } else {
+            buckets.compatible_modified.push(CompatibleApiModification {
+                change_evidence: None,
+                name: candidate.name,
+                inline_module: candidate.inline_module,
+                kind: candidate.kind,
+                file: candidate.file,
+                old_signature: Some(candidate.signature),
+                new_signature: Some(new_signature),
+                reason: "python_import_rebinding".to_owned(),
+            });
         }
-        rebindings.push(evidence);
     }
     (removed, rebindings)
 }
@@ -259,7 +305,7 @@ fn prove_binding(
     inputs: &DetectionInputs<'_>,
     candidate: &ApiSymbolCandidate,
     cache: &mut Cache,
-) -> Option<(PythonImportRebinding, String)> {
+) -> Option<(Rebinding, String)> {
     if candidate.kind != "function"
         || candidate.name.contains('.')
         || !candidate.file.ends_with(".py")
@@ -267,23 +313,29 @@ fn prove_binding(
         return None;
     }
     let current = cache.file(inputs.dir, &candidate.file)?;
-    let [Binding::Import { module, name }] = current.bindings.get(&candidate.name)?.as_slice()
-    else {
+    let binding = current.bindings.get(&candidate.name)?.as_slice();
+    if let [Binding::LocalAlias(name)] = binding {
+        let function = current.function(name)?;
+        return Some((
+            Rebinding::LocalAlias,
+            function_signature(function, &current.source)?,
+        ));
+    }
+    let [Binding::Import { module, name }] = binding else {
         return None;
     };
     let target_path = super::python_module_path::resolve(inputs.dir, module)?;
     if !cache.graph_is_acyclic(inputs.dir, &candidate.file) {
         return None;
     }
-    let target = cache.file(inputs.dir, &target_path)?;
+    let target = cache.import_file(inputs.dir, &target_path)?;
     let target_function = target.function(name)?;
     let old = Module::parse(SourceBuf::Vec(inputs.base_blobs.read(&candidate.file)?))?;
+    if old.local_alias_proof_only {
+        return None;
+    }
     let old_function = old.function(&candidate.name)?;
-    let target_body = target_function.child_by_field_name("body")?;
-    let new_signature = text(target_function, &target.source)?
-        .get(..target_body.start_byte() - target_function.start_byte())?
-        .trim()
-        .to_owned();
+    let new_signature = function_signature(target_function, &target.source)?;
     let mut uses = Vec::new();
     let _: ControlFlow<()> = walk_preorder(current.tree.root_node(), Children::Named, |node, _| {
         if matches!(node.kind(), "import_from_statement" | "import_statement") {
@@ -306,7 +358,7 @@ fn prove_binding(
         site.binding_verified = equal;
     }
     Some((
-        PythonImportRebinding {
+        Rebinding::Import(PythonImportRebinding {
             name: candidate.name.clone(),
             kind: candidate.kind.clone(),
             file: candidate.file.clone(),
@@ -321,9 +373,16 @@ fn prove_binding(
                 RebindingEquivalence::Unverified
             },
             same_file_uses: uses,
-        },
+        }),
         new_signature,
     ))
+}
+
+fn function_signature(function: Node<'_>, source: &[u8]) -> Option<String> {
+    let body = function.child_by_field_name("body")?;
+    text(function, source)?
+        .get(..body.start_byte() - function.start_byte())
+        .map(|header| header.trim().to_owned())
 }
 
 fn import_names<'a>(node: Node<'_>, source: &'a [u8]) -> Option<(&'a str, &'a str)> {
@@ -346,8 +405,12 @@ fn inert_header(function: Node<'_>, source: &[u8]) -> bool {
     let Some(name) = function.child_by_field_name("name") else {
         return false;
     };
+    let start = function
+        .child(0)
+        .filter(|keyword| keyword.kind() == "async")
+        .map_or(function.start_byte(), |keyword| keyword.end_byte());
     if source
-        .get(function.start_byte()..name.start_byte())
+        .get(start..name.start_byte())
         .and_then(|s| std::str::from_utf8(s).ok())
         .map(str::trim)
         != Some("def")
@@ -583,7 +646,8 @@ fn project_uses_are_closed(
                     if !inventory.contains(imported_path.as_str()) {
                         return ControlFlow::Break(());
                     }
-                    let Some(imported_module) = cache.file(inputs.dir, &imported_path) else {
+                    let Some(imported_module) = cache.import_file(inputs.dir, &imported_path)
+                    else {
                         return ControlFlow::Break(());
                     };
                     for import in children(node) {
@@ -595,7 +659,7 @@ fn project_uses_are_closed(
                         };
                         if !matches!(
                             imported_module.bindings.get(imported).map(Vec::as_slice),
-                            Some([Binding::Function] | [Binding::Import { .. }])
+                            Some([Binding::Function(_)] | [Binding::Import { .. }])
                         ) {
                             return ControlFlow::Break(());
                         }
