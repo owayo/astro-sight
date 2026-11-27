@@ -3,6 +3,144 @@
 use super::support::*;
 
 #[test]
+fn rust_parent_visible_function_distinguishes_lexical_names_and_other_owners() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='reports'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod producer; mod reader; mod rows; mod other; mod ambiguous;\n",
+    );
+    repo.write("src/other.rs", "pub fn record(value: u8) -> u8 { value }\n");
+    repo.write(
+        "src/producer.rs",
+        "fn record(value: u8) -> u8 { value }\nfn trace() { record(1); }\n",
+    );
+    repo.write(
+        "src/reader.rs",
+        r#"use crate::other::record;
+struct Row { data: u8 }
+fn read(rows: Vec<Row>) {
+    record(1);
+    crate::other::record(2);
+    let _ = rows.iter().map(|record| record.data);
+    for record in rows { drop(record); }
+    if let Some(record) = Some(Row { data: 3 }) { drop(record); }
+}
+"#,
+    );
+    repo.write(
+        "src/ambiguous.rs",
+        "use crate::producer::*; use crate::other::*;\nfn trace() { record(2); }\nfn entries() { for record in [1] { drop(record); } }\n",
+    );
+    repo.create_dir_all("src/rows");
+    repo.write("src/rows.rs", "struct Row(u8); mod collect;\n");
+    repo.write(
+        "src/rows/collect.rs",
+        r#"use super::*;
+fn entries(rows: Vec<Row>) {
+    let _ = rows.iter().map(|record| record.0);
+    for record in rows { drop(record); }
+    if let Some(record) = Some(Row(1)) { drop(record); }
+    let record = || 1;
+    let _ = record();
+}
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    for (signature, args) in [
+        ("pub(super) fn record(value: u8)", &["--git"][..]),
+        (
+            "pub(super) fn record(\n value: u8,\n)",
+            &["--git", "--staged"][..],
+        ),
+    ] {
+        repo.write(
+            "src/producer.rs",
+            format!("{signature} -> u8 {{ value }}\nfn trace() {{ record(1); }}\n"),
+        );
+        repo.stage_all();
+        let result = repo.run_json("context", args);
+        let callers = result["changes"][0]["impacted_callers"].as_array().unwrap();
+        let paths: Vec<_> = callers
+            .iter()
+            .map(|row| row["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            ["src/ambiguous.rs", "src/ambiguous.rs", "src/producer.rs"],
+            "{callers:?}"
+        );
+    }
+    repo.write(
+        "src/other.rs",
+        "pub fn record(value: u8, extra: u8) -> u8 { value + extra }\n",
+    );
+    let result = repo.run_json("context", &["--git"]);
+    let other = result["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "src/other.rs")
+        .unwrap();
+    assert!(
+        other["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "src/reader.rs" && row["line"] == 3),
+        "{other}"
+    );
+}
+
+#[test]
+fn rust_parent_visible_function_checks_the_crate_root_of_a_dependency_glob() {
+    for (declaration, expected) in [
+        ("", false),
+        ("extern crate self as dep;", true),
+        (
+            "macro_rules! alias { () => { extern crate self as dep; }; } alias!();",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.create_dir_all("dep/src");
+        repo.write("Cargo.toml", "[package]\nname='reports'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ndep={path='dep'}\n");
+        repo.write(
+            "dep/Cargo.toml",
+            "[package]\nname='dep'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        repo.write(
+            "dep/src/lib.rs",
+            "pub mod facade { pub fn something() {} }\n",
+        );
+        repo.write("src/lib.rs", format!("{declaration}\nmod producer; mod reader; mod other;\npub(crate) mod facade {{ pub(crate) use crate::producer::*; pub(crate) use crate::other::*; }}\n"));
+        repo.write("src/other.rs", "pub(crate) fn record() {}\n");
+        repo.write(
+            "src/reader.rs",
+            "use dep::facade::*;\nfn read() { for record in [1] { drop(record); } }\n",
+        );
+        repo.write("src/producer.rs", "fn record() {}\n");
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/producer.rs", "pub(super) fn record() {}\n");
+        let result = repo.run_json("context", &["--git"]);
+        let found = result["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row["path"] == "src/reader.rs" && row["line"] == 1)
+            });
+        assert_eq!(found, expected, "{declaration}: {result}");
+    }
+}
+
+#[test]
 fn rust_private_function_distinguishes_tracing_fields_from_value_expressions() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

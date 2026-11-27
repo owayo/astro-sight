@@ -87,6 +87,27 @@ pub(super) fn stock_dependency(
         let lock_source = read_input_text_file(&project.root.join("Cargo.lock"))?;
         let lock = toml::from_str::<toml::Value>(&lock_source).ok()?;
         let names = registry_closure(&lock, name)?;
+        if name == "schemars" {
+            if !names.contains("schemars_derive") {
+                return None;
+            }
+            // use と impl が無名定数の中に生成されることを確認した提供元・版に限る。
+            let packages = lock.get("package")?.as_array()?;
+            for (dependency, version) in [
+                ("schemars", "1.2.3"),
+                ("schemars_derive", "1.2.3"),
+                ("serde", "1.0.229"),
+                ("serde_derive", "1.0.229"),
+            ] {
+                let mut matches = packages.iter().filter(|pkg| {
+                    pkg.get("name").and_then(toml::Value::as_str) == Some(dependency)
+                });
+                if matches.next()?.get("version")?.as_str()? != version || matches.next().is_some()
+                {
+                    return None;
+                }
+            }
+        }
         if name == "serde" && !names.contains("serde_derive") {
             return None;
         }
@@ -274,60 +295,95 @@ impl RustPathOwnerIndex {
     }
 }
 
-/// 直接 import した Serialize/Deserialize か、明示した serde::Deserialize などに限る。
-pub(super) fn serde_attribute(
-    root: Node<'_>,
-    item: Node<'_>,
-    source: &[u8],
-) -> Option<Vec<String>> {
-    let direct = |name: &str| {
-        let mut cursor = root.walk();
-        root.named_children(&mut cursor).any(|n| {
-            n.kind() == "use_declaration"
-                && !has_attribute_prefix(n)
-                && n.child_by_field_name("argument")
-                    .and_then(|a| a.utf8_text(source).ok())
-                    .is_some_and(|path| path.strip_prefix("serde::") == Some(name))
-        })
-    };
-    let known_derive = |attr: Node<'_>| {
-        let text = attr
-            .utf8_text(source)
-            .ok()?
-            .strip_prefix("#[derive(")?
-            .strip_suffix(")]")?;
-        let mut serde = false;
-        let mut shadowable = vec!["derive".to_owned(), "serde".to_owned()];
-        for name in text.split(',').map(str::trim) {
-            if matches!(name, "serde::Deserialize" | "serde::Serialize")
-                || matches!(name, "Serialize" | "Deserialize") && direct(name)
-            {
-                serde = true;
-            } else if !super::super::rust_std_origin::builtin_derive(name) {
-                return None;
-            } else {
-                shadowable.push(name.to_owned());
+pub(super) struct SerdeDerives {
+    direct: HashSet<&'static str>,
+    pub(super) schema: bool,
+}
+
+impl SerdeDerives {
+    pub(super) fn imports(root: Node<'_>, source: &[u8], schema: bool) -> Self {
+        let mut direct = HashSet::new();
+        let mut attributed = false;
+        for item in root.named_children(&mut root.walk()) {
+            match item.kind() {
+                "attribute_item" => {
+                    attributed = true;
+                    continue;
+                }
+                "line_comment" | "block_comment" => continue,
+                "use_declaration"
+                    if !attributed && let Some(arg) = item.child_by_field_name("argument") =>
+                {
+                    let group = (schema
+                        && arg.kind() == "scoped_use_list"
+                        && arg
+                            .child_by_field_name("path")
+                            .is_some_and(|path| path.utf8_text(source) == Ok("serde")))
+                    .then(|| arg.child_by_field_name("list"))
+                    .flatten();
+                    for name in ["Serialize", "Deserialize"] {
+                        if arg
+                            .utf8_text(source)
+                            .is_ok_and(|path| path.strip_prefix("serde::") == Some(name))
+                            || group.is_some_and(|group| {
+                                group.named_children(&mut group.walk()).any(|n| {
+                                    n.kind() == "identifier" && n.utf8_text(source) == Ok(name)
+                                })
+                            })
+                        {
+                            direct.insert(name);
+                        }
+                    }
+                }
+                _ => {}
             }
+            attributed = false;
         }
-        serde.then_some(shadowable)
-    };
-    if let Some(names) = known_derive(item) {
-        return Some(names);
+        Self { direct, schema }
     }
-    if !item
-        .utf8_text(source)
-        .is_ok_and(|text| text.starts_with("#[serde("))
-    {
-        return None;
-    }
-    let mut prev = item.prev_named_sibling();
-    while let Some(a) = prev.filter(|a| a.kind() == "attribute_item") {
-        if let Some(names) = known_derive(a) {
+
+    pub(super) fn attribute(&self, item: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+        let known_derive = |attr: Node<'_>| {
+            let text = attr
+                .utf8_text(source)
+                .ok()?
+                .strip_prefix("#[derive(")?
+                .strip_suffix(")]")?;
+            let mut serde = false;
+            let mut shadowable = vec!["derive".to_owned(), "serde".to_owned()];
+            for name in text.split(',').map(str::trim) {
+                if matches!(name, "serde::Deserialize" | "serde::Serialize")
+                    || self.direct.contains(name)
+                {
+                    serde = true;
+                } else if self.schema && name == "schemars::JsonSchema" {
+                    shadowable.push("schemars".to_owned());
+                } else if !super::super::rust_std_origin::builtin_derive(name) {
+                    return None;
+                } else {
+                    shadowable.push(name.to_owned());
+                }
+            }
+            serde.then_some(shadowable)
+        };
+        if let Some(names) = known_derive(item) {
             return Some(names);
         }
-        prev = a.prev_named_sibling();
+        if !item
+            .utf8_text(source)
+            .is_ok_and(|text| text.starts_with("#[serde("))
+        {
+            return None;
+        }
+        let mut prev = item.prev_named_sibling();
+        while let Some(a) = prev.filter(|a| a.kind() == "attribute_item") {
+            if let Some(names) = known_derive(a) {
+                return Some(names);
+            }
+            prev = a.prev_named_sibling();
+        }
+        None
     }
-    None
 }
 
 #[cfg(test)]

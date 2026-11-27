@@ -1,7 +1,6 @@
 //! Proof for a Rust file-root item whose only edit widens private visibility.
 //!
-//! The byte comparison is deliberately strict: formatting, attributes, or
-//! another edit in the file make the old binding uncertain.
+//! The comparison preserves each parameter, the body and surrounding items.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -100,6 +99,7 @@ pub(super) enum WideningScope {
 
 #[derive(Clone, Debug)]
 pub(super) struct ExplicitWidening {
+    pub(super) plain_private_function: bool,
     edit: VisibilityEdit,
     /// 同じファイルで可視性を書き換えた宣言すべて (この宣言を含む)。
     file_edits: Arc<[VisibilityEdit]>,
@@ -304,6 +304,32 @@ fn visibility_only_edits<'a>(
         if let Some(node) = new_modifier {
             new_removed.push(modifier_range(node, new_source, one_sided));
         }
+        // 引数列の改行と末尾カンマだけが変わっても、各引数の宣言は同じ。
+        if new_item.kind() == "function_item"
+            && edit.old == Visibility::Private
+            && matches!(&edit.new, Visibility::Restricted(path) if path == &["super"])
+            && !super::rust_path_owner::has_attribute_prefix(new_item)
+        {
+            let before = old_item.child_by_field_name("parameters")?;
+            let after = new_item.child_by_field_name("parameters")?;
+            let (mut a, mut b) = (before.walk(), after.walk());
+            if before
+                .named_children(&mut a)
+                .map(|n| (n.kind(), &old_source[n.byte_range()]))
+                .eq(after
+                    .named_children(&mut b)
+                    .map(|n| (n.kind(), &new_source[n.byte_range()])))
+                && before.named_child_count() > 0
+                && [before, after].into_iter().all(|params| {
+                    params
+                        .children(&mut params.walk())
+                        .all(|n| matches!(n.kind(), "parameter" | "(" | ")" | ","))
+                })
+            {
+                old_removed.push(before.byte_range());
+                new_removed.push(after.byte_range());
+            }
+        }
         edits.push((name, new_item.kind(), edit));
     }
     (without_ranges(old_source, &old_removed) == without_ranges(new_source, &new_removed))
@@ -360,6 +386,7 @@ pub(super) fn explicit_widenings(
         .iter()
         .map(|(_, _, edit)| edit.clone())
         .collect::<Arc<[_]>>();
+    let opaque = std::cell::OnceCell::new();
     for changed in affected
         .iter()
         .filter(|item| item.change_type == "modified")
@@ -370,9 +397,11 @@ pub(super) fn explicit_widenings(
         let Some((_, kind, edit)) = named.next() else {
             continue;
         };
+        // 型と値で同じ名前を使えるので、一意性は宣言の kind ごとに確認する。
+        let Some(item) = unique_declaration(root, source, &changed.name, kind) else {
+            continue;
+        };
         if named.next().is_some()
-            // 型と値で同じ名前を使えるので、一意性は宣言の kind ごとに確認する。
-            || unique_declaration(root, source, &changed.name, kind).is_none()
             // private から `pub(crate)` / `pub` への拡大は `private_widening_names` が扱う。
             || (edit.old == Visibility::Private && edit.new.is_crate_or_public())
             || edit.new == Visibility::Private
@@ -382,6 +411,13 @@ pub(super) fn explicit_widenings(
         result.insert(
             changed.name.clone(),
             ExplicitWidening {
+                plain_private_function: *kind == "function_item"
+                    && edit.old == Visibility::Private
+                    && !opaque
+                        .get_or_init(|| {
+                            super::rust_macro_site::OpaqueAttributeScopes::build(root, source)
+                        })
+                        .contains(item),
                 edit: edit.clone(),
                 file_edits: Arc::clone(&file_edits),
             },

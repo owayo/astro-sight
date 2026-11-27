@@ -1,5 +1,6 @@
 //! 標準 format! と証明できる引数内だけ、外側のローカルな値束縛を使う。
 
+use super::registry_macros::SerdeDerives;
 use super::*;
 use crate::engine::tree_walk::{Children, any_node};
 
@@ -27,6 +28,14 @@ impl Environment {
     /// それらは自作のものかもしれず、展開が名前の束縛を足し得る)。
     pub(super) fn consistent(&self) -> bool {
         self.imports.is_disjoint(&self.attributes) && self.imports.is_disjoint(&self.used_macros)
+    }
+
+    pub(super) fn closed_imports(&self) -> bool {
+        self.used_macros.is_empty() && self.consistent()
+    }
+
+    pub(super) fn plain_block(&self, name: &str) -> bool {
+        self.attributes.is_empty() && self.used_macros.is_empty() && !self.imports.contains(name)
     }
 
     /// `names` のどれかを import・マクロの定義で差し替えているか。
@@ -76,7 +85,7 @@ pub(super) fn environment_with_glob(
     approved: Option<usize>,
     imports_in_scope: bool,
 ) -> Option<(Environment, bool)> {
-    scope_environment(scope, source, approved, imports_in_scope, false)
+    scope_environment(scope, source, approved, imports_in_scope, None)
 }
 
 /// serde の derive が crates.io のものと確認済みのモジュールでは、生成される impl が別の文のマクロを差し替えない。
@@ -93,7 +102,28 @@ fn module_environment(
         {
             return None;
         }
-        scope_environment(scope, source, None, visible, true)
+        let derives = SerdeDerives::imports(scope, source, false);
+        scope_environment(scope, source, None, visible, Some(&derives))
+    })
+}
+
+/// 確認した版の JsonSchema と serde の derive は、生成する use・impl を無名定数の中に置く。
+pub(super) fn visibility_environment(
+    scope: Node<'_>,
+    source: &[u8],
+    file: &Path,
+    project: &RustPathOwnerProjectProof,
+) -> Option<(Environment, bool)> {
+    module_environment(scope, source, file, project, true).or_else(|| {
+        if memchr::memmem::find(source, b"schemars::JsonSchema").is_none()
+            || has_parent_glob(scope)
+            || !super::registry_macros::stock_dependency(project, file, "serde")
+            || !super::registry_macros::stock_dependency(project, file, "schemars")
+        {
+            return None;
+        }
+        let derives = SerdeDerives::imports(scope, source, true);
+        scope_environment(scope, source, None, true, Some(&derives)).filter(|(_, glob)| !glob)
     })
 }
 
@@ -102,7 +132,7 @@ fn scope_environment(
     source: &[u8],
     approved: Option<usize>,
     imports_in_scope: bool,
-    serde: bool,
+    derives: Option<&SerdeDerives>,
 ) -> Option<(Environment, bool)> {
     let mut result = Environment::default();
     let mut textual = HashSet::new();
@@ -136,22 +166,18 @@ fn scope_environment(
                     result.attributes.insert("global_allocator".to_owned());
                     continue;
                 }
-                if let Some(names) = super::super::rust_std_origin::safe_attribute(item, source) {
-                    result.attributes.extend(names);
-                } else if serde
-                    && let Some(names) =
-                        super::registry_macros::serde_attribute(scope, item, source)
-                {
-                    result.attributes.extend(names);
-                } else {
-                    return None;
-                }
+                let names = super::super::rust_std_origin::safe_attribute(item, source)
+                    .or_else(|| derives?.attribute(item, source))?;
+                result.attributes.extend(names);
             }
             "mod_item" | "type_item"
-                if serde
+                if derives.is_some()
                     && item.child_by_field_name("name").is_some_and(|n| {
                         n.utf8_text(source).ok().is_none_or(|name| {
-                            !name.is_ascii() || name.trim_start_matches("r#") == "serde"
+                            !name.is_ascii()
+                                || name.trim_start_matches("r#") == "serde"
+                                || derives.is_some_and(|d| d.schema)
+                                    && name.trim_start_matches("r#") == "schemars"
                         })
                     }) =>
             {

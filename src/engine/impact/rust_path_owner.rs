@@ -30,6 +30,7 @@ mod macro_crate;
 mod nominal;
 mod registry_macros;
 mod tracing_fields;
+mod visibility_names;
 mod workspace_members;
 
 pub(super) use macro_copy::MacroCopy;
@@ -136,6 +137,7 @@ pub(super) struct RustPathOwnerIndex {
     independent_pointers: std::cell::OnceCell<HashSet<usize>>,
     json_calls: RefCell<HashMap<usize, bool>>,
     tracing_fields: std::cell::OnceCell<Option<HashSet<usize>>>,
+    visibility_imports: visibility_names::Imports,
     local_type_names: HashSet<String>,
     local_value_names: HashSet<String>,
     closed_local_rule: OnceLock<Option<usize>>,
@@ -161,6 +163,7 @@ enum Rebind {
     Type,
     /// [`scope_can_rebind_import_name_beside`] と、標準と証明したマクロの呼び出し
     Value(Option<usize>),
+    WidenedFunction,
 }
 
 /// Module-relative paths need a unique compilation context for each source
@@ -2397,6 +2400,7 @@ impl RustPathOwnerIndex {
             macro_paths: std::cell::OnceCell::new(),
             json_calls: RefCell::default(),
             tracing_fields: Default::default(),
+            visibility_imports: Default::default(),
             local_type_names,
             local_value_names,
             closed_local_rule: OnceLock::new(),

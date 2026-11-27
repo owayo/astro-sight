@@ -175,7 +175,7 @@ pub(super) fn is_low_confidence_caller(e: &RefEventMini, all_symbol_names: &[Str
 
 /// 環境変数 `ASTRO_SIGHT_NO_CONFIDENCE_FILTER=1` で低確信度ルーティングを無効化する。
 /// デバッグ目的で全 caller を `impacted_callers` に流したいときのみ使用する。
-fn confidence_filter_disabled() -> bool {
+pub(super) fn confidence_filter_disabled() -> bool {
     std::env::var("ASTRO_SIGHT_NO_CONFIDENCE_FILTER")
         .ok()
         .as_deref()
@@ -596,6 +596,7 @@ impl ImpactCollector<'_> {
                 lexical_binding: LexicalBinding::Unknown,
                 js_signature_site: JsSignatureSite::Unknown,
                 node: Some(node),
+                rust_scope: None,
                 rust_format_capture: None,
                 source,
             },
@@ -615,6 +616,7 @@ impl ImpactCollector<'_> {
             rust_macro_callee,
             usage,
             lexical_binding,
+            rust_scope,
             js_signature_site,
             node,
             rust_format_capture,
@@ -1416,7 +1418,32 @@ impl ImpactCollector<'_> {
                         self.rust_path_owner_project,
                     )
                 });
+        let visibility_independent = scoped_node.zip(scoped_view).is_some_and(|(node, view)| {
+            let ([fc], Some((scope, ancestors))) = (self.sym_to_fc[ix].as_slice(), rust_scope)
+            else {
+                return false;
+            };
+            let ctx = &self.file_contexts[*fc as usize];
+            let name = &self.all_symbol_names[ix];
+            !is_import
+                && refs::is_rust_shadowable_value_identifier(node)
+                && ctx.rust_super_functions.contains(name)
+                && ctx.rust_explicit_widenings.contains_key(name)
+                && ctx.new_path != self.path_str
+                && self
+                    .rust_path_owner
+                    .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source))
+                    .outside_widened_binding(
+                        ancestors,
+                        scope.has_lexical_name(name, node, ancestors),
+                        source,
+                        (Path::new(&ctx.new_path), name),
+                        Path::new(self.path_str),
+                        view,
+                    )
+        });
         let rust_local_owner = rust_local_owner
+            || visibility_independent
             || (rust_name_site == super::rust_macro_site::MacroSite::RuleBody
                 && rust_owner_index
                     .zip(node)
@@ -2053,6 +2080,7 @@ impl<'a> ImpactCollector<'a> {
             return true;
         }
         if e.rust_module_scope_site
+            && !ctx.rust_explicit_widenings.contains_key(name)
             && ctx.rust_super_functions.contains(name)
             && ctx.rust_free_function_names.contains(name)
             && *evidence.outside_parent.entry(fc_ix).or_insert_with(|| {
