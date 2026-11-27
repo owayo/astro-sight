@@ -354,6 +354,22 @@ fn analyze_changed_file(
     // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
     let changed_line_facts = diff::extract_changed_line_facts(file_diff, &df.new_path);
     let changed_new_lines = &changed_line_facts.added_lines;
+    let declaration_input = declaration::DeclarationChangeInput {
+        file_diff,
+        file_path: &df.new_path,
+        old_file_path: &df.old_path,
+        syms: &syms,
+        hunks: &df.hunks,
+        root,
+        source: &source,
+        lang_id,
+        facts: &changed_line_facts,
+        reexport_moves,
+    };
+    let old_side = declaration::LazyOldSide::default();
+    let foreign = declaration::ForeignChanges::collect(&declaration_input, &old_side);
+    let start =
+        |sym: &Symbol| tree_sitter::Point::new(sym.range.start.line, sym.range.start.column);
     let eol_unchanged = if lang_id == LangId::Rust {
         rust_line_endings::unchanged_symbols(
             file_diff,
@@ -393,9 +409,18 @@ fn analyze_changed_file(
     };
     let affected_raw: Vec<_> = impact_syms
         .iter()
-        .filter(|sym| !eol_unchanged.contains(&(sym.name.as_str(), symbol_kind_str(sym.kind))))
         .filter_map(|sym| {
-            classify_symbol_change(sym, &df.hunks, Some(&changed_line_facts)).map(|change_type| {
+            let pos = start(sym);
+            let classification = if foreign.changed.contains_key(&pos) {
+                Some("modified")
+            } else if foreign.unchanged.contains(&pos)
+                || eol_unchanged.contains(&(sym.name.as_str(), symbol_kind_str(sym.kind)))
+            {
+                None
+            } else {
+                classify_symbol_change(sym, &df.hunks, Some(&changed_line_facts))
+            };
+            classification.map(|change_type| {
                 (
                     sym,
                     AffectedSymbol {
@@ -480,21 +505,31 @@ fn analyze_changed_file(
     let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
     // 複数行ヘッダや宣言移動の差分は、旧側 AST と突き合わせて補う。
     let declaration_proof = declaration::reconcile_declaration_changes(
-        &declaration::DeclarationChangeInput {
-            file_diff,
-            file_path: &df.new_path,
-            old_file_path: &df.old_path,
-            syms: &syms,
-            hunks: &df.hunks,
-            root,
-            source: &source,
-            lang_id,
-            facts: &changed_line_facts,
-            reexport_moves,
-        },
+        old_side,
+        &declaration_input,
         &mut affected,
         &mut sig_changes,
     );
+    if !foreign.changed.is_empty() {
+        // 行比較の結果があっても、外側の ABI を含めた宣言を表示する。
+        let mut replaced: HashSet<&str> = foreign
+            .changed
+            .values()
+            .map(|change| change.name.as_str())
+            .collect();
+        for original in &originals {
+            if !foreign.changed.contains_key(&start(original)) {
+                replaced.remove(original.name.as_str());
+            }
+        }
+        sig_changes.retain(|prior| !replaced.contains(prior.name.as_str()));
+        for (original, affected) in originals.iter().zip(&mut affected) {
+            if let Some(change) = foreign.changed.get(&start(original)) {
+                affected.change_type = "modified".to_owned();
+                sig_changes.push(change.clone());
+            }
+        }
+    }
     // 同名の別クラスのメソッドを、行比較による旧宣言との対応付けに混ぜない。
     // 宣言比較の後に、元の所有型で証明した新規追加だけを確定する。
     if lang_id == LangId::Python && single_in_place_file {

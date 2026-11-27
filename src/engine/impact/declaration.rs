@@ -27,6 +27,9 @@ use crate::models::symbol::{Symbol, SymbolKind};
 
 use super::signature::find_signature_in_lines;
 
+mod foreign;
+pub(super) use foreign::ForeignChanges;
+
 /// 宣言ノードから本体ノードを探す方法。
 #[derive(Clone, Copy)]
 enum BodyLocator {
@@ -400,21 +403,12 @@ struct OldSide {
 }
 
 /// 変更前ソースは必要になったときだけ 1 度復元する (多くのファイルでは使わない)。
-enum LazyOldSide {
-    Pending,
-    Unavailable,
-    Ready(OldSide),
-}
+#[derive(Default)]
+pub(super) struct LazyOldSide(std::cell::OnceCell<Option<OldSide>>);
 
 impl LazyOldSide {
-    fn get(&mut self, input: &DeclarationChangeInput<'_>) -> Option<&OldSide> {
-        if matches!(self, LazyOldSide::Pending) {
-            *self = build_old_side(input).map_or(LazyOldSide::Unavailable, LazyOldSide::Ready);
-        }
-        match self {
-            LazyOldSide::Ready(old) => Some(old),
-            LazyOldSide::Pending | LazyOldSide::Unavailable => None,
-        }
+    fn get(&self, input: &DeclarationChangeInput<'_>) -> Option<&OldSide> {
+        self.0.get_or_init(|| build_old_side(input)).as_ref()
     }
 }
 
@@ -987,12 +981,12 @@ fn rust_modified_alias_names(
 /// Rust と、明示戻り型を持つ TS/TSX の root 関数は、一意な旧新ヘッダと本体以外の
 /// ソースが一致するときに行比較へ混ざった本体の差を取り消す。
 pub(super) fn reconcile_declaration_changes(
+    mut old_side: LazyOldSide,
     input: &DeclarationChangeInput<'_>,
     affected: &mut [AffectedSymbol],
     sig_changes: &mut Vec<SignatureChange>,
 ) -> DeclarationProof {
     let file_has_removed_lines = !input.facts.deletion_gaps.is_empty();
-    let mut old_side = LazyOldSide::Pending;
     // 混在 hunk 内の新規宣言は行だけでは modified になる。旧側の同名宣言と
     // diff 全体の削除名が無いと証明できる場合に限り added へ戻す。
     // 同名複数・復元失敗では AffectedSymbol を位置へ一意に対応付けられない。
@@ -1998,6 +1992,7 @@ mod tests {
                 LangId::Rust,
             );
             reconcile_declaration_changes(
+                LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &section,
                     file_path: path,
@@ -2044,6 +2039,7 @@ mod tests {
             let mut signatures =
                 super::super::signature::detect_signature_changes(&text, path, &affected, lang);
             reconcile_declaration_changes(
+                LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &text,
                     file_path: path,
@@ -2377,6 +2373,7 @@ mod tests {
             super::super::signature::detect_signature_changes(&text, path, &affected, LangId::Rust);
         assert!(diff::reconstruct_old_source(&text, path, source).is_none());
         reconcile_declaration_changes(
+            LazyOldSide::default(),
             &DeclarationChangeInput {
                 file_diff: &text,
                 file_path: path,
@@ -2517,6 +2514,7 @@ mod tests {
             let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
             let mut sig_changes = Vec::new();
             reconcile_declaration_changes(
+                LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     file_path: "api.rs",
@@ -2751,6 +2749,7 @@ mod tests {
             super::super::signature::detect_signature_changes(&diff_text, path, &affected, lang_id);
         if reconcile {
             reconcile_declaration_changes(
+                LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     file_path: path,
@@ -3203,6 +3202,7 @@ mod tests {
                 LangId::Rust,
             );
             let proof = reconcile_declaration_changes(
+                LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     file_path: path,

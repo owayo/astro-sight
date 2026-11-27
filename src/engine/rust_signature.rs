@@ -16,6 +16,7 @@ use crate::language::LangId;
 
 mod const_qualifier;
 mod const_value;
+pub(crate) mod foreign;
 mod parameter_patterns;
 pub(crate) use const_qualifier::{RustConstQualifier, RustFileItems, rust_const_qualifier};
 pub(crate) use const_value::{is_type_like_name, rust_const_value_contract};
