@@ -392,6 +392,8 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) rust_source_paths: &'a [Option<PathBuf>],
     pub(super) rust_path_owner_enabled: bool,
     pub(super) rust_nominal_names: &'a std::collections::HashSet<&'a str>,
+    pub(super) rust_constant_names: &'a std::collections::HashSet<String>,
+    pub(super) staged_constant_source_matches: std::cell::OnceCell<bool>,
     pub(super) rust_std_project_allowed: std::cell::OnceCell<bool>,
     pub(super) rust_std_project: &'a super::rust_std_origin::RustStdProjectProof,
     pub(super) rust_cargo_reachability: &'a super::rust_cargo_reachability::RustCargoReachability,
@@ -1332,19 +1334,54 @@ impl ImpactCollector<'_> {
                         )
                     })
             });
-        let rust_local_owner = (rust_plain_name
-            && owner_index.zip(owner_node).is_some_and(|(index, node)| {
-                index.plain_local_owner(node, owner_source, &self.all_symbol_names[ix])
-                    || index.plain_local_value_owner(node, owner_source, &self.all_symbol_names[ix])
-                    || index.format_local_value_owner(
-                        node,
-                        owner_source,
-                        &self.all_symbol_names[ix],
-                        Path::new(self.dir),
-                        self.path_str,
-                        self.rust_path_owner_project,
-                    )
-            }))
+        let constant_read = rust_plain_name
+            && !is_import
+            && self
+                .rust_constant_names
+                .contains(&self.all_symbol_names[ix])
+            && node.is_some_and(|n| {
+                refs::is_rust_shadowable_value_identifier(n)
+                    && !n
+                        .parent()
+                        .is_some_and(|p| matches!(p.kind(), "token_tree" | "token_repetition"))
+            });
+        let attribute_constant = constant_read
+            && node.is_some_and(|n| {
+                self.rust_opaque_attributes
+                    .get_or_init(|| super::rust_macro_site::OpaqueAttributeScopes::build(n, source))
+                    .contains(n)
+            });
+        let staged_local_value = constant_read && !attribute_constant
+            && !self.rust_path_owner_enabled
+            && node.is_some_and(|n| {
+                self.rust_path_owner
+                    .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(n, source))
+                    .plain_local_value_owner(n, source, &self.all_symbol_names[ix])
+                    // 字句束縛は同じファイルの木で確定する。行末だけの差では束縛は変わらない。
+                    && *self.staged_constant_source_matches.get_or_init(|| {
+                        self.rust_path_owner_project.staged_bindings()
+                            .and_then(|view| crate::engine::bounded_read::read_input_file(&view.root.join(self.path_str)))
+                            .is_some_and(|indexed| super::rust_line_endings::same_text(source, &indexed))
+                    })
+            });
+        let rust_local_owner = staged_local_value
+            || (rust_plain_name
+                && owner_index.zip(owner_node).is_some_and(|(index, node)| {
+                    index.plain_local_owner(node, owner_source, &self.all_symbol_names[ix])
+                        || index.plain_local_value_owner(
+                            node,
+                            owner_source,
+                            &self.all_symbol_names[ix],
+                        )
+                        || index.format_local_value_owner(
+                            node,
+                            owner_source,
+                            &self.all_symbol_names[ix],
+                            Path::new(self.dir),
+                            self.path_str,
+                            self.rust_path_owner_project,
+                        )
+                }))
             || rust_owner_index
                 .zip(rust_format_capture)
                 .is_some_and(|(index, tree)| {
@@ -1456,7 +1493,7 @@ impl ImpactCollector<'_> {
             ts_import_binding_use,
             ts_rebound_const_owner,
             alias_owner,
-            ref_in_macro: ref_in_macro || rust_attribute_call,
+            ref_in_macro: ref_in_macro || rust_attribute_call || attribute_constant,
             rust_macro_evidence,
             rust_macro_callee,
             rust_receiver_member: rust_receiver_member && !rust_attribute_call,
@@ -1495,7 +1532,7 @@ impl ImpactCollector<'_> {
             rust_owner_is_free_function,
             rust_non_function_path,
             rust_registry_qualified_call,
-            rust_local_owner,
+            rust_local_owner: rust_local_owner && !attribute_constant,
             rust_direct_import_site,
             rust_import_binding_safe,
             rust_import_namespace,

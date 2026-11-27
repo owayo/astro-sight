@@ -334,14 +334,15 @@ pub(super) fn owner(
             {
                 return None;
             }
-            if matches!(
+            if (matches!(
                 parent.kind(),
                 "function_item" | "closure_expression" | "block"
-            ) && (has_attribute_prefix(parent)
-                || match namespace {
-                    Namespace::Type => scope_can_rebind_name(parent, source, name),
-                    Namespace::Function => scope_can_rebind_import_name(parent, source, name),
-                })
+            ) || (namespace == Namespace::Function && parent.kind() == "match_arm"))
+                && (has_attribute_prefix(parent)
+                    || match namespace {
+                        Namespace::Type => scope_can_rebind_name(parent, source, name),
+                        Namespace::Function => scope_can_rebind_import_name(parent, source, name),
+                    })
             {
                 return None;
             }

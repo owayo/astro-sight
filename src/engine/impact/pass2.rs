@@ -472,11 +472,18 @@ pub(super) fn stream_caller_maps(
     let string_pool = std::sync::Mutex::new(StringPool::new());
     let python_import_cache = super::python_imports::PythonImportCache::default();
     let mut nominal = HashMap::new();
+    let mut constant_names = HashMap::new();
     for ctx in file_contexts
         .iter()
         .filter(|ctx| ctx.lang_id == LangId::Rust)
     {
         for symbol in &ctx.affected {
+            let constant = symbol.kind == "constant"
+                && symbol.change_type == "modified"
+                && !ctx.rust_kind_changes.contains(&symbol.name);
+            *constant_names
+                .entry(ci_key(LangId::Rust, &symbol.name))
+                .or_insert(true) &= constant;
             let matches = matches!(symbol.kind.as_str(), "enum" | "struct" | "union")
                 && !ctx.rust_kind_changes.contains(&symbol.name);
             *nominal.entry(symbol.name.as_str()).or_insert(true) &= matches;
@@ -485,6 +492,10 @@ pub(super) fn stream_caller_maps(
     let rust_nominal_names: std::collections::HashSet<_> = nominal
         .into_iter()
         .filter_map(|(name, matches)| matches.then_some(name))
+        .collect();
+    let rust_constant_names = constant_names
+        .into_iter()
+        .filter_map(|(name, constant)| constant.then_some(name))
         .collect();
     let mut rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
         dir,
@@ -580,6 +591,8 @@ pub(super) fn stream_caller_maps(
                             rust_std_origin: std::cell::OnceCell::new(),
                             rust_collections: std::cell::OnceCell::new(),
                             rust_nominal_names: &rust_nominal_names,
+                            rust_constant_names: &rust_constant_names,
+                            staged_constant_source_matches: Default::default(),
                             rust_local_macros: std::cell::OnceCell::new(),
                             rust_opaque_attributes: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
