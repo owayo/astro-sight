@@ -167,6 +167,10 @@ pub(crate) struct RefVisitEvent<'a> {
     pub(crate) js_signature_site: crate::engine::js_occurrence::JsSignatureSite,
     /// callback の間だけ有効な AST とソース。impact 固有の証明は collector 側で行う。
     pub(crate) node: Option<Node<'a>>,
+    pub(crate) rust_scope: Option<(
+        &'a crate::engine::rust_scope::RustScopeIndex,
+        &'a [Node<'a>],
+    )>,
     /// Rust の書式マクロの暗黙キャプチャのとき、キャプチャを含む書式マクロの token tree。
     /// キャプチャには識別子のノードが無いので `node` は `None` のまま。
     pub(crate) rust_format_capture: Option<Node<'a>>,
@@ -236,6 +240,7 @@ pub(crate) enum HitOrigin<'tree> {
 pub(crate) struct RawRefHit<'idx, 'tree> {
     matches: MatchSet<'idx>,
     origin: HitOrigin<'tree>,
+    ancestors: &'idx [Node<'tree>],
     line: usize,
     column: usize,
     is_def: bool,
@@ -491,6 +496,11 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 rust_macro_callee,
                 usage,
                 lexical_binding,
+                rust_scope: env
+                    .rust_scope_index
+                    .get()
+                    .and_then(Option::as_ref)
+                    .map(|scope| (scope, hit.ancestors)),
                 js_signature_site,
                 node: match hit.origin {
                     HitOrigin::Identifier(node) => Some(node),
@@ -598,6 +608,7 @@ fn emit_segment_hit<M: RefMatcher, S: RawRefSink>(
             RawRefHit {
                 matches,
                 origin,
+                ancestors: &[],
                 line: row,
                 column,
                 is_def: false,
@@ -663,6 +674,7 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
             RawRefHit {
                 matches,
                 origin: HitOrigin::Identifier(node),
+                ancestors,
                 line: pos.row,
                 column: pos.column,
                 is_def,

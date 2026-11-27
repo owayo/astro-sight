@@ -62,6 +62,63 @@ pub(crate) struct RustScopeIndex {
 }
 
 impl RustScopeIndex {
+    /// 可視性の変更時に、非修飾名の由来になり得るローカルな宣言があるか。
+    /// パターンは定数名とも競合するので、import の到達性は呼び出し側で別に確認する。
+    pub(crate) fn has_lexical_name(&self, name: &str, site: Node<'_>, scopes: &[Node<'_>]) -> bool {
+        let name = binding_name(name);
+        if self.pattern_positions.contains(&site.id())
+            || self.unknown_positions.contains(&site.id())
+        {
+            return true;
+        }
+        for &scope in scopes.iter().rev() {
+            let names = match scope.kind() {
+                "function_item" => {
+                    return self
+                        .parameters
+                        .get(&scope.id())
+                        .is_some_and(|p| p.contains(name));
+                }
+                "block" => {
+                    if self
+                        .blocks
+                        .get(&scope.id())
+                        .and_then(|b| b.lets.get(name))
+                        .and_then(|b| b.first())
+                        .is_some_and(|binding| binding.start <= site.start_byte())
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                "for_expression"
+                    if field_contains(scope, "pattern", site)
+                        || field_contains(scope, "body", site) =>
+                {
+                    self.for_pattern_names.get(&scope.id())
+                }
+                "closure_expression" => self.scoped_patterns.get(&scope.id()),
+                "let_condition" if field_contains(scope, "pattern", site) => {
+                    self.scoped_patterns.get(&scope.id())
+                }
+                "if_expression" | "while_expression"
+                    if field_contains(scope, "consequence", site)
+                        || field_contains(scope, "body", site) =>
+                {
+                    scope
+                        .child_by_field_name("condition")
+                        .and_then(|n| self.scoped_patterns.get(&n.id()))
+                }
+                kind if ITEM_BOUNDARIES.contains(&kind) => return false,
+                _ => continue,
+            };
+            if names.is_some_and(|names| names.contains(name)) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn blocks_without_imports(&self, path: &[Node<'_>]) -> bool {
         path.iter()
             .filter_map(|node| self.blocks.get(&node.id()))

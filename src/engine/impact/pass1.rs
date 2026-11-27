@@ -809,6 +809,22 @@ fn analyze_changed_file(
     } else {
         HashMap::new()
     };
+    let mut rust_super_functions = declaration_proof.rust_super_functions;
+    if declaration_input.complete_single_file_diff
+        && !rust_explicit_widenings.is_empty()
+        && !super::collector::confidence_filter_disabled()
+    {
+        rust_super_functions.extend(
+            declaration_proof
+                .rust_new_super_functions
+                .into_iter()
+                .filter(|name| {
+                    rust_explicit_widenings
+                        .get(name)
+                        .is_some_and(|edit| edit.plain_private_function)
+                }),
+        );
+    }
     for symbol in &mut affected {
         if symbol.change_type == "modified" {
             symbol.change_evidence = Some(syntax_evidence.get(&symbol.name, &symbol.kind, lang_id));
@@ -824,7 +840,7 @@ fn analyze_changed_file(
                 .python_modified_direct_function_names,
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
-            rust_super_functions: declaration_proof.rust_super_functions,
+            rust_super_functions,
             rust_receiverless_associated_names: declaration_proof
                 .rust_receiverless_associated_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,

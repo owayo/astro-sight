@@ -881,6 +881,7 @@ pub(super) struct DeclarationProof {
     pub(super) rust_free_function_names: HashSet<String>,
     /// 旧新ともこのファイル直下にただ一つの pub(super) 自由関数がある名前。
     pub(super) rust_super_functions: HashSet<String>,
+    pub(super) rust_new_super_functions: HashSet<String>,
     pub(super) rust_receiverless_associated_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
@@ -1553,6 +1554,7 @@ pub(super) fn reconcile_declaration_changes(
         .intersection(&restricted_new)
         .cloned()
         .collect();
+    proof.rust_new_super_functions = restricted_new;
     proof.rust_receiverless_associated_names = associated;
     proof.rust_free_function_names = proof
         .rust_function_names
