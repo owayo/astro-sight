@@ -4,6 +4,83 @@
 use super::support::{TestRepo, cargo_bin};
 
 #[test]
+fn optional_type_members_verify_key_observers_and_module_augmentations() {
+    let interface = "export interface Options { label: string; }";
+    let alias = "export type Options = { label: string; };";
+    let plain = "export const item: Options = {label:'a'};";
+    let record = "export const keys: Record<keyof Options, number> = {label:1};";
+    for (before, imported, usage, safe) in [
+        (interface, "Options", record, false),
+        (alias, "Options", record, false),
+        (
+            interface,
+            "",
+            "declare module './model' { interface Options { emphasis?: string } }\nexport {};",
+            false,
+        ),
+        (
+            alias,
+            "Options",
+            "const data={label:'a',emphasis:1}; export const item: Options = data;",
+            false,
+        ),
+        (
+            "export interface Options { label: Record<keyof this,string>; }",
+            "Options",
+            "export const item: Options = {label:{label:'a'}};",
+            false,
+        ),
+        (alias, "Options", plain, true),
+        (
+            interface,
+            "Options as Original",
+            "interface Options { label: string }\nexport const keys: Record<keyof Options,number>={label:1};\nexport const item: Original={label:'a'};",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let after = before.replace("; }", "; emphasis?: boolean; }");
+        repo.write("model.ts", before);
+        let import = if imported.is_empty() {
+            String::new()
+        } else {
+            format!("import type {{ {imported} }} from './model';\n")
+        };
+        repo.write("reader.ts", format!("{import}{usage}\n"));
+        repo.commit_all("base");
+        repo.write("model.ts", after);
+        repo.stage_all();
+        for staged in [false, true] {
+            if staged {
+                repo.write("model.ts", before);
+            }
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"]);
+            if staged {
+                cmd.arg("--staged");
+            }
+            let output = cmd.output().unwrap();
+            let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(
+                output.status.success(),
+                safe,
+                "{before} {usage} staged={staged}: {hook}"
+            );
+            let bucket = if safe { "mod_compat" } else { "mod" };
+            assert!(
+                hook["api"][bucket]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["n"] == "Options")),
+                "{hook}"
+            );
+        }
+    }
+}
+
+#[test]
 fn property_removal_preserves_unchanged_callable_members() {
     for extension in ["ts", "tsx"] {
         for member in ["render(): string;", "readonly render: () => string;"] {

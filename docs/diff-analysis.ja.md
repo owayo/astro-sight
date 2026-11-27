@@ -207,6 +207,10 @@ export した関数の明示戻り型と、その関数を受け取る interface
 
 inventory の上限は TS/TSX 512ファイル、旧新合計8MiB、AST 100,000ノード、深さ128、候補照合2,048回である。別名/default/namespace import、再 export、動的 loader、JS・埋込 source、JSDoc、解析・読取失敗、リンク、不確定な設定 (extends/rootDirs/moduleSuffixes/paths/baseUrl) があれば証明しない。観測した内部の手渡しと限定した consumer の依存を確認するもので、一般的な API 互換性や TypeScript 全体の型検査を保証しない。
 
+### TypeScript の公開型への任意プロパティ追加
+
+公開した型や interface に `emphasis?: boolean` を足しても、既存の `const item: Options = { label: "a" }` は引き続き型検査を通る。一方、`keyof Options` には `"emphasis"` が加わるため、`label` だけを持つ `Record<keyof Options, number>` は必須キーが足りなくなる。キー集合の利用やモジュール拡張の互換性を確認できなければ、`review` は公開型の変更を `api.mod` に残す。型検査を通るキー集合の利用も、この判定に含まれることがある。
+
 ### TypeScript の型への必須プロパティ追加
 
 export した TS / TSX の interface か object 型の type alias へ、必須プロパティや引数なしの void コールバックを足した変更を扱う。その型の値を作る箇所と受け取る関数が同じ差分で追随していれば、`modified_closed_in_diff` (`api.mod_closed`) に分ける。型への参照は、それぞれ次のどれかでなければならない。

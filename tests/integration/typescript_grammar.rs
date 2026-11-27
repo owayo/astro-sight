@@ -565,7 +565,6 @@ fn typescript_import_type_arguments_cli_keeps_malformed_diagnostics() {
 #[test]
 fn typescript_import_type_array_does_not_block_optional_interface_addition() {
     for extension in ["ts", "tsx"] {
-        let repo = TestRepo::new();
         let target = format!("shapes.{extension}");
         let old = r#"export interface Item {
   levels: import("./level").Level[];
@@ -576,12 +575,22 @@ export interface Change {
 }
 export const existing: Change = { oldPath: "a", newPath: "b" };
 "#;
-        repo.write("level.ts", "export type Level = 'high' | 'low';\n");
-        repo.write(&target, old);
-        repo.init_git();
-        repo.commit_all("initial");
-        for (property, compatible) in [("newFile?: boolean", true), ("newFile: boolean", false)] {
-            let new = old.replace(
+        for (property, usage, compatible) in [
+            ("newFile?: boolean", "", true),
+            ("newFile: boolean", "", false),
+            (
+                "newFile?: boolean",
+                "export const keys: Record<keyof import('./shapes').Change, number> = {oldPath: 1, newPath: 1};",
+                false,
+            ),
+        ] {
+            let repo = TestRepo::new();
+            repo.write("level.ts", "export type Level = 'high' | 'low';\n");
+            let base = format!("{old}{usage}\n");
+            repo.write(&target, &base);
+            repo.init_git();
+            repo.commit_all("initial");
+            let new = base.replace(
                 "  newPath: string;",
                 &format!("  newPath: string;\n  {property};"),
             );

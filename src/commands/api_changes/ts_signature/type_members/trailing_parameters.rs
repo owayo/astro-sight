@@ -1,8 +1,9 @@
-//! 型引数の末尾への既定値付き追加を、既存メンバーだけを読む利用の範囲で証明する。
+//! 既定値付き型引数または optional メンバーの追加について、宣言と利用の両方を検査する。
 
 use super::super::removed_params::{
-    InventoryView, OptionalRemovalCache, checked_nodes, dependency_target, dynamic_execution_entry,
-    escaped_identifier, imports_only_unrelated_names,
+    InventoryView, OptionalRemovalCache, UseRule, checked_nodes, dependency_target,
+    dynamic_execution_entry, escaped_identifier, imports_only_unrelated_names, object_omits,
+    unique_function_declaration,
 };
 use super::super::repository_audit::PackageBoundary;
 use super::*;
@@ -18,10 +19,19 @@ struct Delta {
     old_arity: usize,
     required: usize,
     retained: HashSet<String>,
+    added_members: Option<HashSet<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ValueRole {
+    Binding,
+    Factory,
+    Reader,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Consumer {
+    role: ValueRole,
     path: String,
     name: String,
     line: usize,
@@ -63,19 +73,86 @@ pub(crate) fn detect_trailing_default_type_params_compatible_mod(
     ) {
         return None;
     }
+    prove_repository_uses(index, site, cache, &expected, &delta)?;
+    Some(site.compatible("trailing_default_type_params"))
+}
+
+pub(super) fn prove_optional_member_uses(
+    index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    cache: &mut OptionalRemovalCache,
+    expected: &[u8],
+    retained: HashSet<String>,
+    added: HashSet<String>,
+) -> Option<()> {
+    if added.iter().any(|name| {
+        crate::commands::api_changes::ts_required_members::INHERITED_NAMES.contains(&name.as_str())
+    }) {
+        return None;
+    }
+    let delta = Delta {
+        retained,
+        old_arity: 0,
+        required: 0,
+        added_members: Some(added),
+    };
+    prove_repository_uses(index, site, cache, expected, &delta)
+}
+
+fn prove_repository_uses(
+    index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    cache: &mut OptionalRemovalCache,
+    expected: &[u8],
+    delta: &Delta,
+) -> Option<()> {
     let refs = index.complete_refs_for(site.name)?;
     let (inventory, evidence) = cache.inventory(site.dir, site.name, site.new_path)?;
-    if !inventory.has_source(site.new_path, &expected)
+    if !inventory.has_source(site.new_path, expected)
         || !evidence.repository.as_ref()?.jsx_standard()
     {
         return None;
     }
-    let consumers = prove_uses(refs, &inventory, evidence.relaxation(), site, &delta)?;
-    for consumer in consumers {
-        let (inventory, evidence) = cache.inventory(site.dir, &consumer.name, &consumer.path)?;
-        prove_consumer_unused(&consumer, &inventory, evidence.relaxation())?;
+    if delta.added_members.is_some() && evidence.declares_global("Object") {
+        return None;
     }
-    Some(site.compatible("trailing_default_type_params"))
+    let consumers = prove_uses(refs, &inventory, evidence.relaxation(), site, delta)?;
+    let names = |role| {
+        consumers
+            .iter()
+            .filter(|consumer| consumer.role == role)
+            .map(|consumer| consumer.name.as_str())
+            .collect::<HashSet<_>>()
+    };
+    let factories = names(ValueRole::Factory);
+    let readers = names(ValueRole::Reader);
+    for consumer in &consumers {
+        let (inventory, evidence) = cache.inventory(site.dir, &consumer.name, &consumer.path)?;
+        let partners = match consumer.role {
+            ValueRole::Factory => Some(&readers),
+            ValueRole::Reader => Some(&factories),
+            ValueRole::Binding => None,
+        }
+        .filter(|names| !names.is_empty());
+        if prove_consumer_uses(
+            consumer,
+            &inventory,
+            evidence.relaxation(),
+            partners,
+            delta.added_members.is_some(),
+        )? {
+            // 両端の全出現を同じ名前解決で確認する。対になる呼び出しの引数は別途検査済み。
+            super::super::removed_params::prove_repository_uses(
+                &[],
+                &inventory,
+                evidence.relaxation(),
+                &consumer.path,
+                &consumer.name,
+                UseRule::DirectCalls,
+            )?;
+        }
+    }
+    Some(())
 }
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -203,14 +280,12 @@ fn classify(
         normalized_members(old_body, old_source)?,
         normalized_members(new_body, new_source)?,
     );
-    if !optional_superset(
+    optional_superset(
         old_members.clone(),
         new_members.clone(),
         old_source,
         new_source,
-    ) {
-        return None;
-    }
+    )?;
     let mut retained = HashSet::new();
     for (_, member) in &old_members {
         let name = member_name(*member, old_source).flatten()?;
@@ -249,9 +324,43 @@ fn classify(
         .count();
     Some(Delta {
         old_arity: old_params.len(),
+        added_members: None,
         required,
         retained,
     })
+}
+
+/// Tree-sitter は型の import も call_expression として返す。配列要素の型としてだけ使い、
+/// 参照先が別のファイルに一意に解決できる場合は、そのモジュールの実行時の利用を増やさない。
+fn check_module_call(
+    call: Node<'_>,
+    source: &[u8],
+    path: &str,
+    paths: &HashMap<String, Vec<String>>,
+    target: &str,
+    allow_type_import: bool,
+) -> Option<()> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "import" {
+        return (text(function, source) != Some("require")).then_some(());
+    }
+    if !allow_type_import {
+        return None;
+    }
+    let member = call.parent()?;
+    if member.kind() != "member_expression"
+        || member.child_by_field_name("object")? != call
+        || member.child_by_field_name("property")?.kind() != "property_identifier"
+        || member.parent()?.kind() != "array_type"
+    {
+        return None;
+    }
+    let args = children(call.child_by_field_name("arguments")?);
+    let [specifier] = args.as_slice() else {
+        return None;
+    };
+    (specifier.kind() == "string" && dependency_target(*specifier, source, path, paths)? != target)
+        .then_some(())
 }
 
 fn prove_uses(
@@ -282,7 +391,7 @@ fn prove_uses(
             &mut consumers,
         )?;
     }
-    if uses == 0
+    if (uses == 0 && delta.added_members.is_none())
         || refs.iter().any(|reference| {
             !positions.contains(&(
                 normalize_workspace_separators(&reference.path),
@@ -312,13 +421,36 @@ fn prove_file(
     consumers: &mut Vec<Consumer>,
 ) -> Option<usize> {
     let nodes = checked_nodes(root)?;
+    let declaration = if path == site.new_path {
+        Some(unique_type_declaration(root, site.name, source)?.0)
+    } else {
+        None
+    };
+    if delta.added_members.is_some()
+        && declaration.is_some_and(|decl| {
+            nodes.iter().any(|node| {
+                node.kind() == "this_type"
+                    && node.start_byte() >= decl.start_byte()
+                    && node.end_byte() <= decl.end_byte()
+            })
+        })
+    {
+        return None;
+    }
+    let mut local_type = false;
     let mut imported = HashSet::new();
+    let mut local_names = HashSet::new();
     let mut import_statements = HashSet::new();
     for &node in &nodes {
         if escaped_identifier(node, source) || dynamic_execution_entry(node, source) {
             return None;
         }
         match node.kind() {
+            "interface_declaration" | "type_alias_declaration"
+                if node_field_name_eq(node, site.name, source) =>
+            {
+                local_type = true;
+            }
             "ambient_declaration"
             | "internal_module"
             | "module"
@@ -338,15 +470,14 @@ fn prove_file(
             {
                 return None;
             }
-            "call_expression"
-                if node
-                    .child_by_field_name("function")
-                    .is_some_and(|function| {
-                        function.kind() == "import" || text(function, source) == Some("require")
-                    }) =>
-            {
-                return None;
-            }
+            "call_expression" => check_module_call(
+                node,
+                source,
+                path,
+                paths,
+                site.new_path,
+                delta.added_members.is_some(),
+            )?,
             "import_statement" | "export_statement" => {
                 let Some(specifier) = node.child_by_field_name("source") else {
                     continue;
@@ -379,13 +510,20 @@ fn prove_file(
                 }
                 for spec in children(*named) {
                     if spec.kind() != "import_specifier"
-                        || spec.child_by_field_name("alias").is_some()
+                        || (delta.added_members.is_none()
+                            && spec.child_by_field_name("alias").is_some())
                     {
                         return None;
                     }
                     let imported_name = spec.child_by_field_name("name")?;
                     if text(imported_name, source)? == site.name {
                         imported.insert(imported_name.id());
+                        if let Some(alias) = spec.child_by_field_name("alias") {
+                            local_names.insert(text(alias, source)?);
+                            imported.insert(alias.id());
+                        } else {
+                            local_names.insert(site.name);
+                        }
                         import_statements.insert(node.id());
                         import_statements.insert(spec.id());
                     }
@@ -394,13 +532,21 @@ fn prove_file(
             _ => {}
         }
     }
-    let declaration = if path == site.new_path {
-        Some(unique_type_declaration(root, site.name, source)?.0)
-    } else {
-        None
-    };
-    let bindings: Vec<_> = collect_bindings_named(root, source, site.name)
-        .into_iter()
+    // 別名で import した元の綴りが、このモジュール自身の型に束縛されることがある。
+    let independent = delta.added_members.is_some()
+        && declaration.is_none()
+        && !local_names.contains(site.name)
+        && local_type
+        && nodes
+            .iter()
+            .any(|node| matches!(node.kind(), "export_statement" | "import_statement"))
+        && unique_type_declaration(root, site.name, source).is_some();
+    if !independent {
+        local_names.insert(site.name);
+    }
+    let bindings: Vec<_> = local_names
+        .iter()
+        .flat_map(|name| collect_bindings_named(root, source, name))
         .filter(|binding| binding.kind() != "generic_type")
         .collect();
     if let Some(declaration) = declaration {
@@ -424,15 +570,26 @@ fn prove_file(
                 | "type_identifier"
                 | "property_identifier"
                 | "shorthand_property_identifier"
-        ) || text(node, source) != Some(site.name)
-        {
+        ) {
             continue;
         }
-        let point = node.start_position();
-        positions.insert((path.to_owned(), point.row, point.column));
+        let name = text(node, source)?;
+        if name == site.name {
+            let point = node.start_position();
+            positions.insert((path.to_owned(), point.row, point.column));
+        }
+        if !local_names.contains(name) {
+            continue;
+        }
         if declaration.is_some_and(|declaration| {
-            node.start_byte() >= declaration.start_byte()
-                && node.end_byte() <= declaration.end_byte()
+            if delta.added_members.is_some() {
+                declaration
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id())
+            } else {
+                node.start_byte() >= declaration.start_byte()
+                    && node.end_byte() <= declaration.end_byte()
+            }
         }) || imported.contains(&node.id())
         {
             continue;
@@ -466,15 +623,51 @@ fn prove_file(
         if annotation.kind() != "type_annotation" || children(annotation).len() != 1 {
             return None;
         }
-        let parameter = annotation.parent()?;
-        if parameter.kind() != "required_parameter"
-            || parameter.child_by_field_name("type")?.id() != annotation.id()
-            || parameter.child_by_field_name("value").is_some()
-        {
-            return None;
-        }
-        let (name, point) = prove_consumer(parameter, root, source, delta)?;
+        let owner = annotation.parent()?;
+        let mut role = ValueRole::Binding;
+        let (name, point) = match owner.kind() {
+            "function_declaration" if owner.child_by_field_name("return_type")? == annotation => {
+                let added = delta.added_members.as_ref()?;
+                let binding = owner.child_by_field_name("name")?;
+                let name = text(binding, source)?;
+                if unique_function_declaration(root, source, name)?.0 != owner
+                    || !object_omits(single_return(owner)?, source, added)
+                {
+                    return None;
+                }
+                role = ValueRole::Factory;
+                (name.to_owned(), binding.start_position())
+            }
+            "required_parameter"
+                if owner.child_by_field_name("type")? == annotation
+                    && owner.child_by_field_name("value").is_none() =>
+            {
+                if delta.added_members.is_some() && children(owner.parent()?).len() == 1 {
+                    role = ValueRole::Reader;
+                }
+                prove_consumer(owner, root, source, delta)?
+            }
+            "variable_declarator" if owner.child_by_field_name("type")? == annotation => {
+                let added = delta.added_members.as_ref()?;
+                let binding = owner.child_by_field_name("name")?;
+                let declaration = owner.parent()?;
+                if binding.kind() != "identifier"
+                    || declaration.kind() != "lexical_declaration"
+                    || declaration.child_by_field_name("kind")?.kind() != "const"
+                    || !super::super::removed_params::object_omits(
+                        owner.child_by_field_name("value")?,
+                        source,
+                        added,
+                    )
+                {
+                    return None;
+                }
+                (text(binding, source)?.to_owned(), binding.start_position())
+            }
+            _ => return None,
+        };
         consumers.push(Consumer {
+            role,
             path: path.to_owned(),
             name,
             line: point.row,
@@ -513,13 +706,23 @@ fn prove_consumer(
     if collect_bindings_named(root, source, function_name).len() != 1 {
         return None;
     }
-    let return_type = function.child_by_field_name("return_type")?;
-    let return_types = children(return_type);
-    let [return_type] = return_types.as_slice() else {
-        return None;
-    };
-    simple_type(*return_type, source)?;
     let body = function.child_by_field_name("body")?;
+    if let Some(return_type) = function.child_by_field_name("return_type") {
+        let return_types = children(return_type);
+        let [return_type] = return_types.as_slice() else {
+            return None;
+        };
+        simple_type(*return_type, source)?;
+    } else {
+        // 戻り値の型注釈がなければ、既存プロパティをそのまま返す場合だけを扱う。
+        let expression = single_return(function)?;
+        if delta.added_members.is_none()
+            || expression.kind() != "member_expression"
+            || text(expression.child_by_field_name("object")?, source)? != name
+        {
+            return None;
+        }
+    }
     if body_rebinds_or_queries(body, source, name, None) {
         return None;
     }
@@ -566,11 +769,68 @@ fn prove_consumer(
     })
 }
 
-fn prove_consumer_unused(
+fn single_return(function: Node<'_>) -> Option<Node<'_>> {
+    let statements = children(function.child_by_field_name("body")?);
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    let expressions = children(*statement);
+    let [expression] = expressions.as_slice() else {
+        return None;
+    };
+    (statement.kind() == "return_statement").then_some(*expression)
+}
+
+/// 新しいキーを持たないリテラルを返す関数と、既存キーだけを読む関数の直接の受け渡し。
+fn paired_call(
+    node: Node<'_>,
+    role: ValueRole,
+    partners: &HashSet<&str>,
+    source: &[u8],
+) -> Option<()> {
+    let call = node.parent()?;
+    if node.kind() != "identifier"
+        || call.kind() != "call_expression"
+        || call.child_by_field_name("function")? != node
+    {
+        return None;
+    }
+    let (args, outer, inner) = match role {
+        ValueRole::Reader => {
+            let args = call.child_by_field_name("arguments")?;
+            (args, call, *children(args).first()?)
+        }
+        ValueRole::Factory => {
+            let args = call.parent()?;
+            (args, args.parent()?, call)
+        }
+        ValueRole::Binding => return None,
+    };
+    if args.kind() != "arguments"
+        || children(args).as_slice() != [inner]
+        || outer.kind() != "call_expression"
+        || outer.child_by_field_name("arguments")? != args
+        || inner.kind() != "call_expression"
+    {
+        return None;
+    }
+    let other = if role == ValueRole::Factory {
+        outer
+    } else {
+        inner
+    }
+    .child_by_field_name("function")?;
+    (other.kind() == "identifier" && partners.contains(text(other, source)?)).then_some(())
+}
+
+fn prove_consumer_uses(
     consumer: &Consumer,
     inventory: &InventoryView<'_>,
     packages: Option<&PackageBoundary>,
-) -> Option<()> {
+    partners: Option<&HashSet<&str>>,
+    optional_members: bool,
+) -> Option<bool> {
+    let mut resolve_calls = false;
     let paths = inventory
         .parsed()
         .map(|(path, _, _, _)| (path.to_owned(), Vec::new()))
@@ -600,25 +860,23 @@ fn prove_consumer_unused(
                 {
                     return None;
                 }
-                "call_expression"
-                    if node
-                        .child_by_field_name("function")
-                        .is_some_and(|function| {
-                            function.kind() == "import" || text(function, source) == Some("require")
-                        }) =>
-                {
-                    return None;
+                "call_expression" => {
+                    check_module_call(node, source, path, &paths, &consumer.path, optional_members)?
                 }
                 "import_statement" | "export_statement" => {
                     if let Some(specifier) = node.child_by_field_name("source") {
                         let target = dependency_target(specifier, source, path, &paths);
-                        if target.as_deref() == Some(consumer.path.as_str())
-                            || (target.is_none()
-                                && !static_specifier(specifier, source).is_some_and(|name| {
-                                    packages.is_some_and(|packages| {
-                                        packages.is_registry_dependency(name)
-                                    })
-                                }))
+                        if target.as_deref() == Some(consumer.path.as_str()) {
+                            if partners.is_none() || node.kind() != "import_statement" {
+                                return None;
+                            }
+                            resolve_calls = true;
+                        }
+                        if target.is_none()
+                            && !static_specifier(specifier, source).is_some_and(|name| {
+                                packages
+                                    .is_some_and(|packages| packages.is_registry_dependency(name))
+                            })
                         {
                             return None;
                         }
@@ -639,12 +897,20 @@ fn prove_consumer_unused(
                     || point.row != consumer.line
                     || point.column != consumer.column
                 {
-                    return None;
+                    let partners = partners?;
+                    if !node.parent().is_some_and(|parent| {
+                        parent.kind() == "import_specifier"
+                            && parent.child_by_field_name("name") == Some(node)
+                            && parent.child_by_field_name("alias").is_none()
+                    }) {
+                        paired_call(node, consumer.role, partners, source)?;
+                    }
+                    resolve_calls = true;
                 }
             }
         }
     }
-    Some(())
+    Some(resolve_calls)
 }
 
 #[cfg(test)]
@@ -667,6 +933,11 @@ mod tests {
                 "interface_declaration",
                 "interface_body",
                 "property_signature",
+                "this_type",
+                "member_expression",
+                "array_type",
+                "lexical_declaration",
+                "variable_declarator",
                 "export_statement",
             ] {
                 tree_sitter::Query::new(&lang.ts_language(), &format!("({kind}) @node"))
