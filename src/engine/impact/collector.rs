@@ -1276,7 +1276,24 @@ impl ImpactCollector<'_> {
                     self.rust_path_owner_project,
                 )
             });
+        let tracing_field = self.ref_lang == Some(LangId::Rust)
+            && node.is_some_and(|n| {
+                n.kind() == "identifier" && n.parent().is_some_and(|p| p.kind() == "token_tree")
+            })
+            && self.sym_to_fc[ix].iter().any(|&fc| {
+                self.file_contexts[fc as usize]
+                    .rust_free_function_names
+                    .contains(&self.all_symbol_names[ix])
+            })
+            && node.is_some_and(|node| {
+                self.rust_path_owner
+                    .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source))
+                    .tracing_field(node, source, Path::new(self.path_str), || {
+                        self.binding_view(source)
+                    })
+            });
         let rust_non_function_path = definite_type
+            || tracing_field
             || owner_index.zip(owner_node).is_some_and(|(index, node)| {
                 super::rust_path_owner::RustPathOwnerIndex::is_nonterminal_path(node)
                     || index.is_local_associated_path(

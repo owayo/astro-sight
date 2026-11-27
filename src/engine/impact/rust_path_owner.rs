@@ -28,6 +28,7 @@ mod macro_copy;
 mod macro_crate;
 mod nominal;
 mod registry_macros;
+mod tracing_fields;
 mod workspace_members;
 
 pub(super) use macro_copy::MacroCopy;
@@ -132,6 +133,7 @@ pub(super) struct RustPathOwnerIndex {
     field_types: std::cell::OnceCell<HashSet<String>>,
     macro_paths: std::cell::OnceCell<HashMap<usize, RuleName>>,
     json_calls: RefCell<HashMap<usize, bool>>,
+    tracing_fields: std::cell::OnceCell<Option<HashSet<usize>>>,
     local_type_names: HashSet<String>,
     local_value_names: HashSet<String>,
     closed_local_rule: OnceLock<Option<usize>>,
@@ -2314,6 +2316,7 @@ impl RustPathOwnerIndex {
             field_types: std::cell::OnceCell::new(),
             macro_paths: std::cell::OnceCell::new(),
             json_calls: RefCell::default(),
+            tracing_fields: Default::default(),
             local_type_names,
             local_value_names,
             closed_local_rule: OnceLock::new(),

@@ -2,6 +2,93 @@
 
 use super::support::*;
 
+#[test]
+fn rust_private_function_distinguishes_tracing_fields_from_value_expressions() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("Cargo.toml", "[package]\nname='reports'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ntracing='0.1'\n");
+    repo.write(
+        "Cargo.lock",
+        include_str!("../fixtures/rust_tracing_fields/Cargo.lock"),
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod producer; mod reader; mod custom; mod rebound; mod fake;\n",
+    );
+    repo.write("src/producer.rs", "pub(super) fn imports(x:u8)->u8 {x}\n");
+    repo.write(
+        "src/reader.rs",
+        r#"use tracing::{debug, debug as log_info};
+pub struct Counts {pub imports: Vec<u8>, pub total: Vec<u8>}
+pub fn log(result: &Counts) {
+    debug!(imports = result.total.len());
+    debug!(total = result.imports.len());
+    debug!(imports = result.imports.len(), "complete");
+    log_info!(fields.imports = ?result.imports.len());
+    tracing::debug!(total = %result.imports.len());
+    debug!(imports = crate::producer::imports(1));
+    let _ = crate::producer::imports(1);
+}
+fn nested(result: &Counts) {
+    macro_rules! from_field { ($v:ident . $f:ident) => {{ let _=$v; crate::producer::$f(1) }}; }
+    debug!(imports = from_field!(result.imports));
+}
+"#,
+    );
+    repo.write(
+        "src/custom.rs",
+        r#"use tracing::debug;
+macro_rules! debug { ($f:ident = $v:expr) => { crate::producer::$f(1) }; }
+fn custom() { let _ = debug!(imports = 0); }
+"#,
+    );
+    repo.write(
+        "src/fake.rs",
+        "macro_rules! pick { ($f:ident = $v:expr) => { crate::producer::$f(1) }; } pub(crate) use pick as debug;\n",
+    );
+    repo.write(
+        "src/rebound.rs",
+        "use crate::fake as r#tracing;\nuse tracing::debug;\nfn log() { let _=debug!(imports = 0); }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/producer.rs",
+        "pub(super) fn imports(x:u8,y:u8)->u8 {x+y}\n",
+    );
+    for staged in [false, true] {
+        let args = if staged {
+            repo.stage_all();
+            repo.create_dir_all(".cargo");
+            repo.write(
+                ".cargo/config.toml",
+                "[source.crates-io]\nreplace-with='other'\n",
+            );
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        for result in [
+            repo.run_json("context", args),
+            repo.run_json("review", args)["impact"].take(),
+        ] {
+            let callers = result["changes"].as_array().unwrap()[0]["impacted_callers"]
+                .as_array()
+                .unwrap();
+            let lines = |file: &str| {
+                callers
+                    .iter()
+                    .filter(|c| c["path"] == file)
+                    .map(|c| c["line"].as_u64().unwrap() + 1)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(lines("src/reader.rs"), [9, 10, 14], "{result}");
+            assert_eq!(lines("src/custom.rs"), [3], "{result}");
+            assert_eq!(lines("src/rebound.rs"), [3], "{result}");
+        }
+    }
+}
+
 fn distinct_function_workspace(update_caller: bool, print: bool, scenario: &str) -> TestRepo {
     let repo = TestRepo::new();
     repo.write("Cargo.toml", "[workspace]\nmembers = [\"crates/core-lib\", \"crates/fetch-lib\", \"crates/sched-lib\", \"crates/app\"]\nresolver = \"3\"\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n");
