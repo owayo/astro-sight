@@ -14,6 +14,12 @@ filter = 'binary_id(astro-sight::integration) & test(integration::review::clap_a
 priority = 50
 threads-required = 2
 
+# Rust の引数型を明示 use で短縮した場合の参照を、通常・index の context と hook で照合する。
+[[profile.default.overrides]]
+filter = 'test(=integration::rust_import_path::rust_import_path_parameter_keeps_only_unproven_callers)'
+priority = 50
+threads-required = 2
+
 # TS の分割代入引数で型・束縛・整形の違いを作業ツリーと index から検査する。
 [[profile.default.overrides]]
 filter = 'test(=integration::destructured_optional_defaults::unannotated_object_parameters_report_inferred_contract_changes) | test(integration::destructured_optional_defaults::optional_prop_additions_check_)'

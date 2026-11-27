@@ -617,6 +617,16 @@ fn analyze_changed_file(
         )
         .into_iter()
         .chain(
+            old_side
+                .imported_parameter_shortening(
+                    &declaration_input,
+                    &sig_changes,
+                    inputs.receiver_layout,
+                )
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
             sig_changes
                 .iter()
                 .filter(|change| {

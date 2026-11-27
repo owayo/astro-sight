@@ -165,6 +165,19 @@ fn pointer_sites(
 
 impl RustPathOwnerProjectProof {
     fn pointer_library(&self, directory: &Path, name: &str) -> Option<PathBuf> {
+        let file = self.required_path_library(directory, name)?;
+        let source = self.ordinary_private_module(&file)?;
+        (source.library_only
+            && source.path.is_empty()
+            && self.in_root_workspace(source.src.parent()?)?)
+        .then_some(file)
+    }
+
+    pub(in crate::engine::impact) fn required_path_library(
+        &self,
+        directory: &Path,
+        name: &str,
+    ) -> Option<PathBuf> {
         if !self.edition_2018_or_later(directory)?
             || !self.in_root_workspace(directory)?
             || !self
@@ -202,14 +215,9 @@ impl RustPathOwnerProjectProof {
                 .get("optional")
                 .is_none_or(|v| v.as_bool() == Some(false))
         };
-        let file = super::super::rust_owner_alias::direct_library(
+        super::super::rust_owner_alias::direct_library(
             directory, &manifest, &workspace, name, self, required,
-        )?;
-        let source = self.ordinary_private_module(&file)?;
-        (source.library_only
-            && source.path.is_empty()
-            && self.in_root_workspace(source.src.parent()?)?)
-        .then_some(file)
+        )
     }
 
     fn unchanged_foreign_pointer(&self, file: &Path, path: &[String]) -> bool {
