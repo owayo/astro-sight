@@ -183,6 +183,22 @@ fn optional_prop_additions_check_inferred_returns_and_outer_bindings() {
             true,
         ),
         (
+            "conditional JSX",
+            added,
+            "return <p>{label}</p>;",
+            "return tone ? <p>{label}</p> : (<b>{label}</b>);",
+            direct,
+            true,
+        ),
+        (
+            "conditional non-JSX branch",
+            added,
+            "return <p>{label}</p>;",
+            "return tone ? <p>{label}</p> : null;",
+            direct,
+            false,
+        ),
+        (
             "JSX body",
             added,
             "return <p>{label}</p>;",
@@ -763,4 +779,113 @@ fn destructured_optional_defaults_require_erased_import_for_effectful_module() {
         assert_eq!(output.status.code(), Some(i32::from(!safe)), "{result}");
         assert_eq!(compatible(&result), safe, "{result}");
     }
+}
+
+#[test]
+fn private_named_props_check_optional_keys_binding_and_repository_uses() {
+    let omit = "<Panel label='a' />";
+    let mut failures = Vec::new();
+    for (declaration, member, body, observer, caller, safe) in [
+        (
+            "interface Props",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "",
+            omit,
+            true,
+        ),
+        (
+            "type Props =",
+            "tone?: boolean",
+            "tone ? <b>{label}</b> : <p>{label}</p>",
+            "",
+            omit,
+            true,
+        ),
+        (
+            "interface Props",
+            "tone: boolean",
+            "<p>{label}</p>",
+            "",
+            omit,
+            false,
+        ),
+        (
+            "interface Props",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "interface Props { extra?: string }",
+            omit,
+            false,
+        ),
+        (
+            "export type Props =",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "",
+            omit,
+            false,
+        ),
+        (
+            "type Props =",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "export const keys: Record<keyof Props, string> = {label: 'label'};",
+            omit,
+            false,
+        ),
+        (
+            "interface Props",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "",
+            "<Panel {...{label:'a', tone:1}} />",
+            false,
+        ),
+        (
+            "type Props =",
+            "tone?: boolean",
+            "<p>{label}</p>",
+            "",
+            "<Panel label='a' tone='bad' />",
+            false,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let panel = |added: &str, binding: &str, body: &str| {
+            format!(
+                "{declaration} {{label: string; {added}}}\n{observer}\nexport function Panel({{ label{binding} }}: Props) {{ return {body}; }}\n"
+            )
+        };
+        repo.write("package.json", r#"{"dependencies":{"react":"19.0.0"}}"#);
+        repo.write("panel.tsx", panel("", "", "<p>{label}</p>"));
+        repo.write(
+            "home.tsx",
+            format!("import {{Panel}} from './panel';\nexport const home = {caller};\n"),
+        );
+        repo.commit_all("base");
+        repo.write("panel.tsx", panel(member, ", tone = false", body));
+        repo.stage_all();
+        for staged in [false, true] {
+            if staged {
+                repo.write("panel.tsx", "export {};");
+            }
+            let (output, result) = run_review(&repo, staged);
+            let modified = result["api"]["mod"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|item| item["n"] == "Panel");
+            if compatible(&result) != safe
+                || (!safe && declaration != "export type Props =" && !modified)
+                || output.status.success() != safe
+            {
+                failures.push(format!(
+                    "{declaration} / {member} / {observer} / {caller} / staged={staged}: {result}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

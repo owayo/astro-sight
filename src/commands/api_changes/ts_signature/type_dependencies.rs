@@ -22,6 +22,40 @@ pub(crate) struct DependencyEnvironment<'a> {
     pub(crate) declared_globally: &'a dyn Fn(&str) -> bool,
 }
 
+/// 引数の object 型を展開して比較した後、各メンバーと戻り値が参照する型を元の環境で照合する。
+pub(super) fn property_dependencies_unchanged(
+    site: &CompatibleModSite<'_>,
+    sources: &super::super::source_pair::OldNewSources,
+    old_root: Node<'_>,
+    new_root: Node<'_>,
+    evidence: &removed_params::RemovalEvidence,
+    diff_files: &[crate::models::impact::DiffFile],
+    roots: &[Node<'_>],
+) -> bool {
+    let Some(packages) = evidence.relaxation() else {
+        return false;
+    };
+    let changed_paths = diff_files
+        .iter()
+        .flat_map(|file| [file.old_path.as_str(), file.new_path.as_str()])
+        .filter(|path| *path != "/dev/null")
+        .map(crate::git_support::normalize_workspace_separators)
+        .collect();
+    type_dependencies_unchanged(
+        &DependencyEnvironment {
+            target_path: site.new_path,
+            changed_paths: &changed_paths,
+            registry_dependency: &|specifier| packages.is_registry_dependency(specifier),
+            declared_globally: &|name| evidence.declares_global(name),
+        },
+        old_root,
+        &sources.old,
+        new_root,
+        &sources.new,
+        roots,
+    )
+}
+
 /// `roots` は新の側の型ノード (旧の側とトークンが同じことは呼び出し側が確かめる)。
 /// 同じファイルのトップレベルの型別名・interface を推移的にたどって旧新のトークン一致を
 /// 求める。ほかのファイルの型は推移的にたどらない。相対 import の型は、宣言のファイルの別の

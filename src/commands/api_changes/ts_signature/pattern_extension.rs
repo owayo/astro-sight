@@ -14,7 +14,7 @@ pub(super) struct AddedBinding {
 
 fn object_branch(ty: Node<'_>) -> Option<Node<'_>> {
     match ty.kind() {
-        "object_type" => Some(ty),
+        "object_type" | "interface_body" => Some(ty),
         "union_type" => {
             let parts = ts_union_type_parts(ty);
             let mut object = None;
@@ -734,6 +734,7 @@ mod tests {
             old.as_bytes(),
             new_fn,
             new.as_bytes(),
+            None,
             None,
         )
         .is_some()

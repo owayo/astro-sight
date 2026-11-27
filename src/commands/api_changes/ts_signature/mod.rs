@@ -727,6 +727,7 @@ fn ts_param_pair_optional_object_extension<'new>(
     old_source: &[u8],
     new_param: tree_sitter::Node<'new>,
     new_source: &[u8],
+    types: (tree_sitter::Node<'_>, tree_sitter::Node<'new>),
     site: Option<&CompatibleModSite<'_>>,
     bindings: &mut Vec<pattern_extension::AddedBinding>,
 ) -> Option<added_props::PropertyTypes<'new>> {
@@ -749,8 +750,7 @@ fn ts_param_pair_optional_object_extension<'new>(
     }
     let old_annotation = old_param.child_by_field_name("type")?;
     let new_annotation = new_param.child_by_field_name("type")?;
-    let old_ty = old_annotation.named_child(0)?;
-    let new_ty = new_annotation.named_child(0)?;
+    let (old_ty, new_ty) = types;
     let members = ts_type_optional_property_additions(old_ty, old_source, new_ty, new_source)?;
     if old_tokens == new_tokens {
         return Some(members);
@@ -806,7 +806,7 @@ fn ts_type_optional_property_additions<'new>(
         return None;
     }
     match (old_ty.kind(), new_ty.kind()) {
-        ("object_type", "object_type") => {
+        ("object_type", "object_type") | ("interface_body", "interface_body") => {
             ts_object_type_members_optional_superset(old_ty, old_source, new_ty, new_source)
         }
         ("union_type", "union_type") => {
