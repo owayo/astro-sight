@@ -34,6 +34,8 @@ pub(crate) struct RustDeclarationContext {
     /// 先頭の内側の属性のうち、`cfg` と、`cfg` だけに絞った `cfg_attr` (外側から)。読めない属性が
     /// あれば None。別のファイルの親 module (`#[cfg(x)] mod m;`) の条件は含まない。
     pub(crate) availability: Option<Vec<AvailabilityAttr>>,
+    /// 外部関数の条件を宣言と祖先の属性から読め、属性マクロによる書き換えも無いか。
+    pub(crate) foreign_cfg_known: bool,
     /// `availability` に入れる属性 (読めないものも) の `cfg`・`cfg_attr` の生のトークン (外側から)。
     /// 読めない属性があるときの字面の比較に使う。
     pub(crate) availability_raw: Vec<String>,
@@ -51,12 +53,34 @@ pub(crate) struct RustDeclarationContext {
 }
 
 /// 宣言の有る条件の属性 1 つ (`cfg(..)` か、`cfg` だけに絞った `cfg_attr(..)`)。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AvailabilityAttr {
     /// 比べる鍵 (`rust_cfg_predicate::Atoms::presence` に渡す)。
     pub(crate) key: Vec<String>,
     /// 表示 (`#[` と `]` を除く)。
     pub(crate) shown: String,
+}
+
+/// 同じ extern ブロックの関数間で、cfg の全設定について調べた結果を共有する。
+#[derive(Default)]
+pub(super) struct ForeignCfgCache(std::collections::HashMap<Vec<AvailabilityAttr>, bool>);
+
+impl ForeignCfgCache {
+    pub(super) fn absent(&mut self, declaration: &RustDeclarationContext) -> bool {
+        let Some(conditions) = declaration
+            .availability
+            .as_deref()
+            .filter(|c| declaration.foreign_cfg_known && !c.is_empty())
+        else {
+            return false;
+        };
+        if let Some(&absent) = self.0.get(conditions) {
+            return absent;
+        }
+        let absent = super::rust_availability::same_in_every_config(&[declaration], &[]);
+        self.0.insert(conditions.to_vec(), absent);
+        absent
+    }
 }
 
 /// 変更ファイルの旧新の公開シンボルの宣言の文脈 (それぞれ `old_syms`・`new_syms` と同じ順)。
@@ -874,6 +898,12 @@ pub(crate) fn rust_declaration_context(
     push_availability(&attributes, source, &mut availability);
     context.availability = availability;
     context.availability_raw = condition_tokens(&attributes, source);
+    context.foreign_cfg_known = context.availability.is_some()
+        && !root.has_error()
+        && crate::engine::rust_signature::foreign::Block::for_function(item, source).is_some()
+        && attributes
+            .iter()
+            .all(|attribute| inert_attribute_item(*attribute, source));
     modules.reverse();
     conditions.reverse();
     context.inline_module = modules.join("::");
@@ -899,8 +929,8 @@ pub(crate) struct RustPairing {
     /// `pairs` のうち、条件付きの分岐 (`#[cfg]` の分岐) の代表として選んだ組。ほかの分岐の形は
     /// 比べていない (Issue #291)。
     pub(crate) branch_representatives: HashSet<(usize, usize)>,
-    /// 旧新の両方に宣言のあるキーの、旧と新の全ての添字の並び (`#[cfg]` の分岐を代表 1 つに縮めない)。
-    /// 項目の有る設定を比べるのに使う (Issue #291)。
+    /// 項目の有る設定を比べる旧新の添字の並び。到達できる分岐は全て残し、片側の extern 関数が
+    /// 全て無効なら、その側の条件も有効化・無効化の表示に残す。
     pub(crate) groups: Vec<(Vec<usize>, Vec<usize>)>,
     /// 旧か新に、同じ qualname の宣言が 2 つ以上ある名前。名前で引く判定は別の宣言に当たり得る。
     shared_names: HashSet<String>,
@@ -956,8 +986,45 @@ impl RustPairing {
                 .map(|(name, _)| name.to_owned())
                 .collect(),
         };
-        for (olds, news) in groups.into_values() {
+        let mut foreign_cfg = ForeignCfgCache::default();
+        let absent: Vec<bool> = old_declarations
+            .iter()
+            .chain(new_declarations)
+            .map(|d| foreign_cfg.absent(d))
+            .collect();
+        let (old_absent, new_absent) = absent.split_at(old.len());
+        for (mut olds, mut news) in groups.into_values() {
             if !olds.is_empty() && !news.is_empty() {
+                match (
+                    olds.iter().all(|&i| old_absent[i]),
+                    news.iter().all(|&j| new_absent[j]),
+                ) {
+                    (true, true) => continue,
+                    (false, false) => {
+                        olds.retain(|&i| !old_absent[i]);
+                        news.retain(|&j| !new_absent[j]);
+                    }
+                    _ => {
+                        // 片側だけに存在する場合は、有る設定の変化として報告する。反対側が
+                        // 不明な属性を持つ場合や追加・削除を確かめられない場合は契約の比較も残す。
+                        let old: Vec<_> = olds.iter().map(|&i| &old_declarations[i]).collect();
+                        let new: Vec<_> = news.iter().map(|&j| &new_declarations[j]).collect();
+                        if old.iter().chain(&new).all(|d| d.foreign_cfg_known)
+                            && matches!(
+                                super::rust_availability::compare(&old, &new),
+                                super::rust_availability::AvailabilityChange::Changed { .. }
+                            )
+                        {
+                            if olds.iter().any(|&i| !old_absent[i]) {
+                                olds.retain(|&i| !old_absent[i]);
+                            } else {
+                                news.retain(|&j| !new_absent[j]);
+                            }
+                            pairing.groups.push((olds, news));
+                            continue;
+                        }
+                    }
+                }
                 pairing.groups.push((olds.clone(), news.clone()));
             }
             match (olds.as_slice(), news.as_slice()) {

@@ -234,6 +234,64 @@ fn rust_extern_signature_change_reaches_the_dependent_crate() {
 }
 
 #[test]
+fn rust_foreign_function_disabled_in_the_review_snapshot() {
+    let old = "pub mod api {\n    unsafe extern \"C\" {\n        #[cfg(any())]\n        pub fn ghost(x: u8);\n    }\n}\n";
+    let new = old.replace("x: u8", "x: i32");
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='ffi'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/lib.rs", old);
+    repo.commit_all("base");
+    repo.write("src/lib.rs", &new);
+    let hook = |args: &[&str], expected| {
+        let output = cargo_bin()
+            .current_dir(repo.root())
+            .args(["review", "--dir", ".", "--git", "--hook"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    hook(&[], 0);
+    repo.stage_all();
+    repo.write("src/lib.rs", new.replace("cfg(any())", "cfg(all())"));
+    hook(&["--staged"], 0);
+    hook(&[], 1);
+    let review = repo.run_json("review", &["--git"]);
+    assert_eq!(review["api_changes"]["added"][0]["name"], "ghost");
+    assert!(
+        review["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "ghost")
+    );
+
+    let both = old.replace("    }", "        pub fn ghost(x: u16);\n    }");
+    repo.write("src/lib.rs", &both);
+    repo.commit_all("add a live declaration with the same name");
+    repo.write("src/lib.rs", both.replace("x: u8", "x: i32"));
+    hook(&[], 0);
+    repo.stage_all();
+    hook(&["--staged"], 0);
+    repo.write("src/lib.rs", both.replace("x: u16", "x: i32"));
+    let review = repo.run_json("review", &["--git"]);
+    let dead = review["dead_symbols"].as_array().unwrap();
+    assert_eq!(dead.len(), 1, "{dead:?}");
+    assert_eq!(dead[0]["name"], "ghost");
+    assert_eq!(dead[0]["line"], 4);
+}
+
+#[test]
 fn rust_foreign_block_abi_changes_reach_function_pointer_users() {
     let mut case = Case::new(A_OLD).depends("b", "a = { path = \"../a\" }\n");
     case.a_old = "pub mod api {\nunsafe extern \"C\" {\n    pub fn translate(x: u8);\n    pub fn second(x: u8);\n    pub static NUMBER: u8;\n}\nunsafe extern \"C\" { pub fn stable(x: u8); }\n}\n".into();

@@ -1055,6 +1055,11 @@ fn filter_exported_with_metadata(
         && source
             .windows(b"// astro-sight:allow-dead".len())
             .any(|bytes| bytes == b"// astro-sight:allow-dead");
+    let check_foreign_cfg = context.exclude_framework_entrypoints
+        && lang_id == crate::language::LangId::Rust
+        && memchr::memmem::find(source, b"extern").is_some()
+        && memchr::memmem::find(source, b"cfg").is_some();
+    let mut foreign_cfg = super::rust_declarations::ForeignCfgCache::default();
     // `stripInternal` で宣言ファイルから消える型のメンバーは、シグネチャと型の依存に含めない。
     // 位置を保って空白にしたソースから作る (宣言の位置は元のソースと同じ)。
     let published = context
@@ -1128,6 +1133,13 @@ fn filter_exported_with_metadata(
             continue;
         }
         if context.rust_owner_type_is_crate_internal(sym, &qualname) {
+            continue;
+        }
+        if check_foreign_cfg
+            && rust_function_node_for_symbol(sym, root, source)
+                .is_some_and(|node| node.kind() == "function_signature_item")
+            && foreign_cfg.absent(&super::rust_declaration_context(sym, root, source))
+        {
             continue;
         }
         // このフラグを持つ経路は dead/test-only の候補抽出だけ。
