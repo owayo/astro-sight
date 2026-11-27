@@ -430,6 +430,11 @@ impl RustStdOriginIndex {
             })
     }
 
+    pub(super) fn unshadowed_item_name(&self, item: Node<'_>, name: &str) -> bool {
+        self.scope_of(item)
+            .is_some_and(|scope| self.root_unbound(scope, name))
+    }
+
     fn root_unbound(&self, scope: usize, root: &str) -> bool {
         for scope_id in self.scope_chain(scope) {
             let scope = &self.scopes[&scope_id];
