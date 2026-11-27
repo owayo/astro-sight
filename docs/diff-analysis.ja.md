@@ -556,6 +556,8 @@ blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` �
 
 ### TypeScript の公開名が指す値の変更
 
+関数の宣言に付けた `export` を同じファイルの `export { f }` に移しても、公開名と関数の値を保てる。逆向きの書き換えも同様。差分がこのファイルだけで、両側の関数、ほかの文、値の公開順が一致すると確認できた場合、`f` の呼び出しは情報提供に回る。別のファイルを同時に変えた場合は、関数の引数が参照する型なども変わり得る。宣言には公開構文が変わったことを記録する。
+
 `export { f }` を `export { other as f } from './provider.js'` に変えると、`f` を import した側には `provider.other` が渡る。元の関数を同じファイルに残して `export { f as legacy }` で公開しても、`review` は公開名 `f` の変更を報告する。たとえば `other` が `false` なら、利用側に残った `f()` は型検査でエラーになる。
 
 元の関数を別ファイルへ移しても、利用側は以前のモジュールから `f` を import し続けることがある。たとえば `export { other as "f" } from './provider.js'` と `export * from './provider.js'` は、どちらも別の値を `f` として公開できる。元の公開名がその値を指すようになった場合、`review` は変更を blocking に残す。

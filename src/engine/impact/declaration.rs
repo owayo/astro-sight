@@ -29,6 +29,8 @@ use super::signature::find_signature_in_lines;
 
 mod foreign;
 pub(super) use foreign::ForeignChanges;
+mod ts_function_exports;
+pub(super) use ts_function_exports::equivalent_function_exports;
 
 /// 宣言ノードから本体ノードを探す方法。
 #[derive(Clone, Copy)]

@@ -503,6 +503,20 @@ fn analyze_changed_file(
     }
     let t = std::time::Instant::now();
     let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
+    // 同時に別ファイルから import した型が変わると、同じ宣言でも呼び出し側の型が変わる。
+    let equivalent_exports = if single_in_place_file
+        && matches!(lang_id, LangId::Typescript | LangId::Tsx)
+        && complete_text_diff(inputs.diff_input, 1)
+    {
+        declaration::equivalent_function_exports(
+            &declaration_input,
+            &old_side,
+            &affected,
+            &syntax_evidence,
+        )
+    } else {
+        HashSet::new()
+    };
     // 複数行ヘッダや宣言移動の差分は、旧側 AST と突き合わせて補う。
     let declaration_proof = declaration::reconcile_declaration_changes(
         old_side,
@@ -584,7 +598,7 @@ fn analyze_changed_file(
         HashSet::new()
     };
     debug_assert_eq!(affected.len(), originals.len());
-    // 透過的な型別名の導入と、関数に `const` を足しただけのシグネチャ変更は互換。
+    // 他の型依存の変更が同じ TS 関数に波及する場合は、export 構文だけの変更とみなさない。
     let compatible_signature_keys: HashSet<String> = if lang_id == LangId::Rust {
         signature::compatible_rust_alias_signature_names(
             file_diff,
@@ -608,7 +622,14 @@ fn analyze_changed_file(
         .map(|name| ci_key(lang_id, &name))
         .collect()
     } else {
-        HashSet::new()
+        equivalent_exports
+            .into_iter()
+            .filter(|name| {
+                !derived_contract_changes
+                    .get(&df.new_path)
+                    .is_some_and(|derived| derived.contains(name))
+            })
+            .collect()
     };
     log_phase(
         &format!(

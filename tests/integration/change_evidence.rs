@@ -1,6 +1,168 @@
 use super::support::{TestRepo, cargo_bin};
 use serde_json::{Value, json};
 
+#[test]
+fn typescript_same_function_export_clause_preserves_caller_compatibility() {
+    let direct = "export function f(): number { return 1; }\n";
+    let clause = "function f(): number { return 1; }\nexport { f };\n";
+    for (before, after) in [(direct, clause), (clause, direct)] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("api.ts", before);
+        repo.write(
+            "use.ts",
+            "import { f } from './api.js';\nimport * as api from './api.js';\nf();\napi.f();\n",
+        );
+        repo.commit_all("base");
+        repo.write("api.ts", after);
+        for staged in [false, true] {
+            if staged {
+                repo.stage_all();
+            }
+            let args = if staged {
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let review = repo.run_json("review", args);
+            let changes = &review["impact"]["changes"][0];
+            assert_eq!(
+                impact_evidence(&review, "api.ts", "f")["changed_parts"],
+                json!(["visibility"]),
+                "{review}"
+            );
+            assert!(
+                changes["impacted_callers"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty),
+                "{review}"
+            );
+            for line in [2, 3] {
+                assert!(
+                    changes["informational_callers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c["path"] == "use.ts" && c["line"] == line),
+                    "{review}"
+                );
+            }
+            let mut cmd = cargo_bin();
+            cmd.args(["review", "--hook", "--dir"])
+                .arg(repo.root())
+                .args(args);
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        repo.write("api.ts", after.replace("return 1", "return 2"));
+        let (output, code) = hook(&repo, false);
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output["blocking_categories"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("impacts")),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn typescript_export_clause_keeps_changed_bindings_and_declaration_emit_blocking() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let f = "function f(): number { return 1; }";
+    let g = "export function g(): number { return 2; }";
+    repo.write("api.ts", format!("export {f}\n{g}\n"));
+    repo.write("use.ts", "import { f } from './api.js';\nf();\n");
+    repo.write("other.ts", "export function f(): number { return 9; }\n");
+    repo.commit_all("base");
+    for after in [
+        format!("{f}\nexport type {{f}};\n{g}"),
+        format!("{f}\nexport {{type f}};\n{g}"),
+        format!("{f}\nexport default f;\n{g}"),
+        format!("{f}\nexport {{f as renamed}};\n{g}"),
+        format!("{f}\nexport {{g as f}};\n{g}"),
+        format!("{f}\nexport {{f}} from './other.js';\n{g}"),
+        format!("{f}\nexport {{f}};\n{g}\nf = () => 9;"),
+        format!("{f}\n/** @internal */ export {{f}};\n{g}"),
+        // CommonJS では exports の挿入順も変わる。
+        format!("{f}\n{g}\nexport {{f}};"),
+    ] {
+        repo.write("api.ts", &after);
+        let (out, code) = hook(&repo, false);
+        assert_eq!(code, 1, "{after}\n{out}");
+    }
+}
+
+#[test]
+fn typescript_export_clause_preserves_the_directive_prologue_after_a_shebang() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let head = "#!/usr/bin/env node\n";
+    let directive = "\"use client\";\n";
+    let f = "function f(): number { return 1; }\n";
+    repo.write("api.ts", format!("{head}{directive}export {f}"));
+    repo.write("use.ts", "import {f} from './api.js';\nf();\n");
+    repo.commit_all("base");
+    for (after, expected) in [
+        (format!("{head}{directive}export {{ f }};\n{f}"), 0),
+        (format!("{head}export {{ f }};\n{directive}{f}"), 1),
+    ] {
+        repo.write("api.ts", after);
+        let out = cargo_bin()
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn typescript_export_clause_with_a_changed_imported_parameter_type_keeps_callers() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let import = "import type {Input} from './types.js';\n";
+    let f = "function f(x: Input): number { return 1; }\n";
+    repo.write("types.ts", "export interface Input { value: string }\n");
+    repo.write("api.ts", format!("{import}export {f}"));
+    repo.write("use.ts", "import {f} from './api.js';\nf({value:'x'});\n");
+    repo.commit_all("base");
+    repo.write("types.ts", "export interface Input { value: number }\n");
+    repo.write("api.ts", format!("{import}{f}export {{f}};\n"));
+    for rename in [false, true] {
+        if rename {
+            repo.write("types.ts", "export interface Input { value: string }\n");
+            repo.git(["mv", "types.ts", "renamed.ts"]);
+        }
+        let context = repo.run_json("context", &["--git"]);
+        let api = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "api.ts")
+            .unwrap();
+        assert!(
+            api["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["path"] == "use.ts" && c["line"] == 1),
+            "{context}"
+        );
+    }
+}
+
 fn fixture(old: &str) -> TestRepo {
     let repo = TestRepo::new();
     repo.init_git();

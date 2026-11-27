@@ -185,8 +185,7 @@ struct FileContext {
     js_modified_direct_function_names: HashSet<String>,
     /// 旧新とも一意な Python の通常直下関数。属性の単純代入は読み出しではない。
     python_modified_direct_function_names: HashSet<String>,
-    /// 透過的な Rust type alias 導入だけ、または関数に `const` を足しただけと old/new AST で
-    /// 証明できたシグネチャ変更。cross-file / same-file の caller は消さず informational へ振り分ける。
+    /// 旧新の宣言で互換性を証明した名前。cross-file / same-file の caller を informational に残す。
     compatible_signature_keys: HashSet<String>,
     hunks: Vec<HunkInfo>,
     call_edges: Vec<CallEdge>,

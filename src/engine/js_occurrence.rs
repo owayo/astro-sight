@@ -373,10 +373,21 @@ fn plain_parameter_binding<'t>(function: Node<'t>, source: &[u8], name: &str) ->
 /// 新旧ともこの証拠を満たすときだけ、シグネチャに依存しない用途を除外できる。
 /// 値から関数への種類変更や、見えている再束縛を関数の変更と取り違えない。
 pub(crate) fn unique_direct_function(root: Node<'_>, source: &[u8], name: &str) -> bool {
+    unique_direct_functions(root, source, |candidate| candidate == name)
+        .next()
+        .is_some()
+}
+
+/// 複数の候補も同じ構文木で一度に確認する。
+pub(crate) fn unique_direct_functions<'a>(
+    root: Node<'_>,
+    source: &'a [u8],
+    include: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = &'a str> {
+    let mut functions = HashMap::new();
     if JsOccurrenceIndex::new(root, source).invalid {
-        return false;
+        return functions.into_keys();
     }
-    let mut function = None;
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
         let declaration = if statement.kind() == "export_statement" {
@@ -389,22 +400,21 @@ pub(crate) fn unique_direct_function(root: Node<'_>, source: &[u8], name: &str) 
         if matches!(
             declaration.kind(),
             "function_declaration" | "generator_function_declaration"
-        ) && declaration
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok())
-            == Some(name)
+        ) && declaration.child_by_field_name("body").is_some()
+            && let Some(name) = declaration
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            && include(name)
         {
-            if function.is_some() || declaration.child_by_field_name("body").is_none() {
-                return false;
-            }
-            function = Some(declaration.id());
+            // 同名の別宣言は下の走査で取り除く。
+            functions.insert(name, declaration.id());
         }
     }
-    let Some(function) = function else {
-        return false;
-    };
-    !walk_preorder(root, Children::Named, |node, _| {
-        let ambiguous = match node.kind() {
+    let _ = walk_preorder(root, Children::Named, |node, _| {
+        if functions.is_empty() {
+            return ControlFlow::Break(());
+        }
+        let pattern = match node.kind() {
             "function_declaration"
             | "generator_function_declaration"
             | "function_expression"
@@ -417,40 +427,47 @@ pub(crate) fn unique_direct_function(root: Node<'_>, source: &[u8], name: &str) 
             | "module"
             | "interface_declaration"
             | "type_alias_declaration" => {
-                node.id() != function
-                    && node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        == Some(name)
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    && functions.get(name).is_some_and(|id| *id != node.id())
+                {
+                    functions.remove(name);
+                }
+                None
             }
-            "variable_declarator" => node
-                .child_by_field_name("name")
-                .is_some_and(|p| pattern_binds_name(p, source, name)),
+            "variable_declarator" => node.child_by_field_name("name"),
             "assignment_expression" | "augmented_assignment_expression" | "for_in_statement" => {
                 node.child_by_field_name("left")
-                    .is_some_and(|p| pattern_binds_name(p, source, name))
             }
-            "update_expression" => node
-                .child_by_field_name("argument")
-                .is_some_and(|p| pattern_binds_name(p, source, name)),
+            "update_expression" => node.child_by_field_name("argument"),
             "unary_expression"
                 if node
                     .child_by_field_name("operator")
                     .is_some_and(|op| op.kind() == "delete") =>
             {
                 node.child_by_field_name("argument")
-                    .is_some_and(|p| pattern_binds_name(p, source, name))
             }
-            "import_statement" => super::js_scope::import_binds_name(node, source, name),
-            _ => false,
+            "import_statement" => {
+                super::js_scope::visit_import_bindings(node, source, |name| {
+                    functions.remove(name);
+                    functions.is_empty()
+                });
+                None
+            }
+            _ => None,
         };
-        if ambiguous {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(Walk::Descend)
+        if let Some(pattern) = pattern {
+            let _ = super::js_binding_pattern::visit_pattern_bindings(pattern, &mut |binding| {
+                if let Ok(name) = binding.utf8_text(source) {
+                    functions.remove(name);
+                }
+                ControlFlow::<(), _>::Continue(())
+            });
         }
-    })
-    .is_break()
+        ControlFlow::Continue(Walk::Descend)
+    });
+    functions.into_keys()
 }
 
 fn truthiness_use(mut node: Node<'_>) -> bool {
@@ -731,6 +748,15 @@ mod tests {
             source.as_bytes(),
             "isOpen"
         ));
+    }
+
+    #[test]
+    fn unique_direct_functions_excludes_only_the_conflicting_candidate() {
+        let source = b"function stable() {} function assigned() {} function nested() {} function other() { function nested() {} } ({assigned} = object);";
+        let tree = parser::parse_source(source, LangId::Typescript).unwrap();
+        let names: Vec<_> =
+            unique_direct_functions(tree.root_node(), source, |name| name != "other").collect();
+        assert_eq!(names, ["stable"]);
     }
 
     #[test]
