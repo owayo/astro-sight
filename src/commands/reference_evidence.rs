@@ -38,7 +38,12 @@ fn test_rules(file: &str) -> Vec<String> {
     rules
 }
 
-fn record(observations: &mut ReferenceObservations, file: &str, line: usize, column: usize) {
+pub(super) fn record(
+    observations: &mut ReferenceObservations,
+    file: &str,
+    line: usize,
+    column: usize,
+) {
     let test_rules = test_rules(file);
     let test = super::dead_code::is_test_path(Path::new(file));
     observations.total += 1;
@@ -65,6 +70,17 @@ fn record(observations: &mut ReferenceObservations, file: &str, line: usize, col
     }
     observations.shown = observations.sites.len();
     observations.omitted = observations.total - observations.shown;
+}
+
+pub(super) fn merge_observations(all: &mut ReferenceObservations, extra: &ReferenceObservations) {
+    all.total += extra.total;
+    all.production_total += extra.production_total;
+    all.test_total += extra.test_total;
+    all.sites.extend_from_slice(&extra.sites);
+    all.sites.sort_unstable();
+    all.sites.truncate(SITE_LIMIT);
+    all.shown = all.sites.len();
+    all.omitted = all.total - all.shown;
 }
 
 fn scope(
@@ -100,6 +116,7 @@ pub(crate) fn attach_dead(
     test_only: &mut [DeadSymbol],
     unverified: &mut [DeadSymbol],
     diagnostics: &[TruncationInfo],
+    exports: &super::dead_code_default_liveness::ExportLiveness,
 ) {
     if dead.is_empty() && test_only.is_empty() && unverified.is_empty() {
         return;
@@ -179,7 +196,7 @@ pub(crate) fn attach_dead(
         (unverified, ReferenceClassification::Unverified),
     ] {
         for symbol in symbols {
-            let references = languages
+            let mut references = languages
                 .get(&symbol.file)
                 .copied()
                 .flatten()
@@ -190,13 +207,21 @@ pub(crate) fn attach_dead(
                 })
                 .map(|index| observations[index].clone())
                 .unwrap_or_default();
+            let static_exports = exports.named_observations(&symbol.file, &symbol.name);
+            if let Some(extra) = static_exports {
+                merge_observations(&mut references, extra);
+            }
             symbol.reference_evidence = Some(ReferenceEvidence {
                 classification: if scan.complete {
                     classification
                 } else {
                     ReferenceClassification::Unverified
                 },
-                attribution: "non_definition_name_match_with_count_filters",
+                attribution: if static_exports.is_some() {
+                    "name_matches_and_static_module_exports"
+                } else {
+                    "non_definition_name_match_with_count_filters"
+                },
                 scope: scan.clone(),
                 references,
                 external_entry: metadata.evidence(&root, &symbol.file, &symbol.name, &symbol.kind),
@@ -605,6 +630,7 @@ mod tests {
             &mut [],
             &mut [],
             &[],
+            &Default::default(),
         );
         let evidence = symbols[0].reference_evidence.as_ref().unwrap();
         assert_eq!(evidence.references.total, 1);

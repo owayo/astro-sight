@@ -1002,6 +1002,8 @@ astro-sight dead-code --dir . --git --staged
 
 `line` は宣言行（0 始まり）。テストからしか参照されないシンボルは `dead_symbols` に含めず、`test_only_symbols` に分けて出す。
 
+JavaScript・TypeScript では、`import * as api from "./lib.js"` の後の `api["f"]()` は、解決したモジュールの公開関数 `f` の参照として数える。`api["\u0066"]()` や `import { "f" as call } from "./lib.js"` でも、公開名を復号して同じ関数に対応付ける。
+
 同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では、`Owner::method()` と同一クラス内の `self::method()` を確定参照として扱う。`$obj->method()` や callable 文字列のように owner を確定できない参照がある場合は、スキップする。`static::` は遅延静的束縛によりサブクラスの override に到達し得るため、確定参照としては解決しない。trait を `use` する class / trait / enum 経由の静的呼び出しは、一意に到達する trait method に限り参照として数える。ただし合成先が同名の具象メソッドを持つ場合は、PHP の解決順に従って trait 側へは辿らない。
 
 Ruby では `Builder.new`・`Demo::Builder.new`・`::Demo::Builder.new` のような静的な定数 receiver の呼び出しを、その class が直接定義する通常の instance `initialize` の潜在的な利用として加算する。字句的にネストした module と別ファイルの呼び出しを扱う。テストからしか呼ばれなければ `test_only_symbols` に分け、本番からの呼び出しがあれば両方の一覧から外す。候補から除外したテスト・生成ファイルも含む、全 Ruby 参照ファイルで所属を確認する。近い module や別の定数束縛がある場合、それを飛ばして外側の同名 class へ解決しない。

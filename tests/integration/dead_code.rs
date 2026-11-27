@@ -6,6 +6,133 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn dead_code_static_string_exports_follow_the_imported_module_and_scope() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "lib.ts",
+        "export function chosen() { return 1; }\nexport function spare() { return 0; }\n",
+    );
+    repo.write("other.ts", "export function chosen() { return 2; }\n");
+    repo.write("main.ts", "");
+    repo.commit_all("baseline");
+    repo.write(
+        "lib.ts",
+        "export function chosen() { return 3; }\nexport function spare() { return 0; }\n",
+    );
+    for (source, used) in [
+        ("import * as api from './lib.ts'; api['chosen']();", true),
+        (
+            r#"import * as api from './lib.ts'; api["\u0063hosen"]();"#,
+            true,
+        ),
+        (
+            r#"import { "chosen" as run } from './lib.ts'; run();"#,
+            true,
+        ),
+        (
+            r#"import * as a\u0070i from './lib.ts'; (api)?.[`\u0063hosen`];"#,
+            true,
+        ),
+        (
+            r#"import type { "chosen" as run } from './lib.ts'; export type Saved = typeof run;"#,
+            true,
+        ),
+        (
+            r#"import { type "chosen" as run } from './lib.ts'; export type Saved = typeof run;"#,
+            true,
+        ),
+        (
+            r#"import type * as api from './lib.ts'; export type Saved = (typeof api)["chosen"];"#,
+            true,
+        ),
+        (
+            r#"import * as api from './lib.ts'; function call(a\u0070i: any) { return api['chosen'] }"#,
+            false,
+        ),
+        ("import * as api from './other.ts'; api['chosen']();", false),
+        (
+            "import * as api from './lib.ts'; function run(x=api['chosen']()) { const api = {}; return x } run();",
+            true,
+        ),
+        (
+            "import * as api from './lib.ts'; const C = class api { static ['chosen']() { return 9 } static run() { return api['chosen']() } }; C.run();",
+            false,
+        ),
+        ("import * as api from './lib.ts'; void 'chosen';", false),
+        (
+            "import * as api from './lib.ts'; ((api: any) => api['chosen']())({});",
+            false,
+        ),
+    ] {
+        repo.write("main.ts", source);
+        for args in [vec!["--glob", "lib.ts"], vec!["--git"]] {
+            let report = repo.run_json("dead-code", &args);
+            let dead = report["dead_symbols"].as_array().unwrap();
+            assert_eq!(
+                dead.iter()
+                    .any(|s| s["file"] == "lib.ts" && s["name"] == "chosen"),
+                !used,
+                "{source}: {report}"
+            );
+            assert!(dead.iter().any(|s| s["name"] == "spare"), "{report}");
+        }
+    }
+    repo.write(
+        "main.ts",
+        "import * as api from './lib.ts'; api['chosen']();",
+    );
+    repo.stage_all();
+    repo.write("main.ts", "import './lib.ts';");
+    for command in ["dead-code", "review"] {
+        for (args, expected_dead) in [(&["--git"][..], true), (&["--git", "--staged"][..], false)] {
+            let report = repo.run_json(command, args);
+            assert_eq!(
+                report["dead_symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["name"] == "chosen"),
+                expected_dead,
+                "{command} {args:?}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dead_code_static_string_exports_keep_test_reference_evidence() {
+    let repo = TestRepo::new();
+    repo.write("lib.ts", "export function chosen() {}");
+    repo.create_dir_all("tests");
+    repo.write(
+        "tests/use.test.ts",
+        "import * as api from '../lib.ts';\napi['chosen']();\napi['chosen']();",
+    );
+    let report = repo.run_json("dead-code", &[]);
+    assert!(
+        report["dead_symbols"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    let test_only = report["test_only_symbols"].as_array().unwrap();
+    assert_eq!(test_only.len(), 1);
+    assert_eq!(test_only[0]["name"], "chosen");
+    let evidence = &test_only[0]["reference_evidence"];
+    assert_eq!(evidence["classification"], "test_references_only");
+    assert_eq!(evidence["references"]["total"], 2);
+    assert_eq!(evidence["references"]["test_total"], 2);
+    assert_eq!(evidence["references"]["production_total"], 0);
+    assert_eq!(
+        evidence["references"]["sites"][0]["file"],
+        "tests/use.test.ts"
+    );
+    assert_eq!(evidence["references"]["sites"][0]["line"], 1);
+    assert_eq!(evidence["references"]["sites"][1]["line"], 2);
+    let refs = repo.run_json("refs", &["--name", "chosen"]);
+    assert_eq!(refs["refs"].as_array().unwrap().len(), 1, "{refs}");
+}
+
+#[test]
 fn dead_code_dynamic_import_default_is_live_without_synthetic_refs() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

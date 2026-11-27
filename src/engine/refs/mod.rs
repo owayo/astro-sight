@@ -970,6 +970,15 @@ const STREAM_SCAN_CHUNK: usize = 8 * 1024 * 1024;
 /// 全部の名前を参照しうるとみなす。時間ではなくバイト数で区切るのは出力を決定論に保つため。
 const STREAM_SCAN_LIMIT: u64 = 1024 * 1024 * 1024;
 
+/// 未観測の JS/TS ファイルにエスケープで綴った公開名が現れ得るか。
+pub(crate) fn uncounted_file_may_contain_escape(path: &camino::Utf8Path) -> bool {
+    let names = [String::from("\\")];
+    build_batch_acs(&names)
+        .ok()
+        .and_then(|acs| stream_present_indices(&acs, &names, path))
+        .is_none_or(|indices| !indices.is_empty())
+}
+
 /// 読み込めないファイル (100MB の上限超過など) を、メモリを上限付きのまま先頭から走査し、
 /// 出現する名前の添字 (昇順) を返す。
 ///
