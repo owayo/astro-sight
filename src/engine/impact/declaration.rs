@@ -384,6 +384,7 @@ fn header_display(source: &[u8], start: usize, end: usize, omitted: &[(usize, us
 pub(super) struct DeclarationChangeInput<'a> {
     /// 対象ファイルの diff 区間。
     pub(super) file_diff: &'a str,
+    pub(super) complete_single_file_diff: bool,
     pub(super) file_path: &'a str,
     pub(super) old_file_path: &'a str,
     pub(super) syms: &'a [Symbol],
@@ -586,28 +587,27 @@ fn rust_inherent_method<'tree, 'src>(
 }
 
 /// マクロや属性を介さず、通常の引数だけを持つ inherent 関連関数。
-fn rust_receiverless_associated_function(
-    root: Node<'_>,
+fn rust_receiverless_parameters<'tree>(
+    root: Node<'tree>,
     source: &[u8],
     symbol: &Symbol,
     attributes: &std::cell::OnceCell<super::rust_macro_site::OpaqueAttributeScopes>,
-) -> bool {
-    let Some((method, _)) = rust_inherent_method(root, source, symbol) else {
-        return false;
-    };
-    let Some(params) = method.child_by_field_name("parameters") else {
-        return false;
-    };
+) -> Option<Node<'tree>> {
+    let (method, _) = rust_inherent_method(root, source, symbol)?;
+    let params = method.child_by_field_name("parameters")?;
     let mut cursor = params.walk();
-    params.named_children(&mut cursor).all(|param| {
+    let ordinary = params.named_children(&mut cursor).all(|param| {
         matches!(param.kind(), "line_comment" | "block_comment")
             || (param.kind() == "parameter"
                 && param
                     .child_by_field_name("pattern")
                     .is_some_and(|pattern| matches!(pattern.kind(), "identifier" | "_")))
-    }) && !attributes
-        .get_or_init(|| super::rust_macro_site::OpaqueAttributeScopes::build(root, source))
-        .contains(method)
+    });
+    (ordinary
+        && !attributes
+            .get_or_init(|| super::rust_macro_site::OpaqueAttributeScopes::build(root, source))
+            .contains(method))
+    .then_some(params)
 }
 
 /// ファイル直下の inherent impl に直接属する、実体のあるメソッドだけを追加候補にする。
@@ -1389,13 +1389,24 @@ pub(super) fn reconcile_declaration_changes(
         .iter()
         .map(|name| super::ci_key(LangId::Rust, name))
         .collect();
-    for (symbols, root, source, free, restricted) in [
+    let mut other_declarations = HashSet::new();
+    let first_edit = if input.complete_single_file_diff && !associated.is_empty() {
+        old.source
+            .iter()
+            .zip(input.source)
+            .position(|(a, b)| a != b)
+    } else {
+        None
+    };
+    let (mut old_parameters, mut new_parameters) = (None, None);
+    for (symbols, root, source, free, restricted, edited_parameters) in [
         (
             &old.symbols[..],
             old.tree.root_node(),
             old.source.as_slice(),
             &mut old_free,
             &mut restricted_old,
+            &mut old_parameters,
         ),
         (
             input.syms,
@@ -1403,6 +1414,7 @@ pub(super) fn reconcile_declaration_changes(
             input.source,
             &mut new_free,
             &mut restricted_new,
+            &mut new_parameters,
         ),
     ] {
         let mut names_seen = HashSet::new();
@@ -1410,13 +1422,29 @@ pub(super) fn reconcile_declaration_changes(
         let mut found = HashSet::new();
         let attributes = std::cell::OnceCell::new();
         for symbol in symbols {
-            // r#name と name は同じメソッド名。旧新どちらかで receiver を取り得れば保留する。
+            // r#name と name は同じメソッド名。
             let key = crate::language::normalize_identifier(LangId::Rust, &symbol.name);
             if associated.contains(key.as_ref()) {
-                if rust_receiverless_associated_function(root, source, symbol, &attributes) {
+                if let Some(params) =
+                    rust_receiverless_parameters(root, source, symbol, &attributes)
+                {
+                    if first_edit.is_some_and(|offset| params.byte_range().contains(&offset))
+                        && !crate::engine::tree_walk::any_node(
+                            params,
+                            crate::engine::tree_walk::Children::Named,
+                            |node| {
+                                matches!(
+                                    node.kind(),
+                                    "block" | "macro_invocation" | "attribute_item"
+                                )
+                            },
+                        )
+                    {
+                        *edited_parameters = Some((key.to_string(), params.byte_range()));
+                    }
                     found.insert(key.clone());
                 } else {
-                    associated.remove(key.as_ref());
+                    other_declarations.insert(key.to_string());
                 }
             }
             if !names_seen.insert(key.clone()) {
@@ -1444,6 +1472,25 @@ pub(super) fn reconcile_declaration_changes(
         restricted.retain(|name| {
             !repeated.contains(crate::language::normalize_identifier(LangId::Rust, name).as_ref())
         });
+    }
+    associated.retain(|name| !other_declarations.contains(name));
+    // 同名の trait メソッドがあっても、一つの引数リストの外側が同じなら
+    // そのメソッドや impl の所有型・型別名を同時に変えた可能性はない。
+    if let (Some((name, before)), Some((after_name, after))) = (old_parameters, new_parameters)
+        && name == after_name
+        && before.start == after.start
+    {
+        let old_suffix = &old.source[before.end..];
+        let new_suffix = &input.source[after.end..];
+        // 逆適用は削除行を LF で復元し、最終行にも LF を付ける。
+        let old_suffix = if new_suffix.ends_with(b"\n") {
+            old_suffix
+        } else {
+            old_suffix.strip_suffix(b"\n").unwrap_or(old_suffix)
+        };
+        if super::rust_line_endings::same_text(old_suffix, new_suffix) {
+            associated.insert(name);
+        }
     }
     proof.rust_super_functions = restricted_old
         .intersection(&restricted_new)
@@ -1997,6 +2044,7 @@ mod tests {
                 LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &section,
+                    complete_single_file_diff: path == old_path,
                     file_path: path,
                     old_file_path: old_path,
                     syms: &syms,
@@ -2044,6 +2092,7 @@ mod tests {
                 LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &text,
+                    complete_single_file_diff: true,
                     file_path: path,
                     old_file_path: path,
                     syms: &syms,
@@ -2378,6 +2427,7 @@ mod tests {
             LazyOldSide::default(),
             &DeclarationChangeInput {
                 file_diff: &text,
+                complete_single_file_diff: true,
                 file_path: path,
                 old_file_path: path,
                 syms: &syms,
@@ -2519,6 +2569,7 @@ mod tests {
                 LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
+                    complete_single_file_diff: true,
                     file_path: "api.rs",
                     old_file_path: "api.rs",
                     syms: &syms,
@@ -2579,6 +2630,28 @@ mod tests {
             format!("{associated}trait Other {{ fn r#comments(&self); }}\n"),
         ] {
             for (old, new) in [(&uncertain, &widened), (&widened, &uncertain)] {
+                assert!(
+                    proof(old, new, false)
+                        .rust_receiverless_associated_names
+                        .is_empty(),
+                    "{old} -> {new}"
+                );
+            }
+        }
+        let mixed = format!("{associated}trait Other {{ fn r#comments(&self); }}\n");
+        let changed = mixed.replace("n: u8", "n: u16");
+        assert!(
+            proof(&mixed, &changed, false)
+                .rust_receiverless_associated_names
+                .contains("comments")
+        );
+        // 引数の型に置ける const block やマクロは、別の型の impl も生みうる。
+        for old_type in [
+            "[u8; { struct Extra; impl Other for Extra { fn comments(&self) {} } 0 }]",
+            "make_type!()",
+        ] {
+            let unknown = mixed.replace("n: u8", &format!("n: {old_type}"));
+            for (old, new) in [(&unknown, &changed), (&changed, &unknown)] {
                 assert!(
                     proof(old, new, false)
                         .rust_receiverless_associated_names
@@ -2754,6 +2827,7 @@ mod tests {
                 LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
+                    complete_single_file_diff: extra_diff.is_empty(),
                     file_path: path,
                     old_file_path: path,
                     syms: &syms,
@@ -3207,6 +3281,7 @@ mod tests {
                 LazyOldSide::default(),
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
+                    complete_single_file_diff: path == old_path,
                     file_path: path,
                     old_file_path: old_path,
                     syms: &syms,

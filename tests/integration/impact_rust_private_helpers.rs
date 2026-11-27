@@ -316,6 +316,69 @@ fn rust_associated_function_changes_distinguish_dot_calls_from_paths() {
 }
 
 #[test]
+fn rust_associated_function_changes_with_a_trait_method_of_the_same_name() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='dispatch'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    repo.write("src/lib.rs", "mod producer; mod reader; mod config;\n");
+    let config = "pub type Arg = crate::producer::Settings;\n";
+    repo.write("src/config.rs", config);
+    let before = "pub struct Item; pub struct Settings; pub struct MenuHost;
+impl Item { pub fn add(_: Settings) -> u8 { 9 } }
+pub trait Ops { fn add(self, value: crate::config::Arg) -> u8; }
+impl Ops for Item { fn add(self, _: crate::config::Arg) -> u8 { 7 } }
+"
+    .trim_end()
+    .replace('\n', "\r\n");
+    repo.write("src/producer.rs", &before);
+    repo.write(
+        "src/reader.rs",
+        "use crate::producer::*;\nfn method() -> u8 { Item.add(Settings) }\nfn associated() -> u8 { Item::add(Settings) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    let inherent = before.replace("pub fn add(_: Settings)", "pub fn add(_: MenuHost)");
+    let both = inherent.replace("crate::config::Arg", "MenuHost");
+    let changed_config = config.replace("Settings", "MenuHost");
+    for (source, arg, expected) in [
+        (&inherent, config, &[3][..]),
+        (&both, config, &[2, 3][..]),
+        (&inherent, changed_config.as_str(), &[2, 3][..]),
+    ] {
+        repo.write("src/producer.rs", source);
+        repo.write("src/config.rs", arg);
+        for staged in [false, true] {
+            let args = if staged {
+                repo.stage_all();
+                repo.write("src/producer.rs", &before);
+                repo.write("src/config.rs", config);
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let context = repo.run_json("context", args);
+            let producer = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["path"] == "src/producer.rs")
+                .unwrap();
+            let lines: Vec<_> = producer["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["path"] == "src/reader.rs")
+                .map(|row| row["line"].as_u64().unwrap() + 1)
+                .collect();
+            assert_eq!(lines, expected, "staged={staged}: {context}");
+        }
+    }
+}
+
+#[test]
 fn impact_rust_independent_root_values_ignore_initializer_mentions() {
     for constant in [true, false] {
         let repo = TestRepo::new();
