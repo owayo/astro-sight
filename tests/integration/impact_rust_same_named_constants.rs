@@ -81,6 +81,94 @@ fn line_of(source: &str, needle: &str) -> u64 {
 }
 
 #[test]
+fn rust_constant_widening_separates_sibling_values_from_imports() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("Cargo.toml", "[package]\nname='scope'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nweave={path='weave'}\n");
+    repo.create_dir_all("weave/src");
+    repo.write(
+        "weave/Cargo.toml",
+        "[package]\nname='weave'\nversion='0.1.0'\nedition='2024'\n[lib]\nproc-macro=true\n",
+    );
+    repo.write(
+        "weave/src/lib.rs",
+        r#"use proc_macro::TokenStream;
+#[proc_macro_attribute]
+pub fn mapped(_: TokenStream, item: TokenStream) -> TokenStream {
+    item.to_string().replace("OPAQUE_SCOPES", "crate::source::OPAQUE_SCOPES").parse().unwrap()
+}
+"#,
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod source; mod sibling; mod imported; mod mapped; mod glob;\n",
+    );
+    repo.write(".gitattributes", "src/source.rs -text\n");
+    let source = "const OPAQUE_SCOPES: &[u8] = &[1];\r\n";
+    let sibling = r#"const OPAQUE_SCOPES: &[u8] = &[2, 3];
+fn local(value: u8) -> usize {
+    let size = OPAQUE_SCOPES.len();
+    match value { x if matches!(x, 0) => size, _ => 0 }
+}
+fn qualified() -> usize {
+    crate::source::OPAQUE_SCOPES.len()
+}
+fn in_block() -> usize {
+    use crate::source::OPAQUE_SCOPES;
+    OPAQUE_SCOPES.len()
+}
+"#;
+    let imported =
+        "use crate::source::OPAQUE_SCOPES;\npub fn read() -> usize { OPAQUE_SCOPES.len() }\n";
+    repo.write("src/source.rs", source);
+    repo.write("src/sibling.rs", sibling);
+    repo.write("src/imported.rs", imported);
+    repo.write("src/glob.rs", "use crate::source::*;\nconst r#OPAQUE_SCOPES: &[u8] = &[2, 3];\npub fn read() -> usize { OPAQUE_SCOPES.len() }\n");
+    repo.write("src/mapped.rs", "const OPAQUE_SCOPES: &[u8] = &[2, 3];\n#[weave::mapped]\nfn read() -> usize { OPAQUE_SCOPES.len() }\nfn local() -> usize { OPAQUE_SCOPES.len() }\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/source.rs", format!("pub(super) {source}"));
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            repo.write("src/source.rs", source);
+            repo.write("src/sibling.rs", sibling.replace('\n', "\r\n"));
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let context = repo.run_json("context", flags);
+        let all = caller_lines(&context, None, "src/sibling.rs");
+        assert!(
+            caller_lines(&context, None, "src/glob.rs").is_empty(),
+            "{staged}: {context}"
+        );
+        assert!(
+            !all.contains(&line_of(sibling, "let size")),
+            "{staged}: {context}"
+        );
+        let kept = caller_lines(&context, Some("impacted_callers"), "src/sibling.rs");
+        assert!(
+            kept.contains(&line_of(sibling, "    crate::source::")),
+            "{staged}: {context}"
+        );
+        assert!(
+            kept.contains(&line_of(sibling, "    OPAQUE_SCOPES.len()")),
+            "{staged}: {context}"
+        );
+        assert!(
+            caller_lines(&context, Some("impacted_callers"), "src/imported.rs").contains(&1),
+            "{staged}: {context}"
+        );
+        assert_eq!(
+            caller_lines(&context, Some("impacted_callers"), "src/mapped.rs"),
+            [2],
+            "{staged}: {context}"
+        );
+    }
+}
+
+#[test]
 fn impact_rust_same_named_constants_use_their_own_bindings_beside_body_macros() {
     // `vec!` は標準のマクロで、修正前から葉モジュールの証明で除けていた対照。
     for call in ["params![id]", "thing!(id)", "vec![id]"] {

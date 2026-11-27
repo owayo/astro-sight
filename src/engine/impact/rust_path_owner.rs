@@ -2128,7 +2128,12 @@ impl RustPathOwnerIndex {
         while let Some(scope) = ancestor {
             if matches!(
                 scope.kind(),
-                "function_item" | "closure_expression" | "block" | "impl_item" | "trait_item"
+                "function_item"
+                    | "closure_expression"
+                    | "block"
+                    | "match_arm"
+                    | "impl_item"
+                    | "trait_item"
             ) && (has_attribute_prefix(scope)
                 || self.rebinds(scope, Rebind::Value(proven_macro), name, || {
                     scope_can_rebind_import_name_beside(scope, source, name, proven_macro)
@@ -2193,7 +2198,7 @@ impl RustPathOwnerIndex {
         while let Some(scope) = ancestor {
             if matches!(
                 scope.kind(),
-                "function_item" | "closure_expression" | "block"
+                "function_item" | "closure_expression" | "block" | "match_arm"
             ) && (has_attribute_prefix(scope)
                 || self.rebinds(scope, Rebind::Value(proven_macro), name, || {
                     scope_can_rebind_import_name_beside(scope, source, name, proven_macro)
@@ -2214,8 +2219,10 @@ impl RustPathOwnerIndex {
         let mut ambiguous_imports = HashSet::new();
         let mut type_counts = HashMap::<String, usize>::new();
         let mut function_counts = HashMap::<String, usize>::new();
+        let mut direct_constants = HashSet::new();
         let mut root_imports = Vec::new();
         let mut import_names = Some(HashSet::new());
+        let mut glob_import = false;
         let mut root_uncertain = node.has_error();
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -2243,7 +2250,11 @@ impl RustPathOwnerIndex {
                         *type_counts.entry(name.to_owned()).or_default() += 1;
                     } else if matches!(child.kind(), "function_item" | "const_item" | "static_item")
                     {
-                        *function_counts.entry(name.to_owned()).or_default() += 1;
+                        let name = crate::language::normalize_identifier(LangId::Rust, name);
+                        if child.kind() == "const_item" {
+                            direct_constants.insert(name.clone());
+                        }
+                        *function_counts.entry(name.into_owned()).or_default() += 1;
                     }
                 }
                 continue;
@@ -2253,13 +2264,14 @@ impl RustPathOwnerIndex {
             } else {
                 root_uncertain = true;
             }
-            import_names =
-                import_names
-                    .zip(root_use_names(child, source))
-                    .map(|(mut names, found)| {
-                        names.extend(found);
-                        names
-                    });
+            let bound = root_use_names(child, source).or_else(|| {
+                glob_import = true;
+                use_names(child, source, true)
+            });
+            import_names = import_names.zip(bound).map(|(mut names, found)| {
+                names.extend(found);
+                names
+            });
             let Some(path) = child
                 .utf8_text(source)
                 .ok()
@@ -2294,11 +2306,19 @@ impl RustPathOwnerIndex {
         };
         let local_type_names = type_counts
             .into_iter()
-            .filter_map(|(name, count)| (count == 1 && safe_name(&name)).then_some(name))
+            .filter_map(|(name, count)| {
+                (count == 1 && !glob_import && safe_name(&name)).then_some(name)
+            })
             .collect();
+        // ファイル直下の無条件の const は同じモジュールの glob より優先される。
         let local_value_names = function_counts
             .into_iter()
-            .filter_map(|(name, count)| (count == 1 && safe_name(&name)).then_some(name))
+            .filter_map(|(name, count)| {
+                (count == 1
+                    && safe_name(&name)
+                    && (!glob_import || direct_constants.contains(name.as_str())))
+                .then_some(name)
+            })
             .collect();
         Self {
             current: FileEvidence::collect(node, source).map(Arc::new),
@@ -4280,8 +4300,16 @@ fn scope_can_rebind_import_name_beside(
     proven_macro: Option<usize>,
 ) -> bool {
     let mut cursor = scope.walk();
-    let mut pending = scope.named_children(&mut cursor).collect::<Vec<_>>();
+    let mut pending = if scope.kind() == "match_arm" {
+        vec![scope]
+    } else {
+        scope.named_children(&mut cursor).collect::<Vec<_>>()
+    };
     while let Some(node) = pending.pop() {
+        // arm のパターン・ガードの束縛はその arm 内だけに届く。参照を囲む arm は別途検査する。
+        if node.kind() == "match_arm" && node != scope {
+            continue;
+        }
         if node.kind() == "use_declaration" {
             return true;
         }
@@ -4314,10 +4342,9 @@ fn scope_can_rebind_import_name_beside(
                 |node| {
                     node.kind() == "macro_invocation"
                         || (matches!(node.kind(), "identifier" | "shorthand_field_identifier")
-                            && node
-                                .utf8_text(source)
-                                .ok()
-                                .is_none_or(|text| text.strip_prefix("r#").unwrap_or(text) == name))
+                            && node.utf8_text(source).ok().is_none_or(|text| {
+                                crate::language::normalize_identifier(LangId::Rust, text) == name
+                            }))
                 },
             )
         }) {
@@ -4336,7 +4363,7 @@ fn scope_can_rebind_import_name_beside(
         ) && node
             .child_by_field_name("name")
             .and_then(|child| child.utf8_text(source).ok())
-            == Some(name)
+            .is_some_and(|item| crate::language::normalize_identifier(LangId::Rust, item) == name)
         {
             return true;
         }
