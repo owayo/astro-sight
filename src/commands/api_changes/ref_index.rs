@@ -2053,10 +2053,7 @@ pub(crate) fn is_used_in_diff_paths(
         let import_lines = import_lines_cache
             .entry(ref_path.to_string())
             .or_insert_with(|| import_statement_lines_for_ref(dir, ref_path));
-        if import_lines.contains(&r.line) {
-            return false;
-        }
-        true
+        !import_lines.contains(&r.line)
     })
 }
 

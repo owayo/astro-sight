@@ -15,6 +15,8 @@ make install SYSTEM_TOOLS=1
 
 ## CI と同じ検査
 
+Cargo 1.100 は `tree-sitter-kotlin` に `unused dependency` の警告を出す。Kotlin 文法の C パーサーはこのクレートがビルドし、`src/language.rs` の `ffi_kotlin` が静的にリンクする。`--all-features` ではヒーププロファイラが `dhat` のアロケータを選ぶため、`mimalloc` にも同じ警告が出る。
+
 Linux と macOS の CI は `make setup` と、`make ci` を構成するターゲット（`make check` と `make test`）を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy は既定の feature と `--all-features` の両方で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。
 
 `make test` は単体テストと結合テストを cargo-nextest で 1 件ずつ別のプロセスとして走らせ（設定は `.config/nextest.toml`）、nextest が扱わない doctest を `cargo test --doc` で回す。一部のテストだけを走らせるときは `mise exec -- cargo nextest run <filter>` のように mise 経由で呼ぶ。

@@ -227,11 +227,7 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
         "static ",
         "async ",
     ];
-    if line.contains('(') && needs_paren_keywords.iter().any(|kw| line.contains(kw)) {
-        return true;
-    }
-
-    false
+    line.contains('(') && needs_paren_keywords.iter().any(|kw| line.contains(kw))
 }
 
 /// 指定ファイルの diff 変更行(+/-)にシンボル名が出現するか確認する。

@@ -3,7 +3,7 @@ name = "astro-sight"
 version = "26.11.111"
 edition = "2024"
 # mise.toml の rust の major.minor。CI で確かめている版だけを最低要件として宣言する
-rust-version = "1.99"
+rust-version = "1.100"
 authors = ["owayo"]
 description = "AI-agent-friendly AST information generation CLI"
 license = "MIT"
@@ -17,7 +17,7 @@ aho-corasick = "1.1.5"
 anyhow = "1.0.104"
 blake3 = "1.8.7"
 camino = { version = "1.2.6", features = ["serde1"] }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 dhat = { version = "0.3.3", optional = true }
 dirs = "7.0.0"
 # `.gitattributes` の解決 (engine/gitattributes.rs)。git を起動せずに Git と同じ規則で属性を引く。
@@ -29,37 +29,37 @@ globset = "0.4.21"
 hashbrown = "0.17.1"
 ignore = "0.4.34"
 logroller = "0.1.12"
-lru = "0.19.0"
+lru = "0.19.1"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 mimalloc = "0.1.52"
 rayon = "1.12.0"
-rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.11.0", features = ["server", "macros", "transport-io"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
-smallvec = "1.16.4"
+smallvec = "1.16.6"
 streaming-iterator = "0.1.9"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "macros", "local-offset"] }
 tokio = { version = "1.54.1", features = ["full"] }
-toml = "1.2.0"
+toml = "1.2.2"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
-tree-sitter = "0.27.1"
+tree-sitter = "0.27.2"
 # 文法の独自修正を使う。上流の更新で path patch が外れないよう版を合わせる。
 tree-sitter-bash = "=0.25.1"
 tree-sitter-c = "0.24.2"
-tree-sitter-c-sharp = "0.23.5"
+tree-sitter-c-sharp = "0.24.0"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23.5"
 tree-sitter-javascript = "0.25"
 tree-sitter-kotlin = "=0.3.5"  # tree-sitter 0.27 と非互換 (0.3.8 以降が >=0.21,<0.23 を要求)
 tree-sitter-language = "0.1.9"
-tree-sitter-php = "0.25.1"
+tree-sitter-php = "0.25.2"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", tag = "v26.10.107" }
 tree-sitter-rust = "=0.24.2"

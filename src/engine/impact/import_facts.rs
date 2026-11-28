@@ -428,12 +428,8 @@ pub(super) fn is_ts_local_shadow_context(context: &str, symbol_name: &str) -> bo
             return true;
         }
     }
-    // destructured params heuristic: `{ symbol_name` または `{ symbol_name,` が `:` の前後
-    // (関数引数 / 分割代入 binding)
-    if has_destructured_binding(ctx, symbol_name) {
-        return true;
-    }
-    false
+    // 関数引数や分割代入の束縛も確認する。
+    has_destructured_binding(ctx, symbol_name)
 }
 
 fn has_destructured_binding(ctx: &str, name: &str) -> bool {

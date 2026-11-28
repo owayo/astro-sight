@@ -15,6 +15,8 @@ make install SYSTEM_TOOLS=1
 
 ## Same Checks as CI
 
+Cargo 1.100 reports an `unused dependency` warning for `tree-sitter-kotlin`. This crate builds the Kotlin C parser that `ffi_kotlin` in `src/language.rs` links statically. With `--all-features`, Cargo also reports `mimalloc` because the heap profiler selects the `dhat` allocator.
+
 Rust owner regressions in `impact_rust_private_helpers` compare functions, constants in non-leaf modules, enum variants, and standard `format!` arguments against real callers, rebinding, macro replacement, `#[path]`, and `include!`. Regressions for implicit format captures and crate-anchored imports next to non-standard macros in function bodies of the changed file are in `impact_rust_same_named_constants`. Direct staged analysis keeps its conservative behavior; the additional owner proofs apply to ordinary analysis.
 
 `rust_private_inline_test` checks that updating an inline test's call arguments does not invalidate private-module placement evidence. This comparison preserves inline module headers and closing boundaries, imports, attributes and macros; it excludes ordinary function bodies. Unchanged real descendant callers stay blocking, and `refs` retains unrelated same-name method occurrences.

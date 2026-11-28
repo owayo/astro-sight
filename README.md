@@ -85,7 +85,7 @@ winget install owayo.astro-sight
 
 ### Cargo
 
-Requires Rust 1.99 or later.
+Requires Rust 1.100 or later.
 
 ```bash
 cargo install --git https://github.com/owayo/astro-sight --locked

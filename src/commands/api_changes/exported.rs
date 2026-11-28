@@ -966,11 +966,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
     /// qualname の確定後にだけ評価できる規約除外を判定する。
     fn is_excluded_by_qualname(&self, sym: &Symbol, qualname: &str) -> bool {
         // qualname ベースでも最終チェック (例: `Foo.testBar` を PHP で除外)
-        if is_phpunit_test_symbol(qualname, sym.kind, self.lang_id) {
-            return true;
-        }
-
-        false
+        is_phpunit_test_symbol(qualname, sym.kind, self.lang_id)
     }
 }
 
