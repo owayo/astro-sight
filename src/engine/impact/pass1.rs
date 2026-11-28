@@ -686,6 +686,7 @@ fn analyze_changed_file(
         .as_ref()
         .filter(|old| old.closed_root)
         .and_then(|_| ordinary_private_bindings(root, &source));
+    let plain_rust_modules = new_bindings.is_some();
     let (rust_private_types, rust_inherent_method_owners, rust_owner_derive) = old
         .as_ref()
         .zip(new_bindings)
@@ -702,10 +703,29 @@ fn analyze_changed_file(
             (private, owners, derive)
         })
         .unwrap_or_default();
-    let (rust_private_root_names, rust_private_method_owners) = old
+    let (rust_private_root_names, mut rust_private_method_owners) = old
         .as_ref()
         .map(|old| rust_private_symbols_of_changes(old, df, root, &source, &syms, &affected))
         .unwrap_or_default();
+    let shared_names: HashSet<_> = sig_changes
+        .iter()
+        .map(|sig| sig.name.as_str())
+        .filter(|name| plain_rust_modules && !rust_private_method_owners.contains_key(*name))
+        .collect();
+    if !shared_names.is_empty() {
+        let candidates = originals
+            .iter()
+            .filter(|s| {
+                shared_names.contains(s.name.as_str())
+                    && declaration::rust_private_inherent_method(root, &source, s).is_some()
+            })
+            .map(|s| s.name.as_str())
+            .collect::<HashSet<_>>();
+        if !candidates.is_empty() {
+            rust_private_method_owners
+                .extend(old_side.changed_receivers(&declaration_input, &candidates));
+        }
+    }
     let rust_private_root_functions = old
         .as_ref()
         .filter(|_| in_place)
@@ -1498,7 +1518,7 @@ fn rust_private_symbols_of_changes(
                 .count()
                 == 1
             && let Some(old_owner) = old.method_owners.get(&change.name)
-            && old_owner.name == new_owner.name
+            && old_owner.names == new_owner.names
         {
             new_owner.unconditional &= old_owner.unconditional;
             method_owners.insert(change.name.clone(), new_owner);

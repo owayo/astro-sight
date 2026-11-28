@@ -21,6 +21,7 @@ use super::import_facts::{
     rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
     should_route_ts_importless_ref_low,
 };
+use super::rust_owner_alias::PrivateCall;
 use super::signature::same_top_level_arity;
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
@@ -93,7 +94,7 @@ pub(super) struct RefEventMini {
     pub(super) rust_method_syntax: bool,
     /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
     pub(super) rust_explicit_method_owner_id: u32,
-    pub(super) rust_private_call_target: u32,
+    pub(super) rust_private_call_target: PrivateCall,
     /// 呼び出し側で確認した具体型名。依存先の名前は空文字、所有元が不明なら u32::MAX。
     pub(super) rust_call_owner_id: u32,
     /// マクロ展開先のスコープに移り得る参照には、ファイルの可視性を適用しない。
@@ -406,7 +407,7 @@ pub(super) struct ImpactCollector<'a> {
         std::cell::OnceCell<Option<&'a super::rust_path_owner::RustPathOwnerProjectProof>>,
     /// [`Self::owner_layout_proved`] の結果 (参照ファイルごと)。
     pub(super) rust_ref_unrelocated: std::cell::OnceCell<bool>,
-    pub(super) rust_private_calls: std::cell::OnceCell<Option<HashMap<usize, u32>>>,
+    pub(super) rust_private_calls: std::cell::OnceCell<Option<HashMap<usize, PrivateCall>>>,
     pub(super) rust_method_bindings:
         std::cell::OnceCell<Option<super::rust_owner_alias::MethodBindings>>,
     pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
@@ -895,7 +896,16 @@ impl ImpactCollector<'_> {
         };
         let rust_private_call_target = node
             .filter(|_| {
-                rust_explicit_method_owner_id != u32::MAX && !is_import && rust_macro_site.is_none()
+                !is_import
+                    && rust_macro_site.is_none()
+                    && (rust_explicit_method_owner_id != u32::MAX
+                        || rust_plain_dot_call
+                            && self.sym_to_fc[ix].iter().any(|&fc| {
+                                self.file_contexts[fc as usize]
+                                    .rust_private_method_owners
+                                    .get(&self.all_symbol_names[ix])
+                                    .is_some_and(|owner| owner.peers.is_some())
+                            }))
             })
             .and_then(|node| {
                 self.rust_private_calls
@@ -917,8 +927,19 @@ impl ImpactCollector<'_> {
                     .as_ref()?
                     .get(&node.id())
                     .copied()
+                    .filter(|call| {
+                        !matches!(call, PrivateCall::Unchanged(_))
+                            || !self
+                                .rust_opaque_attributes
+                                .get_or_init(|| {
+                                    super::rust_macro_site::OpaqueAttributeScopes::build(
+                                        node, source,
+                                    )
+                                })
+                                .contains(node)
+                    })
             })
-            .unwrap_or(u32::MAX);
+            .unwrap_or_default();
         // 変更した inherent メソッドの参照だけ、パスの修飾が指す型の名前を確かめる (Issue #470)。
         let rust_call_owner_id = if self.ref_lang == Some(LangId::Rust)
             && !is_import
@@ -2063,6 +2084,8 @@ impl<'a> ImpactCollector<'a> {
         evidence: &mut RefFileEvidence<'a>,
     ) -> CandidateDecision {
         if e.alias_owner.is_some_and(|owner| owner as usize != fc_ix)
+            || !evidence.filter_disabled
+                && e.rust_private_call_target == PrivateCall::Unchanged(fc_ix as u32)
             || self.excluded_by_owner_evidence(e, facts, fc_ix, evidence)
         {
             return CandidateDecision::Exclude;
@@ -2383,7 +2406,10 @@ impl<'a> ImpactCollector<'a> {
                 .get(name)
                 .is_some_and(|owner| {
                     let pool = self.pool.lock().expect("string pool mutex poisoned");
-                    pool.get(e.rust_explicit_method_owner_id) != owner.name
+                    !owner
+                        .names
+                        .iter()
+                        .any(|ty| ty == pool.get(e.rust_explicit_method_owner_id))
                 });
         let private_method_unanchored = private_method_candidate
             && !e.rust_attribute_call
@@ -2504,10 +2530,12 @@ impl<'a> ImpactCollector<'a> {
                 });
         if scope.visibility_only_informational || e.ts_rebound_const_owner == fc_ix as u32 {
             CallerRoute::Informational
-        } else if scope.private_method_low && e.rust_private_call_target != fc_ix as u32 {
+        } else if scope.private_method_low
+            && e.rust_private_call_target != PrivateCall::Changed(fc_ix as u32)
+        {
             CallerRoute::Low
         } else {
-            let bound_method = e.rust_private_call_target == fc_ix as u32;
+            let bound_method = e.rust_private_call_target == PrivateCall::Changed(fc_ix as u32);
             let mut route = RouteDecisionContext {
                 filter_disabled,
                 js_signature_sites_trusted: self.new_side_is_worktree,
@@ -2646,7 +2674,7 @@ mod tests {
             rust_attribute_call: false,
             rust_method_syntax: false,
             rust_explicit_method_owner_id: u32::MAX,
-            rust_private_call_target: u32::MAX,
+            rust_private_call_target: PrivateCall::Unknown,
             rust_call_owner_id: u32::MAX,
             rust_private_type_site: false,
             rust_name_site: super::super::rust_macro_site::MacroSite::Plain,

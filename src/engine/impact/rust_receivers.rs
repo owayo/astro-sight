@@ -422,6 +422,14 @@ pub(super) fn independent_calls<'p>(
                     && match receiver {
                         Receiver::Slice => true,
                         Receiver::Collection => standard(),
+                        // 型引数を省いた impl のメソッドは、別の具体化では Deref 先を指し得る。
+                        Receiver::Struct(ty) => {
+                            types.fields.contains_key(ty)
+                                && owners[name]
+                                    .peers
+                                    .as_ref()
+                                    .is_some_and(|other| other.contains(ty))
+                        }
                         Receiver::Factory {
                             module,
                             ty,
@@ -429,7 +437,6 @@ pub(super) fn independent_calls<'p>(
                         } => {
                             imports().is_some_and(|i| i.factory_method(module, ty, function, name))
                         }
-                        _ => false,
                     }
                 {
                     calls.insert(member.start_position());
@@ -567,6 +574,9 @@ fn get_result_type<'a>(
     if !target.unconditional {
         return None;
     }
+    let [target_name] = target.names.as_slice() else {
+        return None;
+    };
     let mut cursor = root.walk();
     for item in root
         .named_children(&mut cursor)
@@ -580,7 +590,7 @@ fn get_result_type<'a>(
         };
         let Some(body) = item
             .child_by_field_name("body")
-            .filter(|_| owner == target.name)
+            .filter(|_| owner == target_name)
         else {
             continue;
         };

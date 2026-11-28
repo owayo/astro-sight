@@ -413,6 +413,119 @@ struct OldSide {
 pub(super) struct LazyOldSide(std::cell::OnceCell<Option<OldSide>>);
 
 impl LazyOldSide {
+    /// 同名メソッドの旧新の変更行が指す所有型を照合する。別の型の呼び出しを
+    /// 除けるのは、両側でその型自身に無条件の &self メソッドがある場合だけ。
+    pub(super) fn changed_receivers(
+        &self,
+        input: &DeclarationChangeInput<'_>,
+        wanted: &HashSet<&str>,
+    ) -> HashMap<String, PrivateMethodOwner> {
+        fn side(
+            root: Node<'_>,
+            source: &[u8],
+            symbols: &[Symbol],
+            lines: &HashSet<usize>,
+            wanted: &HashSet<&str>,
+        ) -> HashMap<String, PrivateMethodOwner> {
+            let mut changed_lines: Vec<_> = lines.iter().copied().collect();
+            changed_lines.sort_unstable();
+            let nominal: HashSet<_> = super::rust_owner_alias::items_with_attributes(
+                root.named_children(&mut root.walk()),
+            )
+            .filter(|(item, attr)| {
+                !attr && matches!(item.kind(), "struct_item" | "enum_item" | "union_item")
+            })
+            .filter_map(|(item, _)| item.child_by_field_name("name")?.utf8_text(source).ok())
+            .collect();
+            let mut groups = HashMap::<&str, Option<PrivateMethodOwner>>::new();
+            for symbol in symbols {
+                let name = symbol.name.trim_start_matches("r#");
+                if !wanted.contains(name) {
+                    continue;
+                }
+                let entry = groups.entry(name).or_insert_with(|| {
+                    Some(PrivateMethodOwner {
+                        names: Default::default(),
+                        peers: Some(HashSet::new()),
+                        unconditional: true,
+                    })
+                });
+                let Some(group) = entry else { continue };
+                let start = changed_lines.partition_point(|&line| line < symbol.range.start.line);
+                let touched = changed_lines
+                    .get(start)
+                    .is_some_and(|&line| line <= symbol.range.end.line);
+                let owner = rust_private_inherent_method(root, source, symbol);
+                if touched {
+                    let Some(owner) = owner else {
+                        *entry = None;
+                        continue;
+                    };
+                    group.unconditional &= owner.unconditional
+                        && owner.names.iter().all(|ty| nominal.contains(ty.as_str()));
+                    group.names.extend(owner.names);
+                } else if owner.is_some_and(|o| o.unconditional)
+                    && let Some((method, ty)) = rust_inherent_method(root, source, symbol)
+                    && nominal.contains(ty)
+                    && let Some(implementation) = method.parent().and_then(|body| body.parent())
+                    && let Some(receiver) = method
+                        .child_by_field_name("parameters")
+                        .and_then(|p| p.named_child(0))
+                    && receiver.kind() == "self_parameter"
+                    && receiver.utf8_text(source) == Ok("&self")
+                    && method.child_by_field_name("type_parameters").is_none()
+                    && [method, implementation].iter().all(|n| {
+                        !n.named_children(&mut n.walk())
+                            .any(|child| child.kind() == "where_clause")
+                    })
+                    && let Some(peers) = &mut group.peers
+                {
+                    peers.insert(ty.to_owned());
+                }
+            }
+            groups
+                .into_iter()
+                .filter_map(|(name, group)| {
+                    let mut group = group?;
+                    group.names.sort_unstable();
+                    group.names.dedup();
+                    (!group.names.is_empty()).then(|| (name.to_owned(), group))
+                })
+                .collect()
+        }
+        let Some(old) = self.get(input) else {
+            return HashMap::new();
+        };
+        let mut new = side(
+            input.root,
+            input.source,
+            input.syms,
+            &input.facts.added_lines,
+            wanted,
+        );
+        let before = side(
+            old.tree.root_node(),
+            &old.source,
+            &old.symbols,
+            &old.removed_lines,
+            wanted,
+        );
+        new.retain(|name, group| {
+            let Some(old) = before.get(name) else {
+                return false;
+            };
+            group.unconditional &= old.unconditional;
+            if let Some(peers) = &mut group.peers {
+                peers.retain(|p| {
+                    !group.names.contains(p)
+                        && old.peers.as_ref().is_some_and(|old| old.contains(p))
+                });
+            }
+            old.names == group.names
+        });
+        new
+    }
+
     pub(super) fn unchanged_receiver_calls<'p>(
         &self,
         input: &DeclarationChangeInput<'_>,
@@ -538,7 +651,9 @@ pub(super) fn is_rust_file_root_symbol(root: Node<'_>, symbol: &Symbol) -> bool 
 
 #[derive(Clone, Debug)]
 pub(super) struct PrivateMethodOwner {
-    pub(super) name: String,
+    pub(super) names: smallvec::SmallVec<[String; 1]>,
+    /// 同名メソッドが複数ある場合に、別の受け手で優先する無条件の宣言。
+    pub(super) peers: Option<HashSet<String>>,
     /// 呼び出し側の型パスで所有元を証明できる、属性と型引数のない impl のメソッド。
     pub(super) unconditional: bool,
 }
@@ -599,7 +714,8 @@ pub(super) fn rust_private_inherent_method(
     };
     (owner.kind() == "type_identifier").then_some(())?;
     Some(PrivateMethodOwner {
-        name: owner.utf8_text(source).ok()?.to_owned(),
+        names: smallvec::smallvec![owner.utf8_text(source).ok()?.to_owned()],
+        peers: None,
         unconditional,
     })
 }

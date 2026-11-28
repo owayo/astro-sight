@@ -92,6 +92,152 @@ fn anchored() { let _ = self::Names::collect(); }
 }
 
 #[test]
+fn rust_private_method_keeps_calls_to_the_changed_receiver_among_same_named_methods() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='receivers'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    let lib = "struct Item;\nimpl Item {\n    fn get(&self) -> i32 { 1 }\n}\nstruct Other;\nimpl Other {\n    fn get(&self) -> i32 { 2 }\n}\nfn near(item: &Item) -> i32 {\n    item.get()\n}\nfn independent(other: &Other) -> i32 {\n    other.get()\n}\nmod child;\n";
+    repo.write("src/lib.rs", lib);
+    repo.write("src/child.rs", "use super::Item as Actual;\nfn far(item: &Actual) -> i32 {\n    item.get()\n}\nfn independent(other: &super::Other) -> i32 {\n    other.get()\n}\nfn mixed(item: &Actual, other: &super::Other) -> i32 {\n    other.get() + super::Item::get(item)\n}\n");
+    repo.init_git();
+    repo.commit_all("base");
+    for (owner, expected) in [
+        (
+            "Item",
+            BTreeSet::from([("src/lib.rs", 9), ("src/child.rs", 2), ("src/child.rs", 8)]),
+        ),
+        (
+            "Other",
+            BTreeSet::from([("src/lib.rs", 12), ("src/child.rs", 5), ("src/child.rs", 8)]),
+        ),
+        (
+            "both",
+            BTreeSet::from([
+                ("src/lib.rs", 9),
+                ("src/lib.rs", 12),
+                ("src/child.rs", 2),
+                ("src/child.rs", 5),
+                ("src/child.rs", 8),
+            ]),
+        ),
+    ] {
+        let mut changed = if owner == "both" {
+            lib.replace("fn get(&self)", "fn get(&mut self)")
+        } else {
+            lib.replace(
+                &format!("impl {owner} {{\n    fn get(&self)"),
+                &format!("impl {owner} {{\n    fn get(&mut self)"),
+            )
+        };
+        if owner == "Other" {
+            changed.push_str("const TAG: u8 = 1;\n");
+        }
+        repo.write("src/lib.rs", changed);
+        for staged in [false, true] {
+            let flags = if staged {
+                repo.stage_all();
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let context = repo.run_json("context", flags);
+            let actual: BTreeSet<_> = context["changes"][0]["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["symbols"].as_array().unwrap().iter().any(|s| s == "get"))
+                .map(|c| (c["path"].as_str().unwrap(), c["line"].as_u64().unwrap()))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "owner={owner}, staged={staged}: {context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_private_method_keeps_deref_calls_outside_a_default_specialization() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='specialized'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    let lib = r#"struct Item;
+impl Item {
+    fn get(&self) -> u8 { 1 }
+}
+struct Other<T=u8>(T, Item);
+impl Other {
+    fn get(&self) -> u8 { 2 }
+}
+impl<T> std::ops::Deref for Other<T> {
+    type Target = Item;
+    fn deref(&self) -> &Item { &self.1 }
+}
+fn read(other: &Other<u16>) -> u8 {
+    other.get()
+}
+trait Read { fn get(&self) -> u8; }
+mod child;
+"#;
+    repo.write("src/lib.rs", lib);
+    repo.write("src/child.rs", "use super::{Item, Other};\nfn selected(#[cfg(all())] v: &Item, #[cfg(any())] v: &Other) -> u8 {\n    v.get()\n}\n");
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        lib.replacen("fn get(&self)", "fn get(&mut self)", 1),
+    );
+    for staged in [false, true] {
+        let flags = if staged {
+            repo.stage_all();
+            &["--git", "--staged"][..]
+        } else {
+            &["--git"][..]
+        };
+        let context = repo.run_json("context", flags);
+        let calls = context["changes"][0]["impacted_callers"]
+            .as_array()
+            .unwrap();
+        assert!(
+            calls.iter().any(|c| c["name"] == "read"
+                && c["line"] == 13
+                && c["symbols"] == serde_json::json!(["get"])),
+            "{context}"
+        );
+        let has_child = |change: &serde_json::Value, bucket: &str| {
+            change[bucket].as_array().into_iter().flatten().any(|c| {
+                c["path"] == "src/child.rs"
+                    && c["line"] == 2
+                    && c["symbols"] == serde_json::json!(["get"])
+            })
+        };
+        if staged {
+            // 生の index では条件付き引数が指す型を確定できない。
+            assert!(
+                has_child(&context["changes"][0], "low_confidence_callers"),
+                "{context}"
+            );
+            let review = repo.run_json("review", flags);
+            assert!(
+                has_child(&review["impact"]["changes"][0], "impacted_callers"),
+                "{review}"
+            );
+        } else {
+            assert!(
+                has_child(&context["changes"][0], "impacted_callers"),
+                "{context}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rust_same_file_method_calls_respect_receiver_types() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
