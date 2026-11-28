@@ -33,6 +33,14 @@ enum Visibility {
 }
 
 impl Visibility {
+    fn extends_beyond_self(&self) -> bool {
+        match self {
+            Self::Restricted(path) => path.as_slice() != ["self"],
+            Self::Public => true,
+            Self::Private => false,
+        }
+    }
+
     /// 宣言モジュール `module` を基準にした可視範囲。祖先でない path や root を越える
     /// `super` は解決できない (`None`)。
     fn boundary(&self, module: &[String]) -> Option<Boundary> {
@@ -192,7 +200,7 @@ fn visibility_path(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
 }
 
 /// 宣言自身の可視性修飾子 (宣言の直接の子)。フィールドやメソッドの修飾子は含まない。
-fn visibility_modifier(item: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn visibility_modifier(item: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = item.walk();
     item.named_children(&mut cursor)
         .find(|node| node.kind() == "visibility_modifier")
@@ -224,21 +232,21 @@ fn declared_visibility(item: Node<'_>, source: &[u8]) -> Option<Visibility> {
 }
 
 pub(super) fn previously_visible_method(item: Node<'_>, source: &[u8]) -> bool {
-    match visibility(item, source) {
-        Some((_, Visibility::Restricted(path))) => path != ["self"],
-        Some((_, Visibility::Public)) => true,
-        _ => false,
-    }
+    visibility(item, source).is_some_and(|(_, value)| value.extends_beyond_self())
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct NarrowedMethod {
+pub(super) struct InherentVisibilityEdit {
     pub(super) owner: String,
     pub(super) name: String,
-    visibility: Visibility,
+    old_visibility: Option<Visibility>,
 }
 
-impl NarrowedMethod {
+impl InherentVisibilityEdit {
+    pub(super) fn is_narrowing(&self) -> bool {
+        self.old_visibility.is_some()
+    }
+
     pub(super) fn prove(
         (owner, name): (&str, &str),
         before: Node<'_>,
@@ -246,26 +254,52 @@ impl NarrowedMethod {
         after: Node<'_>,
         new: &[u8],
     ) -> Option<Self> {
-        let (modifier, visibility) = visibility(before, old)?;
-        if before.start_byte() != modifier.start_byte() {
+        let narrowing = visibility_modifier(after).is_none();
+        let (visible, with, private, without) = if narrowing {
+            (before, old, after, new)
+        } else {
+            (after, new, before, old)
+        };
+        let (modifier, visibility) = visibility(visible, with)?;
+        if visible.start_byte() != modifier.start_byte()
+            || !visibility.extends_beyond_self()
+            || visibility_modifier(private).is_some()
+        {
             return None;
         }
-        let removed = modifier_range(modifier, old, true);
-        (super::rust_line_endings::same_text(&old[..removed.start], &new[..after.start_byte()])
-            && super::rust_line_endings::same_text(&old[removed.end..], &new[after.start_byte()..]))
+        let removed = modifier_range(modifier, with, true);
+        (super::rust_line_endings::same_text(
+            &with[..removed.start],
+            &without[..private.start_byte()],
+        ) && super::rust_line_endings::same_text(
+            &with[removed.end..],
+            &without[private.start_byte()..],
+        ))
         .then(|| Self {
             owner: super::ci_key(LangId::Rust, owner),
             name: super::ci_key(LangId::Rust, name),
-            visibility,
+            old_visibility: narrowing.then_some(visibility),
         })
     }
 
     pub(super) fn outside_old_scope(&self, origin: &[String], reader: &[String]) -> bool {
-        let Some(Boundary::Module(boundary)) = self.visibility.boundary(origin) else {
+        let Some(Boundary::Module(boundary)) = self
+            .old_visibility
+            .as_ref()
+            .and_then(|old| old.boundary(origin))
+        else {
             return false;
         };
         // 参照ファイル内の inline module が旧範囲に入る場合も残す。
         !reader.starts_with(&boundary) && !boundary.starts_with(reader)
+    }
+}
+
+impl super::FileContext {
+    pub(super) fn narrowed_method(&self) -> Option<&InherentVisibilityEdit> {
+        self.rust_method_visibility
+            .as_ref()
+            .filter(|edit| edit.is_narrowing())
     }
 }
 

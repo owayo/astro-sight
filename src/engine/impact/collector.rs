@@ -220,8 +220,7 @@ impl RouteDecisionContext<'_> {
         let kind_changed = file_context.rust_kind_changes.contains(symbol_name);
         let fn_value_informational = !kind_changed
             && file_context
-                .rust_narrowed_method
-                .as_ref()
+                .narrowed_method()
                 .is_none_or(|edit| edit.name != symbol_name)
             && event.fn_value_ref
             && file_context.sig_changes.iter().any(|change| {
@@ -859,8 +858,7 @@ impl ImpactCollector<'_> {
                     let name = &self.all_symbol_names[ix];
                     ctx.rust_private_method_owners.contains_key(name)
                         || ctx
-                            .rust_narrowed_method
-                            .as_ref()
+                            .narrowed_method()
                             .is_some_and(|method| &method.name == name)
                 })
             });
@@ -1493,38 +1491,47 @@ impl ImpactCollector<'_> {
                 };
                 let ctx = &self.file_contexts[*fc as usize];
                 let name = &self.all_symbol_names[ix];
-                let narrowed = ctx
-                    .rust_narrowed_method
+                let visibility_edit = ctx
+                    .rust_method_visibility
                     .as_ref()
                     .filter(|edit| &edit.name == name);
-                if node.kind() != "identifier"
-                    || (narrowed.is_none()
-                        && !(ctx.rust_receiverless_associated_names.contains(name)
-                            && ctx.rust_inherent_method_owners.contains_key(name)))
-                {
+                if node.kind() != "identifier" {
+                    return false;
+                }
+                let explicit_trait = visibility_edit.is_some() && explicit_rust_trait_member(node);
+                let check_owner = (ctx.rust_receiverless_associated_names.contains(name)
+                    && ctx.rust_inherent_method_owners.contains_key(name))
+                    || ctx.narrowed_method().is_some_and(|edit| &edit.name == name);
+                if !explicit_trait && !check_owner {
                     return false;
                 }
                 let view = self.binding_view(source).or_else(|| {
-                    narrowed?;
+                    visibility_edit?;
                     let view = self.rust_path_owner_project.staged_bindings()?;
                     self.indexed_rust_source_matches(view, source)
                         .then_some(view)
                 });
                 view.is_some_and(|view| {
-                    let index = self.rust_path_owner.get_or_init(|| {
-                        super::rust_path_owner::RustPathOwnerIndex::build(node, source)
-                    });
-                    index.separate_inherent_call(node, source, Path::new(self.path_str), ctx, view)
-                        || (narrowed.is_some()
-                            && explicit_rust_trait_member(node)
-                            && !self
-                                .rust_opaque_attributes
+                    (explicit_trait
+                        && !self
+                            .rust_opaque_attributes
+                            .get_or_init(|| {
+                                super::rust_macro_site::OpaqueAttributeScopes::build(node, source)
+                            })
+                            .contains(node))
+                        || (check_owner
+                            && self
+                                .rust_path_owner
                                 .get_or_init(|| {
-                                    super::rust_macro_site::OpaqueAttributeScopes::build(
-                                        node, source,
-                                    )
+                                    super::rust_path_owner::RustPathOwnerIndex::build(node, source)
                                 })
-                                .contains(node))
+                                .separate_inherent_call(
+                                    node,
+                                    source,
+                                    Path::new(self.path_str),
+                                    ctx,
+                                    view,
+                                ))
                 })
             });
         let rust_local_owner = rust_local_owner
@@ -1733,8 +1740,8 @@ fn explicit_rust_trait_member(node: tree_sitter::Node<'_>) -> bool {
             && member.child_by_field_name("path").is_some_and(|path| {
                 path.kind() == "bracketed_type"
                     && path
-                        .named_child(0)
-                        .is_some_and(|ty| ty.kind() == "qualified_type")
+                        .named_children(&mut path.walk())
+                        .any(|ty| ty.kind() == "qualified_type")
             })
     })
 }
@@ -2882,7 +2889,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
-            rust_narrowed_method: None,
+            rust_method_visibility: None,
             affected,
             sig_changes,
             compatible_signature_keys: Default::default(),

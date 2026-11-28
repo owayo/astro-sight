@@ -398,11 +398,7 @@ impl RustPathOwnerIndex {
                         .rust_inherent_method_owners
                         .keys()
                         .map(String::as_str)
-                        .chain(
-                            ctx.rust_narrowed_method
-                                .iter()
-                                .map(|edit| edit.name.as_str()),
-                        )
+                        .chain(ctx.narrowed_method().map(|edit| edit.name.as_str()))
                         .collect();
                     Some(local_inherent_calls(root, source, &reader.path, &wanted))
                 };

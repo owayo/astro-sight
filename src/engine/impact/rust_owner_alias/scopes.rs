@@ -126,7 +126,8 @@ pub(in super::super) fn private_calls(
     let mut has_peers = false;
     let mut narrowed_names = HashSet::new();
     for (index, ctx) in contexts.iter().enumerate() {
-        if (ctx.rust_private_method_owners.is_empty() && ctx.rust_narrowed_method.is_none())
+        let narrowed = ctx.narrowed_method();
+        if (ctx.rust_private_method_owners.is_empty() && narrowed.is_none())
             || Path::new(&ctx.new_path) == file
         {
             continue;
@@ -147,7 +148,7 @@ pub(in super::super) fn private_calls(
                 .and_modify(|old| *old = PrivateCall::Unknown)
                 .or_insert(call);
         };
-        if let Some(edit) = &ctx.rust_narrowed_method {
+        if let Some(edit) = narrowed {
             let call = if edit.outside_old_scope(&origin.modules, &reference.modules) {
                 PrivateCall::Unchanged(index as u32)
             } else {
