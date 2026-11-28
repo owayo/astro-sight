@@ -219,6 +219,10 @@ impl RouteDecisionContext<'_> {
         // また removed (存在破壊) は sig_changes に載らないため、どちらも blocking 維持。
         let kind_changed = file_context.rust_kind_changes.contains(symbol_name);
         let fn_value_informational = !kind_changed
+            && file_context
+                .rust_narrowed_method
+                .as_ref()
+                .is_none_or(|edit| edit.name != symbol_name)
             && event.fn_value_ref
             && file_context.sig_changes.iter().any(|change| {
                 ci_key(file_context.lang_id, &change.name) == symbol_name
@@ -851,9 +855,13 @@ impl ImpactCollector<'_> {
         let private_method_target = self.ref_lang == Some(LangId::Rust)
             && self.sym_to_fc.get(ix).is_some_and(|contexts| {
                 contexts.iter().any(|&fc_ix| {
-                    self.file_contexts[fc_ix as usize]
-                        .rust_private_method_owners
-                        .contains_key(&self.all_symbol_names[ix])
+                    let ctx = &self.file_contexts[fc_ix as usize];
+                    let name = &self.all_symbol_names[ix];
+                    ctx.rust_private_method_owners.contains_key(name)
+                        || ctx
+                            .rust_narrowed_method
+                            .as_ref()
+                            .is_some_and(|method| &method.name == name)
                 })
             });
         // AST ノードを持たない参照 (属性の文字列 `"super::Limits::is_unset"` など) は構文で
@@ -1485,22 +1493,39 @@ impl ImpactCollector<'_> {
                 };
                 let ctx = &self.file_contexts[*fc as usize];
                 let name = &self.all_symbol_names[ix];
-                node.kind() == "identifier"
-                    && ctx.rust_receiverless_associated_names.contains(name)
-                    && ctx.rust_inherent_method_owners.contains_key(name)
-                    && self.binding_view(source).is_some_and(|view| {
-                        self.rust_path_owner
-                            .get_or_init(|| {
-                                super::rust_path_owner::RustPathOwnerIndex::build(node, source)
-                            })
-                            .separate_inherent_call(
-                                node,
-                                source,
-                                Path::new(self.path_str),
-                                ctx,
-                                view,
-                            )
-                    })
+                let narrowed = ctx
+                    .rust_narrowed_method
+                    .as_ref()
+                    .filter(|edit| &edit.name == name);
+                if node.kind() != "identifier"
+                    || (narrowed.is_none()
+                        && !(ctx.rust_receiverless_associated_names.contains(name)
+                            && ctx.rust_inherent_method_owners.contains_key(name)))
+                {
+                    return false;
+                }
+                let view = self.binding_view(source).or_else(|| {
+                    narrowed?;
+                    let view = self.rust_path_owner_project.staged_bindings()?;
+                    self.indexed_rust_source_matches(view, source)
+                        .then_some(view)
+                });
+                view.is_some_and(|view| {
+                    let index = self.rust_path_owner.get_or_init(|| {
+                        super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                    });
+                    index.separate_inherent_call(node, source, Path::new(self.path_str), ctx, view)
+                        || (narrowed.is_some()
+                            && explicit_rust_trait_member(node)
+                            && !self
+                                .rust_opaque_attributes
+                                .get_or_init(|| {
+                                    super::rust_macro_site::OpaqueAttributeScopes::build(
+                                        node, source,
+                                    )
+                                })
+                                .contains(node))
+                })
             });
         let rust_local_owner = rust_local_owner
             || separate_inherent
@@ -1697,6 +1722,20 @@ fn rust_member_is_called(node: tree_sitter::Node<'_>) -> bool {
             && call
                 .child_by_field_name("function")
                 .is_some_and(|function| function.id() == callee.id())
+    })
+}
+
+/// `<T as Trait>::member` は inherent メソッドを選ばない。
+fn explicit_rust_trait_member(node: tree_sitter::Node<'_>) -> bool {
+    node.parent().is_some_and(|member| {
+        member.kind() == "scoped_identifier"
+            && member.child_by_field_name("name") == Some(node)
+            && member.child_by_field_name("path").is_some_and(|path| {
+                path.kind() == "bracketed_type"
+                    && path
+                        .named_child(0)
+                        .is_some_and(|ty| ty.kind() == "qualified_type")
+            })
     })
 }
 
@@ -2843,6 +2882,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
+            rust_narrowed_method: None,
             affected,
             sig_changes,
             compatible_signature_keys: Default::default(),

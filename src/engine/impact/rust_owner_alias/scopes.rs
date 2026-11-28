@@ -124,40 +124,54 @@ pub(in super::super) fn private_calls(
     let reference = project.private_call_module(file)?;
     let mut targets = HashMap::<String, HashMap<Vec<String>, PrivateCall>>::new();
     let mut has_peers = false;
+    let mut narrowed_names = HashSet::new();
     for (index, ctx) in contexts.iter().enumerate() {
-        if ctx.rust_private_method_owners.is_empty() || Path::new(&ctx.new_path) == file {
+        if (ctx.rust_private_method_owners.is_empty() && ctx.rust_narrowed_method.is_none())
+            || Path::new(&ctx.new_path) == file
+        {
             continue;
         }
         let Some(origin) = project.private_call_module(Path::new(&ctx.new_path)) else {
             continue;
         };
-        if reference.crate_root != origin.crate_root
-            || !reference.modules.starts_with(&origin.modules)
-        {
+        if reference.crate_root != origin.crate_root {
+            continue;
+        }
+        let mut insert = |method: &str, owner: &str, call| {
+            let mut path = origin.modules.clone();
+            path.push(identifier(owner));
+            targets
+                .entry(identifier(method))
+                .or_default()
+                .entry(path)
+                .and_modify(|old| *old = PrivateCall::Unknown)
+                .or_insert(call);
+        };
+        if let Some(edit) = &ctx.rust_narrowed_method {
+            let call = if edit.outside_old_scope(&origin.modules, &reference.modules) {
+                PrivateCall::Unchanged(index as u32)
+            } else {
+                PrivateCall::Changed(index as u32)
+            };
+            insert(&edit.name, &edit.owner, call);
+            narrowed_names.insert(edit.name.as_str());
+        }
+        if !reference.modules.starts_with(&origin.modules) {
             continue;
         }
         for (method, owner) in &ctx.rust_private_method_owners {
             if !owner.unconditional {
                 continue;
             }
-            let owners = targets.entry(identifier(method)).or_default();
-            let mut insert = |name, call| {
-                let mut path = origin.modules.clone();
-                path.push(identifier(name));
-                owners
-                    .entry(path)
-                    .and_modify(|old| *old = PrivateCall::Unknown)
-                    .or_insert(call);
-            };
             for name in &owner.names {
-                insert(name, PrivateCall::Changed(index as u32));
+                insert(method, name, PrivateCall::Changed(index as u32));
             }
             if let Some(peers) = &owner.peers
                 && !project.reexport_old_sources.contains_key(file)
             {
                 has_peers = true;
                 for peer in peers {
-                    insert(peer, PrivateCall::Unchanged(index as u32));
+                    insert(method, peer, PrivateCall::Unchanged(index as u32));
                 }
             }
         }
@@ -177,6 +191,7 @@ pub(in super::super) fn private_calls(
     let mut generic_end = 0;
     let mut parameters = HashMap::new();
     let mut function_end = 0;
+    let mut callee_id = None;
     let mut calls = HashMap::new();
     let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, depth| {
         let skip = ControlFlow::Continue(Walk::Skip);
@@ -211,23 +226,32 @@ pub(in super::super) fn private_calls(
                 parameters = receiver_parameters(node, source, Some);
                 function_end = node.end_byte();
             }
-        } else if node.kind() == "call_expression"
-            && let Some(callee) = node.child_by_field_name("function")
-            && let Some((member, receiver)) = match callee.kind() {
-                "scoped_identifier" => callee
-                    .child_by_field_name("name")
-                    .zip(callee.child_by_field_name("path")),
-                "field_expression" if node.start_byte() < function_end => {
-                    let ty = callee
-                        .child_by_field_name("value")
-                        .filter(|v| v.kind() == "identifier")
-                        .and_then(|v| plain_name(v, source))
-                        .and_then(|name| parameters.get(name).copied());
-                    callee.child_by_field_name("field").zip(ty)
-                }
-                _ => None,
+        } else if node.kind() == "call_expression" {
+            callee_id = node
+                .child_by_field_name("function")
+                .map(|callee| callee.id());
+        } else if let Some((member, receiver)) = match node.kind() {
+            "scoped_identifier" => node
+                .child_by_field_name("name")
+                .filter(|name| {
+                    callee_id == Some(node.id())
+                        || plain_name(*name, source)
+                            .is_some_and(|name| narrowed_names.contains(name))
+                })
+                .zip(node.child_by_field_name("path")),
+            "field_expression"
+                if callee_id == Some(node.id()) && node.start_byte() < function_end =>
+            {
+                let ty = node
+                    .child_by_field_name("value")
+                    .filter(|v| v.kind() == "identifier")
+                    .and_then(|v| plain_name(v, source))
+                    .and_then(|name| parameters.get(name).copied());
+                node.child_by_field_name("field").zip(ty)
             }
-            && let Some(owners) = plain_name(member, source).and_then(|name| targets.get(name))
+            _ => None,
+        } && let Some(owners) =
+            plain_name(member, source).and_then(|name| targets.get(name))
         {
             let target = match receiver.kind() {
                 "identifier" | "type_identifier" => {

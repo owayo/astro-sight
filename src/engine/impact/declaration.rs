@@ -741,6 +741,21 @@ fn rust_inherent_method<'tree, 'src>(
     source: &'src [u8],
     symbol: &Symbol,
 ) -> Option<(Node<'tree>, &'src str)> {
+    let (method, implementation, owner) = inherent_method_site(root, source, symbol)?;
+    ordinary_inherent_method(root, method, implementation).then_some((method, owner))
+}
+
+fn ordinary_inherent_method(root: Node<'_>, method: Node<'_>, implementation: Node<'_>) -> bool {
+    implementation.parent() == Some(root)
+        && !super::rust_path_owner::has_attribute_prefix(implementation)
+        && !super::rust_path_owner::has_attribute_prefix(method)
+}
+
+fn inherent_method_site<'tree, 'src>(
+    root: Node<'tree>,
+    source: &'src [u8],
+    symbol: &Symbol,
+) -> Option<(Node<'tree>, Node<'tree>, &'src str)> {
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
         return None;
     }
@@ -760,19 +775,17 @@ fn rust_inherent_method<'tree, 'src>(
     if implementation.child_by_field_name("trait").is_some() {
         return None;
     }
-    if implementation.parent()? != root
-        || super::rust_path_owner::has_attribute_prefix(implementation)
-        || super::rust_path_owner::has_attribute_prefix(method)
-    {
-        return None;
-    }
     let owner = implementation.child_by_field_name("type")?;
     let owner = if owner.kind() == "generic_type" {
         owner.child_by_field_name("type")?
     } else {
         owner
     };
-    (owner.kind() == "type_identifier").then_some((method, owner.utf8_text(source).ok()?))
+    (owner.kind() == "type_identifier").then_some((
+        method,
+        implementation,
+        owner.utf8_text(source).ok()?,
+    ))
 }
 
 /// マクロや属性を介さず、通常の引数だけを持つ inherent 関連関数。
@@ -1006,6 +1019,8 @@ pub(super) struct DeclarationProof {
     /// 旧新ともこのファイル直下にただ一つの pub(super) 自由関数がある名前。
     pub(super) rust_super_functions: HashSet<String>,
     pub(super) rust_new_super_functions: HashSet<String>,
+    pub(super) rust_visible_inherent_methods: HashSet<(usize, usize)>,
+    pub(super) rust_narrowed_method: Option<super::rust_visibility_scope::NarrowedMethod>,
     pub(super) rust_receiverless_associated_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
@@ -1024,6 +1039,65 @@ pub(super) struct RustValueOnlyConstant {
     /// 値が昇格できるかで変わる (`None` → `Some(AtomicU8::new(0))` で E0515)。
     pub(super) is_static: bool,
     pub(super) type_names: std::collections::BTreeSet<String>,
+}
+
+/// 変更前に可視範囲を明示した inherent メソッドを、新しい宣言の所有型と名前で照合する。
+fn previously_visible_methods(
+    input: &DeclarationChangeInput<'_>,
+    old: &OldSide,
+    changes: &[SignatureChange],
+    proof: &mut DeclarationProof,
+) {
+    if changes.is_empty() || input.old_file_path != input.file_path {
+        return;
+    }
+    let changed: HashSet<_> = changes.iter().map(|c| c.name.as_str()).collect();
+    let mut old_methods = HashMap::<_, Vec<_>>::new();
+    for symbol in &old.symbols {
+        if changed.contains(symbol.name.as_str())
+            && let Some((item, implementation, owner)) =
+                inherent_method_site(old.tree.root_node(), &old.source, symbol)
+            && super::rust_visibility_scope::previously_visible_method(item, &old.source)
+        {
+            old_methods
+                .entry((owner, symbol.name.as_str()))
+                .or_default()
+                .push((item, implementation));
+        }
+    }
+    if old_methods.is_empty() {
+        return;
+    }
+    let mut candidates = Vec::new();
+    for symbol in input.syms {
+        if changed.contains(symbol.name.as_str())
+            && let Some((new, implementation, owner)) =
+                inherent_method_site(input.root, input.source, symbol)
+            && let Some(previous) = old_methods.get(&(owner, symbol.name.as_str()))
+            && !new
+                .named_children(&mut new.walk())
+                .any(|child| child.kind() == "visibility_modifier")
+        {
+            proof
+                .rust_visible_inherent_methods
+                .insert((symbol.range.start.line, symbol.range.start.column));
+            if let [(before, old_impl)] = previous.as_slice()
+                && ordinary_inherent_method(old.tree.root_node(), *before, *old_impl)
+                && ordinary_inherent_method(input.root, new, implementation)
+            {
+                candidates.push((*before, new, owner, symbol.name.as_str()));
+            }
+        }
+    }
+    if let [(before, after, owner, name)] = candidates.as_slice() {
+        proof.rust_narrowed_method = super::rust_visibility_scope::NarrowedMethod::prove(
+            (owner, name),
+            *before,
+            &old.source,
+            *after,
+            input.source,
+        );
+    }
 }
 
 /// モジュール直下の type alias だけを対象にする。trait / impl の関連型は同じ
@@ -1532,6 +1606,7 @@ pub(super) fn reconcile_declaration_changes(
     if old.tree.root_node().has_error() {
         return proof;
     }
+    previously_visible_methods(input, old, sig_changes, &mut proof);
     let mut old_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
     let mut new_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
     for (symbols, root, kinds) in [

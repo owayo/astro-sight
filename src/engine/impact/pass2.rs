@@ -730,6 +730,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_super_functions: Default::default(),
             rust_receiverless_associated_names: Default::default(),
+            rust_narrowed_method: None,
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
             rust_private_root_functions: Default::default(),

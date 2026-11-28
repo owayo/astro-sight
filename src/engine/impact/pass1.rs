@@ -781,6 +781,7 @@ fn analyze_changed_file(
         rust_alias_changes: &declaration_proof.rust_alias_changes,
         rust_value_only_constants: &declaration_proof.rust_value_only_constants,
         rust_private_method_owners: &rust_private_method_owners,
+        rust_visible_inherent_methods: &declaration_proof.rust_visible_inherent_methods,
         diff_input: file_diff,
         file_path: &df.new_path,
         root,
@@ -912,6 +913,7 @@ fn analyze_changed_file(
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_super_functions,
+            rust_narrowed_method: declaration_proof.rust_narrowed_method,
             rust_receiverless_associated_names: declaration_proof
                 .rust_receiverless_associated_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,

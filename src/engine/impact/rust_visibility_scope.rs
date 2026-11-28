@@ -223,6 +223,52 @@ fn declared_visibility(item: Node<'_>, source: &[u8]) -> Option<Visibility> {
     visibility(item, source).map(|(_, value)| value)
 }
 
+pub(super) fn previously_visible_method(item: Node<'_>, source: &[u8]) -> bool {
+    match visibility(item, source) {
+        Some((_, Visibility::Restricted(path))) => path != ["self"],
+        Some((_, Visibility::Public)) => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct NarrowedMethod {
+    pub(super) owner: String,
+    pub(super) name: String,
+    visibility: Visibility,
+}
+
+impl NarrowedMethod {
+    pub(super) fn prove(
+        (owner, name): (&str, &str),
+        before: Node<'_>,
+        old: &[u8],
+        after: Node<'_>,
+        new: &[u8],
+    ) -> Option<Self> {
+        let (modifier, visibility) = visibility(before, old)?;
+        if before.start_byte() != modifier.start_byte() {
+            return None;
+        }
+        let removed = modifier_range(modifier, old, true);
+        (super::rust_line_endings::same_text(&old[..removed.start], &new[..after.start_byte()])
+            && super::rust_line_endings::same_text(&old[removed.end..], &new[after.start_byte()..]))
+        .then(|| Self {
+            owner: super::ci_key(LangId::Rust, owner),
+            name: super::ci_key(LangId::Rust, name),
+            visibility,
+        })
+    }
+
+    pub(super) fn outside_old_scope(&self, origin: &[String], reader: &[String]) -> bool {
+        let Some(Boundary::Module(boundary)) = self.visibility.boundary(origin) else {
+            return false;
+        };
+        // 参照ファイル内の inline module が旧範囲に入る場合も残す。
+        !reader.starts_with(&boundary) && !boundary.starts_with(reader)
+    }
+}
+
 /// 取り除く修飾子の範囲。旧新の片側にしか修飾子が無いときは、次のトークンとの間の空白も含める。
 fn modifier_range(node: Node<'_>, source: &[u8], with_space: bool) -> Range<usize> {
     let mut end = node.end_byte();
