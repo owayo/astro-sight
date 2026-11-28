@@ -248,8 +248,8 @@ fn without_ranges(source: &[u8], ranges: &[Range<usize>]) -> Vec<u8> {
 /// (名前, kind, 旧新の可視性) をソースの順に返す。
 ///
 /// 直下の項目をソースの順・kind・名前で対応付け、書き換えた修飾子を取り除いた残り
-/// (本文・属性・コメント・宣言の順) が byte で一致することを求める。フィールド・メソッド・
-/// inline module の中・`use` の修飾子は取り除かないので、それらが変わると一致しない。
+/// (本文・属性・コメント・宣言の順) を CRLF と LF の違いだけ許して比べる。フィールド・
+/// メソッド・inline module の中・`use` の修飾子は取り除かないので、それらが変わると一致しない。
 /// 書き換えた修飾子を解釈できないときも `None` (証明しない)。
 fn visibility_only_edits<'a>(
     old_root: Node<'_>,
@@ -332,8 +332,11 @@ fn visibility_only_edits<'a>(
         }
         edits.push((name, new_item.kind(), edit));
     }
-    (without_ranges(old_source, &old_removed) == without_ranges(new_source, &new_removed))
-        .then_some(edits)
+    super::rust_line_endings::same_text(
+        &without_ranges(old_source, &old_removed),
+        &without_ranges(new_source, &new_removed),
+    )
+    .then_some(edits)
 }
 
 fn unique_declaration<'a>(
@@ -812,6 +815,16 @@ mod explicit_tests {
                     "{new} {reference:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn explicit_visibility_recognizes_crlf_and_preserves_carriage_returns() {
+        let old = "fn parse() { let _ = \"before\\rafter\"; } /* a\rb */\n";
+        let new = format!("pub(super) {old}").replace('\n', "\r\n");
+        assert!(widenings(old, &new, &["parse"]).contains_key("parse"));
+        for changed in [new.replace("a\rb", "ab"), new.replace("\\r", "")] {
+            assert!(widenings(old, &changed, &["parse"]).is_empty());
         }
     }
 

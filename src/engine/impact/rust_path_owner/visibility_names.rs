@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct Imports {
-    module: std::cell::OnceCell<Option<format_owner::Environment>>,
+    modules: RefCell<HashMap<PathBuf, Option<format_owner::Environment>>>,
     blocks: RefCell<HashMap<usize, Option<format_owner::Environment>>>,
 }
 
@@ -48,11 +48,15 @@ impl RustPathOwnerIndex {
                 _ => {}
             }
         }
-        let Some(imports) = self
-            .visibility_imports
-            .module
-            .get_or_init(|| module_imports(root, source, file, changed, project))
-        else {
+        // super::* の経路に変更元が現れたら、その先で別の束縛だとは証明できない。
+        let mut modules = self.visibility_imports.modules.borrow_mut();
+        if !modules.contains_key(changed) {
+            modules.insert(
+                changed.to_owned(),
+                module_imports(root, source, file, changed, project),
+            );
+        }
+        let Some(Some(imports)) = modules.get(changed) else {
             return lexical
                 && project.outside_parent(changed, file)
                 && file.to_str().is_some_and(|path| {
@@ -102,12 +106,23 @@ fn module_imports(
     }
     let mut combined = format_owner::Environment::default();
     let mut check = |root: Node<'_>, bytes: &[u8], path: &Path| {
-        let (env, glob) = format_owner::visibility_environment(root, bytes, path, project)?;
-        if !env.closed_imports() || glob && !external_glob(root, bytes, &reader, project) {
-            return None;
+        let mut inspect = |root: Node<'_>, bytes: &[u8]| {
+            let (env, glob) = format_owner::visibility_environment(root, bytes, path, project)?;
+            if !env.closed_imports() || glob && !external_glob(root, bytes, &reader, project) {
+                return None;
+            }
+            combined.merge(env);
+            Some(format_owner::has_parent_glob(root))
+        };
+        let parent_glob = inspect(root, bytes)?;
+        if let Some(old) = project.reexport_old_sources.get(path) {
+            let old = old.as_deref()?;
+            let tree = parser::parse_source(old, LangId::Rust).ok()?;
+            if tree.root_node().has_error() || inspect(tree.root_node(), old)? != parent_glob {
+                return None;
+            }
         }
-        combined.merge(env);
-        Some(format_owner::has_parent_glob(root))
+        Some(parent_glob)
     };
     let mut parent_glob = check(root, source, file)?;
     let mut module = reader.path.as_slice();

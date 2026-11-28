@@ -98,6 +98,147 @@ fn entries(rows: Vec<Row>) {
 }
 
 #[test]
+fn rust_parent_visible_function_checks_each_binding_in_mixed_diffs() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    const PRODUCER: &str = "fn record(_: u8) {}\r\nfn inside() { record(0); }\r\n";
+    const MODULES: &str = "mod producer;\nmod other;\nmod reader;\n";
+    const READER: &str = "use crate::other;\nfn unrelated() {\n    other::record(1);\n    for record in [1] { std::hint::black_box(record); }\n}\n";
+    const OTHER: &str = "pub(crate) fn record(_: u8) {}\n";
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='mixed'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    for (path, bytes) in [
+        ("src/producer.rs", PRODUCER),
+        ("src/lib.rs", MODULES),
+        ("src/reader.rs", READER),
+        ("src/other.rs", OTHER),
+        ("README.md", "One.\n"),
+    ] {
+        repo.write(path, bytes);
+    }
+    repo.init_git();
+    repo.git(["config", "core.autocrlf", "false"]);
+    repo.commit_all("base");
+    repo.write("src/producer.rs", format!("pub(super) {PRODUCER}"));
+    repo.write("README.md", "Two.\n");
+    let check = |cmd, flags: &[&str], expected: &[(&str, u64)]| {
+        let result = repo.run_json(cmd, flags);
+        let changes = result.get("impact").unwrap_or(&result)["changes"]
+            .as_array()
+            .unwrap();
+        let producer = changes
+            .iter()
+            .find(|change| change["path"] == "src/producer.rs")
+            .unwrap();
+        let rows = producer["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "record")
+            })
+            .map(|row| (row["path"].as_str().unwrap(), row["line"].as_u64().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "{producer}");
+    };
+    check("context", &["--git"], &[("src/producer.rs", 1)]);
+    repo.write("src/lib.rs", format!("{MODULES}mod audit;\n"));
+    repo.write("src/audit.rs", "fn log() { crate::producer::record(3); }\n");
+    repo.stage_all();
+    let audit = [("src/audit.rs", 0), ("src/producer.rs", 1)];
+    check("context", &["--git"], &audit);
+    repo.write("src/producer.rs", PRODUCER);
+    repo.write("src/reader.rs", READER.replace('\n', "\r\n"));
+    check("context", &["--git", "--staged"], &audit);
+    // 作業ツリーで同じ呼び出しが変更元を指しても、staged review は index の経路で照合する。
+    repo.write(
+        "src/reader.rs",
+        READER.replace("use crate::other;", "use crate::producer as other;"),
+    );
+    check("review", &["--git", "--staged"], &audit);
+    // direct staged は作業ツリーの参照位置を読む。import が違う行の所有元は確定しない。
+    check(
+        "context",
+        &["--git", "--staged"],
+        &[
+            audit[0],
+            audit[1],
+            ("src/reader.rs", 2),
+            ("src/reader.rs", 3),
+        ],
+    );
+    repo.write("src/producer.rs", format!("pub(super) {PRODUCER}"));
+    let rebound = [audit[0], audit[1], ("src/reader.rs", 2)];
+    check("context", &["--git"], &rebound);
+    repo.write("src/reader.rs", READER);
+    repo.write("src/other.rs", "pub(super) use crate::producer::record;\n");
+    check("context", &["--git"], &rebound);
+    repo.write("src/other.rs", OTHER);
+    repo.write("src/reader.rs", format!("{READER}use crate::other::*; use crate::producer::*;\nfn ambiguous() {{ record(2); }}\n"));
+    check(
+        "context",
+        &["--git"],
+        &[
+            audit[0],
+            audit[1],
+            ("src/reader.rs", 3),
+            ("src/reader.rs", 6),
+        ],
+    );
+}
+
+#[test]
+fn rust_parent_glob_checks_each_widened_functions_module() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/parent");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='owners'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    repo.write("src/lib.rs", "mod producer; mod parent;\n");
+    let files = [
+        ("src/producer.rs", "fn first(_:u8) {}\n"),
+        ("src/parent.rs", "fn second(_:u8) {}\nmod child;\n"),
+    ];
+    for (path, source) in files {
+        repo.write(path, source);
+    }
+    repo.write("src/parent/child.rs", "use super::*;\nfn run(){\n    for second in [2]{drop(second);}\n    for first in [1]{drop(first);}\n    second(2);\n}\n");
+    repo.init_git();
+    repo.commit_all("base");
+    for (path, source) in files {
+        repo.write(path, format!("pub(super) {source}"));
+    }
+    let result = repo.run_json("context", &["--git"]);
+    let changes = result["changes"].as_array().unwrap();
+    let changed = |path| {
+        changes
+            .iter()
+            .find(|change| change["path"] == path)
+            .unwrap()
+    };
+    let callers = &changed("src/producer.rs")["impacted_callers"];
+    assert!(callers.as_array().is_none_or(Vec::is_empty), "{callers}");
+    let parent = changed("src/parent.rs");
+    assert!(
+        parent["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "src/parent/child.rs"
+                && row["line"] == 4
+                && row["symbols"] == serde_json::json!(["second"])),
+        "{parent}"
+    );
+}
+
+#[test]
 fn rust_parent_visible_function_checks_the_crate_root_of_a_dependency_glob() {
     for (declaration, expected) in [
         ("", false),
