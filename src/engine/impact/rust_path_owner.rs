@@ -207,6 +207,7 @@ pub(super) struct RustPathOwnerProjectProof {
     pub(super) staged_binding_diff: Option<Box<str>>,
     staged_private_call_wiring: OnceLock<bool>,
     callable_cargo_known: bool,
+    multiple_changed_files: bool,
     registry_macros: Mutex<HashMap<String, bool>>,
     lockfile_unchanged: bool,
     callable_layout_stable: OnceLock<bool>,
@@ -298,6 +299,7 @@ impl RustPathOwnerProjectProof {
             staged_binding_diff: None,
             staged_private_call_wiring: OnceLock::new(),
             callable_cargo_known: reexport_cargo_enabled,
+            multiple_changed_files: diff_files.len() > 1,
             registry_macros: Mutex::default(),
             lockfile_unchanged: !diff_files.iter().any(|file| {
                 [&file.old_path, &file.new_path].iter().any(|p| {
@@ -1628,7 +1630,7 @@ impl RustPathOwnerProjectProof {
         name: &str,
         proof: &super::rust_visibility_scope::ExplicitWidening,
     ) -> Option<super::rust_visibility_scope::WideningScope> {
-        if !self.allows_private_widening_paths(name) {
+        if self.multiple_changed_files || !self.allows_private_widening_paths(name) {
             return None;
         }
         let source = self.visibility_module(Path::new(source_path))?;

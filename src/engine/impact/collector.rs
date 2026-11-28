@@ -1263,9 +1263,24 @@ impl ImpactCollector<'_> {
                                     .json_expression(node, source, Path::new(self.path_str), view)
                         })
                 }));
+        // 修飾パスと字句束縛の照合には名前を渡すので、index との行末の違いは許せる。
+        let name_view = scoped_view.or_else(|| {
+            scoped_node?;
+            let name = &self.all_symbol_names[ix];
+            if !self.sym_to_fc[ix].iter().any(|&fc| {
+                self.file_contexts[fc as usize]
+                    .rust_explicit_widenings
+                    .contains_key(name)
+            }) {
+                return None;
+            }
+            let view = self.rust_path_owner_project.staged_bindings()?;
+            self.indexed_rust_source_matches(view, source)
+                .then_some(view)
+        });
         let known_owner = scoped_node
             .filter(|node| node.kind() == "identifier")
-            .zip(scoped_view)
+            .zip(name_view)
             .and_then(|(node, view)| {
                 self.rust_path_owner
                     .get_or_init(|| super::rust_path_owner::RustPathOwnerIndex::build(node, source))
@@ -1438,7 +1453,7 @@ impl ImpactCollector<'_> {
                         self.rust_path_owner_project,
                     )
                 });
-        let visibility_independent = scoped_node.zip(scoped_view).is_some_and(|(node, view)| {
+        let visibility_independent = scoped_node.zip(name_view).is_some_and(|(node, view)| {
             let ([fc], Some((scope, ancestors))) = (self.sym_to_fc[ix].as_slice(), rust_scope)
             else {
                 return false;

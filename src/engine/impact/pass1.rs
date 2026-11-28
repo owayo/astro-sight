@@ -52,6 +52,7 @@ struct Pass1Inputs<'a> {
     single_in_place_file: bool,
     /// JS 系の旧側監査は、追加候補を見つけたときに一度だけ実行する。
     old_js_declarations: OnceCell<Option<OldJsDeclarations>>,
+    complete_diff: OnceCell<bool>,
     receiver_layout: &'a dyn Fn() -> Option<&'a super::rust_path_owner::RustPathOwnerProjectProof>,
     receiver_project: OnceCell<Option<super::rust_receivers::Project<'a>>>,
 }
@@ -63,6 +64,12 @@ struct OldJsDeclarations {
 }
 
 impl Pass1Inputs<'_> {
+    fn complete_text_diff(&self) -> bool {
+        *self
+            .complete_diff
+            .get_or_init(|| complete_text_diff(self.diff_input, self.diff_files.len()))
+    }
+
     fn has_no_matching_old_js_declaration(&self, name: &str, kind: &'static str) -> bool {
         self.old_js_declarations
             .get_or_init(|| collect_old_js_declarations(self))
@@ -131,6 +138,7 @@ pub(super) fn collect<'a>(
         file_sections: diff::FileSections::split(diff_input),
         single_in_place_file: matches!(diff_files, [only] if only.old_path == only.new_path),
         old_js_declarations: OnceCell::new(),
+        complete_diff: OnceCell::new(),
         receiver_layout,
         receiver_project: OnceCell::new(),
     };
@@ -170,7 +178,7 @@ fn is_js_family(lang: LangId) -> bool {
 
 /// 証明が必要になったときだけ旧側を走査する。構文木はファイルごとに手放す。
 fn collect_old_js_declarations(inputs: &Pass1Inputs<'_>) -> Option<OldJsDeclarations> {
-    if !complete_text_diff(inputs.diff_input, inputs.diff_files.len()) {
+    if !inputs.complete_text_diff() {
         return None;
     }
     let mut declarations = OldJsDeclarations::default();
@@ -363,7 +371,7 @@ fn analyze_changed_file(
         file_diff,
         complete_single_file_diff: single_in_place_file
             && matches!(lang_id, LangId::Rust | LangId::Typescript | LangId::Tsx)
-            && complete_text_diff(inputs.diff_input, 1),
+            && inputs.complete_text_diff(),
         file_path: &df.new_path,
         old_file_path: &df.old_path,
         syms: &syms,
@@ -846,13 +854,34 @@ fn analyze_changed_file(
     } else {
         HashSet::new()
     };
-    let rust_explicit_widenings = if lang_id == LangId::Rust && single_in_place_file {
-        rust_visibility_scope::explicit_widenings(file_diff, &df.new_path, &source, root, &affected)
-    } else {
-        HashMap::new()
-    };
+    let mixed_super_function = !single_in_place_file
+        && df.old_path == df.new_path
+        && !declaration_proof
+            .rust_new_super_functions
+            .is_subset(&declaration_proof.rust_super_functions)
+        && inputs.complete_text_diff();
+    let rust_explicit_widenings =
+        if lang_id == LangId::Rust && (single_in_place_file || mixed_super_function) {
+            let mut edits = rust_visibility_scope::explicit_widenings(
+                file_diff,
+                &df.new_path,
+                &source,
+                root,
+                &affected,
+            );
+            if mixed_super_function {
+                // 他ファイルも変わったときは可視範囲だけで参照を落とさず、参照ごとに束縛を確かめる。
+                edits.retain(|name, edit| {
+                    edit.plain_private_function
+                        && declaration_proof.rust_new_super_functions.contains(name)
+                });
+            }
+            edits
+        } else {
+            HashMap::new()
+        };
     let mut rust_super_functions = declaration_proof.rust_super_functions;
-    if declaration_input.complete_single_file_diff
+    if (declaration_input.complete_single_file_diff || mixed_super_function)
         && !rust_explicit_widenings.is_empty()
         && !super::collector::confidence_filter_disabled()
     {
