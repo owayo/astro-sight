@@ -777,6 +777,8 @@ When a binding changed, the declaration is a blocking `api.mod` with `unverified
 
 When a public `async fn` or a function returning `impl Trait` calls a private helper, the helper can affect the hidden return type. For example, a value kept across an `.await` can determine whether the future implements `Send`. If `warehouse::inventory` calls its own module's private `limit()`, editing a separate `landing::limit` leaves `inventory` out of `api.mod` when the local binding can be verified.
 
+Changing a helper from private to `pub(super)`, or back, preserves a direct call that resolves to the same function in its defining module. A glob import in another module can gain or lose that name. Review continues to report opaque return types that may depend on such an import.
+
 On a struct using Clap 4 from crates.io, editing only the literal in `#[command(about = "…")]` following `#[derive(clap::Parser)]` changes the command's help text. Review preserves the API classification of unchanged async functions, including functions that take this struct as an argument. With an additional derive or a Cargo source override, the same attribute can affect a generated type, so review keeps the change blocking.
 
 ### Rust items moved behind `pub use`

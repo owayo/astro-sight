@@ -674,8 +674,8 @@ impl DependencyIndex {
         })
     }
 
-    /// 同じ module の値の名前空間に、無条件の非公開自由関数が一意にあるか。
-    pub(super) fn private_function_binding(&self, scope: &[String], name: &str) -> bool {
+    /// 同じ module の値の名前空間に、crate 内でのみ見える無条件の自由関数が一意にあるか。
+    pub(super) fn restricted_function_binding(&self, scope: &[String], name: &str) -> bool {
         let Some(bindings) = self.scopes.get(scope) else {
             return false;
         };
@@ -685,7 +685,7 @@ impl DependencyIndex {
         item.kind == "function_item"
             && matches!(&item.visibility, Visibility::Within(owner)
                 if self.file_module.as_deref().is_some_and(|file|
-                    owner.iter().eq(file.iter().chain(scope))))
+                    owner.iter().eq(file.iter().chain(scope).take(owner.len()))))
             && item.conditions.is_empty()
             && !item.opaque_attributes
             && self.file_availability() == Some(&[])
