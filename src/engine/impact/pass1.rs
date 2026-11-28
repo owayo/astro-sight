@@ -731,13 +731,23 @@ fn analyze_changed_file(
         .filter(|_| in_place)
         .map(|old| private_root_functions(old, &rust_private_root_names, root, &source, &syms))
         .unwrap_or_default();
-    if sig_changes
+    let free: HashSet<_> = sig_changes
         .iter()
-        .any(|sig| rust_private_method_owners.contains_key(&sig.name))
+        .map(|sig| sig.name.as_str())
+        .filter(|name| {
+            rust_private_root_functions.contains(*name)
+                || declaration_proof.rust_super_functions.contains(*name)
+        })
+        .collect();
+    if !free.is_empty()
+        || sig_changes
+            .iter()
+            .any(|sig| rust_private_method_owners.contains_key(&sig.name))
     {
-        let independent = old_side.unchanged_receiver_calls(
+        let independent = old_side.unchanged_independent_calls(
             &declaration_input,
             &rust_private_method_owners,
+            &free,
             || {
                 inputs
                     .receiver_project

@@ -528,6 +528,17 @@ impl RustPathOwnerProjectProof {
                 .is_some_and(|path| self.std_project.allows(path))
     }
 
+    pub(super) fn stable_call_owner(
+        &self,
+        file: &Path,
+        path: &[String],
+    ) -> Option<QualifiedCallOwner> {
+        self.callable_layout_stable()
+            .then(|| super::rust_reexport_owner::declared_call_owner(self, file, path))
+            .flatten()
+            .filter(|_| self.unrelocated(file))
+    }
+
     fn callable_layout_stable(&self) -> bool {
         self.callable_cargo_known
             && *self.callable_layout_stable.get_or_init(|| {
@@ -2548,11 +2559,7 @@ impl RustPathOwnerIndex {
         if let Some(owner) = self.qualified_call_owners.borrow().get(&path) {
             return owner.clone();
         }
-        let owner = project
-            .callable_layout_stable()
-            .then(|| super::rust_reexport_owner::declared_call_owner(project, file, &path))
-            .flatten()
-            .filter(|_| project.unrelocated(file));
+        let owner = project.stable_call_owner(file, &path);
         self.qualified_call_owners
             .borrow_mut()
             .insert(path, owner.clone());
@@ -2933,6 +2940,31 @@ struct AssociatedScope {
     parent: Option<usize>,
     names: HashSet<String>,
     opaque: bool,
+}
+
+/// 相対パスの先頭がブロック内の use/type/mod で隠されていれば、ファイルの import で解決しない。
+pub(super) fn module_call_path(
+    mut callee: Node<'_>,
+    root: Node<'_>,
+    source: &[u8],
+    scopes: &std::cell::OnceCell<HashSet<usize>>,
+) -> Option<Vec<String>> {
+    let path = path_segments(callee, source)?;
+    if !matches!(path.first()?.as_str(), "crate" | "self" | "super") {
+        while let Some(prefix) = callee
+            .child_by_field_name("path")
+            .filter(|n| n.kind() == "scoped_identifier")
+        {
+            callee = prefix;
+        }
+        if !scopes
+            .get_or_init(|| root_associated_paths(root, source))
+            .contains(&callee.id())
+        {
+            return None;
+        }
+    }
+    Some(path)
 }
 
 /// 型名を再束縛し得るスコープだけを一度走査し、参照ごとの祖先の再走査を避ける。

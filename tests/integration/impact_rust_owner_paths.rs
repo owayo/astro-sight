@@ -849,3 +849,77 @@ fn rust_function_pointers_distinguish_qualified_module_declarations() {
         );
     }
 }
+
+#[test]
+fn same_file_rust_free_function_calls_keep_only_possible_owners() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='owners'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/other.rs", "pub(super) fn collect<T: Default>() -> T { T::default() }\npub(super) struct Batch;\nimpl Batch { pub(super) fn collect<T: Default>() -> T { T::default() } }\n");
+    repo.write("src/forward.rs", "pub(super) use crate::collect;\n");
+    let old = r#"mod other;
+mod forward;
+fn collect(n: u8) -> u8 { n }
+fn caller() {
+    let _ = collect(3);
+    let _ = self::collect(3);
+    let _ = crate::collect(3);
+    let _ = forward::collect(3);
+    let _: (u8, _) = (other::collect(), collect(3));
+}
+fn unrelated() {
+    let _: Vec<u8> = (0u8..3).collect();
+    let _: u8 = other::collect();
+    let _: u8 = other::Batch::collect();
+    let _ = (0u8..3).collect::<Vec<_>>();
+    let _ = other::collect::<u8>();
+    let _ = other::Batch::collect::<u8>();
+}
+fn shadowed() {
+    use crate as other;
+    let _ = other::collect(3);
+}
+"#;
+    repo.write("src/lib.rs", old);
+    repo.init_git();
+    repo.commit_all("base");
+    let new = old.replace("collect(n: u8)", "collect(n: u8, _: bool)");
+    for updated in [false, true] {
+        repo.write(
+            "src/lib.rs",
+            if updated {
+                new.replace("collect(3)", "collect(3, true)")
+            } else {
+                new.clone()
+            },
+        );
+        for staged in [false, true] {
+            let args = if staged {
+                repo.stage_all();
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let context = repo.run_json("context", args);
+            let actual: BTreeSet<_> = context["changes"][0]["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|row| row["path"] == "src/lib.rs")
+                .map(|row| row["line"].as_u64().unwrap())
+                .collect();
+            let wanted = if updated {
+                BTreeSet::new()
+            } else {
+                (4..=8).chain([20]).collect()
+            };
+            assert_eq!(
+                actual, wanted,
+                "updated={updated} staged={staged} {context}"
+            );
+        }
+    }
+}

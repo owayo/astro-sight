@@ -526,15 +526,13 @@ impl LazyOldSide {
         new
     }
 
-    pub(super) fn unchanged_receiver_calls<'p>(
+    pub(super) fn unchanged_independent_calls<'p>(
         &self,
         input: &DeclarationChangeInput<'_>,
         owners: &HashMap<String, PrivateMethodOwner>,
+        free: &HashSet<&str>,
         project: impl Fn() -> Option<&'p super::rust_receivers::Project<'p>>,
     ) -> HashSet<tree_sitter::Point> {
-        if !owners.values().any(|owner| owner.unconditional) {
-            return HashSet::new();
-        }
         let Some(old) = self.get(input) else {
             return HashSet::new();
         };
@@ -546,29 +544,37 @@ impl LazyOldSide {
                 owners.remove(normalized);
             }
         }
-        if !owners.values().any(|owner| owner.unconditional) {
-            return HashSet::new();
-        }
-        let new_calls = super::rust_receivers::independent_calls(
-            input.root,
-            input.source,
-            &owners,
-            input.file_path,
-            false,
-            &project,
-        );
+        let methods = owners.values().any(|owner| owner.unconditional);
+        let independent = |root: tree_sitter::Node<'_>, source: &[u8], old| {
+            let mut calls = if free.is_empty() {
+                HashSet::new()
+            } else {
+                super::rust_receivers::independent_free_calls(
+                    root,
+                    source,
+                    free,
+                    input.file_path,
+                    &project,
+                )
+            };
+            if methods {
+                calls.extend(super::rust_receivers::independent_calls(
+                    root,
+                    source,
+                    &owners,
+                    input.file_path,
+                    old,
+                    &project,
+                ));
+            }
+            calls
+        };
+        let new_calls = independent(input.root, input.source, false);
         if new_calls.is_empty() {
             return new_calls;
         }
         let old_root = old.tree.root_node();
-        let old_calls = super::rust_receivers::independent_calls(
-            old_root,
-            &old.source,
-            &owners,
-            input.file_path,
-            true,
-            &project,
-        );
+        let old_calls = independent(old_root, &old.source, true);
         let old_rows =
             (0..=old_root.end_position().row).filter(|line| !old.removed_lines.contains(line));
         let new_rows = (0..=input.root.end_position().row)

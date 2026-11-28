@@ -1,4 +1,4 @@
-//! 同じファイルの private inherent メソッドと結び付かないドット呼び出し。
+//! 同じファイルの変更した Rust 関数・メソッドと結び付かない呼び出し。
 
 mod project;
 
@@ -277,6 +277,69 @@ impl<'a> Types<'a> {
         (ty.kind() == "type_identifier" && self.names.file_type(scope, self.root, name))
             .then_some(Receiver::Struct(name))
     }
+}
+
+/// ドット呼び出しと、別の宣言まで辿れる修飾パスは、変更した自由関数を呼ばない。
+pub(super) fn independent_free_calls<'p>(
+    root: Node<'_>,
+    source: &[u8],
+    names: &HashSet<&str>,
+    file: &str,
+    project: &impl Fn() -> Option<&'p Project<'p>>,
+) -> HashSet<Point> {
+    use super::rust_path_owner::{QualifiedCallOwner, module_call_path};
+    let mut calls = HashSet::new();
+    let opaque = OpaqueAttributeScopes::build(root, source);
+    let file = Path::new(file);
+    let scopes = OnceCell::new();
+    let mut resolved = HashMap::new();
+    let mut different_owner = |callee| {
+        module_call_path(callee, root, source, &scopes).is_some_and(|path| {
+            *resolved.entry(path).or_insert_with_key(|path| {
+                match project().and_then(|p| p.layout.stable_call_owner(file, path)) {
+                    Some(QualifiedCallOwner::Type) => true,
+                    Some(QualifiedCallOwner::Function(owner)) => owner != file,
+                    None => false,
+                }
+            })
+        })
+    };
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        if opaque.contains(node)
+            || matches!(
+                node.kind(),
+                "mod_item"
+                    | "macro_definition"
+                    | "token_tree"
+                    | "attribute_item"
+                    | "inner_attribute_item"
+            )
+        {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+        {
+            let callee = if function.kind() == "generic_function" {
+                function.child_by_field_name("function")
+            } else {
+                Some(function)
+            };
+            if let Some(callee) = callee
+                && let Some(name) = match callee.kind() {
+                    "field_expression" => callee.child_by_field_name("field"),
+                    "scoped_identifier" => callee.child_by_field_name("name"),
+                    _ => None,
+                }
+                && text(name, source).is_some_and(|s| names.contains(s))
+                && (callee.kind() == "field_expression" || different_owner(callee))
+            {
+                calls.insert(name.start_position());
+            }
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    calls
 }
 
 pub(super) fn independent_calls<'p>(
