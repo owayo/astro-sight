@@ -72,12 +72,21 @@ impl PackageCache {
         file: &Path,
     ) -> Option<()> {
         let module = project.ordinary_private_module(file)?;
-        if !module.library_only {
-            return None;
-        }
         let lib = module.src.join("lib.rs");
+        let crate_root = if module.library_only {
+            lib
+        } else {
+            // lib を併設すると同じモジュールを共有したり、lib 名が extern prelude に入ったりする。
+            if project.reexport_old_sources.contains_key(&lib)
+                || crate::git_support::tree_view(&project.root).hides(&lib)
+                || project.root.join(&lib).try_exists().ok()?
+            {
+                return None;
+            }
+            module.src.join("main.rs")
+        };
         self.collection_preludes
-            .get(&lib, || {
+            .get(&crate_root, || {
                 let manifest = self.manifest(&project.root, module.src.parent()?)?;
                 // 依存先の lib target はパッケージと別名で extern prelude に入ることがある。
                 let mut tables = vec![manifest.as_ref()];
@@ -100,10 +109,10 @@ impl PackageCache {
                     let names = Names::collect(tree.root_node(), source, &[])?;
                     names.globs.is_empty().then_some(())
                 };
-                if let Some(old) = project.reexport_old_sources.get(&lib) {
+                if let Some(old) = project.reexport_old_sources.get(&crate_root) {
                     plain_root(old.as_deref()?)?;
                 }
-                plain_root(&read_input_file(&project.root.join(&lib))?)
+                plain_root(&read_input_file(&project.root.join(&crate_root))?)
             })
             .map(|_| ())
     }

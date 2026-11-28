@@ -252,6 +252,70 @@ fn qualified_constructor() { let _: Vec<u8> = ::std::vec::Vec::<u8>::new(); }
 }
 
 #[test]
+fn rust_binary_sibling_keeps_only_constructors_of_the_changed_type() {
+    for shared in [false, true] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname='meter'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        if shared {
+            repo.write("src/lib.rs", "mod meter;\nmod spool;\n");
+        }
+        let main = "mod meter;\nmod spool;\nfn main() { let _ = meter::Gauge::new(); }\n";
+        let meter =
+            "pub(super) struct Gauge;\nimpl Gauge {\n    pub(super) fn new() -> Self { Self }\n}\n";
+        repo.write("src/main.rs", main);
+        repo.write("src/meter.rs", meter);
+        repo.write(
+            "src/spool.rs",
+            concat!(
+                "use super::meter::Gauge;\n",
+                "fn samples(_: &Gauge) -> Vec<usize> { Vec::new() }\n",
+                "fn stale() -> Gauge { Gauge::new() }\n",
+                "fn shadow() -> Gauge { use super::meter::Gauge as Vec; Vec::new() }\n",
+            ),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/main.rs", main.replace("new()", "new(4)"));
+        repo.write(
+            "src/meter.rs",
+            meter.replace("fn new()", "fn new(_: usize)"),
+        );
+        for staged in [false, true] {
+            let flags = if staged {
+                repo.stage_all();
+                repo.write("src/meter.rs", meter);
+                &["--git", "--staged"][..]
+            } else {
+                &["--git"][..]
+            };
+            let context = repo.run_json("context", flags);
+            let change = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["path"] == "src/meter.rs")
+                .unwrap();
+            let lines: Vec<_> = change["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|caller| caller["path"] == "src/spool.rs")
+                .map(|caller| caller["line"].as_u64().unwrap() + 1)
+                .collect();
+            let expected: &[u64] = if shared { &[2, 3, 4] } else { &[3, 4] };
+            assert_eq!(
+                lines, expected,
+                "shared={shared}, staged={staged}: {context}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rust_associated_function_changes_distinguish_dot_calls_from_paths() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
