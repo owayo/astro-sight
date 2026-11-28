@@ -4,7 +4,7 @@ mod package;
 mod scopes;
 use package::{Declaration, Package, ReceiverBound};
 pub(super) use package::{PackageCache, items_with_attributes};
-pub(super) use scopes::private_calls;
+pub(super) use scopes::{PrivateCall, private_calls};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
