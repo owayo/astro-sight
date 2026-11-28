@@ -92,6 +92,127 @@ fn anchored() { let _ = self::Names::collect(); }
 }
 
 #[test]
+fn rust_widened_inherent_function_keeps_implicit_and_projected_trait_calls() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='dispatch'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    let library = "mod producer; mod consumer;\n";
+    repo.write("src/lib.rs", library);
+    repo.write("README.md", "Dispatch\n");
+    let producer = "pub(super) struct Names;\nimpl Names {\n    fn collect() -> u8 { 2 }\n}\n";
+    repo.write("src/producer.rs", producer);
+    repo.write(
+        "src/consumer.rs",
+        r#"use crate::producer::Names;
+pub trait Gather { type Item; fn collect() -> u8; }
+impl Gather for Names { type Item = Names; fn collect() -> u8 { 1 } }
+fn fixed() -> u8 { <Names as Gather>::collect() }
+fn pointer() -> fn() -> u8 { <Names as Gather>::collect }
+fn inferred() -> u8 { Names::collect() }
+fn bracketed() -> u8 { <Names>::collect() }
+fn projected() -> u8 { <Names as Gather>::Item::collect() }
+fn both() -> u8 { <Names as Gather>::collect() + Names::collect() }
+macro_rules! implicit { (<$owner:ty as $t:path>::$method:ident) => { <$owner>::$method() }; }
+fn rewritten() -> u8 { implicit!(<Names as Gather>::collect) }
+fn annotated() -> u8 { </* owner */ Names as Gather>::collect() }
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "src/producer.rs",
+        producer.replace("fn collect", "pub(super) fn collect"),
+    );
+    for mixed in [false, true] {
+        if mixed {
+            repo.write("README.md", "Rust dispatch\n");
+            repo.write("src/lib.rs", format!("{library}// module list\n"));
+        }
+        repo.stage_all();
+        for args in [&["--git"][..], &["--git", "--staged"][..]] {
+            let result = repo.run_json("context", args);
+            let changes = result["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|change| change["path"] == "src/producer.rs")
+                .unwrap();
+            let lines = changes["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row["path"] == "src/consumer.rs"
+                        && row["symbols"] == serde_json::json!(["collect"])
+                })
+                .map(|row| row["line"].as_u64().unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                lines,
+                BTreeSet::from([5, 6, 7, 8, 10]),
+                "mixed={mixed} {args:?}: {changes}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_explicit_trait_call_retains_a_changed_trait_signature() {
+    for origin in ["producer", "dispatch"] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname='dispatch'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        repo.write("src/lib.rs", "mod producer; mod consumer; mod dispatch;\n");
+        let inherent = "pub(super) struct Names;\nimpl Names {\n    fn collect() -> u8 { 2 }\n}\n";
+        let dispatch = "pub(super) trait Gather { fn collect() -> u8; }\nimpl Gather for crate::producer::Names { fn collect() -> u8 { 1 } }\n";
+        let write = |inherent: &str, dispatch: &str| {
+            if origin == "dispatch" {
+                repo.write("src/producer.rs", inherent);
+                repo.write("src/dispatch.rs", dispatch);
+            } else {
+                repo.write("src/producer.rs", format!("{inherent}{dispatch}"));
+                repo.write("src/dispatch.rs", "");
+            }
+        };
+        write(inherent, dispatch);
+        repo.write(
+        "src/consumer.rs",
+        format!("use crate::producer::Names; use crate::{origin}::Gather;\nfn run() -> u8 {{ <Names as Gather>::collect() }}\n"),
+    );
+        repo.init_git();
+        repo.commit_all("base");
+        write(
+            &inherent.replace("fn collect", "pub(super) fn collect"),
+            &dispatch.replace("collect()", "collect(_: u8)"),
+        );
+        repo.stage_all();
+        for args in [&["--git"][..], &["--git", "--staged"][..]] {
+            let result = repo.run_json("context", args);
+            let path = format!("src/{origin}.rs");
+            let change = result["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["path"] == path)
+                .unwrap();
+            let rows = change["impacted_callers"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|row| row["path"] == "src/consumer.rs"
+                    && row["line"] == 1
+                    && row["symbols"] == serde_json::json!(["Gather", "collect"])),
+                "{args:?} {result}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rust_private_method_keeps_calls_to_the_changed_receiver_among_same_named_methods() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

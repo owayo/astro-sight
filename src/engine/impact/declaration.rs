@@ -1020,7 +1020,7 @@ pub(super) struct DeclarationProof {
     pub(super) rust_super_functions: HashSet<String>,
     pub(super) rust_new_super_functions: HashSet<String>,
     pub(super) rust_visible_inherent_methods: HashSet<(usize, usize)>,
-    pub(super) rust_narrowed_method: Option<super::rust_visibility_scope::NarrowedMethod>,
+    pub(super) rust_method_visibility: Option<super::rust_visibility_scope::InherentVisibilityEdit>,
     pub(super) rust_receiverless_associated_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
@@ -1041,8 +1041,8 @@ pub(super) struct RustValueOnlyConstant {
     pub(super) type_names: std::collections::BTreeSet<String>,
 }
 
-/// 変更前に可視範囲を明示した inherent メソッドを、新しい宣言の所有型と名前で照合する。
-fn previously_visible_methods(
+/// 旧新の inherent メソッドを所有型と名前で照合し、可視性だけの変更を識別する。
+fn inherent_visibility_edits(
     input: &DeclarationChangeInput<'_>,
     old: &OldSide,
     changes: &[SignatureChange],
@@ -1052,17 +1052,21 @@ fn previously_visible_methods(
         return;
     }
     let changed: HashSet<_> = changes.iter().map(|c| c.name.as_str()).collect();
-    let mut old_methods = HashMap::<_, Vec<_>>::new();
+    let mut old_methods = HashMap::new();
     for symbol in &old.symbols {
         if changed.contains(symbol.name.as_str())
             && let Some((item, implementation, owner)) =
                 inherent_method_site(old.tree.root_node(), &old.source, symbol)
-            && super::rust_visibility_scope::previously_visible_method(item, &old.source)
         {
+            let visible =
+                super::rust_visibility_scope::previously_visible_method(item, &old.source);
             old_methods
                 .entry((owner, symbol.name.as_str()))
-                .or_default()
-                .push((item, implementation));
+                .and_modify(|(any_visible, unique)| {
+                    *any_visible |= visible;
+                    *unique = None;
+                })
+                .or_insert((visible, Some((item, implementation))));
         }
     }
     if old_methods.is_empty() {
@@ -1073,15 +1077,16 @@ fn previously_visible_methods(
         if changed.contains(symbol.name.as_str())
             && let Some((new, implementation, owner)) =
                 inherent_method_site(input.root, input.source, symbol)
-            && let Some(previous) = old_methods.get(&(owner, symbol.name.as_str()))
-            && !new
-                .named_children(&mut new.walk())
-                .any(|child| child.kind() == "visibility_modifier")
+            && let Some((was_visible, unique)) = old_methods.get(&(owner, symbol.name.as_str()))
         {
-            proof
-                .rust_visible_inherent_methods
-                .insert((symbol.range.start.line, symbol.range.start.column));
-            if let [(before, old_impl)] = previous.as_slice()
+            let private = super::rust_visibility_scope::visibility_modifier(new).is_none();
+            if private && *was_visible {
+                proof
+                    .rust_visible_inherent_methods
+                    .insert((symbol.range.start.line, symbol.range.start.column));
+            }
+            if let Some((before, old_impl)) = unique
+                && private != super::rust_visibility_scope::visibility_modifier(*before).is_none()
                 && ordinary_inherent_method(old.tree.root_node(), *before, *old_impl)
                 && ordinary_inherent_method(input.root, new, implementation)
             {
@@ -1090,7 +1095,7 @@ fn previously_visible_methods(
         }
     }
     if let [(before, after, owner, name)] = candidates.as_slice() {
-        proof.rust_narrowed_method = super::rust_visibility_scope::NarrowedMethod::prove(
+        proof.rust_method_visibility = super::rust_visibility_scope::InherentVisibilityEdit::prove(
             (owner, name),
             *before,
             &old.source,
@@ -1606,7 +1611,7 @@ pub(super) fn reconcile_declaration_changes(
     if old.tree.root_node().has_error() {
         return proof;
     }
-    previously_visible_methods(input, old, sig_changes, &mut proof);
+    inherent_visibility_edits(input, old, sig_changes, &mut proof);
     let mut old_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
     let mut new_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
     for (symbols, root, kinds) in [

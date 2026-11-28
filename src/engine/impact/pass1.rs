@@ -913,7 +913,9 @@ fn analyze_changed_file(
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_super_functions,
-            rust_narrowed_method: declaration_proof.rust_narrowed_method,
+            rust_method_visibility: declaration_proof
+                .rust_method_visibility
+                .filter(|edit| edit.is_narrowing() || inputs.complete_text_diff()),
             rust_receiverless_associated_names: declaration_proof
                 .rust_receiverless_associated_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,
