@@ -551,6 +551,121 @@ fn rebound() {
 }
 
 #[test]
+fn narrowed_inherent_function_retains_former_sibling_callers() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='library'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/lib.rs", "mod producer; mod consumer; mod other;\n");
+    let old =
+        "pub(super) struct Names;\nimpl Names {\n    pub(super) fn collect() -> u8 { 2 }\n}\n";
+    repo.write("src/producer.rs", old);
+    repo.write("src/consumer.rs", "use crate::producer::Names as Local;\nfn direct() -> u8 { Local::collect() }\nfn value() -> fn() -> u8 { Local::collect }\n");
+    repo.write("src/other.rs", "struct Names;\nimpl Names { fn collect() -> u8 { 8 } }\nfn unrelated() -> u8 { Names::collect() }\n");
+    repo.init_git();
+    repo.commit_all("base");
+    let new = old.replace("pub(super) fn", "fn");
+    repo.write("src/producer.rs", &new);
+    repo.stage_all();
+    for (cmd, args) in [
+        ("context", &["--git"][..]),
+        ("review", &["--git", "--staged"][..]),
+    ] {
+        if cmd == "review" {
+            repo.write("src/producer.rs", old);
+        }
+        let result = repo.run_json(cmd, args);
+        let changes = result.get("impact").unwrap_or(&result)["changes"]
+            .as_array()
+            .unwrap();
+        let source = changes
+            .iter()
+            .find(|c| c["path"] == "src/producer.rs")
+            .unwrap();
+        let callers: Vec<_> = source["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["symbols"] == serde_json::json!(["collect"]))
+            .map(|c| (c["path"].as_str().unwrap(), c["line"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            callers,
+            [("src/consumer.rs", 1), ("src/consumer.rs", 2)],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn narrowed_inherent_function_respects_the_old_scope_and_explicit_trait_calls() {
+    for (visibility, outside_affected) in [("pub(in crate::group)", false), ("pub(crate)", true)] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/group");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname='library'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        repo.write("src/lib.rs", "mod group; mod outside;\n");
+        repo.write("src/group.rs", "pub(crate) mod producer; mod reader;\n");
+        let path = "src/group/producer.rs";
+        let old = format!(
+            "pub(crate) struct Names;\nimpl Names {{\n    {visibility} fn collect() -> u8 {{ 2 }}\n}}\npub(crate) trait Gather {{ fn collect() -> u8; }}\nimpl Gather for Names {{ fn collect() -> u8 {{ 1 }} }}\n"
+        );
+        repo.write(path, &old);
+        for file in ["src/group/reader.rs", "src/outside.rs"] {
+            repo.write(file, "use crate::group::producer::{Names, Gather};\nfn choose() -> u8 { Names::collect() }\nfn fixed() -> u8 { <Names as Gather>::collect() }\n");
+        }
+        repo.init_git();
+        repo.commit_all("base");
+        repo.write(path, old.replacen(&format!("{visibility} fn"), "fn", 1));
+        repo.stage_all();
+        for args in [&["--git"][..], &["--git", "--staged"][..]] {
+            let result = repo.run_json("context", args);
+            let source = &result["changes"][0];
+            let mut expected = vec![("src/group/reader.rs", 1)];
+            if outside_affected {
+                expected.push(("src/outside.rs", 1));
+            }
+            let rows = source["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["symbols"] == serde_json::json!(["collect"]))
+                .map(|c| (c["path"].as_str().unwrap(), c["line"].as_u64().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "{visibility} {source}");
+        }
+    }
+}
+
+#[test]
+fn narrowed_inherent_function_with_attributes_retains_callers() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname='library'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    repo.write("src/lib.rs", "mod producer; mod consumer;\n");
+    let old = "pub(super) struct Names;\nimpl Names {\n    #[cfg(all())]\n    #[inline]\n    pub(super) fn collect() -> u8 { 2 }\n}\n";
+    repo.write("src/producer.rs", old);
+    repo.write(
+        "src/consumer.rs",
+        "use crate::producer::Names;\nfn read() -> u8 { Names::collect() }\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("src/producer.rs", old.replace("pub(super) fn", "fn"));
+    let result = repo.run_json("context", &["--git"]);
+    let caller = &result["changes"][0]["impacted_callers"][0];
+    assert_eq!(caller["path"], "src/consumer.rs", "{result}");
+    assert_eq!(caller["line"], 1, "{result}");
+}
+
+#[test]
 fn private_inherent_staged_call_uses_the_index_module_binding() {
     let repo = TestRepo::new();
     repo.create_dir_all("src/producer");

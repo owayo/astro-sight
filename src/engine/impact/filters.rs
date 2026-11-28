@@ -30,6 +30,7 @@ pub(super) struct CrossFileFilterContext<'a> {
     /// 初期値だけを変えた非公開の Rust の const / static (`declaration::rust_value_only_constants`)。
     pub(super) rust_value_only_constants: &'a HashMap<String, declaration::RustValueOnlyConstant>,
     pub(super) rust_private_method_owners: &'a HashMap<String, declaration::PrivateMethodOwner>,
+    pub(super) rust_visible_inherent_methods: &'a HashSet<(usize, usize)>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,
@@ -149,6 +150,9 @@ impl CrossFileFilterContext<'_> {
                     && self.rust_private_method_owners.contains_key(&s.name)
                     && declaration::rust_private_inherent_method(self.root, self.source, s)
                         .is_some())
+                || self
+                    .rust_visible_inherent_methods
+                    .contains(&(s.range.start.line, s.range.start.column))
                 || symbols::is_symbol_exported(
                     self.root,
                     self.source,
@@ -723,6 +727,7 @@ mod tests {
             rust_alias_changes: &rust_alias_changes,
             rust_value_only_constants: &HashMap::new(),
             rust_private_method_owners: &HashMap::new(),
+            rust_visible_inherent_methods: &HashSet::new(),
             sig_changes,
             diff_input: &diff_input,
             file_path: "src/lib.rs",
@@ -851,6 +856,7 @@ mod tests {
             rust_alias_changes: &HashSet::new(),
             rust_value_only_constants: &HashMap::new(),
             rust_private_method_owners: &HashMap::new(),
+            rust_visible_inherent_methods: &HashSet::new(),
             sig_changes: &[],
             diff_input,
             file_path: "mod.ts",
@@ -1030,6 +1036,7 @@ mod tests {
                 rust_alias_changes: &HashSet::new(),
                 rust_value_only_constants: &HashMap::new(),
                 rust_private_method_owners: &HashMap::new(),
+                rust_visible_inherent_methods: &HashSet::new(),
                 sig_changes,
                 diff_input: diff,
                 file_path: "mod.ts",
@@ -1077,6 +1084,7 @@ mod tests {
                 rust_alias_changes: &HashSet::new(),
                 rust_value_only_constants: value_only,
                 rust_private_method_owners: &HashMap::new(),
+                rust_visible_inherent_methods: &HashSet::new(),
                 sig_changes: &[],
                 diff_input: diff,
                 file_path: "src/lib.rs",

@@ -213,6 +213,7 @@ struct FileContext {
     rust_free_function_names: HashSet<String>,
     rust_super_functions: HashSet<String>,
     rust_receiverless_associated_names: HashSet<String>,
+    rust_narrowed_method: Option<rust_visibility_scope::NarrowedMethod>,
     /// 旧新の種別が異なる名前では束縛と値渡しを降格しない。
     rust_kind_changes: HashSet<String>,
     /// Direct file-root Rust declarations whose current visibility is private.
