@@ -263,19 +263,8 @@ fn plain_path(root: &Path, relative: &str) -> bool {
         paths.push(path.clone());
     }
     paths.iter().all(|path| {
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-            if metadata.file_type().is_symlink() {
-                return false;
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                if metadata.file_attributes() & 0x400 != 0 {
-                    return false;
-                }
-            }
-            true
-        })
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| !crate::git_support::is_link(&metadata))
     })
 }
 

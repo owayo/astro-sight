@@ -58,6 +58,19 @@ pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::proc
     }
 }
 
+/// `symlink_metadata` で取得したリンクと Windows の再解析ポイントを判定する。
+pub(crate) fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    metadata.file_type().is_symlink()
+}
+
 /// snapshot が書き出さなかった symlink と gitlink の記録 (snapshot の `.git` の下、JSON)。
 pub(crate) const SNAPSHOT_OMISSIONS: &str = "astro-sight-snapshot-omissions.json";
 pub(crate) const SNAPSHOT_OMISSIONS_VERSION: u32 = 1;

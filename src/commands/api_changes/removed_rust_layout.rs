@@ -5,6 +5,7 @@
 
 use super::{ChildModule, FileScopes, ModuleRef};
 use crate::engine::{bounded_read::read_input_file, parser};
+use crate::git_support::is_link;
 use crate::language::LangId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -886,21 +887,6 @@ fn collect_path_inputs(
         }
     }
     Some(())
-}
-
-fn is_link(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
 }
 
 /// テンプレートで任意トークン・item・属性を受け渡す宣言マクロは、配置変更を否定できない。

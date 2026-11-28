@@ -40,7 +40,7 @@ use super::ts_module_paths::{
     registry_spec, with_suffix,
 };
 use crate::engine::bounded_read::read_utf8_file_limited;
-use crate::git_support::normalize_workspace_separators;
+use crate::git_support::{is_link, normalize_workspace_separators};
 
 mod config_fs;
 mod strip_internal;
@@ -582,21 +582,6 @@ fn missing(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::NotADirectory
             | std::io::ErrorKind::InvalidFilename
     )
-}
-
-fn is_link(metadata: &std::fs::Metadata) -> bool {
-    metadata.file_type().is_symlink() || is_reparse_point(metadata)
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes() & 0x400 != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_: &std::fs::Metadata) -> bool {
-    false
 }
 
 /// symlink でない通常のファイルがあるか。symlink か、読めないときは None。

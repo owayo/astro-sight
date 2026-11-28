@@ -597,15 +597,8 @@ fn list_worktree(dir: &str) -> Option<HashSet<String>> {
         entries_left = entries_left.checked_sub(1)?;
         let entry = entry.ok()?;
         let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
-        if metadata.file_type().is_symlink() {
+        if crate::git_support::is_link(&metadata) {
             return None;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes() & 0x400 != 0 {
-                return None;
-            }
         }
         if metadata.is_file() {
             if paths.len() == MAX_ENTRIES {
@@ -653,19 +646,7 @@ fn list_worktree(dir: &str) -> Option<HashSet<String>> {
 }
 
 fn plain_metadata(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        if metadata.file_type().is_symlink() {
-            return false;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes() & 0x400 != 0 {
-                return false;
-            }
-        }
-        true
-    })
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| !crate::git_support::is_link(&metadata))
 }
 
 fn plain_external_configs(
