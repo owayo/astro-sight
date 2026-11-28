@@ -265,13 +265,15 @@ pub(crate) fn analyze(
         ccd as f64 / count as f64
     };
     let pc = if count == 0 { 0.0 } else { acd / count as f64 };
-    let edge_output: Vec<_> = component_edges
+    let component_edge = |(a, b): (usize, usize)| DependencyEdge {
+        from: components[a].path.clone(),
+        to: components[b].path.clone(),
+        evidence: grouped_evidence[&(a, b)].iter().cloned().collect(),
+    };
+    let edge_output = component_edges
         .iter()
-        .map(|&(a, b)| DependencyEdge {
-            from: components[a].path.clone(),
-            to: components[b].path.clone(),
-            evidence: grouped_evidence[&(a, b)].iter().cloned().collect(),
-        })
+        .copied()
+        .map(component_edge)
         .collect();
     let cycle_paths = graph::representative_cycles(count, &grouped.cycles, &component_edges)?;
     let cycle_evidence = grouped
@@ -283,14 +285,7 @@ pub(crate) fn analyze(
                 .iter()
                 .map(|&id| components[id].path.clone())
                 .collect(),
-            steps: path
-                .into_iter()
-                .map(|(a, b)| DependencyEdge {
-                    from: components[a].path.clone(),
-                    to: components[b].path.clone(),
-                    evidence: grouped_evidence[&(a, b)].iter().cloned().collect(),
-                })
-                .collect(),
+            steps: path.into_iter().map(component_edge).collect(),
         })
         .collect();
     summary.dynamic_imports = diagnostics

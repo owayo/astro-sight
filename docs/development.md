@@ -122,3 +122,7 @@ python tools/bench-result-summary.py --repeats 9 `
 The benchmark measures summary aggregation only; it excludes source parsing, filesystem traversal, and output rendering. Cases cover small inputs, repeated paths, many paths, unique paths, and empty input. The harness warms up both executables, alternates execution order, verifies all summary fields on every run, and saves raw timings, medians, ranges, and executable hashes. On Windows, peak working set covers the entire benchmark process across all cases; other platforms record null. These timings do not establish a speedup for an entire `refs` command.
 
 Results, the empty-input tradeoff, and raw samples are in [the measurement record](benchmarks/2026-11-12-result-summary/README.md).
+
+## Dependency Graph Performance
+
+The `metrics` benchmark measures reachability in both directions on six graphs, including the dependencies between this project's source files. [Timings, peak memory and raw samples](benchmarks/2026-11-28-metrics-reachability/README.md).

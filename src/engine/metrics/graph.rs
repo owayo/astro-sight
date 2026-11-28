@@ -69,8 +69,10 @@ pub(super) fn analyze(count: usize, edges: &BTreeSet<(usize, usize)>) -> GraphMe
         }
     }
     let sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
-    let forward = reachable_counts(&dag, &sizes);
-    let backward = reachable_counts(&reverse, &sizes);
+    // Kosaraju の第2パスで付けた成分 ID は元の DAG のトポロジカル順。
+    let ids = 0..groups.len();
+    let forward = reachable_counts(&dag, &sizes, ids.clone().rev());
+    let backward = reachable_counts(&reverse, &sizes, ids);
     let mut cycles: Vec<_> = groups.into_iter().filter(|g| g.len() > 1).collect();
     cycles.sort();
     GraphMetrics {
@@ -82,15 +84,24 @@ pub(super) fn analyze(count: usize, edges: &BTreeSet<(usize, usize)>) -> GraphMe
     }
 }
 
-fn reachable_counts(graph: &[BTreeSet<usize>], sizes: &[usize]) -> Vec<usize> {
+fn reachable_counts(
+    graph: &[BTreeSet<usize>],
+    sizes: &[usize],
+    leaves_first: impl Iterator<Item = usize>,
+) -> Vec<usize> {
     let mut seen = vec![usize::MAX; graph.len()];
     let mut counts = vec![0; graph.len()];
     let mut pending = Vec::new();
-    for (start, count) in counts.iter_mut().enumerate() {
+    for start in leaves_first {
+        // 行き先が1つなら到達集合が重ならず、計算済みの件数をそのまま足せる。
+        if graph[start].len() <= 1 {
+            counts[start] = sizes[start] + graph[start].first().map_or(0, |&child| counts[child]);
+            continue;
+        }
         seen[start] = start;
         pending.push(start);
         while let Some(node) = pending.pop() {
-            *count += sizes[node];
+            counts[start] += sizes[node];
             for &child in &graph[node] {
                 if seen[child] != start {
                     seen[child] = start;
@@ -167,6 +178,25 @@ mod tests {
         assert_eq!(result.cycles, [vec![1, 3]]);
         assert_eq!(result.fan_in, [0, 2, 1, 2, 0]);
         assert!(analyze(0, &BTreeSet::new()).cycles.is_empty());
+    }
+
+    #[test]
+    fn graph_counts_shared_suffix_with_weighted_components() {
+        let edges = BTreeSet::from([
+            (0, 1),
+            (1, 0),
+            (1, 2),
+            (1, 3),
+            (2, 4),
+            (3, 4),
+            (4, 5),
+            (5, 4),
+            (5, 6),
+            (6, 7),
+        ]);
+        let graph = analyze(8, &edges);
+        assert_eq!(graph.depends_on, [8, 8, 5, 5, 4, 4, 2, 1]);
+        assert_eq!(graph.used_by, [2, 2, 3, 3, 6, 6, 7, 8]);
     }
 
     #[test]
