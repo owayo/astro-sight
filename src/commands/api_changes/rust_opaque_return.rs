@@ -64,6 +64,8 @@ struct PublicFunction {
 
 struct Declaration {
     fingerprint: blake3::Hash,
+    /// 同じ module 内の直接呼び出し先を特定できる自由関数について、可視性以外の宣言を比較する。
+    local_implementation: Option<blake3::Hash>,
     name: String,
     bound_names: BTreeSet<String>,
     references: BTreeSet<String>,
@@ -899,22 +901,24 @@ fn nested_constructs(node: tree_sitter::Node<'_>, source: &[u8], path: &str) -> 
 }
 
 fn fingerprint(node: tree_sitter::Node<'_>, source: &[u8]) -> blake3::Hash {
-    item_fingerprint(node, source, None)
+    item_fingerprint(node, source, None, None)
 }
 
 fn item_fingerprint(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     help: Option<tree_sitter::Node<'_>>,
+    omit_child: Option<tree_sitter::Node<'_>>,
 ) -> blake3::Hash {
     let mut tokens = Vec::new();
-    if matches!(node.kind(), "mod_item" | "trait_item") {
-        let body = node.child_by_field_name("body");
+    let omitted = if matches!(node.kind(), "mod_item" | "trait_item") {
+        node.child_by_field_name("body")
+    } else {
+        omit_child
+    };
+    if let Some(omitted) = omitted {
         let mut cursor = node.walk();
-        for child in node
-            .children(&mut cursor)
-            .filter(|child| Some(*child) != body)
-        {
+        for child in node.children(&mut cursor).filter(|child| *child != omitted) {
             push_tokens(child, source, &mut tokens);
         }
     } else {
@@ -1265,7 +1269,7 @@ impl Snapshot {
                 let inline = inline_modules(&scopes);
                 let mut candidates: BTreeMap<_, _> = references
                     .iter()
-                    .filter(|reference| index.private_function_binding(&inline, reference))
+                    .filter(|reference| index.restricted_function_binding(&inline, reference))
                     .map(|name| (name.clone(), format!("@fn:{}:{name}", module.to_hex())))
                     .collect();
                 if !candidates.is_empty()
@@ -1297,6 +1301,15 @@ impl Snapshot {
             } else {
                 (BTreeSet::new(), None)
             };
+            let full_fingerprint = fingerprint(node, source);
+            let local_implementation = private_key.as_ref().map(|_| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "visibility_modifier")
+                    .map_or(full_fingerprint, |visibility| {
+                        item_fingerprint(node, source, None, Some(visibility))
+                    })
+            });
             bound_names.extend(private_key);
             let start = node.start_position();
             let public = if opaque_function(node) {
@@ -1347,12 +1360,13 @@ impl Snapshot {
                 {
                     self.clap_help.insert(
                         key.clone(),
-                        (module, item_fingerprint(node, source, Some(help))),
+                        (module, item_fingerprint(node, source, Some(help), None)),
                     );
                 }
             }
             self.declarations.entry(key).or_default().push(Declaration {
-                fingerprint: fingerprint(node, source),
+                fingerprint: full_fingerprint,
+                local_implementation,
                 name,
                 bound_names,
                 references,
@@ -1658,6 +1672,22 @@ fn changed_names_with(old: &Snapshot, new: &Snapshot, dependents: &Dependents<'_
         .chain(new.declarations.keys())
         .collect();
     for key in keys {
+        if let (Some([before]), Some([after])) = (
+            old.declarations.get(key).map(Vec::as_slice),
+            new.declarations.get(key).map(Vec::as_slice),
+        ) && before.fingerprint != after.fingerprint
+            && before.local_implementation.is_some()
+            && before.local_implementation == after.local_implementation
+            && before.bound_names == after.bound_names
+            && before.conditions == after.conditions
+        {
+            // 可視性だけの変更は glob や解決できない名前には伝える。同じ module の
+            // 関数に解決済みの呼び出しは専用の鍵を参照しており、従来の実装を呼ぶ。
+            if remember(&mut changes, &before.name, &before.conditions) {
+                pending.push_back((before.name.clone(), before.conditions.clone()));
+            }
+            continue;
+        }
         let fingerprint = |snapshot: &Snapshot| {
             let mut hashes: Vec<_> = snapshot
                 .declarations
@@ -1996,6 +2026,28 @@ mod tests {
                 .all(|change| !matches!(change.name.as_str(), "indirect" | "direct")),
             "{api:?}"
         );
+    }
+
+    #[test]
+    fn opaque_returns_keep_local_calls_when_only_helper_visibility_changes() {
+        let before = r#"
+mod keys {
+    fn drop(_: ()) -> std::rc::Rc<u8> { std::rc::Rc::new(1) }
+    pub fn value() -> std::rc::Rc<u8> { drop(()) }
+}
+pub fn items() -> impl Sized { keys::value() }
+pub mod consumer {
+    use super::keys::*;
+    pub fn selected() -> impl Sized { drop(()) }
+}
+"#;
+        let visible = before.replace("fn drop(", "pub(super) fn drop(");
+        for (old, new) in [(before, visible.as_str()), (visible.as_str(), before)] {
+            let api = changes(&[("src/lib.rs", old)], &[("src/lib.rs", new)]);
+            assert!(!modified(&api, "items"), "{api:?}");
+            // glob から見えるようになった drop と prelude の drop では戻り値が違う。
+            assert!(modified(&api, "selected"), "{api:?}");
+        }
     }
 
     #[test]
